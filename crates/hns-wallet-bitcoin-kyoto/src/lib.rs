@@ -1037,7 +1037,7 @@ mod tests {
                 .bitcoin_public_key()
                 .expect("compressed public key")
                 .to_string(),
-            "020a32c24be2befb82a9a41ef0941379195f3e7112a051f282a304757d821c79a0"
+            "0250713ff8ce00f01a5957b253d1f0f72b6fa56cc3fa1de6b60bbf66a58482118b"
         );
 
         let preimage = [9_u8; 32];
