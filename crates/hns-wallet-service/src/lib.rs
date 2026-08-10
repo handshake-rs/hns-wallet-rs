@@ -1043,38 +1043,6 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             ));
         }
         let method = ProviderMethod::parse(&method_name).map_err(provider_failure)?;
-        if matches!(
-            method,
-            ProviderMethod::HnsRequestAccounts
-                | ProviderMethod::HnsAccounts
-                | ProviderMethod::HnsGetBalance
-                | ProviderMethod::HnsGetTransactions
-                | ProviderMethod::HnsGetReceiveAddress
-                | ProviderMethod::HnsGetNames
-        ) {
-            validate_empty_params(&params)?;
-        }
-        if method == ProviderMethod::HnsGetName {
-            hns_name_hash_param(&params)?;
-        }
-        if matches!(
-            method,
-            ProviderMethod::WalletGetCapabilities
-                | ProviderMethod::WalletGetPermissions
-                | ProviderMethod::WalletGetStatus
-                | ProviderMethod::WalletRevokePermissions
-                | ProviderMethod::WalletLock
-        ) {
-            validate_empty_params(&params)?;
-        }
-        if method == ProviderMethod::WalletRequestPermissions {
-            let requested = requested_capabilities_from_params(&params)?;
-            if !requested.is_subset(&self.grantable_permission_capabilities()) {
-                return Err(ServiceFailure::unsupported(
-                    ServiceCapability::ProviderDispatch,
-                ));
-            }
-        }
         if method == ProviderMethod::WalletLock
             && !self
                 .capabilities
@@ -1108,6 +1076,49 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             return Err(ServiceFailure::unsupported(
                 ServiceCapability::ProviderDispatch,
             ));
+        }
+        if method == ProviderMethod::WalletRequestPermissions
+            && self.grantable_permission_capabilities().is_empty()
+        {
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ));
+        }
+
+        // Availability is decided before method-specific parameter parsing.
+        // An unavailable surface must have one fail-closed response regardless
+        // of attacker-controlled parameter shape.
+        if matches!(
+            method,
+            ProviderMethod::HnsRequestAccounts
+                | ProviderMethod::HnsAccounts
+                | ProviderMethod::HnsGetBalance
+                | ProviderMethod::HnsGetTransactions
+                | ProviderMethod::HnsGetReceiveAddress
+                | ProviderMethod::HnsGetNames
+        ) {
+            validate_empty_params(&params)?;
+        }
+        if method == ProviderMethod::HnsGetName {
+            hns_name_hash_param(&params)?;
+        }
+        if matches!(
+            method,
+            ProviderMethod::WalletGetCapabilities
+                | ProviderMethod::WalletGetPermissions
+                | ProviderMethod::WalletGetStatus
+                | ProviderMethod::WalletRevokePermissions
+                | ProviderMethod::WalletLock
+        ) {
+            validate_empty_params(&params)?;
+        }
+        if method == ProviderMethod::WalletRequestPermissions {
+            let requested = requested_capabilities_from_params(&params)?;
+            if !requested.is_subset(&self.grantable_permission_capabilities()) {
+                return Err(ServiceFailure::unsupported(
+                    ServiceCapability::ProviderDispatch,
+                ));
+            }
         }
         let encoded_request = serde_json::to_vec(&json!({
             "method": method_name.clone(),
