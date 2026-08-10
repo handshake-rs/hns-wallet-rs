@@ -55,6 +55,7 @@ pub const MAX_KYOTO_SYNC_TIMEOUT: Duration = Duration::from_secs(86_400);
 /// Wallet-private HKDF-SHA256 salt for Bitcoin atomic-swap keys. This is not a
 /// registered BIP-32 purpose or an interoperable descriptor path.
 pub const BITCOIN_SWAP_DERIVATION_DOMAIN: &[u8] = b"hns-wallet-rs/bitcoin-atomic-swap-key/v1";
+#[cfg(test)]
 const BITCOIN_SWAP_DERIVATION_INFO_TAG: &[u8; 4] = b"HSWP";
 const BITCOIN_SWAP_ALLOCATION_DERIVATION_DOMAIN: &[u8] =
     b"hns-wallet-rs/bitcoin-atomic-swap-allocation-key/v1";
@@ -245,6 +246,7 @@ impl BitcoinSwapKeyReference {
         }
     }
 
+    #[cfg(test)]
     fn derivation_info(self, counter: u8) -> Result<[u8; 25], BitcoinWalletError> {
         self.validate()?;
         let mut info = [0_u8; 25];
@@ -308,6 +310,7 @@ impl fmt::Debug for DerivedBitcoinSwapKey {
 }
 
 /// Context-free mnemonic derivation retained for crate-local vectors.
+#[cfg(test)]
 pub(crate) fn derive_bitcoin_swap_key(
     mnemonic: &Mnemonic,
     reference: BitcoinSwapKeyReference,
@@ -316,6 +319,7 @@ pub(crate) fn derive_bitcoin_swap_key(
     derive_bitcoin_swap_key_from_seed(seed.as_slice(), reference)
 }
 
+#[cfg(test)]
 fn derive_bitcoin_swap_key_from_seed(
     seed: &[u8],
     reference: BitcoinSwapKeyReference,

@@ -1074,7 +1074,7 @@ impl KyotoSupervisor {
             started_revision,
         } = match start {
             BroadcastStart::AlreadyObserved(receipt) => return Ok(receipt),
-            BroadcastStart::Submit(submission) => submission,
+            BroadcastStart::Submit(submission) => *submission,
         };
 
         let returned_wtxid = tokio::time::timeout(
@@ -1112,7 +1112,7 @@ impl KyotoSupervisor {
 
 enum BroadcastStart {
     AlreadyObserved(BitcoinBroadcastReceipt),
-    Submit(PendingBitcoinSubmission),
+    Submit(Box<PendingBitcoinSubmission>),
 }
 
 struct PendingBitcoinSubmission {
@@ -1192,11 +1192,11 @@ fn begin_broadcast_submission(
     intent.last_submission_started_at_unix = Some(now_unix);
     let started_revision =
         store.save_bitcoin_transaction(&txid, stored.revision, &record, now_unix)?;
-    Ok(BroadcastStart::Submit(PendingBitcoinSubmission {
+    Ok(BroadcastStart::Submit(Box::new(PendingBitcoinSubmission {
         transaction,
         record,
         started_revision,
-    }))
+    })))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1498,6 +1498,10 @@ pub fn bitcoin_broadcast_approval_commitment(
 /// Persists the complete signed transaction and exact approval binding before
 /// the supervisor is allowed to hand bytes to Kyoto. This is idempotent only
 /// for identical terms at the expected record revision.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the persistence boundary keeps wallet/store authority, signed bytes, approval commitment, fee cap, revision, and validity window explicit for auditability"
+)]
 pub fn persist_prepared_bitcoin_broadcast(
     wallet: &Wallet,
     store: &mut WalletStore,
@@ -1641,55 +1645,6 @@ fn tip_mismatch_requires_recovery(
     wallet_tip != last_consistent_checkpoint
 }
 
-#[cfg(test)]
-mod restart_tests {
-    use super::*;
-
-    fn checkpoint(height: u32, byte: u8) -> BitcoinCheckpoint {
-        BitcoinCheckpoint {
-            height,
-            block_hash: [byte; 32],
-        }
-    }
-
-    #[test]
-    fn synchronizing_tip_ahead_requires_recovery_but_exact_reconciliation_resumes() {
-        let prior = checkpoint(100, 1);
-        let committed = checkpoint(101, 2);
-        let synchronizing = KyotoSyncPhase::Synchronizing {
-            sequence: 7,
-            from: prior,
-        };
-        assert!(tip_mismatch_requires_recovery(
-            &synchronizing,
-            prior,
-            committed,
-        ));
-
-        let reconciling = KyotoSyncPhase::Reconciling {
-            sequence: 7,
-            wallet_tip: committed,
-            common_ancestor: Some(prior),
-        };
-        assert!(!tip_mismatch_requires_recovery(
-            &reconciling,
-            prior,
-            committed,
-        ));
-        assert!(tip_mismatch_requires_recovery(
-            &reconciling,
-            prior,
-            checkpoint(102, 3),
-        ));
-
-        assert!(!tip_mismatch_requires_recovery(
-            &KyotoSyncPhase::Ready,
-            committed,
-            committed,
-        ));
-    }
-}
-
 fn wallet_recent_checkpoints(
     wallet: &Wallet,
     recovery_checkpoint: BitcoinCheckpoint,
@@ -1713,6 +1668,7 @@ fn wallet_recent_checkpoints(
     Ok(recent)
 }
 
+#[cfg(test)]
 pub(crate) fn highest_common_checkpoint(
     first: &[BitcoinCheckpoint],
     second: &[BitcoinCheckpoint],
@@ -2000,4 +1956,53 @@ fn bitcoin_outpoint_id(txid: [u8; 32], output_index: u32) -> Vec<u8> {
     id.extend_from_slice(&txid);
     id.extend_from_slice(&output_index.to_be_bytes());
     id
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    fn checkpoint(height: u32, byte: u8) -> BitcoinCheckpoint {
+        BitcoinCheckpoint {
+            height,
+            block_hash: [byte; 32],
+        }
+    }
+
+    #[test]
+    fn synchronizing_tip_ahead_requires_recovery_but_exact_reconciliation_resumes() {
+        let prior = checkpoint(100, 1);
+        let committed = checkpoint(101, 2);
+        let synchronizing = KyotoSyncPhase::Synchronizing {
+            sequence: 7,
+            from: prior,
+        };
+        assert!(tip_mismatch_requires_recovery(
+            &synchronizing,
+            prior,
+            committed,
+        ));
+
+        let reconciling = KyotoSyncPhase::Reconciling {
+            sequence: 7,
+            wallet_tip: committed,
+            common_ancestor: Some(prior),
+        };
+        assert!(!tip_mismatch_requires_recovery(
+            &reconciling,
+            prior,
+            committed,
+        ));
+        assert!(tip_mismatch_requires_recovery(
+            &reconciling,
+            prior,
+            checkpoint(102, 3),
+        ));
+
+        assert!(!tip_mismatch_requires_recovery(
+            &KyotoSyncPhase::Ready,
+            committed,
+            committed,
+        ));
+    }
 }

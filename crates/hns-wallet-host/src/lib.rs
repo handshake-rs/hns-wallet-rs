@@ -126,6 +126,10 @@ pub struct AcceptedEvent {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "this public output enum preserves its established by-value variant representation for downstream host integrations"
+)]
 pub enum HostOutput {
     Negotiated(NegotiatedSession),
     Response(AcceptedResponse),
@@ -1174,10 +1178,9 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
         if matches!(
             code,
             ServiceErrorCode::AuthorityUnknown | ServiceErrorCode::AuthorityStale
-        ) {
-            if let Some(handle) = class.authority() {
-                self.mark_authority_stale(handle);
-            }
+        ) && let Some(handle) = class.authority()
+        {
+            self.mark_authority_stale(handle);
         }
     }
 
@@ -1717,13 +1720,13 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
     fn remember_request_id(&mut self, request_id: ProviderRequestId) {
         self.recent_request_ids.insert(request_id);
         self.request_id_order.push_back(request_id);
-        if self.request_id_order.len() > MAX_RECENT_REQUEST_IDS {
-            if let Some(expired) = self.request_id_order.pop_front() {
-                if self.pending.contains_key(&expired) {
-                    self.aged_out_request_ids.insert(expired);
-                } else {
-                    self.recent_request_ids.remove(&expired);
-                }
+        if self.request_id_order.len() > MAX_RECENT_REQUEST_IDS
+            && let Some(expired) = self.request_id_order.pop_front()
+        {
+            if self.pending.contains_key(&expired) {
+                self.aged_out_request_ids.insert(expired);
+            } else {
+                self.recent_request_ids.remove(&expired);
             }
         }
     }
@@ -1731,10 +1734,10 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
     fn remember_nonce(&mut self, handle: HostAuthorityHandleId, nonce: u64) {
         self.recent_nonces.insert((handle, nonce));
         self.nonce_order.push_back((handle, nonce));
-        if self.nonce_order.len() > MAX_RECENT_PROVIDER_NONCES {
-            if let Some(expired) = self.nonce_order.pop_front() {
-                self.recent_nonces.remove(&expired);
-            }
+        if self.nonce_order.len() > MAX_RECENT_PROVIDER_NONCES
+            && let Some(expired) = self.nonce_order.pop_front()
+        {
+            self.recent_nonces.remove(&expired);
         }
     }
 

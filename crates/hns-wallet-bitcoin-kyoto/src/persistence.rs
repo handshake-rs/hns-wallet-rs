@@ -58,7 +58,10 @@ impl StoredBdkWalletState {
 
 enum PersisterState {
     Uninitialized,
-    Initialized { revision: u64, aggregate: ChangeSet },
+    Initialized {
+        revision: u64,
+        aggregate: Box<ChangeSet>,
+    },
 }
 
 /// BDK persistence adapter backed by one authenticated, encrypted WalletStore
@@ -134,7 +137,7 @@ impl BdkWalletStorePersister {
         }
         self.state = PersisterState::Initialized {
             revision: stored.revision,
-            aggregate: stored.value.changeset,
+            aggregate: Box::new(stored.value.changeset),
         };
         Ok(())
     }
@@ -151,7 +154,7 @@ impl WalletPersister for BdkWalletStorePersister {
             let aggregate = ChangeSet::default();
             persister.state = PersisterState::Initialized {
                 revision: 0,
-                aggregate: aggregate.clone(),
+                aggregate: Box::new(aggregate.clone()),
             };
             return Ok(aggregate);
         };
@@ -159,7 +162,7 @@ impl WalletPersister for BdkWalletStorePersister {
         let aggregate = stored.value.changeset;
         persister.state = PersisterState::Initialized {
             revision: stored.revision,
-            aggregate: aggregate.clone(),
+            aggregate: Box::new(aggregate.clone()),
         };
         Ok(aggregate)
     }
@@ -172,7 +175,7 @@ impl WalletPersister for BdkWalletStorePersister {
             PersisterState::Initialized {
                 revision,
                 aggregate,
-            } => (*revision, aggregate.clone()),
+            } => (*revision, aggregate.as_ref().clone()),
         };
         Self::reject_immutable_changes(&aggregate, changeset)?;
         let mut candidate = aggregate.clone();
@@ -193,7 +196,7 @@ impl WalletPersister for BdkWalletStorePersister {
             Ok(revision) => {
                 persister.state = PersisterState::Initialized {
                     revision,
-                    aggregate: candidate,
+                    aggregate: Box::new(candidate),
                 };
                 Ok(())
             }
@@ -413,7 +416,7 @@ mod tests {
         )
         .expect("winning initial create");
         let winner_initial_changeset = match &winner_initial.persister.state {
-            PersisterState::Initialized { aggregate, .. } => aggregate.clone(),
+            PersisterState::Initialized { aggregate, .. } => aggregate.as_ref().clone(),
             PersisterState::Uninitialized => panic!("initialized winning persister"),
         };
         assert!(matches!(
@@ -433,7 +436,7 @@ mod tests {
         )
         .expect("create persisted wallet");
         let aggregate = match &first.persister.state {
-            PersisterState::Initialized { aggregate, .. } => aggregate.clone(),
+            PersisterState::Initialized { aggregate, .. } => aggregate.as_ref().clone(),
             PersisterState::Uninitialized => panic!("initialized persister"),
         };
         let unsupported = StoredBdkWalletState {
@@ -502,8 +505,10 @@ mod tests {
                 .expect("persisted public descriptor"),
             PersisterState::Uninitialized => panic!("initialized persister"),
         };
-        let mut descriptor_change = ChangeSet::default();
-        descriptor_change.descriptor = Some(other_descriptor);
+        let descriptor_change = ChangeSet {
+            descriptor: Some(other_descriptor),
+            ..ChangeSet::default()
+        };
         assert!(matches!(
             <BdkWalletStorePersister as WalletPersister>::persist(
                 &mut winner.persister,
@@ -512,8 +517,10 @@ mod tests {
             Err(BitcoinWalletError::BitcoinWalletStateConflict)
         ));
 
-        let mut network_change = ChangeSet::default();
-        network_change.network = Some(Network::Bitcoin);
+        let network_change = ChangeSet {
+            network: Some(Network::Bitcoin),
+            ..ChangeSet::default()
+        };
         assert!(matches!(
             <BdkWalletStorePersister as WalletPersister>::persist(
                 &mut winner.persister,
