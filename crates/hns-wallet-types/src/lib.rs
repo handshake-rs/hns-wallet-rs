@@ -103,7 +103,7 @@ const BASE64URL_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 fn encode_wire_id(bytes: &[u8]) -> String {
-    let mut encoded = String::with_capacity((bytes.len() * 4 + 2) / 3);
+    let mut encoded = String::with_capacity((bytes.len() * 4).div_ceil(3));
     let mut index = 0;
     while index + 3 <= bytes.len() {
         let first = bytes[index];
@@ -204,7 +204,7 @@ macro_rules! wire_id {
 
         impl $name {
             pub const LENGTH: usize = $size;
-            pub const ENCODED_LENGTH: usize = ($size * 4 + 2) / 3;
+            pub const ENCODED_LENGTH: usize = ($size * 4_usize).div_ceil(3);
 
             pub fn from_bytes(bytes: [u8; $size]) -> Result<Self, WireIdError> {
                 if bytes == [0_u8; $size] {
