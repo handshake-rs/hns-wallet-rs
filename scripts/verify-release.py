@@ -255,11 +255,18 @@ def verify_publish_script_safety(repo: Path) -> None:
         "verify_protocol_packages_published()",
         "require_clean_archive_vcs=yes",
         '*\\"dirty\\":true*',
-        'python3 -c \'import json, sys; print(json.load(sys.stdin)["git"]["sha1"])\'',
+        'protocol_vcs_info="$release_tmp/$package-$protocol_version.cargo_vcs_info.json"',
+        '> "$protocol_vcs_info"',
+        'json.load(open(sys.argv[1], encoding="utf-8"))["git"]["sha1"]',
     )
     for fragment in required_fragments:
         if fragment not in script:
             fail(f"scripts/publish.sh omits execute safety fragment {fragment!r}")
+    if (
+        "protocol_vcs_sha=$(tar -xOf" in script
+        or "protocol_vcs_dirty=$(tar -xOf" in script
+    ):
+        fail("execute-mode protocol VCS reads must materialize tar output")
 
     try:
         execute = script.split("    --execute)", 1)[1]

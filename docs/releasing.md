@@ -48,13 +48,14 @@ or test success does not enable provider, value, settlement, or marketplace
 product gates. Registry and tag state are external facts and must be checked at
 release time rather than embedded as a claim in the source snapshot.
 
-The checked-in `0.1.0` heading and package-local changelogs describe an
-unpublished candidate. Their plain `CHANGELOG.md` reference deliberately does
-not point at a tag that does not yet exist. Before an authorized upload, replace
-the canonical `candidate` marker and its adjacent statement in both changelog
-authorities with the canonical `release` forms below, synchronize every package
-copy, and let the execute-mode validator reject any stale, missing, malformed,
-or mismatched declaration.
+The selected `0.1.0` heading and package-local changelogs use one
+version-scoped canonical release-state declaration. Candidate form describes an
+unpublished candidate and deliberately uses a plain `CHANGELOG.md` reference
+instead of a tag link. Before an authorized upload, replace the canonical
+`candidate` marker and its adjacent statement in both changelog authorities
+with the canonical `release` forms below, synchronize every package copy, and
+let the execute-mode validator reject any stale, missing, malformed, or
+mismatched declaration.
 
 Root `CHANGELOG.md` release form:
 

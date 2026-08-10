@@ -523,19 +523,26 @@ verify_protocol_packages_published() {
             --user-agent "hns-wallet-rs-release/$protocol_version (https://github.com/handshake-rs/hns-wallet-rs)" \
             --output "$protocol_archive" \
             "https://crates.io/api/v1/crates/$package/$protocol_version/download"
-        protocol_vcs_sha=$(tar -xOf \
+        protocol_vcs_info="$release_tmp/$package-$protocol_version.cargo_vcs_info.json"
+        if ! tar -xOf \
             "$protocol_archive" \
-            "$package-$protocol_version/.cargo_vcs_info.json" |
-            python3 -c 'import json, sys; print(json.load(sys.stdin)["git"]["sha1"])')
+            "$package-$protocol_version/.cargo_vcs_info.json" \
+            > "$protocol_vcs_info"
+        then
+            echo "error: required protocol package $package $protocol_version has no readable VCS identity" >&2
+            exit 1
+        fi
+        protocol_vcs_sha=$(python3 -c \
+            'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["git"]["sha1"])' \
+            "$protocol_vcs_info")
         if [ "$protocol_vcs_sha" != "$protocol_revision" ]
         then
             echo "error: required protocol package $package $protocol_version identifies source $protocol_vcs_sha, expected $protocol_revision" >&2
             exit 1
         fi
-        protocol_vcs_dirty=$(tar -xOf \
-            "$protocol_archive" \
-            "$package-$protocol_version/.cargo_vcs_info.json" |
-            python3 -c 'import json, sys; print(str(json.load(sys.stdin)["git"].get("dirty", False)).lower())')
+        protocol_vcs_dirty=$(python3 -c \
+            'import json, sys; print(str(json.load(open(sys.argv[1], encoding="utf-8"))["git"].get("dirty", False)).lower())' \
+            "$protocol_vcs_info")
         if [ "$protocol_vcs_dirty" = "true" ]
         then
             echo "error: required protocol package $package $protocol_version records a dirty source tree" >&2
