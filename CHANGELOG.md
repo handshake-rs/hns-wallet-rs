@@ -3,6 +3,16 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## Unreleased
+
+- Added an injectable `MobileHnsReadController` composition which transfers or
+  opens one exact shared-store authority, performs bounded synchronized HNS
+  reads, and returns a minimized serializable balance/receive/history/known-name/
+  module-status snapshot. The existing lifecycle-only mobile controller API is
+  preserved. Reads reject an epoch-bound height-zero block that does not match
+  the selected account network. No production device backend, provider, value,
+  signing, settlement, HNSA/HNSR, Shakedex, or marketplace gate is enabled.
+
 ## 0.1.0 - 2026-08-10
 
 Initial release source for the independent Handshake wallet boundary:

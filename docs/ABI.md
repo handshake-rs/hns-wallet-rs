@@ -173,9 +173,11 @@ Approval schema v3 deliberately replaces the unpublished v2 projection because
 exact provider-capability snapshot negotiates approval schema v3 before the
 host can issue any provider request, so mismatched peers fail before an
 approval is decoded. Wallet FFI, service, host, private/public schemas, and
-vectors use the one exact v3 shape. Browser/mobile consumers must negotiate,
-adopt, and render it before Names becomes available; strict v2 and v3 shapes
-reject one another rather than silently dropping disclosure.
+vectors use the one exact v3 shape. Browser or future mobile-provider consumers
+must negotiate, adopt, and render it before provider Names becomes available;
+strict v2 and v3 shapes reject one another rather than silently dropping
+disclosure. The trusted-native mobile read snapshot is not a provider consumer
+and grants no website authority.
 
 The frame fixtures describe the JSON payload after the four-byte length prefix;
 the prefix and encoded byte ceilings remain codec/transport invariants. JSON
@@ -189,6 +191,6 @@ false.
 
 The historical host and contract regression baseline passed the exact
 `ba9f013` workspace CI recorded in
-[`QUALIFICATION.md`](QUALIFICATION.md). Installed browser/mobile adoption and
-artifact-authenticity evidence belongs to downstream products and does not
-change this private ABI or any fixed availability gate.
+[`QUALIFICATION.md`](QUALIFICATION.md). Installed browser/mobile-provider
+adoption and artifact-authenticity evidence belongs to downstream products and
+does not change this private ABI or any fixed availability gate.

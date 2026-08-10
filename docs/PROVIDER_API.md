@@ -191,8 +191,10 @@ without truncation. A nonempty persisted set remains invalid without HNS
 namespace, Accounts, Names, and a nonempty account binding.
 
 Non-Names permission prompts and `hns_requestAccounts` carry `hnsNames: []`.
-Browser/mobile consumers must negotiate, adopt, preserve, and render this
-approval-v3 shape before the read composition is product-available.
+Browser or future mobile-provider consumers must negotiate, adopt, preserve,
+and render this approval-v3 shape before the provider read composition is
+product-available. The separate trusted-native mobile snapshot creates no
+provider permission or website surface.
 Strict approval-v2 consumers reject the new field, while v3 consumers reject
 its omission.
 

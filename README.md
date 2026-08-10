@@ -27,10 +27,17 @@ sandbox, ACL and data-protection policy, backup exclusion, and
 Keystore/Keychain wrapping. A platform-neutral native controller now
 creates or restores exactly one non-value HNS account, opens only a complete
 seed/account bootstrap, and exposes status, unlock, lock, and account identity
-through a private ABI-v2 session. Platform bindings, native product screens,
-and installed-device qualification are downstream release requirements rather
-than authorities supplied by this crate, and no value/provider release gate is
-enabled.
+through a private ABI-v2 session. A separate backend-injected native read
+controller can now reuse that exact shared-store authority and return one
+bounded serializable balance/receive/history/known-name/module-status snapshot.
+It includes no concrete mobile backend. The current epoch protocol delivers
+derived watch ScriptIds before the selected-network genesis check, and fresh
+history needs archive raw transactions unless the authenticated wallet already
+cached them. A trusted local, deadline-enforced, archive-capable (or durably
+indexed) device backend, platform bindings, native product screens, and
+installed-device qualification therefore remain downstream release
+requirements rather than authorities supplied by this crate, and no
+value/provider release gate is enabled.
 
 ABI wallet status/unlock/lock and a narrow provider
 control surface are implemented. One library composition can bind an exact
@@ -46,13 +53,15 @@ approval-schema-v3 Names prompt carried by private ABI v2 contains the exact
 sorted canonical name/lowercase-hash set it may grant. The service freezes that
 bounded set before prompting, re-synchronizes at approval, rejects any account
 or set change, and persists only the unchanged displayed hashes. This
-approval-v3 shape is
-incompatible with consumers that omit or do not understand `hnsNames`; browser
-and mobile adapters must negotiate, adopt, and render it exactly before Names
-is available. The checked-in executable still has no account-selection or
-backend inputs, so it remains the control-only runtime. The native controller
-is a library-only composition; wallet creation/restoration in shipped apps,
-browser integration, and every value path remain unavailable there.
+approval-v3 shape is incompatible with consumers that omit or do not understand
+`hnsNames`; browser adapters must negotiate, adopt, and render it exactly before
+provider Names access is available. The native read controller is a distinct
+trusted-app surface: it minimizes only already-persisted known names and exposes
+no provider authority or name-import path. The checked-in executable still has
+no account-selection or backend inputs, so it remains the control-only runtime.
+The native controllers are library-only compositions; a production mobile
+wallet-index backend, shipped bindings, browser integration, and every value
+path remain unavailable here.
 
 Current safety status: the production-hardening source boundary is implemented,
 but executable HNS, Bitcoin, and Ethereum value operations and all mainnet
@@ -126,8 +135,9 @@ gate stays false.
 - `hns-wallet-shakedex`: release-gated persisted seller/buyer/recovery and
   post-TRANSFER script-FINALIZE schemas.
 - `hns-wallet-market`: price-bound reservations and atomic-swap recovery.
-- `hns-wallet-mobile`: platform-neutral, single-account Android/iOS controller
-  for atomic create/restore/open and private status/unlock/lock/account control.
+- `hns-wallet-mobile`: platform-neutral, single-account Android/iOS lifecycle
+  controller plus an injected, synchronized, minimized HNS read composition;
+  no concrete device backend or value/provider surface.
 - `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet, encrypted session-bound swap-key allocation primitive, and Bitcoin HTLC adapter.
 - `hns-wallet-ethereum`: offline native-ETH account derivation plus
   release-gated Helios/HTLC policy.

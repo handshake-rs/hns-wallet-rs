@@ -924,11 +924,15 @@ dependencies = [
 name = "hns-wallet-mobile"
 version = "0.1.0"
 dependencies = [
+ "hns-transaction",
  "hns-wallet-ffi",
  "hns-wallet-hns",
  "hns-wallet-host",
  "hns-wallet-service",
  "hns-wallet-store",
+ "hns-wallet-types",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "zeroize",

@@ -46,6 +46,18 @@ add a nonzero process-instance nonce and generation; both remain exact across
 all continuations, gap-limit expansion, transaction/parent reads, and workflow
 reconciliation. Any difference discards the partial snapshot.
 
+Immediately after the first complete scan establishes that epoch binding, the
+non-value account-read runtime requests height-zero block evidence under the
+same binding and compares it with the pinned genesis for the selected account's
+network. A mainnet snapshot cannot be accepted for a regtest account (or vice
+versa), even when its tip, epoch, pages, and mempool data are internally
+coherent. The current protocol cannot do this before the first confirmed query
+because `get_chain_tip` carries no epoch. Derived ScriptIds therefore reach the
+authenticated backend before the genesis check. This ordering makes the
+loopback companion a trusted privacy boundary; do not expose arbitrary remote
+backend configuration until a pre-script epoch/network-identity exchange is
+designed and reviewed.
+
 Every current tip also carries the HSD-compatible median time past computed by
 the node from that tip and up to ten ancestors inside the same immutable read.
 The wallet wire field is mandatory. Legacy persisted bindings decode with zero
@@ -66,6 +78,13 @@ inclusion heights, raw transactions, txids,
 outpoint echoes, cursor lengths, collection bounds, fee evidence, inclusion
 counts, optional transaction positions, and optional exact block/admission
 times are validated before projection into wallet types.
+
+A pruned node may legitimately return no raw transaction bytes. Fresh history
+reconciliation can use that response only when the exact raw transaction is
+already present in authenticated wallet state; otherwise it fails closed.
+Consequently a production fresh-restore companion must retain archive history
+or a durable wallet-relevant raw-transaction index. The currently available
+pruned development node is not general production read-backend evidence.
 
 `quote_transaction_fee` binds the exact final signed transaction bytes to the
 current chain epoch/tip, mempool instance/generation, and requested confirmation

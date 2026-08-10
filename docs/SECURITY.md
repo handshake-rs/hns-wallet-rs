@@ -102,7 +102,7 @@ node I/O, and never creates, updates, signs for, or broadcasts from an account. 
 opened handle to the same database path is rejected as a different key
 authority.
 
-The synchronized non-value HNS read composition proves the same Arc identity
+The synchronized read-only HNS composition proves the same Arc identity
 for its selector, service/provider state, and `HnsAccountReadRuntime`. It stages
 only authenticated rows inside bounded store closures; no backend method is
 called until the closure and mutex guard have returned. A durable discovery
@@ -111,8 +111,27 @@ exact account revision plus coin, transaction, name, and recovery rows loaded
 before node I/O. Account selection is checked again after scanning and after
 commit. Stale chain epochs, changed tips, restarted mempool instance nonces,
 generation changes, account changes, lock transitions, malformed evidence, or
-row changes fail closed. The one chain/mempool binding is trusted-service state
-and never appears in website JSON.
+row changes fail closed. The mobile read controller constructs this composition
+internally from its lifecycle controller's literal shared authority or from one
+newly opened shared authority; callers cannot inject a selector/runtime/store
+join. Its combined synchronization obtains the trusted snapshot directly from
+the composed service, immediately minimizes it, and never serializes the
+chain/mempool binding or raw name proof/state/resource/owner/derivation
+evidence. Every failed read locks before retry. The same binding never appears
+in website JSON, and no mobile provider entry point exists.
+
+The injected backend is synchronous and broader than this read subset, but the
+read controller exposes none of its broadcast, fee, signing, action, or value
+methods. Products must enforce backend deadlines and call reads off the UI
+thread. This repository includes no production Android/iOS wallet-index
+backend; the authenticated loopback node RPC adapter is not device integration.
+Its epoch is first learned from a confirmed script-set query, so the runtime's
+exact selected-network genesis check occurs only after derived watch scripts
+reach that trusted backend. No remote user-configurable backend is eligible
+without a pre-script identity binding. A pruned companion may omit raw
+confirmed transactions; fresh history then fails unless authenticated wallet
+state already retained those bytes, so production restore requires archive
+history or a durable wallet-relevant raw-transaction index.
 
 This boundary reuses the canonical HNS scanner and reconciliation helpers. The
 legacy value runtime's full reconciliation still spans backend work while its

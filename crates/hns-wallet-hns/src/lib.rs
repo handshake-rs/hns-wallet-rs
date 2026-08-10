@@ -1502,7 +1502,10 @@ pub struct HnsAccountReadSnapshot {
 /// every node call runs after the closure has returned, and the result commits
 /// only after an exact account/entity revision fence is re-authenticated. This
 /// type exposes no signing, broadcasting, import, allocation, or settlement
-/// method and does not alter either HNS value release gate.
+/// method and does not alter either HNS value release gate. Because the durable
+/// chain epoch is first learned from a script-set query, the backend is a
+/// trusted product boundary: derived watch scripts reach it before the runtime
+/// can bind height-zero evidence to the selected account network.
 pub struct HnsAccountReadRuntime<B, C = SystemClock> {
     backend: B,
     clock: C,
@@ -1553,6 +1556,15 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             .map_err(map_shared_store_error)??;
         let tip = self.backend.get_chain_tip()?;
         let scan = scan_hns_account_read(&self.backend, &self.store, &preparation, tip)?;
+        // The first confirmed page is the existing protocol's source of the
+        // durable chain epoch. Bind that exact snapshot to the configured
+        // network immediately afterward, before accepting or committing any
+        // projected wallet result.
+        verify_hns_read_chain_identity(
+            &self.backend,
+            preparation.fenced_account.config.network,
+            scan.binding,
+        )?;
         let selected_after_scan = self.selector.selected_account()?;
         if selected_after_scan != preparation.fenced_account {
             return Err(HnsWalletError::StaleAccountRead);
@@ -4140,6 +4152,22 @@ fn hns_read_common_ancestor<B: HnsBackend>(
         }
     }
     Ok(account_birthday_ancestor(birthday_height))
+}
+
+fn verify_hns_read_chain_identity<B: HnsBackend>(
+    backend: &B,
+    network: HnsNetwork,
+    binding: SnapshotBinding,
+) -> Result<(), HnsWalletError> {
+    let (_, expected_genesis_hash) = name_workflow::expected_chain_identity(network)?;
+    let genesis = backend.get_block_hash(0, binding)?;
+    if genesis.binding != binding || genesis.height != 0 {
+        return Err(HnsWalletError::StaleNodeSnapshot);
+    }
+    if genesis.block_hash != Some(expected_genesis_hash) {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(())
 }
 
 fn hns_read_checkpoints<B: HnsBackend>(
@@ -8043,6 +8071,7 @@ mod tests {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ProductionFollowupReadFault {
         Healthy,
+        WrongNetwork,
         StaleChain,
         RestartedMempool,
         ChangedAccount,
@@ -8052,6 +8081,7 @@ mod tests {
     struct ProductionFollowupReadBackend {
         store: SharedWalletStore,
         account_id: [u8; 32],
+        network: HnsNetwork,
         fault: ProductionFollowupReadFault,
         tip_calls: AtomicUsize,
         confirmed_calls: AtomicUsize,
@@ -8067,6 +8097,7 @@ mod tests {
             Self {
                 store,
                 account_id: account_entity_id(config),
+                network: config.network,
                 fault,
                 tip_calls: AtomicUsize::new(0),
                 confirmed_calls: AtomicUsize::new(0),
@@ -8160,14 +8191,22 @@ mod tests {
             binding: SnapshotBinding,
         ) -> Result<BlockHashEvidence, HnsWalletError> {
             self.prove_store_mutex_is_released()?;
+            let block_hash = if height == 0 {
+                let network = if self.fault == ProductionFollowupReadFault::WrongNetwork {
+                    HnsNetwork::Mainnet
+                } else {
+                    self.network
+                };
+                name_workflow::expected_chain_identity(network)?.1
+            } else if height == binding.tip.height {
+                binding.tip.block_hash
+            } else {
+                [35; 32]
+            };
             Ok(BlockHashEvidence {
                 binding,
                 height,
-                block_hash: Some(if height == binding.tip.height {
-                    binding.tip.block_hash
-                } else {
-                    [35; 32]
-                }),
+                block_hash: Some(block_hash),
             })
         }
 
@@ -9302,6 +9341,21 @@ mod tests {
                 Ok(())
             })
             .expect("authenticated read commit");
+    }
+
+    #[test]
+    fn production_followup_account_reads_reject_mainnet_genesis_for_regtest_account() {
+        let (store, config) = production_followup_read_store();
+        assert_eq!(config.network, HnsNetwork::Regtest);
+        let runtime = production_followup_read_runtime(
+            store,
+            config,
+            ProductionFollowupReadFault::WrongNetwork,
+        );
+        assert!(matches!(
+            runtime.synchronize(),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
     }
 
     #[test]

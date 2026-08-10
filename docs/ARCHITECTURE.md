@@ -39,7 +39,7 @@ application workflows.
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
 | `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact listing/cancellation protocol verification, canonical fulfillment/recovery/script-FINALIZE planning, encrypted parent-plan CAS, durable buyer-fulfillment/seller-recovery/seller-script-FINALIZE value aggregate, canonical Denuo adapter, encrypted sequence/tombstone board | proof/listing/Denuo codecs, raw HNS keys, product coin selection, caller-asserted clock/chain truth, or release qualification |
 | `hns-wallet-market` | reservations and evidence-driven cross-chain sessions | chain networking |
-| `hns-wallet-mobile` | one platform-neutral native controller owning the exact shared store/host/service composition, atomic single-HNS-account bootstrap, and private ABI-v2 status/unlock/lock/account controls | raw platform keys, WebView/provider entry points, chain backends, value actions, or marketplace transport |
+| `hns-wallet-mobile` | one platform-neutral lifecycle controller plus a backend-injected synchronized HNS read controller, both owning exact shared store/host/service composition; atomic single-HNS-account bootstrap, private ABI-v2 lifecycle controls, and minimized serializable balance/receive/history/already-known-name/module-status reads | raw platform keys, a concrete device backend, WebView/provider entry points, name import, value actions, or marketplace transport |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
 | `hns-wallet-ffi` | strict ABI v2 framing, canonical service IDs, typed approvals/events | raw keys/native commands or engine authority objects |
@@ -56,9 +56,10 @@ The machine-readable contract bundle under `abi/` describes strict private
 ABI-v2 JSON payloads, the private capability snapshot, public approval/event
 projections, and signed-artifact manifest structure. It is an interface source,
 not an executable runtime, generated platform binding, trusted signing key, or
-artifact verifier. The platform-neutral mobile controller owns no generated
-binding or UI; the browser and mobile repositories still own their outer
-transport wrappers and independently qualified platform integration.
+artifact verifier. The platform-neutral mobile controllers own no generated
+binding, concrete device backend, or UI; the browser and mobile repositories
+still own their outer transport wrappers and independently qualified platform
+integration.
 
 ## Evidence authority
 
@@ -77,6 +78,17 @@ outpoint-spend evidence bound to that same snapshot. A stale cursor, restarted
 mempool instance, or generation change restarts the bounded snapshot rather
 than combining observations from different views.
 
+The durable chain epoch first arrives with the confirmed script-set query, so
+the read runtime verifies the configured network's exact genesis at height zero
+immediately after that scan, under the learned binding. Wrong-network results
+cannot be accepted or committed, but derived ScriptIds have already reached the
+backend. The backend is therefore a trusted local privacy boundary; remote
+user-selected configuration remains unavailable until the protocol can bind
+network identity before receiving watch scripts. Fresh history also requires
+raw transaction bytes unless the authenticated wallet already cached them, so
+a general production restore source must be archive-capable or maintain a
+durable wallet-relevant raw-transaction index.
+
 `HnsAccountReadRuntime` is the product-composable non-value read boundary. It
 uses the canonical account record, derivation, three-branch scanner, coin and
 transaction reconciliation, name proof validation, checkpoint, and encrypted
@@ -84,10 +96,13 @@ persistence helpers; it is not a second wallet index or cache schema. Each
 call stages one durable discovery fence and the exact account/entity corpus in
 short `SharedWalletStore` closures, releases the store mutex before every node
 request, and commits only if account selection, revisions, ciphertext-backed
-rows, chain tip/epoch, and mempool instance/generation still match. The service
-retains the resulting binding internally and projects only the account's
-balance, transaction summaries, receive target, and approved known-name
-summaries.
+rows, chain tip/epoch, and mempool instance/generation still match. Provider
+service calls retain the resulting binding internally and project only the
+account's balance, transaction summaries, receive target, and approved
+known-name summaries. The trusted-native mobile composition obtains the same
+snapshot directly from its composed service only long enough to build a
+minimized serializable result; its public snapshot omits the binding and all raw
+name proof/state/resource/owner/derivation evidence.
 
 Names consent is a two-snapshot service flow, not post-approval enumeration.
 Prompt preparation synchronizes once, projects a sorted maximum-64 canonical
@@ -96,8 +111,10 @@ name/hash list, and retains that exact account/list/hash set in ephemeral
 account, or current scope before consuming the approval; the provider grant
 receives only the frozen hashes. Required approval-schema-v3 `hnsNames`
 prevents trusted host UIs from reducing Names consent to a generic capability
-label. Browser and mobile adapters remain unavailable until they negotiate and
-adopt that versioned shape.
+label. Browser/provider adapters remain unavailable until they negotiate and
+adopt that versioned shape. Native mobile known-name display is separate from
+provider consent and can only minimize already-persisted names; it adds no name
+import or provider path.
 
 The earlier value-capable `HnsWalletRuntime` still owns a private
 `Mutex<WalletStore>` and its legacy full reconciliation holds that mutex across

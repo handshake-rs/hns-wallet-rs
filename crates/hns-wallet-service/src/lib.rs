@@ -1944,6 +1944,26 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsR
         let runtime = PersistentHnsReadRuntime::new(store.clone(), config);
         Self::new(store, runtime, true)
     }
+
+    /// Perform one bounded synchronized HNS account read for a trusted native
+    /// product composition. The returned binding is authority for projecting
+    /// this one result only and must remain inside the trusted native boundary;
+    /// browser/provider callers continue through the permission-scoped methods.
+    ///
+    /// This method exposes no signing, value movement, settlement, provider,
+    /// or marketplace operation. It fails instead of truncating a result that
+    /// exceeds the service's existing public read bounds.
+    pub fn synchronize_trusted_native_hns_reads(
+        &self,
+    ) -> Result<HnsAccountReadSnapshot, ServiceFailure> {
+        let snapshot = self.runtime.synchronize()?;
+        if snapshot.transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS
+            || snapshot.known_names.len() > MAX_HNS_NAME_DISCLOSURES
+        {
+            return Err(hns_read_result_bound());
+        }
+        Ok(snapshot)
+    }
 }
 
 fn provider_authority(
