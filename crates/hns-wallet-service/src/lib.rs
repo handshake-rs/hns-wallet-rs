@@ -1077,17 +1077,12 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 ServiceCapability::ProviderDispatch,
             ));
         }
-        if method == ProviderMethod::WalletRequestPermissions
-            && self.grantable_permission_capabilities().is_empty()
-        {
-            return Err(ServiceFailure::unsupported(
-                ServiceCapability::ProviderDispatch,
-            ));
-        }
-
-        // Availability is decided before method-specific parameter parsing.
-        // An unavailable surface must have one fail-closed response regardless
-        // of attacker-controlled parameter shape.
+        // Runtime and release-gate availability is decided before
+        // method-specific parameter parsing. An unavailable runtime surface
+        // must have one fail-closed response regardless of attacker-controlled
+        // parameter shape. The service-owned permission request remains below
+        // because its closed vocabulary distinguishes invalid capabilities
+        // from otherwise valid but currently ungrantable capabilities.
         if matches!(
             method,
             ProviderMethod::HnsRequestAccounts
