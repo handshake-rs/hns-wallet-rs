@@ -19,7 +19,7 @@ hostile website
 Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
 proofs, signed fixed-price listings/cancellations, and Denuo name-market
 envelopes remain in `hns-rs`. This workspace consumes the required protocol
-crates from reviewed immutable revision `abf11ff`; its exact source and lock
+crates from reviewed immutable revision `b24b66c`; its exact source and lock
 coherence are checked before the workspace gate. The wallet owns only the
 protocol-verification boundary and encrypted replay/tombstone board state. Node
 indexes and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority

@@ -187,6 +187,8 @@ signature verification, durable rollback state, artifact hashing, and the
 release gate are not implemented here, so artifact/runtime availability stays
 false.
 
-The host and contract regressions in this boundary passed the exact `ba9f013`
-workspace CI recorded in [`QUALIFICATION.md`](QUALIFICATION.md). Installed
-browser/mobile adoption and artifact-authenticity qualification remain open.
+The historical host and contract regression baseline passed the exact
+`ba9f013` workspace CI recorded in
+[`QUALIFICATION.md`](QUALIFICATION.md). Installed browser/mobile adoption and
+artifact-authenticity evidence belongs to downstream products and does not
+change this private ABI or any fixed availability gate.

@@ -21,10 +21,10 @@ in source only through a process-owned `0700` directory and a regular,
 single-link `0600` database. Creation requires an absent path and atomically
 precreates that file before SQLite opens it without create permission. The
 selected entries may not be symlinks, and the file identity is checked around
-SQLite's no-follow open. This policy has been executed on Linux; Android and
-iOS target/runtime qualification remains required. The mobile host must still
-establish the app sandbox, ACL and data-protection policy, backup exclusion,
-and Keystore/Keychain key wrapping. A platform-neutral native controller now
+SQLite's no-follow open. This repository's portable filesystem regressions run
+on Linux; downstream mobile products own their target/runtime evidence, app
+sandbox, ACL and data-protection policy, backup exclusion, and
+Keystore/Keychain wrapping. A platform-neutral native controller now
 creates or restores exactly one non-value HNS account, opens only a complete
 seed/account bootstrap, and exposes status, unlock, lock, and account identity
 through a private ABI-v2 session. Platform bindings, native product screens,
@@ -46,7 +46,7 @@ approval-schema-v3 Names prompt carried by private ABI v2 contains the exact
 sorted canonical name/lowercase-hash set it may grant. The service freezes that
 bounded set before prompting, re-synchronizes at approval, rejects any account
 or set change, and persists only the unchanged displayed hashes. This
-unreleased approval-v3 shape is
+approval-v3 shape is
 incompatible with consumers that omit or do not understand `hnsNames`; browser
 and mobile adapters must negotiate, adopt, and render it exactly before Names
 is available. The checked-in executable still has no account-selection or
@@ -102,8 +102,10 @@ funding/value/fee gate remains `false`. The exact implementation predecessor
 `ba9f013a098679fe8e3d812a7e09020803e27d53` passed the complete CI and CodeQL
 workflows on 2026-08-10. That source evidence includes the synchronized account
 read and purpose-separation regressions but is not product, regtest, resource,
-or release-gate qualification. Evidence for the current release candidate is
-recorded only after its exact pushed commit completes the same gates; see
+or release-gate qualification. Release-source evidence is commit-scoped: the
+routine CI, CodeQL, and manual preflight records attached to one exact release
+commit are authoritative, while this historical result is retained as a
+baseline; see
 [`docs/QUALIFICATION.md`](docs/QUALIFICATION.md).
 
 Bitcoin BDK state now uses the same encrypted shared SQLite authority as the

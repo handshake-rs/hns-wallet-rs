@@ -1,8 +1,10 @@
 # Qualification matrix
 
-Snapshot: 2026-08-10. This file records evidence, not intent. Unit coverage,
-source packaging, or publication never authorizes mainnet value. Evidence is
-attached to exact commits and is not inherited automatically by later source.
+Snapshot: 2026-08-10. This file records source-scoped evidence and the durable
+qualification procedure, not transient workflow or registry state. Unit
+coverage, source packaging, or publication never authorizes mainnet value.
+Evidence is attached to exact commits and is not inherited automatically by
+later source.
 
 The complete CI run
 [`31383987461`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31383987461)
@@ -14,16 +16,27 @@ the atomic native bootstrap, mobile controller, synchronized HNS reads,
 approval-v3 provider framing, Shakedex purpose separation, encrypted BDK
 persistence, and deterministic Ethereum contract checks present at that commit.
 
-The release-tooling changes and final `hns-rs` release-candidate repin that
-follow `ba9f013` require their own exact-commit CI and manual release preflight.
-Predecessor success is implementation evidence only; it does not qualify the
-current uncommitted or later release source.
+The rows below retain that historical implementation baseline. For the dated
+`0.1.0` release source, routine CI, CodeQL, and the manually dispatched release
+preflight must all succeed for the same exact wallet commit. Their immutable
+run records establish that release-source result; this document deliberately
+does not encode a pending or latest-run claim.
+
+The final protocol source
+`b24b66c382de53330ec21dd3137e056a2bea3e2d` independently passed its complete
+[`hns-rs` CI run](https://github.com/handshake-rs/hns-rs/actions/runs/31398600728),
+four-language
+[`hns-rs` CodeQL run](https://github.com/handshake-rs/hns-rs/actions/runs/31398598588),
+and
+[`hns-rs` 17-package release preflight](https://github.com/handshake-rs/hns-rs/actions/runs/31399004538)
+on 2026-08-10. That is upstream protocol-source evidence only; it neither
+qualifies a wallet commit nor changes a wallet product gate.
 
 | Area | Exact source evidence | Persistence/restart and reorg | Product/network evidence | Release status |
 | --- | --- | --- | --- | --- |
-| Types and chain traits | complete locked workspace CI passed at `ba9f013` | n/a | no product dependency | source-qualified predecessor; API review remains |
+| Types and chain traits | historical complete locked workspace CI passed at `ba9f013` | n/a | no product dependency | implementation baseline recorded; API review remains |
 | Encrypted store/schema v3 | complete CI passed, including atomic bootstrap, rollback, migrations, encrypted CRUD/CAS, and Unix filesystem regressions | source reopen/restart tests; no Android/iOS secure-store runtime evidence | no device filesystem, Keystore, or Keychain qualification | platform qualification pending |
-| HNS wallet and names | complete CI passed, including bootstrap, synchronized reads, purpose separation, name workflows, and fail-closed value gates | source restart/reorg paths; no multi-process regtest | node RPC source only; protocol repinned to immutable `hns-rs` `abf11ff` | HNS funding, value, and fee gates remain `false` |
+| HNS wallet and names | complete historical CI passed, including bootstrap, synchronized reads, purpose separation, name workflows, and fail-closed value gates | source restart/reorg paths; no multi-process regtest | node RPC source only; protocol pinned to final immutable `hns-rs` `b24b66c` | HNS funding, value, and fee gates remain `false` |
 | Provider core | complete CI passed, including account binding, scoped reads, exact Names consent, and unavailable-method ordering | grants persist; pending approval/UI authority remains process-local | no installed-browser consent or backend E2E | browser and value exposure unavailable |
 | Fixed-price Shakedex | complete CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Denuo, provider, trusted UI, or product coin selection | every Shakedex and dependent HNS value gate remains `false` |
 | Market sessions | complete workspace CI passed | CAS journal source; recovery evidence incomplete | no pair E2E, rendezvous, or relay transport | unavailable |
@@ -33,9 +46,10 @@ current uncommitted or later release source.
 | Mobile controller | Android create and iOS open/restore simulations passed in workspace CI | atomic seed/account bootstrap and reopen tests; platform key stores are downstream | JNI/Swift product integration and installed-device qualification are downstream | native non-value controls only; provider/value/market unavailable |
 | Browser products | separate repositories | platform integration pending | no installed/signed E2E | unavailable |
 
-CodeQL passed at `ba9f013`, but no independent security audit, database or
-resource benchmark, multi-process network test, installed-device run, or
-installed-browser run is recorded for this package release candidate.
+The historical CodeQL baseline passed at `ba9f013`. This repository records no
+independent security audit, database or resource benchmark, multi-process
+network test, installed-device run, or installed-browser run for the package
+boundary; downstream product evidence does not enable these fixed gates.
 
 ## Qualification commands
 
@@ -79,10 +93,8 @@ gate-change authorization.
 
 Before any wallet upload, all 17 `hns-rs` `0.2.0` archives must be visible on
 crates.io and each archive must identify exact source commit
-`abf11ff3b16920c08f3c0b6d32d2e1af7cbe37b2` in `.cargo_vcs_info.json`. The
+`b24b66c382de53330ec21dd3137e056a2bea3e2d` in `.cargo_vcs_info.json`. The
 wallet execute path verifies this provenance, constructs and inspects each
 normalized wallet archive before upload, and requires a clean source record.
-If final protocol release preparation creates a later commit, the wallet pin,
-lockfile, release constants, documentation, and exact-commit CI must move to
-that actual published commit before wallet execution.
+Any differing protocol provenance aborts execution.
 Actual publication remains a separate, explicitly authorized human action.

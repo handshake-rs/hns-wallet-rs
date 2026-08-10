@@ -3,9 +3,9 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
-## 0.1.0 - unreleased
+## 0.1.0 - 2026-08-10
 
-Initial release-candidate source for the independent Handshake wallet boundary:
+Initial release source for the independent Handshake wallet boundary:
 
 - wallet-local identifiers, summaries, and capability-separated chain APIs;
 - authenticated encrypted SQLite persistence with one shared lock and key

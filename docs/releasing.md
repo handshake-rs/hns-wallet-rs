@@ -36,24 +36,23 @@ crates.io metadata, internal version requirements, immutable protocol source,
 dependency order, ABI release copies, and Ethereum contract artifact without
 compiling Rust or Solidity.
 
-## 0.1.0 release candidate
+## 0.1.0 release source
 
-Version `0.1.0` is the initial `hns-wallet-rs` release-candidate line. The
+Version `0.1.0` is the initial `hns-wallet-rs` release line. The
 canonical feature inventory is in `CHANGELOG.md`; source packaging, publication,
 or test success does not enable provider, value, settlement, or marketplace
 product gates. Registry and tag state are external facts and must be checked at
 release time rather than embedded as a claim in the source snapshot.
 
-Wallet source consumes the final immutable `hns-rs` release-candidate revision
-`abf11ff3b16920c08f3c0b6d32d2e1af7cbe37b2`. Before any wallet upload, all 17
+Wallet source consumes the final immutable `hns-rs` release revision
+`b24b66c382de53330ec21dd3137e056a2bea3e2d`. Before any wallet upload, all 17
 shared `hns-rs` `0.2.0` packages must be visible on crates.io, and every
 downloaded archive must identify that exact revision in
 `.cargo_vcs_info.json`. Dry-run preflight patches protocol dependencies to that
 Git revision and wallet dependencies to local workspace paths. Those patches
 are verification aids only; they are never used during an actual upload.
-If the protocol release-date preparation creates a later `hns-rs` source
-commit, stop and repin every wallet protocol authority to the actual published
-commit before qualifying or executing the wallet release.
+If the protocol artifacts identify any other source commit, stop rather than
+qualifying or executing this wallet release.
 
 The `hns-wallet-ffi` package archive must contain byte-identical copies of
 `abi/contracts-v2.schema.json` and `abi/golden-vectors-v2.json`. The
@@ -99,7 +98,7 @@ document and verify boundaries; they grant no runtime or deployment authority.
 
    Do not repeat an identical expensive gate locally and in CI.
 
-5. After routine CI succeeds for the exact release candidate, manually dispatch
+5. After routine CI succeeds for the exact release source, manually dispatch
    [`.github/workflows/release-preflight.yml`](../.github/workflows/release-preflight.yml)
    and supply that qualified 40-character commit as `expected_commit`. The
    workflow checks out and verifies that exact immutable commit. This isolated
