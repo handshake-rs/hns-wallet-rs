@@ -433,6 +433,9 @@ pub struct CoinSelection {
 }
 
 pub trait HnsBackend {
+    /// Returns the current initialized tip and durable chain epoch without
+    /// receiving any wallet script identifiers.
+    fn get_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError>;
     fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError>;
     fn get_block_hash(
         &self,
@@ -1502,10 +1505,10 @@ pub struct HnsAccountReadSnapshot {
 /// every node call runs after the closure has returned, and the result commits
 /// only after an exact account/entity revision fence is re-authenticated. This
 /// type exposes no signing, broadcasting, import, allocation, or settlement
-/// method and does not alter either HNS value release gate. Because the durable
-/// chain epoch is first learned from a script-set query, the backend is a
-/// trusted product boundary: derived watch scripts reach it before the runtime
-/// can bind height-zero evidence to the selected account network.
+/// method and does not alter either HNS value release gate. Before deriving or
+/// transmitting any wallet script identifiers, synchronization obtains a
+/// script-free chain binding and binds height-zero evidence to the selected
+/// account network.
 pub struct HnsAccountReadRuntime<B, C = SystemClock> {
     backend: B,
     clock: C,
@@ -1554,17 +1557,17 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             .store
             .with_store_mut(|store| Ok(prepare_hns_account_read(store, &selected, now_unix)))
             .map_err(map_shared_store_error)??;
-        let tip = self.backend.get_chain_tip()?;
-        let scan = scan_hns_account_read(&self.backend, &self.store, &preparation, tip)?;
-        // The first confirmed page is the existing protocol's source of the
-        // durable chain epoch. Bind that exact snapshot to the configured
-        // network immediately afterward, before accepting or committing any
-        // projected wallet result.
+        let binding = self.backend.get_chain_snapshot()?;
         verify_hns_read_chain_identity(
             &self.backend,
             preparation.fenced_account.config.network,
-            scan.binding,
+            binding,
         )?;
+        // Script derivation and every wallet-index query remain after the
+        // script-free binding has been authenticated against the account's
+        // selected network.
+        let scan = scan_hns_account_read(&self.backend, &self.store, &preparation, binding)?;
+        let tip = binding.tip;
         let selected_after_scan = self.selector.selected_account()?;
         if selected_after_scan != preparation.fenced_account {
             return Err(HnsWalletError::StaleAccountRead);
@@ -3432,7 +3435,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let allocated_next = shakedex_key::allocation_next_index(store, &account.config)
             .map_err(map_shakedex_restore_error)?;
         normalize_restore_scan_account(&mut account, allocated_next)?;
-        let scan = scan_restore_snapshot(&self.backend, account, expected_tip, |account| {
+        let scan = scan_restore_snapshot(&self.backend, account, expected_tip, None, |account| {
             Ok([
                 derive_restore_addresses(store, account, KeyRole::HnsCoin)?,
                 derive_restore_addresses(store, account, KeyRole::HnsName)?,
@@ -4107,12 +4110,13 @@ fn scan_hns_account_read<B: HnsBackend>(
     backend: &B,
     store: &SharedWalletStore,
     preparation: &HnsReadPreparation,
-    expected_tip: ChainTip,
+    expected_binding: SnapshotBinding,
 ) -> Result<HnsReadScan, HnsWalletError> {
     scan_restore_snapshot(
         backend,
         preparation.scan_account.clone(),
-        expected_tip,
+        expected_binding.tip,
+        Some(expected_binding),
         |account| {
             store
                 .with_store(|store| {
@@ -4830,14 +4834,18 @@ fn scan_restore_snapshot<B, F>(
     backend: &B,
     mut account: HnsAccountRecord,
     expected_tip: ChainTip,
+    initial_binding: Option<SnapshotBinding>,
     mut derive_branches: F,
 ) -> Result<HnsReadScan, HnsWalletError>
 where
     B: HnsBackend,
     F: FnMut(&HnsAccountRecord) -> Result<[Vec<DerivedHnsAddress>; 3], HnsWalletError>,
 {
+    if initial_binding.is_some_and(|binding| binding.tip != expected_tip) {
+        return Err(HnsWalletError::StaleNodeSnapshot);
+    }
     let gap = account.config.restore_lookahead;
-    let mut expected_binding = None;
+    let mut expected_binding = initial_binding;
     let mut expected_mempool = None;
     loop {
         let [coin_addresses, name_addresses, shakedex_addresses] = derive_branches(&account)?;
@@ -8083,6 +8091,7 @@ mod tests {
         account_id: [u8; 32],
         network: HnsNetwork,
         fault: ProductionFollowupReadFault,
+        snapshot_calls: AtomicUsize,
         tip_calls: AtomicUsize,
         confirmed_calls: AtomicUsize,
         mempool_calls: AtomicUsize,
@@ -8099,6 +8108,7 @@ mod tests {
                 account_id: account_entity_id(config),
                 network: config.network,
                 fault,
+                snapshot_calls: AtomicUsize::new(0),
                 tip_calls: AtomicUsize::new(0),
                 confirmed_calls: AtomicUsize::new(0),
                 mempool_calls: AtomicUsize::new(0),
@@ -8150,9 +8160,9 @@ mod tests {
     }
 
     impl HnsBackend for ProductionFollowupReadBackend {
-        fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
+        fn get_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError> {
             self.prove_store_mutex_is_released()?;
-            if self.tip_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            if self.snapshot_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 match self.fault {
                     ProductionFollowupReadFault::ChangedAccount => {
                         self.store
@@ -8182,6 +8192,12 @@ mod tests {
                     _ => {}
                 }
             }
+            Ok(Self::binding())
+        }
+
+        fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            self.tip_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Self::binding().tip)
         }
 
@@ -8212,11 +8228,16 @@ mod tests {
 
         fn get_confirmed_wallet_page(
             &self,
-            _: ConfirmedWalletPageRequest<'_>,
+            request: ConfirmedWalletPageRequest<'_>,
         ) -> Result<ConfirmedWalletPage, HnsWalletError> {
             self.prove_store_mutex_is_released()?;
             let call = self.confirmed_calls.fetch_add(1, Ordering::SeqCst);
             let mut binding = Self::binding();
+            if request.expected_tip != binding.tip
+                || request.expected_epoch != Some(binding.chain_epoch)
+            {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
             if self.fault == ProductionFollowupReadFault::StaleChain && call > 0 {
                 binding.chain_epoch += 1;
             }
@@ -9325,6 +9346,10 @@ mod tests {
         assert_eq!(snapshot.receive_target.account, config.account_id);
         assert_eq!(snapshot.receive_target.derivation_index, 0);
         assert!(snapshot.receive_target.display.starts_with("rs1"));
+        assert_eq!(runtime.backend.snapshot_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.backend.tip_calls.load(Ordering::SeqCst), 0);
+        assert!(runtime.backend.confirmed_calls.load(Ordering::SeqCst) > 0);
+        assert!(runtime.backend.mempool_calls.load(Ordering::SeqCst) > 0);
 
         store
             .with_store(|wallet| {
@@ -9356,6 +9381,10 @@ mod tests {
             runtime.synchronize(),
             Err(HnsWalletError::InvalidEvidence)
         ));
+        assert_eq!(runtime.backend.snapshot_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.backend.tip_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.backend.confirmed_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.backend.mempool_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

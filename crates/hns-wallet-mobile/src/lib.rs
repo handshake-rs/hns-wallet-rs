@@ -14,8 +14,12 @@ use hns_wallet_hns::{
     HnsWalletBootstrap, HnsWalletError, KnownName, NameOwnershipStatus, NameResourceStatus,
     RecoveryPhrase,
 };
+/// Backend composition types exposed for downstream native shells. The
+/// concrete RPC adapter accepts authenticated loopback sockets only; production
+/// Android/iOS transport and lifecycle integration remain external.
 pub use hns_wallet_hns::{
-    HnsBackend, HnsBootstrapPolicy, HnsClock, HnsNetwork, SystemClock as HnsReadSystemClock,
+    HnsBackend, HnsBootstrapPolicy, HnsClock, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
+    SystemClock as HnsReadSystemClock,
 };
 use hns_wallet_host::{
     Clock, ClockError, HostError, HostOutput, SystemClock, SystemEntropy, WalletHost,
@@ -174,9 +178,10 @@ pub struct MobileHnsReadSnapshot {
 /// Backend-injected native HNS read controller. It composes the exact same
 /// `SharedWalletStore` authority through account selection, synchronized HNS
 /// reconciliation, provider-state persistence, and private ABI lifecycle
-/// control. Its backend is trusted with derived watch scripts before the first
-/// epoch-bound genesis check and must not be remotely user-configurable. It
-/// exposes no browser/provider entry point or value operation.
+/// control. It authenticates a script-free epoch/tip and selected-network
+/// genesis before deriving or querying watch scripts. Backend transport remains
+/// a product-owned trust boundary. This controller exposes no browser/provider
+/// entry point or value operation.
 pub struct MobileHnsReadController<B, C = HnsReadSystemClock> {
     session: MobileControllerSession<PersistentHnsReadRuntime<B, C>>,
     account_config: HnsRuntimeConfig,
@@ -810,6 +815,7 @@ mod tests {
     #[derive(Default)]
     struct MockReadProbe {
         fail_synchronization: AtomicBool,
+        snapshot_calls: AtomicUsize,
         tip_calls: AtomicUsize,
         confirmed_calls: AtomicUsize,
         mempool_calls: AtomicUsize,
@@ -873,13 +879,18 @@ mod tests {
     }
 
     impl HnsBackend for MockReadBackend {
-        fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
-            self.probe.tip_calls.fetch_add(1, Ordering::SeqCst);
+        fn get_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError> {
+            self.probe.snapshot_calls.fetch_add(1, Ordering::SeqCst);
             if self.probe.fail_synchronization.load(Ordering::SeqCst) {
                 return Err(HnsWalletError::Backend(
                     "injected mobile read failure".to_owned(),
                 ));
             }
+            Ok(Self::binding())
+        }
+
+        fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
+            self.probe.tip_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Self::tip())
         }
 
@@ -1170,9 +1181,9 @@ mod tests {
         assert_eq!(accounts[0].account_id, expected_account);
         assert_eq!(accounts[0].receive_display, None);
 
-        let before = probe.tip_calls.load(Ordering::SeqCst);
+        let before = probe.snapshot_calls.load(Ordering::SeqCst);
         let snapshot = reads.synchronize().expect("synchronized mobile snapshot");
-        assert_eq!(probe.tip_calls.load(Ordering::SeqCst), before + 1);
+        assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), before + 1);
         assert_eq!(snapshot.balance, Amount::new(WalletAsset::Hns, 0));
         assert_eq!(snapshot.receive_target.module, ModuleId::Handshake);
         assert_eq!(snapshot.receive_target.account, expected_account);
@@ -1213,12 +1224,12 @@ mod tests {
             snapshot
         );
 
-        let before = probe.tip_calls.load(Ordering::SeqCst);
+        let before = probe.snapshot_calls.load(Ordering::SeqCst);
         assert_eq!(
             reads.balance().expect("fresh balance"),
             Amount::new(WalletAsset::Hns, 0)
         );
-        assert_eq!(probe.tip_calls.load(Ordering::SeqCst), before + 1);
+        assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), before + 1);
         assert_eq!(
             reads
                 .receive_target()
@@ -1237,7 +1248,8 @@ mod tests {
             reads.module_status().expect("fresh module status").phase,
             SyncPhase::Ready
         );
-        assert_eq!(probe.tip_calls.load(Ordering::SeqCst), before + 5);
+        assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), before + 5);
+        assert_eq!(probe.tip_calls.load(Ordering::SeqCst), 0);
         assert!(probe.confirmed_calls.load(Ordering::SeqCst) > 0);
         assert!(probe.mempool_calls.load(Ordering::SeqCst) > 0);
         assert_eq!(probe.evidence_calls.load(Ordering::SeqCst), 0);

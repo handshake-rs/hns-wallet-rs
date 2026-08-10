@@ -78,13 +78,15 @@ outpoint-spend evidence bound to that same snapshot. A stale cursor, restarted
 mempool instance, or generation change restarts the bounded snapshot rather
 than combining observations from different views.
 
-The durable chain epoch first arrives with the confirmed script-set query, so
-the read runtime verifies the configured network's exact genesis at height zero
-immediately after that scan, under the learned binding. Wrong-network results
-cannot be accepted or committed, but derived ScriptIds have already reached the
-backend. The backend is therefore a trusted local privacy boundary; remote
-user-selected configuration remains unavailable until the protocol can bind
-network identity before receiving watch scripts. Fresh history also requires
+The read runtime first obtains the durable chain epoch and exact initialized tip
+through a script-free chain snapshot. It verifies the configured network's
+exact genesis at height zero under that binding before deriving or transmitting
+any ScriptId, then requires the same tip and explicit epoch on the first
+confirmed query. Wrong-network results therefore trigger zero confirmed or
+mempool script queries. This removes the earlier protocol-ordering privacy
+blocker, but does not provide production transport: the concrete adapter remains
+authenticated loopback-only, and product device/remote transport requires its
+own security and installed-network qualification. Fresh history also requires
 raw transaction bytes unless the authenticated wallet already cached them, so
 a general production restore source must be archive-capable or maintain a
 durable wallet-relevant raw-transaction index.

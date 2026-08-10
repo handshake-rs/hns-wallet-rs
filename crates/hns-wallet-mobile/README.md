@@ -35,24 +35,25 @@ before another request can proceed.
 Known-name output can only revalidate and minimize names already persisted by a
 separately authorized workflow. This crate does not add a mobile name-import
 path. It also does not ship a production device backend: the existing
-`HnsNodeRpcBackend` is an authenticated loopback node adapter, not an Android or
-iOS wallet-index integration. Downstream applications must provide a bounded,
-deadline-enforced backend, call synchronous reads off the UI thread, add their
-JNI/C/Swift projection, and qualify the exact installed product before exposing
-these reads.
+`HnsNodeRpcBackend` and `HnsNodeRpcConfig` are re-exported here for downstream
+composition, but remain an authenticated loopback node adapter rather than an
+Android or iOS wallet-index integration. Downstream applications must provide
+or integrate a bounded, deadline-enforced product backend, call synchronous
+reads off the UI thread, add their JNI/C/Swift projection, and qualify the exact
+installed product before exposing these reads.
 
-The existing backend protocol first learns its durable chain epoch from a
-confirmed script-set query, then immediately checks height-zero block evidence
-against the selected account network. A wrong-network snapshot is rejected
-before any wallet result is accepted or committed, but the backend has already
-received derived watch scripts at that point. It is therefore a trusted local
-component and must not be exposed as remotely user-configurable until a
-pre-script network-identity protocol exists. A pruned node is also not a
-general fresh-restore source: transaction history reconciliation requires raw
-transaction bytes when they are not already retained in authenticated wallet
-state. Production must use an archive-capable companion or a durable
-wallet-relevant raw-transaction index. Missing evidence remains a fail-closed
-read error.
+Each read first obtains the durable chain epoch and initialized tip through the
+script-free `chain_snapshot` backend call, validates height-zero block evidence
+against the selected account network under that exact binding, and only then
+derives and transmits wallet ScriptIds. The first confirmed page requires that
+same tip and `Some(chain_epoch)`. A wrong-network backend therefore receives no
+confirmed or mempool script query. This removes the earlier protocol-ordering
+privacy blocker; it does not supply or qualify production mobile transport. A
+pruned node is also not a general fresh-restore source: transaction history
+reconciliation requires raw transaction bytes when they are not already
+retained in authenticated wallet state. Production must use an archive-capable
+companion or a durable wallet-relevant raw-transaction index. Missing evidence
+remains a fail-closed read error.
 
 Value movement, signing, provider/browser integration, HNSA/HNSR, settlement,
 Shakedex, and every P2P marketplace gate remain unavailable.

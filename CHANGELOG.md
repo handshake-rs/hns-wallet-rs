@@ -9,9 +9,12 @@ file. The public crates use a shared version and follow Semantic Versioning.
   opens one exact shared-store authority, performs bounded synchronized HNS
   reads, and returns a minimized serializable balance/receive/history/known-name/
   module-status snapshot. The existing lifecycle-only mobile controller API is
-  preserved. Reads reject an epoch-bound height-zero block that does not match
-  the selected account network. No production device backend, provider, value,
-  signing, settlement, HNSA/HNSR, Shakedex, or marketplace gate is enabled.
+  preserved. Reads obtain a script-free chain epoch/tip snapshot and reject its
+  bound height-zero block when it does not match the selected account network,
+  before deriving or transmitting any wallet ScriptId. The concrete
+  authenticated loopback node backend is re-exported for native composition;
+  no production device transport, provider, value, signing, settlement,
+  HNSA/HNSR, Shakedex, or marketplace gate is enabled.
 
 ## 0.1.0 - 2026-08-10
 

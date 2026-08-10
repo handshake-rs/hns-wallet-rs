@@ -817,6 +817,20 @@ struct WireTip {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(untagged)]
+enum WireRequiredNullableTip {
+    Initialized(WireTip),
+    Uninitialized(()),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct WireChainSnapshot {
+    chain_epoch: u64,
+    tip: WireRequiredNullableTip,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct WireOutpoint {
     txid: String,
@@ -1244,6 +1258,19 @@ fn chain_tip(wire: WireTip) -> Result<ChainTip, HnsWalletError> {
     })
 }
 
+fn chain_snapshot(wire: WireChainSnapshot) -> Result<SnapshotBinding, HnsWalletError> {
+    let tip = match wire.tip {
+        WireRequiredNullableTip::Initialized(tip) => tip,
+        WireRequiredNullableTip::Uninitialized(()) => {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+    };
+    Ok(SnapshotBinding {
+        tip: chain_tip(tip)?,
+        chain_epoch: wire.chain_epoch,
+    })
+}
+
 fn snapshot_binding(
     chain_epoch: u64,
     tip: Option<WireTip>,
@@ -1355,6 +1382,13 @@ fn expected_mempool_json(binding: MempoolSnapshotBinding) -> Value {
 }
 
 impl HnsBackend for HnsNodeRpcBackend {
+    fn get_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError> {
+        let response: WireChainSnapshot = self.rpc(serde_json::json!({
+            "method": "chain_snapshot",
+        }))?;
+        chain_snapshot(response)
+    }
+
     fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
         let response: Option<WireTip> = self.rpc(serde_json::json!({
             "method": "chain_tip",
@@ -2342,6 +2376,53 @@ mod tests {
     use super::*;
     use hns_covenants::hash_name;
     use hns_primitives::{Height, Outpoint};
+
+    #[test]
+    fn chain_snapshot_wire_schema_is_closed_and_uninitialized_tip_is_stale() {
+        let response = serde_json::json!({
+            "chain_epoch": 9,
+            "tip": {
+                "hash": hex::encode([1; 32]),
+                "height": 42,
+                "tree_root": hex::encode([2; 32]),
+                "median_time_past": 1_800_000_000_u64,
+            },
+        });
+        let parsed: WireChainSnapshot =
+            serde_json::from_value(response.clone()).expect("strict chain snapshot");
+        assert_eq!(
+            chain_snapshot(parsed).expect("initialized chain snapshot"),
+            SnapshotBinding {
+                tip: ChainTip {
+                    height: 42,
+                    block_hash: [1; 32],
+                    tree_root: [2; 32],
+                    median_time_past: 1_800_000_000,
+                },
+                chain_epoch: 9,
+            }
+        );
+
+        let mut missing_tip = response.clone();
+        missing_tip
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("tip");
+        assert!(serde_json::from_value::<WireChainSnapshot>(missing_tip).is_err());
+
+        let mut null_tip = response.clone();
+        null_tip["tip"] = serde_json::Value::Null;
+        let null_tip = serde_json::from_value::<WireChainSnapshot>(null_tip)
+            .expect("uninitialized chain snapshot shape");
+        assert!(matches!(
+            chain_snapshot(null_tip),
+            Err(HnsWalletError::StaleNodeSnapshot)
+        ));
+
+        let mut extra_field = response;
+        extra_field["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WireChainSnapshot>(extra_field).is_err());
+    }
 
     #[test]
     fn canonical_hns_v2_node_projection_must_equal_raw_name_state() {

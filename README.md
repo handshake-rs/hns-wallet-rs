@@ -30,14 +30,16 @@ seed/account bootstrap, and exposes status, unlock, lock, and account identity
 through a private ABI-v2 session. A separate backend-injected native read
 controller can now reuse that exact shared-store authority and return one
 bounded serializable balance/receive/history/known-name/module-status snapshot.
-It includes no concrete mobile backend. The current epoch protocol delivers
-derived watch ScriptIds before the selected-network genesis check, and fresh
-history needs archive raw transactions unless the authenticated wallet already
-cached them. A trusted local, deadline-enforced, archive-capable (or durably
-indexed) device backend, platform bindings, native product screens, and
-installed-device qualification therefore remain downstream release
-requirements rather than authorities supplied by this crate, and no
-value/provider release gate is enabled.
+It obtains the durable epoch and exact tip through a script-free chain snapshot,
+binds height-zero evidence to the selected account network, and only then
+derives and queries wallet ScriptIds. The mobile crate re-exports the concrete
+authenticated loopback adapter for downstream native composition, but it does
+not supply production device transport. Fresh history also needs archive raw
+transactions unless the authenticated wallet already cached them. A
+deadline-enforced, archive-capable (or durably indexed) device backend,
+platform bindings, native product screens, and installed-device qualification
+therefore remain downstream release requirements rather than authorities
+supplied by this crate, and no value/provider release gate is enabled.
 
 ABI wallet status/unlock/lock and a narrow provider
 control surface are implemented. One library composition can bind an exact

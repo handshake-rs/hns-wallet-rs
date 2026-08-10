@@ -1,11 +1,11 @@
 # Handshake node wallet RPC adapter
 
 `HnsNodeRpcBackend` is the concrete synchronous wallet-side adapter for the
-authenticated `hns-node-rs` wallet RPC v1 contract frozen at node commit
-`c1b633d1aa7f1be290d20ecf5b653f396a9b0e6c`. It implements `HnsBackend`; the
-node supplies canonical chain evidence and broadcast admission while the wallet
-alone derives keys, signs, approves, and persists workflows. The node never
-signs.
+authenticated `hns-node-rs` wallet RPC v1 contract, including its additive
+script-free chain-snapshot call. It implements `HnsBackend`; the node supplies
+canonical chain evidence and broadcast admission while the wallet alone derives
+keys, signs, approves, and persists workflows. The node never signs. Exact
+wallet/node commit pairing remains required qualification evidence.
 
 ## Trusted configuration and transport
 
@@ -38,25 +38,33 @@ script-set query.
 
 ## Snapshot and evidence rules
 
-The first confirmed page learns the durable `u64` chain epoch. Every page must
-match the complete requested tip, and every later block-hash, mempool,
-transaction, spender, and name read is bound to that epoch and tip. Confirmed
-cursors are opaque bytes tied to the exact sorted ScriptId set. Mempool pages
-add a nonzero process-instance nonce and generation; both remain exact across
-all continuations, gap-limit expansion, transaction/parent reads, and workflow
-reconciliation. Any difference discards the partial snapshot.
+The script-free request is exactly `{"method":"chain_snapshot"}`. Its strict
+result has exactly `chain_epoch` and `tip`. The tip is the existing initialized
+tip object (`hash`, `height`, `tree_root`, and `median_time_past`) or `null`
+before the node has an active chain. Unknown or missing fields are protocol
+errors; a valid `tip: null` maps to `StaleNodeSnapshot` and stops before any
+script derivation or query. With an initialized tip, the non-value account-read
+runtime obtains this binding without transmitting a ScriptId, requests
+height-zero block evidence under the same binding, and compares it with the
+pinned genesis for the selected account network. Only after that succeeds may
+it derive ScriptIds or issue confirmed/mempool wallet queries. A mainnet
+snapshot presented for a regtest account therefore results in zero script
+queries.
 
-Immediately after the first complete scan establishes that epoch binding, the
-non-value account-read runtime requests height-zero block evidence under the
-same binding and compares it with the pinned genesis for the selected account's
-network. A mainnet snapshot cannot be accepted for a regtest account (or vice
-versa), even when its tip, epoch, pages, and mempool data are internally
-coherent. The current protocol cannot do this before the first confirmed query
-because `get_chain_tip` carries no epoch. Derived ScriptIds therefore reach the
-authenticated backend before the genesis check. This ordering makes the
-loopback companion a trusted privacy boundary; do not expose arbitrary remote
-backend configuration until a pre-script epoch/network-identity exchange is
-designed and reviewed.
+The first and every later confirmed page must match the complete snapshot tip
+and receives `expected_epoch: Some(chain_epoch)`. Every later block-hash,
+mempool, transaction, spender, and name read remains bound to that epoch and
+tip. Confirmed cursors are opaque bytes tied to the exact sorted ScriptId set.
+Mempool pages add a nonzero process-instance nonce and generation; both remain
+exact across all continuations, gap-limit expansion, transaction/parent reads,
+and workflow reconciliation. Any difference discards the partial snapshot.
+`get_chain_tip` remains available for legacy/value workflows that have not been
+admitted to the product read composition.
+
+This ordering removes the earlier pre-script privacy blocker. It does not widen
+transport eligibility: `HnsNodeRpcConfig` remains authenticated loopback-only,
+and production Android/iOS transport, lifecycle, resource, and installed-network
+qualification remain external product gates.
 
 Every current tip also carries the HSD-compatible median time past computed by
 the node from that tip and up to ten ancestors inside the same immutable read.

@@ -3184,6 +3184,10 @@ mod tests {
 
     #[cfg(unix)]
     impl HnsBackend for ProductionNextUnusedBackend {
+        fn get_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError> {
+            panic!("backend is not used while opening the persistence fixture")
+        }
+
         fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
             panic!("backend is not used while opening the persistence fixture")
         }

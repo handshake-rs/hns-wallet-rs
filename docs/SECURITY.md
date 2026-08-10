@@ -125,13 +125,17 @@ read controller exposes none of its broadcast, fee, signing, action, or value
 methods. Products must enforce backend deadlines and call reads off the UI
 thread. This repository includes no production Android/iOS wallet-index
 backend; the authenticated loopback node RPC adapter is not device integration.
-Its epoch is first learned from a confirmed script-set query, so the runtime's
-exact selected-network genesis check occurs only after derived watch scripts
-reach that trusted backend. No remote user-configurable backend is eligible
-without a pre-script identity binding. A pruned companion may omit raw
-confirmed transactions; fresh history then fails unless authenticated wallet
-state already retained those bytes, so production restore requires archive
-history or a durable wallet-relevant raw-transaction index.
+The runtime obtains its epoch/tip through a script-free chain snapshot, verifies
+the selected network's exact genesis under that binding, and only then derives
+or queries watch scripts. A wrong-network backend receives zero confirmed or
+mempool script queries. This closes the protocol-ordering privacy gap but does
+not qualify transport: the concrete adapter remains authenticated loopback-only,
+and any production device/remote backend needs independently reviewed
+authentication, confidentiality, deadlines, lifecycle, and installed-network
+evidence. A pruned companion may omit raw confirmed transactions; fresh history
+then fails unless authenticated wallet state already retained those bytes, so
+production restore requires archive history or a durable wallet-relevant
+raw-transaction index.
 
 This boundary reuses the canonical HNS scanner and reconciliation helpers. The
 legacy value runtime's full reconciliation still spans backend work while its
