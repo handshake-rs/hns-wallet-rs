@@ -24,8 +24,12 @@ selected entries may not be symlinks, and the file identity is checked around
 SQLite's no-follow open. This policy has been executed on Linux; Android and
 iOS target/runtime qualification remains required. The mobile host must still
 establish the app sandbox, ACL and data-protection policy, backup exclusion,
-and Keystore/Keychain key wrapping. Generated mobile bindings remain absent,
-and no value/provider release gate is enabled.
+and Keystore/Keychain key wrapping. A platform-neutral native controller now
+creates or restores exactly one non-value HNS account, opens only a complete
+seed/account bootstrap, and exposes status, unlock, lock, and account identity
+through a private ABI-v2 session. Generated JNI/Swift bindings, native product
+screens, and installed-device qualification remain absent, and no
+value/provider release gate is enabled.
 
 ABI wallet status/unlock/lock and a narrow provider
 control surface are implemented. One library composition can bind an exact
@@ -45,9 +49,9 @@ unreleased approval-v3 shape is
 incompatible with consumers that omit or do not understand `hnsNames`; browser
 and mobile adapters must negotiate, adopt, and render it exactly before Names
 is available. The checked-in executable still has no account-selection or
-backend inputs, so it remains the control-only runtime. Wallet
-creation/restoration, browser
-integration, and every value path remain unavailable there.
+backend inputs, so it remains the control-only runtime. The native controller
+is a library-only composition; wallet creation/restoration in shipped apps,
+browser integration, and every value path remain unavailable there.
 
 Current safety status: the production-hardening source boundary is implemented,
 but executable HNS, Bitcoin, and Ethereum value operations and all mainnet
@@ -121,6 +125,8 @@ gate stays false.
 - `hns-wallet-shakedex`: release-gated persisted seller/buyer/recovery and
   post-TRANSFER script-FINALIZE schemas.
 - `hns-wallet-market`: price-bound reservations and atomic-swap recovery.
+- `hns-wallet-mobile`: platform-neutral, single-account Android/iOS controller
+  for atomic create/restore/open and private status/unlock/lock/account control.
 - `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet, encrypted session-bound swap-key allocation primitive, and Bitcoin HTLC adapter.
 - `hns-wallet-ethereum`: offline native-ETH account derivation plus
   release-gated Helios/HTLC policy.

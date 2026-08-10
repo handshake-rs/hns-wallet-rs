@@ -7,6 +7,7 @@ members = [
     "crates/hns-wallet-provider",
     "crates/hns-wallet-shakedex",
     "crates/hns-wallet-market",
+    "crates/hns-wallet-mobile",
     "crates/hns-wallet-bitcoin-kyoto",
     "crates/hns-wallet-ethereum",
     "crates/hns-wallet-ffi",
@@ -33,6 +34,7 @@ hns-wallet-hns = { version = "0.1.0", path = "crates/hns-wallet-hns" }
 hns-wallet-provider = { version = "0.1.0", path = "crates/hns-wallet-provider" }
 hns-wallet-shakedex = { version = "0.1.0", path = "crates/hns-wallet-shakedex" }
 hns-wallet-market = { version = "0.1.0", path = "crates/hns-wallet-market" }
+hns-wallet-mobile = { version = "0.1.0", path = "crates/hns-wallet-mobile" }
 hns-wallet-bitcoin-kyoto = { version = "0.1.0", path = "crates/hns-wallet-bitcoin-kyoto" }
 hns-wallet-ethereum = { version = "0.1.0", path = "crates/hns-wallet-ethereum" }
 hns-wallet-ffi = { version = "0.1.0", path = "crates/hns-wallet-ffi" }

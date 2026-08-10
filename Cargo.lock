@@ -921,6 +921,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hns-wallet-mobile"
+version = "0.1.0"
+dependencies = [
+ "hns-wallet-ffi",
+ "hns-wallet-hns",
+ "hns-wallet-host",
+ "hns-wallet-service",
+ "hns-wallet-store",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "hns-wallet-provider"
 version = "0.1.0"
 dependencies = [
