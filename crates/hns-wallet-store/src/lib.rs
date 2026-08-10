@@ -62,6 +62,7 @@ pub enum EntityKind {
     BitcoinHeader,
     BitcoinFilterHeader,
     BitcoinPeer,
+    BitcoinWalletState,
     BitcoinScanState,
     BitcoinSwapKeyAllocation,
     BitcoinUtxo,
@@ -95,6 +96,7 @@ impl EntityKind {
             Self::BitcoinHeader => "bitcoin_header",
             Self::BitcoinFilterHeader => "bitcoin_filter_header",
             Self::BitcoinPeer => "bitcoin_peer",
+            Self::BitcoinWalletState => "bitcoin_wallet_state",
             Self::BitcoinScanState => "bitcoin_scan_state",
             Self::BitcoinSwapKeyAllocation => "bitcoin_swap_key_allocation",
             Self::BitcoinUtxo => "bitcoin_utxo",
@@ -116,7 +118,9 @@ impl EntityKind {
     const fn deletion_protected(self) -> bool {
         matches!(
             self,
-            Self::HnsShakedexKeyAllocation | Self::BitcoinSwapKeyAllocation
+            Self::HnsShakedexKeyAllocation
+                | Self::BitcoinWalletState
+                | Self::BitcoinSwapKeyAllocation
         )
     }
 }
@@ -286,12 +290,25 @@ impl SharedWalletStore {
         &self,
         operation: impl FnOnce(&WalletStore) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
+        self.try_with_store(operation)
+    }
+
+    /// Run a bounded synchronous read while allowing the caller to preserve a
+    /// richer error type. The store mutex is never intended to cross an
+    /// external call or an async suspension point.
+    pub fn try_with_store<T, E>(
+        &self,
+        operation: impl FnOnce(&WalletStore) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
         let store = match self.inner.lock() {
             Ok(store) => store,
             Err(poisoned) => {
                 let mut store = poisoned.into_inner();
                 store.lock();
-                return Err(StoreError::Concurrency);
+                return Err(StoreError::Concurrency.into());
             }
         };
         operation(&store)
@@ -307,12 +324,25 @@ impl SharedWalletStore {
         &self,
         operation: impl FnOnce(&mut WalletStore) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
+        self.try_with_store_mut(operation)
+    }
+
+    /// Run a bounded synchronous mutation while allowing the caller to
+    /// preserve a richer error type. Poison recovery always clears the record
+    /// key and fails closed before the operation can run.
+    pub fn try_with_store_mut<T, E>(
+        &self,
+        operation: impl FnOnce(&mut WalletStore) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
         let mut store = match self.inner.lock() {
             Ok(store) => store,
             Err(poisoned) => {
                 let mut store = poisoned.into_inner();
                 store.lock();
-                return Err(StoreError::Concurrency);
+                return Err(StoreError::Concurrency.into());
             }
         };
         operation(&mut store)
@@ -890,6 +920,13 @@ impl WalletStore {
             bitcoin_peers,
             delete_bitcoin_peer,
             BitcoinPeer
+        ),
+        (
+            save_bitcoin_wallet_state,
+            bitcoin_wallet_state,
+            bitcoin_wallet_states,
+            delete_bitcoin_wallet_state,
+            BitcoinWalletState
         ),
         (
             save_bitcoin_scan_state,

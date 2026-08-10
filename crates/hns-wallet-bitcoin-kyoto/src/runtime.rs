@@ -9,14 +9,14 @@ use bdk_wallet::bitcoin::consensus::{deserialize, serialize};
 use bdk_wallet::bitcoin::hashes::Hash;
 use bdk_wallet::bitcoin::{BlockHash, Network, Transaction};
 use bdk_wallet::chain::{ChainPosition, ConfirmationBlockTime};
-use bdk_wallet::{KeychainKind, PersistedWallet, Wallet};
-use hns_wallet_store::{EntityBatchSave, WalletStore};
+use bdk_wallet::{KeychainKind, Wallet};
+use hns_wallet_store::{EntityBatchSave, SharedWalletStore, WalletStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED, BitcoinWalletError, KyotoRuntimeConfig,
-    MAX_RECOVERY_SCRIPT_INDEX, build_kyoto_client,
+    BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED, BitcoinWalletError, EncryptedPersistedBitcoinWallet,
+    KyotoRuntimeConfig, MAX_RECOVERY_SCRIPT_INDEX, build_kyoto_client,
 };
 
 pub const KYOTO_WALLET_STATE_VERSION: u16 = 1;
@@ -143,7 +143,7 @@ pub enum KyotoSyncPhase {
     },
 }
 
-/// Encrypted wallet-owned metadata around BDK's durable SQLite wallet state.
+/// Encrypted wallet-owned metadata around BDK's encrypted changeset snapshot.
 /// Kyoto 0.17 does not expose a durable filter-header database, so this record
 /// never pretends to be the header/filter authority.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -666,38 +666,46 @@ impl KyotoTipDiscovery {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Authenticated scan journal permanently bound to the shared store authority
+/// from which it was created or loaded. It deliberately has no `Debug`
+/// implementation.
+#[derive(Clone)]
 pub struct StoredKyotoWalletState {
     account_id: Vec<u8>,
     revision: u64,
     state: KyotoWalletState,
+    store: SharedWalletStore,
 }
 
 impl StoredKyotoWalletState {
     pub fn create(
-        store: &mut WalletStore,
+        store: &SharedWalletStore,
         account_id: &[u8],
         state: KyotoWalletState,
         now_unix: u64,
     ) -> Result<Self, BitcoinWalletError> {
         state.validate()?;
-        let revision = store.save_bitcoin_scan_state(account_id, 0, &state, now_unix)?;
+        let revision = store.with_store_mut(|store| {
+            store.save_bitcoin_scan_state(account_id, 0, &state, now_unix)
+        })?;
         Ok(Self {
             account_id: account_id.to_vec(),
             revision,
             state,
+            store: store.clone(),
         })
     }
 
-    pub fn load(store: &WalletStore, account_id: &[u8]) -> Result<Self, BitcoinWalletError> {
+    pub fn load(store: &SharedWalletStore, account_id: &[u8]) -> Result<Self, BitcoinWalletError> {
         let stored = store
-            .bitcoin_scan_state::<KyotoWalletState>(account_id)?
+            .with_store(|store| store.bitcoin_scan_state::<KyotoWalletState>(account_id))?
             .ok_or(BitcoinWalletError::BitcoinStateNotFound)?;
         stored.value.validate()?;
         Ok(Self {
             account_id: stored.id,
             revision: stored.revision,
             state: stored.value,
+            store: store.clone(),
         })
     }
 
@@ -709,18 +717,11 @@ impl StoredKyotoWalletState {
         self.revision
     }
 
-    fn persist(
-        &mut self,
-        store: &mut WalletStore,
-        now_unix: u64,
-    ) -> Result<(), BitcoinWalletError> {
+    fn persist(&mut self, now_unix: u64) -> Result<(), BitcoinWalletError> {
         self.state.validate()?;
-        self.revision = store.save_bitcoin_scan_state(
-            &self.account_id,
-            self.revision,
-            &self.state,
-            now_unix,
-        )?;
+        self.revision = self.store.with_store_mut(|store| {
+            store.save_bitcoin_scan_state(&self.account_id, self.revision, &self.state, now_unix)
+        })?;
         Ok(())
     }
 }
@@ -734,34 +735,42 @@ pub struct KyotoSupervisor {
     poisoned: bool,
     resume_reconciliation: Option<(BitcoinCheckpoint, Option<BitcoinCheckpoint>)>,
     durable: StoredKyotoWalletState,
+    store: SharedWalletStore,
 }
 
 impl KyotoSupervisor {
     pub fn start(
-        wallet: &Wallet,
+        wallet: &EncryptedPersistedBitcoinWallet,
         config: KyotoRuntimeConfig,
         mut durable: StoredKyotoWalletState,
-        store: &mut WalletStore,
         now_unix: u64,
     ) -> Result<(Self, LoggingSubscribers), BitcoinWalletError> {
         if wallet.network() != durable.state.network || wallet.network() != config.network {
             return Err(BitcoinWalletError::NetworkMismatch);
         }
+        if wallet.account_id() != durable.account_id.as_slice() {
+            return Err(BitcoinWalletError::WalletStoreAuthorityMismatch);
+        }
+        if !wallet.shared_store().is_same_authority(&durable.store) {
+            return Err(BitcoinWalletError::WalletStoreAuthorityMismatch);
+        }
+        let store = durable.store.clone();
         durable.state.validate()?;
         let _runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| BitcoinWalletError::RuntimeUnavailable)?;
+        let current_wallet_tip = BitcoinCheckpoint::from_wallet(wallet);
         let resume_reconciliation = match &durable.state.phase {
             KyotoSyncPhase::Reconciling {
                 wallet_tip,
                 common_ancestor,
                 ..
-            } => Some((*wallet_tip, *common_ancestor)),
+            } if *wallet_tip == current_wallet_tip => Some((*wallet_tip, *common_ancestor)),
             _ => None,
         };
         let force_recovery = restart_requires_recovery(&durable.state, wallet);
         let scan_type = durable.state.scan_type(force_recovery)?;
         durable.state.begin_start(force_recovery, now_unix)?;
-        durable.persist(store, now_unix)?;
+        durable.persist(now_unix)?;
         let required_peers = config.required_peers;
         let request_timeout = config.supervisor_request_timeout;
         let sync_timeout = config.supervisor_sync_timeout;
@@ -778,6 +787,7 @@ impl KyotoSupervisor {
                 poisoned: false,
                 resume_reconciliation,
                 durable,
+                store,
             },
             logging,
         ))
@@ -797,20 +807,21 @@ impl KyotoSupervisor {
     /// requires reconstruction because Kyoto's update future is not cancel safe.
     pub async fn synchronize_once(
         &mut self,
-        wallet: &mut PersistedWallet<bdk_wallet::rusqlite::Connection>,
-        wallet_connection: &mut bdk_wallet::rusqlite::Connection,
-        store: &mut WalletStore,
+        wallet: &mut EncryptedPersistedBitcoinWallet,
         now_unix: u64,
     ) -> Result<KyotoSyncReceipt, BitcoinWalletError> {
-        if wallet.network() != self.durable.state.network {
-            return Err(BitcoinWalletError::NetworkMismatch);
+        if wallet.network() != self.durable.state.network
+            || wallet.account_id() != self.durable.account_id.as_slice()
+            || !wallet.shared_store().is_same_authority(&self.store)
+        {
+            return Err(BitcoinWalletError::WalletStoreAuthorityMismatch);
         }
         if self.poisoned {
             return Err(BitcoinWalletError::SupervisorPoisoned);
         }
         if matches!(&self.durable.state.phase, KyotoSyncPhase::Ready) {
             self.durable.state.begin_cycle(now_unix)?;
-            self.durable.persist(store, now_unix)?;
+            self.durable.persist(now_unix)?;
         }
         let sequence = self.durable.state.pending_sequence;
         if sequence == 0 || sequence <= self.durable.state.completed_sequence {
@@ -822,7 +833,7 @@ impl KyotoSupervisor {
                 self.durable.state.phase = KyotoSyncPhase::RecoveryRequired {
                     reason: KyotoRecoveryReason::CheckpointMismatch,
                 };
-                self.durable.persist(store, now_unix)?;
+                self.durable.persist(now_unix)?;
                 return Err(BitcoinWalletError::CheckpointMismatch);
             }
             self.durable.state.validated_checkpoint = wallet_tip;
@@ -832,16 +843,9 @@ impl KyotoSupervisor {
                 wallet_tip,
                 common_ancestor,
             };
-            self.durable.persist(store, now_unix)?;
+            self.durable.persist(now_unix)?;
             return self
-                .finish_reconciliation(
-                    wallet,
-                    store,
-                    sequence,
-                    wallet_tip,
-                    common_ancestor,
-                    now_unix,
-                )
+                .finish_reconciliation(wallet, sequence, wallet_tip, common_ancestor, now_unix)
                 .await;
         }
         let previous_tip = self.durable.state.last_consistent_checkpoint;
@@ -849,7 +853,7 @@ impl KyotoSupervisor {
             sequence,
             from: previous_tip,
         };
-        self.durable.persist(store, now_unix)?;
+        self.durable.persist(now_unix)?;
 
         let update = match tokio::time::timeout(self.sync_timeout, self.updates.update()).await {
             Ok(Ok(update)) => update,
@@ -858,7 +862,7 @@ impl KyotoSupervisor {
                 self.durable.state.phase = KyotoSyncPhase::RecoveryRequired {
                     reason: KyotoRecoveryReason::InterruptedSynchronization,
                 };
-                self.durable.persist(store, now_unix)?;
+                self.durable.persist(now_unix)?;
                 return Err(BitcoinWalletError::KyotoNodeStopped);
             }
             Err(_) => {
@@ -871,7 +875,7 @@ impl KyotoSupervisor {
                         KyotoRecoveryReason::InterruptedSynchronization
                     },
                 };
-                self.durable.persist(store, now_unix)?;
+                self.durable.persist(now_unix)?;
                 return Err(BitcoinWalletError::OperationTimedOut);
             }
         };
@@ -887,9 +891,7 @@ impl KyotoSupervisor {
         wallet
             .apply_update(update)
             .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
-        wallet
-            .persist(wallet_connection)
-            .map_err(|error| BitcoinWalletError::WalletPersistence(error.to_string()))?;
+        wallet.persist(now_unix)?;
 
         let wallet_tip = BitcoinCheckpoint::from_wallet(wallet);
         if wallet_tip != announced_tip {
@@ -935,7 +937,7 @@ impl KyotoSupervisor {
             self.durable.state.phase = KyotoSyncPhase::RecoveryRequired {
                 reason: KyotoRecoveryReason::DeepReorganization,
             };
-            self.durable.persist(store, now_unix)?;
+            self.durable.persist(now_unix)?;
             self.poisoned = true;
             let _ = self.requester.shutdown();
             return Err(BitcoinWalletError::DeepReorganization);
@@ -953,30 +955,26 @@ impl KyotoSupervisor {
             wallet_tip,
             common_ancestor: reorg_ancestor,
         };
-        self.durable.persist(store, now_unix)?;
+        self.durable.persist(now_unix)?;
 
-        self.finish_reconciliation(
-            wallet,
-            store,
-            sequence,
-            wallet_tip,
-            reorg_ancestor,
-            now_unix,
-        )
-        .await
+        self.finish_reconciliation(wallet, sequence, wallet_tip, reorg_ancestor, now_unix)
+            .await
     }
 
     async fn finish_reconciliation(
         &mut self,
         wallet: &Wallet,
-        store: &mut WalletStore,
         sequence: u64,
         wallet_tip: BitcoinCheckpoint,
         reorg_ancestor: Option<BitcoinCheckpoint>,
         now_unix: u64,
     ) -> Result<KyotoSyncReceipt, BitcoinWalletError> {
-        let transaction_count = reconcile_transaction_records(wallet, store, now_unix)?;
-        let output_count = reconcile_output_records(wallet, store, now_unix)?;
+        let transaction_count = self
+            .store
+            .try_with_store_mut(|store| reconcile_transaction_records(wallet, store, now_unix))?;
+        let output_count = self
+            .store
+            .try_with_store_mut(|store| reconcile_output_records(wallet, store, now_unix))?;
         let peer_count = tokio::time::timeout(self.request_timeout, self.requester.peer_info())
             .await
             .ok()
@@ -1005,7 +1003,7 @@ impl KyotoSupervisor {
         self.durable.state.connected_peer_count = peer_count;
         self.durable.state.last_completed_at_unix = Some(now_unix);
         self.durable.state.phase = KyotoSyncPhase::Ready;
-        self.durable.persist(store, now_unix)?;
+        self.durable.persist(now_unix)?;
 
         Ok(KyotoSyncReceipt {
             sequence,
@@ -1045,7 +1043,6 @@ impl KyotoSupervisor {
     pub async fn broadcast_prepared_transaction(
         &self,
         _permit: &BitcoinValueRuntimePermit,
-        store: &mut WalletStore,
         txid: [u8; 32],
         now_unix: u64,
     ) -> Result<BitcoinBroadcastReceipt, BitcoinWalletError> {
@@ -1068,71 +1065,17 @@ impl KyotoSupervisor {
         if peers.len() < usize::from(self.required_peers) {
             return Err(BitcoinWalletError::PeerQuorumUnavailable);
         }
-        let stored = store
-            .bitcoin_transaction::<BitcoinTransactionRecord>(&txid)?
-            .ok_or(BitcoinWalletError::BroadcastIntentNotFound)?;
-        let mut record = stored.value;
-        record.validate()?;
-        let raw = record
-            .raw_transaction
-            .as_ref()
-            .ok_or(BitcoinWalletError::BroadcastNotPrepared)?;
-        let transaction: Transaction =
-            deserialize(raw).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
-        if transaction.compute_txid().to_byte_array() != txid {
-            return Err(BitcoinWalletError::BroadcastConflict);
-        }
-        let intent = record
-            .broadcast
-            .as_mut()
-            .ok_or(BitcoinWalletError::BroadcastNotPrepared)?;
-        if intent.network != self.durable.state.network {
-            return Err(BitcoinWalletError::NetworkMismatch);
-        }
-        if now_unix < intent.prepared_at_unix {
-            return Err(BitcoinWalletError::ClockRollbackDetected);
-        }
-        if now_unix >= intent.expires_at_unix {
-            return Err(BitcoinWalletError::BroadcastApprovalExpired);
-        }
-        if matches!(
-            &record.observation,
-            BitcoinChainObservation::Confirmed { .. } | BitcoinChainObservation::Unconfirmed { .. }
-        ) {
-            return Ok(BitcoinBroadcastReceipt {
-                txid,
-                wtxid: transaction.compute_wtxid().to_byte_array(),
-                attempt_count: intent.attempt_count,
-                submitted_at_unix: intent.last_submitted_at_unix,
-            });
-        }
-        let last_attempt_at_unix = match intent.phase {
-            BitcoinBroadcastPhase::Prepared => None,
-            BitcoinBroadcastPhase::SubmissionStarted => intent.last_submission_started_at_unix,
-            BitcoinBroadcastPhase::Submitted => intent.last_submitted_at_unix,
+        let start = self.store.try_with_store_mut(|store| {
+            begin_broadcast_submission(store, self.durable.state.network, txid, now_unix)
+        })?;
+        let PendingBitcoinSubmission {
+            transaction,
+            mut record,
+            started_revision,
+        } = match start {
+            BroadcastStart::AlreadyObserved(receipt) => return Ok(receipt),
+            BroadcastStart::Submit(submission) => submission,
         };
-        if let Some(last_attempt_at_unix) = last_attempt_at_unix {
-            if now_unix < last_attempt_at_unix {
-                return Err(BitcoinWalletError::ClockRollbackDetected);
-            }
-            let next_allowed = last_attempt_at_unix
-                .checked_add(MIN_REBROADCAST_INTERVAL_SECONDS)
-                .ok_or(BitcoinWalletError::SequenceOverflow)?;
-            if now_unix < next_allowed {
-                return Err(BitcoinWalletError::BroadcastRetryNotReady);
-            }
-        }
-        intent.attempt_count = intent
-            .attempt_count
-            .checked_add(1)
-            .ok_or(BitcoinWalletError::BroadcastAttemptLimit)?;
-        if intent.attempt_count > MAX_BROADCAST_ATTEMPTS {
-            return Err(BitcoinWalletError::BroadcastAttemptLimit);
-        }
-        intent.phase = BitcoinBroadcastPhase::SubmissionStarted;
-        intent.last_submission_started_at_unix = Some(now_unix);
-        let started_revision =
-            store.save_bitcoin_transaction(&txid, stored.revision, &record, now_unix)?;
 
         let returned_wtxid = tokio::time::timeout(
             self.request_timeout,
@@ -1153,7 +1096,11 @@ impl KyotoSupervisor {
         intent.last_submitted_at_unix = Some(now_unix);
         let attempt_count = intent.attempt_count;
         let submitted_at_unix = intent.last_submitted_at_unix;
-        store.save_bitcoin_transaction(&txid, started_revision, &record, now_unix)?;
+        self.store.with_store_mut(|store| {
+            store
+                .save_bitcoin_transaction(&txid, started_revision, &record, now_unix)
+                .map(|_| ())
+        })?;
         Ok(BitcoinBroadcastReceipt {
             txid,
             wtxid: expected_wtxid.to_byte_array(),
@@ -1161,6 +1108,95 @@ impl KyotoSupervisor {
             submitted_at_unix,
         })
     }
+}
+
+enum BroadcastStart {
+    AlreadyObserved(BitcoinBroadcastReceipt),
+    Submit(PendingBitcoinSubmission),
+}
+
+struct PendingBitcoinSubmission {
+    transaction: Transaction,
+    record: BitcoinTransactionRecord,
+    started_revision: u64,
+}
+
+fn begin_broadcast_submission(
+    store: &mut WalletStore,
+    network: Network,
+    txid: [u8; 32],
+    now_unix: u64,
+) -> Result<BroadcastStart, BitcoinWalletError> {
+    let stored = store
+        .bitcoin_transaction::<BitcoinTransactionRecord>(&txid)?
+        .ok_or(BitcoinWalletError::BroadcastIntentNotFound)?;
+    let mut record = stored.value;
+    record.validate()?;
+    let raw = record
+        .raw_transaction
+        .as_ref()
+        .ok_or(BitcoinWalletError::BroadcastNotPrepared)?;
+    let transaction: Transaction =
+        deserialize(raw).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    if transaction.compute_txid().to_byte_array() != txid {
+        return Err(BitcoinWalletError::BroadcastConflict);
+    }
+    let intent = record
+        .broadcast
+        .as_mut()
+        .ok_or(BitcoinWalletError::BroadcastNotPrepared)?;
+    if intent.network != network {
+        return Err(BitcoinWalletError::NetworkMismatch);
+    }
+    if now_unix < intent.prepared_at_unix {
+        return Err(BitcoinWalletError::ClockRollbackDetected);
+    }
+    if now_unix >= intent.expires_at_unix {
+        return Err(BitcoinWalletError::BroadcastApprovalExpired);
+    }
+    if matches!(
+        &record.observation,
+        BitcoinChainObservation::Confirmed { .. } | BitcoinChainObservation::Unconfirmed { .. }
+    ) {
+        return Ok(BroadcastStart::AlreadyObserved(BitcoinBroadcastReceipt {
+            txid,
+            wtxid: transaction.compute_wtxid().to_byte_array(),
+            attempt_count: intent.attempt_count,
+            submitted_at_unix: intent.last_submitted_at_unix,
+        }));
+    }
+    let last_attempt_at_unix = match intent.phase {
+        BitcoinBroadcastPhase::Prepared => None,
+        BitcoinBroadcastPhase::SubmissionStarted => intent.last_submission_started_at_unix,
+        BitcoinBroadcastPhase::Submitted => intent.last_submitted_at_unix,
+    };
+    if let Some(last_attempt_at_unix) = last_attempt_at_unix {
+        if now_unix < last_attempt_at_unix {
+            return Err(BitcoinWalletError::ClockRollbackDetected);
+        }
+        let next_allowed = last_attempt_at_unix
+            .checked_add(MIN_REBROADCAST_INTERVAL_SECONDS)
+            .ok_or(BitcoinWalletError::SequenceOverflow)?;
+        if now_unix < next_allowed {
+            return Err(BitcoinWalletError::BroadcastRetryNotReady);
+        }
+    }
+    intent.attempt_count = intent
+        .attempt_count
+        .checked_add(1)
+        .ok_or(BitcoinWalletError::BroadcastAttemptLimit)?;
+    if intent.attempt_count > MAX_BROADCAST_ATTEMPTS {
+        return Err(BitcoinWalletError::BroadcastAttemptLimit);
+    }
+    intent.phase = BitcoinBroadcastPhase::SubmissionStarted;
+    intent.last_submission_started_at_unix = Some(now_unix);
+    let started_revision =
+        store.save_bitcoin_transaction(&txid, stored.revision, &record, now_unix)?;
+    Ok(BroadcastStart::Submit(PendingBitcoinSubmission {
+        transaction,
+        record,
+        started_revision,
+    }))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1582,11 +1618,76 @@ fn restart_requires_recovery(state: &KyotoWalletState, wallet: &Wallet) -> bool 
         return true;
     }
     let wallet_tip = BitcoinCheckpoint::from_wallet(wallet);
-    if wallet_tip.height < state.last_consistent_checkpoint.height {
-        return true;
+    tip_mismatch_requires_recovery(&state.phase, state.last_consistent_checkpoint, wallet_tip)
+}
+
+fn tip_mismatch_requires_recovery(
+    phase: &KyotoSyncPhase,
+    last_consistent_checkpoint: BitcoinCheckpoint,
+    wallet_tip: BitcoinCheckpoint,
+) -> bool {
+    if let KyotoSyncPhase::Reconciling {
+        wallet_tip: journaled_tip,
+        ..
+    } = phase
+    {
+        return wallet_tip != *journaled_tip;
     }
-    wallet_tip.height == state.last_consistent_checkpoint.height
-        && wallet_tip.block_hash != state.last_consistent_checkpoint.block_hash
+    // The only safe non-ready mismatch is the exact authenticated
+    // `Reconciling` resume above. In particular, a wallet tip ahead of a
+    // `Synchronizing` journal means BDK committed immediately before a crash;
+    // restarting from that journal requires a recovery scan rather than
+    // silently treating the old checkpoint as current.
+    wallet_tip != last_consistent_checkpoint
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+
+    fn checkpoint(height: u32, byte: u8) -> BitcoinCheckpoint {
+        BitcoinCheckpoint {
+            height,
+            block_hash: [byte; 32],
+        }
+    }
+
+    #[test]
+    fn synchronizing_tip_ahead_requires_recovery_but_exact_reconciliation_resumes() {
+        let prior = checkpoint(100, 1);
+        let committed = checkpoint(101, 2);
+        let synchronizing = KyotoSyncPhase::Synchronizing {
+            sequence: 7,
+            from: prior,
+        };
+        assert!(tip_mismatch_requires_recovery(
+            &synchronizing,
+            prior,
+            committed,
+        ));
+
+        let reconciling = KyotoSyncPhase::Reconciling {
+            sequence: 7,
+            wallet_tip: committed,
+            common_ancestor: Some(prior),
+        };
+        assert!(!tip_mismatch_requires_recovery(
+            &reconciling,
+            prior,
+            committed,
+        ));
+        assert!(tip_mismatch_requires_recovery(
+            &reconciling,
+            prior,
+            checkpoint(102, 3),
+        ));
+
+        assert!(!tip_mismatch_requires_recovery(
+            &KyotoSyncPhase::Ready,
+            committed,
+            committed,
+        ));
+    }
 }
 
 fn wallet_recent_checkpoints(

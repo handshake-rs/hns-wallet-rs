@@ -1,9 +1,11 @@
 #![doc = "Kyoto-only Bitcoin wallet integration and native HTLC settlement."]
 #![forbid(unsafe_code)]
 
+mod persistence;
 mod runtime;
 mod swap_key_store;
 
+pub use persistence::*;
 pub use runtime::*;
 pub use swap_key_store::*;
 
@@ -27,7 +29,7 @@ use bdk_wallet::bitcoin::{
     Transaction, TxIn, TxOut, Witness, bip32::Xpriv, psbt::Psbt, transaction,
 };
 use bdk_wallet::template::Bip84;
-use bdk_wallet::{KeychainKind, PersistedWallet, SignOptions, Wallet};
+use bdk_wallet::{KeychainKind, SignOptions, Wallet};
 use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
 use hns_wallet_types::{
@@ -414,52 +416,6 @@ pub fn create_descriptor_wallet(
     .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))
 }
 
-/// Creates a BDK descriptor wallet in SQLite. BDK persists public descriptors
-/// and chain data; private descriptor keys are extracted into the in-memory
-/// signer map and must be reconstructed from the encrypted mnemonic on load.
-pub fn create_persisted_descriptor_wallet(
-    mnemonic: &Mnemonic,
-    network: Network,
-    connection: &mut bdk_wallet::rusqlite::Connection,
-) -> Result<PersistedWallet<bdk_wallet::rusqlite::Connection>, BitcoinWalletError> {
-    let seed = Zeroizing::new(mnemonic.to_seed_normalized(""));
-    let root = Xpriv::new_master(network, seed.as_slice())
-        .map_err(|_| BitcoinWalletError::KeyDerivation)?;
-    Wallet::create(
-        Bip84(root, KeychainKind::External),
-        Bip84(root, KeychainKind::Internal),
-    )
-    .network(network)
-    .use_spk_cache(true)
-    .create_wallet(connection)
-    .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))
-}
-
-pub fn load_persisted_descriptor_wallet(
-    mnemonic: &Mnemonic,
-    network: Network,
-    connection: &mut bdk_wallet::rusqlite::Connection,
-) -> Result<PersistedWallet<bdk_wallet::rusqlite::Connection>, BitcoinWalletError> {
-    let seed = Zeroizing::new(mnemonic.to_seed_normalized(""));
-    let root = Xpriv::new_master(network, seed.as_slice())
-        .map_err(|_| BitcoinWalletError::KeyDerivation)?;
-    Wallet::load()
-        .descriptor(
-            KeychainKind::External,
-            Some(Bip84(root, KeychainKind::External)),
-        )
-        .descriptor(
-            KeychainKind::Internal,
-            Some(Bip84(root, KeychainKind::Internal)),
-        )
-        .extract_keys()
-        .check_network(network)
-        .use_spk_cache(true)
-        .load_wallet(connection)
-        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?
-        .ok_or(BitcoinWalletError::WalletNotFound)
-}
-
 pub fn next_receive_address(wallet: &mut Wallet) -> String {
     wallet
         .reveal_next_address(KeychainKind::External)
@@ -824,6 +780,20 @@ pub enum BitcoinWalletError {
     InvalidSwapKeyReference,
     #[error("Bitcoin wallet was not found in persistence")]
     WalletNotFound,
+    #[error("Bitcoin wallet persistence already contains an account")]
+    WalletAlreadyExists,
+    #[error("Bitcoin descriptor wallet creation failed")]
+    WalletCreationFailed,
+    #[error("Bitcoin wallet persistence was used before initialization")]
+    BitcoinWalletPersisterUninitialized,
+    #[error("persisted Bitcoin wallet state uses an unsupported format")]
+    UnsupportedBitcoinWalletState,
+    #[error("persisted Bitcoin wallet state is corrupt")]
+    CorruptBitcoinWalletState,
+    #[error("persisted Bitcoin wallet descriptor or network is immutable")]
+    BitcoinWalletStateConflict,
+    #[error("Bitcoin wallet and runtime do not share the same store/account authority")]
+    WalletStoreAuthorityMismatch,
     #[error("Bitcoin wallet error: {0}")]
     Wallet(String),
     #[error("Kyoto client error: {0}")]
@@ -840,8 +810,6 @@ pub enum BitcoinWalletError {
     PeerQuorumUnavailable,
     #[error("a Tokio runtime is required to supervise Kyoto")]
     RuntimeUnavailable,
-    #[error("Bitcoin wallet-state persistence failed: {0}")]
-    WalletPersistence(String),
     #[error(transparent)]
     Store(#[from] hns_wallet_store::StoreError),
     #[error("address or wallet network mismatch")]

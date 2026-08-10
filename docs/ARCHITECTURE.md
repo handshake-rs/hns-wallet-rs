@@ -286,12 +286,13 @@ Signed-spend supervision and complete restart/reorg qualification remain
 release blockers.
 
 The Kyoto module starts from an explicit validated birthday, persists a
-sequence/phase transition before sync, commits each returned update to BDK
-SQLite, reconciles encrypted transaction/output mirrors in bounded chunks, and
-commits ready last. Crash recovery can resume a pending reconciliation from the
-durable BDK tip. A bounded set of previous hashes is checked against Kyoto's
-local most-work chain to identify reorg ancestry; an unbounded/deep mismatch
-requires recovery.
+sequence/phase transition before sync, commits each returned update to a
+versioned encrypted BDK changeset entity, reconciles encrypted
+transaction/output mirrors in bounded chunks, and commits ready last. Crash
+recovery can resume an exact pending reconciliation from the durable BDK tip;
+a tip ahead of a still-synchronizing journal forces recovery. A bounded set of
+previous hashes is checked against Kyoto's local most-work chain to identify
+reorg ancestry; an unbounded/deep mismatch requires recovery.
 
 A signed broadcast record is content-addressed by txid and binds the wallet
 network, wtxid, BDK-calculated fee, approved fee maximum, and expiry. The raw
@@ -300,9 +301,11 @@ requires ready state, a running node and peer quorum, then records
 `submission_started` before its bounded P2P request. Timeouts are retryable from
 that record.
 
-The BDK database and encrypted journal are independent durable boundaries, so
-ready-last sequencing supplies logical recovery rather than pretending they are
-one SQLite transaction. Pinned Kyoto does not durably expose headers, filter
+The BDK entity and encrypted scan journal share one store/key authority but are
+independent commits, so ready-last sequencing supplies logical recovery rather
+than pretending they are one SQLite transaction. The aggregate BDK entity is
+bounded to 1 MiB and requires a normalized or authenticated chunked successor
+before production scale. Pinned Kyoto does not durably expose headers, filter
 headers/filters, or its address book; those missing objects prevent production
 qualification. `BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED` remains false.
 

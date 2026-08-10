@@ -21,11 +21,14 @@ The bounded supervisor now owns these transitions:
   wallet does not guess a height from wall-clock time;
 - the encrypted scan record uses CAS revisions and explicit starting,
   synchronizing, reconciling, ready, and recovery-required phases;
-- each Kyoto update is applied and committed to BDK SQLite before bounded
-  transaction/output mirrors are reconciled in encrypted 512-record chunks;
-  the ready checkpoint is committed last. A crash in a chunk leaves the state
-  reconciling, so restart replays reconciliation from the already-durable BDK
-  view without another network scan;
+- each Kyoto update is applied and committed as a strict, versioned BDK
+  changeset snapshot in the authenticated encrypted wallet store before
+  bounded transaction/output mirrors are reconciled in encrypted 512-record
+  chunks; the ready checkpoint is committed last. A crash in a chunk leaves
+  the state reconciling, so restart replays reconciliation from the
+  already-durable BDK view without another network scan. A crash after the BDK
+  commit but before `reconciling` leaves a tip mismatch and forces a recovery
+  scan rather than accepting the older journal checkpoint;
 - exact block-hash membership queries locate a retained common ancestor. A
   reorg deeper than the bounded 32-checkpoint recovery window fails closed and
   requires a recovery-anchor scan;
@@ -48,11 +51,31 @@ operation.
 
 ## Persistence ownership and pinned limitation
 
-BDK SQLite durably owns descriptors, revealed derivations, local-chain
-checkpoints, relevant transactions, and wallet outputs. The encrypted wallet
-store owns birthday, supervisor sequence/phase, last consistent checkpoint,
-the distinct recovery checkpoint, bounded recent checkpoints,
-transaction/output reconciliation records, and broadcast intents.
+One protected `bitcoin_wallet_state` entity durably owns BDK's public
+descriptors, revealed derivations, local-chain checkpoints, relevant
+transactions, and wallet outputs. Its strict envelope is format v1, uses the
+exact wallet account ID as authenticated associated data, records the exact BDK
+3.1.0 serialization contract, and is updated by CAS. Private descriptor keys
+are reconstructed from the protected mnemonic and are not serialized in that
+record. The same
+`SharedWalletStore` authority owns birthday, supervisor sequence/phase, last
+consistent checkpoint, the distinct recovery checkpoint, bounded recent
+checkpoints, transaction/output reconciliation records, and broadcast intents.
+The BDK snapshot commit and scan-journal commit are deliberately ordered
+transactions, not one falsely atomic transaction.
+
+This first backend stores one aggregate changeset and therefore inherits the
+encrypted entity cleartext limit of 1 MiB. BDK's persistent script cache is
+disabled to avoid needless growth, but transaction and derivation history can
+still reach the limit. Capacity exhaustion fails closed. A normalized or
+authenticated chunked BDK backend is required before the documented 4,096-row
+mirror ceilings can be treated as production-scale capacity; this is an
+independent reason the Bitcoin value gate remains false.
+
+The former standalone BDK SQLite backend is not imported, opened, truncated,
+or deleted. There is no migration tool in this revision. An upgraded product
+which has such a database must retain it and stop for an explicit future import
+instead of treating `WalletNotFound` as permission to create replacement state.
 
 `bip157` 0.6.3 accepts `data_dir`, but this pinned release discards the field in
 `Node::new`; it does not persist headers, compact-filter headers/filters, or its

@@ -370,11 +370,15 @@ online evidence and value paths remain behind unavailable opaque permits.
 
 ## Bitcoin Kyoto recovery journal
 
-The Bitcoin module persists two coordinated stores. BDK SQLite is the durable
-descriptor/local-chain/transaction/output authority. The encrypted wallet store
-records an authenticated birthday, a distinct non-genesis new-wallet recovery
-anchor, bounded recent checkpoints, supervisor sequence and phase,
-transaction/output reconciliation mirrors, and signed broadcast intents.
+The Bitcoin module uses one shared encrypted store authority with two ordered
+record boundaries. A strict v1 `bitcoin_wallet_state` entity contains the
+aggregate BDK-3.1.0 public descriptor/local-chain/transaction/output
+changeset. It is account-ID authenticated, deletion-protected, and updated by
+CAS. Separate encrypted records contain the authenticated birthday, distinct
+non-genesis new-wallet recovery anchor, bounded recent checkpoints, supervisor
+sequence and phase, transaction/output reconciliation mirrors, and signed
+broadcast intents. These commits are ordered but are not claimed as one atomic
+transaction.
 
 Bitcoin swap keys add an encrypted entity namespace without a plaintext schema
 table or seed copy. Each role allocation atomically writes an immutable
@@ -398,14 +402,23 @@ a different numeric reference. Session IDs must never be recycled, and a
 current encrypted database backup is required to recover already active swaps;
 the mnemonic alone is not an allocation journal.
 
-A sync records `synchronizing`, applies the Kyoto update, persists BDK, records
-`reconciling`, applies encrypted mirror changes in bounded chunks, and commits
-`ready` last. Consumers must ignore an incomplete mirror unless the scan record
-is ready at its completed sequence. Restart from `reconciling` compares the BDK
-tip to the pending checkpoint and resumes the chunks without another network
-update. A sync timeout discards the non-cancel-safe subscriber, shuts down the
-node, and persists `recovery_required`; the poisoned supervisor cannot be
-reused.
+A sync records `synchronizing`, applies the Kyoto update, commits the encrypted
+BDK snapshot, records `reconciling`, applies encrypted mirror changes in bounded
+chunks, and commits `ready` last. Consumers must ignore an incomplete mirror
+unless the scan record is ready at its completed sequence. Restart from
+`reconciling` compares the BDK tip to the pending checkpoint and resumes the
+chunks without another network update. If the BDK commit landed but the
+`reconciling` commit did not, the unequal tip forces a recovery scan. A sync
+timeout discards the non-cancel-safe subscriber, shuts down the node, and
+persists `recovery_required`; the poisoned supervisor cannot be reused.
+
+The aggregate BDK snapshot has the same 1 MiB cleartext limit as every generic
+encrypted entity, and its persistent script cache is disabled. Oversize state
+fails closed; a normalized or authenticated chunked backend remains required
+before Bitcoin value qualification. Standalone BDK SQLite databases from the
+older source boundary are left untouched and are not imported. No migration
+tool exists yet, so callers must retain such files and must not interpret a
+missing encrypted entity as authorization to create over legacy state.
 
 Broadcast preparation resolves every input through the same BDK wallet,
 calculates the exact fee, verifies the approved maximum, and persists raw bytes

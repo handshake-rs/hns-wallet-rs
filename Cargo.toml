@@ -50,9 +50,11 @@ hex = "0.4.3"
 hkdf = "0.12.4"
 hmac = "0.12.1"
 k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "std"] }
-# Kept on BDK 3.1's rusqlite line so the standalone workspace has one
-# `sqlite3` native link target.
-rusqlite = { version = "0.31.0", features = ["bundled"] }
+# One native SQLite link target shared with the mobile embedding workspaces.
+# BDK persistence is implemented over encrypted WalletStore records and must
+# not re-enable BDK's independent rusqlite feature. `fallible_uint` preserves
+# checked failure for the store's u64/usize SQLite boundaries.
+rusqlite = { version = "=0.39.0", features = ["bundled", "fallible_uint"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.142"
 sha2 = "0.10.9"
@@ -72,8 +74,9 @@ hns-swap = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.g
 hns-transaction = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4331eee2265ebc43a28390517c24a958fa4b7733" }
 hns-urkel-proof = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4331eee2265ebc43a28390517c24a958fa4b7733" }
 
-# The only Bitcoin production synchronization implementation.
-bdk_wallet = { version = "3.1.0", features = ["rusqlite", "keys-bip39"] }
+# The only Bitcoin production synchronization implementation. The exact BDK
+# release is part of the encrypted changeset format contract.
+bdk_wallet = { version = "=3.1.0", features = ["keys-bip39"] }
 bdk_kyoto = "0.17.0"
 bip157 = "0.6.3"
 bitcoin = { version = "0.32.8", features = ["serde"] }

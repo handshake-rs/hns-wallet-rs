@@ -418,12 +418,16 @@ are still absent, and no Bitcoin signing or value permit is exposed by this key
 slice.
 
 Bitcoin's supervisor does not authorize from a peer status field. A completed
-Kyoto wallet update is committed to BDK SQLite before encrypted transaction and
-output mirrors advance; the authenticated scan record becomes ready only after
-all bounded reconciliation chunks commit. Exact local-chain hash-membership
-queries identify a retained reorg ancestor. Missing ancestry, capacity
-exhaustion, timeout of the non-cancel-safe update, or BDK/encrypted-state
-rollback mismatch fails closed and requires a new supervisor/recovery scan.
+Kyoto wallet update is committed to the strict versioned encrypted BDK
+changeset entity before encrypted transaction and output mirrors advance; the
+authenticated scan record becomes ready only after all bounded reconciliation
+chunks commit. The BDK entity and journal share the exact same non-debuggable
+store/key authority. Exact local-chain hash-membership queries identify a
+retained reorg ancestor. Missing ancestry, the BDK entity's 1 MiB capacity,
+timeout of the non-cancel-safe update, or BDK/journal rollback mismatch fails
+closed and requires a new supervisor/recovery scan. A standalone legacy BDK
+SQLite database is never opened or silently discarded; migration tooling is
+still absent.
 
 The dormant broadcast path resolves every input as an unspent wallet output,
 uses BDK's exact fee calculation, and verifies a domain-separated approval over

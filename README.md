@@ -92,6 +92,13 @@ The synchronized account-read tranche adds focused `production_followup_`
 runtime/provider/service tests in source. They have not been executed in this
 change; the prior results above do not qualify the new composition.
 
+Bitcoin BDK state now uses the same encrypted shared SQLite authority as the
+wallet journal instead of BDK's independent rusqlite feature. Its strict
+aggregate snapshot is CAS-protected and ordered before reconciliation/ready,
+but is limited to 1 MiB; a normalized or authenticated chunked backend and an
+explicit legacy-BDK-SQLite importer remain release blockers. The Bitcoin value
+gate stays false.
+
 ## Crates
 
 - `hns-wallet-types`: wallet-local identifiers and UI-safe summaries.
