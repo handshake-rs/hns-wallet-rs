@@ -4,15 +4,18 @@ set -euo pipefail
 wallet_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$wallet_root"
 
+./scripts/check-publish-arguments.sh
+./scripts/publish.sh --archive-only
+
 if rg -n 'path\s*=\s*"\.\./' --glob Cargo.toml .; then
   echo "sibling path dependency is forbidden" >&2
   exit 1
 fi
 
-hns_revision="b33b346780c8f6a9bb18a54390019486cdab0221"
+hns_revision="abf11ff3b16920c08f3c0b6d32d2e1af7cbe37b2"
 hns_repository="https://github.com/handshake-rs/hns-rs.git"
 hns_lock_source="git+${hns_repository}?rev=${hns_revision}#${hns_revision}"
-for package in hns-covenants hns-encoding hns-marketplace-protocol hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
+for package in hns-covenants hns-encoding hns-marketplace-protocol hns-p2p-experimental hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
   if ! awk -v package="$package" -v source="$hns_lock_source" '
     BEGIN { RS = ""; found = 0 }
     index($0, "name = \"" package "\"") {

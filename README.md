@@ -27,9 +27,10 @@ establish the app sandbox, ACL and data-protection policy, backup exclusion,
 and Keystore/Keychain key wrapping. A platform-neutral native controller now
 creates or restores exactly one non-value HNS account, opens only a complete
 seed/account bootstrap, and exposes status, unlock, lock, and account identity
-through a private ABI-v2 session. Generated JNI/Swift bindings, native product
-screens, and installed-device qualification remain absent, and no
-value/provider release gate is enabled.
+through a private ABI-v2 session. Platform bindings, native product screens,
+and installed-device qualification are downstream release requirements rather
+than authorities supplied by this crate, and no value/provider release gate is
+enabled.
 
 ABI wallet status/unlock/lock and a narrow provider
 control surface are implemented. One library composition can bind an exact
@@ -96,16 +97,14 @@ state. Save, signing, and submission reacquire the non-serializable current
 TRANSFER authority; a harmless live binding advance is accepted only when the
 stable transfer/owner/state/renewal identity is unchanged, while the HNS
 runtime requires exact bindings within each immediate live fence. Persisted
-evidence never recreates authority. Every Shakedex and
-dependent HNS funding/value/fee gate remains `false`. At exact local source
-revision `9d0cbeb8e59dcd74c189ec973b218a9f3afe167e`, the one combined
-`production_next` filter passed all 13 matching HNS, provider, service, and
-Shakedex tests with zero failures; this is not product, regtest, or full-gate
-qualification.
-
-The synchronized account-read tranche adds focused `production_followup_`
-runtime/provider/service tests in source. They have not been executed in this
-change; the prior results above do not qualify the new composition.
+evidence never recreates authority. Every Shakedex and dependent HNS
+funding/value/fee gate remains `false`. The exact implementation predecessor
+`ba9f013a098679fe8e3d812a7e09020803e27d53` passed the complete CI and CodeQL
+workflows on 2026-08-10. That source evidence includes the synchronized account
+read and purpose-separation regressions but is not product, regtest, resource,
+or release-gate qualification. Evidence for the current release candidate is
+recorded only after its exact pushed commit completes the same gates; see
+[`docs/QUALIFICATION.md`](docs/QUALIFICATION.md).
 
 Bitcoin BDK state now uses the same encrypted shared SQLite authority as the
 wallet journal instead of BDK's independent rusqlite feature. Its strict
@@ -155,3 +154,4 @@ Run `scripts/check.sh` once for the complete local qualification gate.
 - [Qualification matrix](docs/QUALIFICATION.md)
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
 - [Future work and excluded features](FUTURE_WORK.md)
+- [Release procedure](docs/releasing.md)

@@ -205,10 +205,9 @@ snapshot bindings as current authority.
 
 Script-controlled FINALIZE is durable in source, including atomic workflow plus
 source/funding reservation persistence and the shared evidence-backed terminal
-release path. At exact local source revision `9d0cbeb8e59dcd74c189ec973b218a9f3afe167e`,
-the one combined `production_next` command passed all seven matching HNS
-purpose-separation and FINALIZE restart/reopen/CAS/replacement/binding-advance/
-reorg/finality tests with zero failures. All
+release path. Its HNS purpose-separation and FINALIZE restart/reopen/CAS/
+replacement/binding-advance/reorg/finality regressions are included in the
+exact CI evidence recorded in `QUALIFICATION.md`. All
 Shakedex value authorization and submission entrypoints remain unreachable
 while the fixed Shakedex and HNS Shakedex-funding/value/fee release gates are
 `false`; live Denuo/provider/UI

@@ -19,7 +19,7 @@ hostile website
 Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
 proofs, signed fixed-price listings/cancellations, and Denuo name-market
 envelopes remain in `hns-rs`. This workspace consumes the required protocol
-crates from reviewed immutable revision `b33b346`; its exact source and lock
+crates from reviewed immutable revision `abf11ff`; its exact source and lock
 coherence are checked before the workspace gate. The wallet owns only the
 protocol-verification boundary and encrypted replay/tombstone board state. Node
 indexes and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
@@ -97,7 +97,7 @@ account, or current scope before consuming the approval; the provider grant
 receives only the frozen hashes. Required approval-schema-v3 `hnsNames`
 prevents trusted host UIs from reducing Names consent to a generic capability
 label. Browser and mobile adapters remain unavailable until they negotiate and
-adopt that unpublished shape.
+adopt that versioned shape.
 
 The earlier value-capable `HnsWalletRuntime` still owns a private
 `Mutex<WalletStore>` and its legacy full reconciliation holds that mutex across

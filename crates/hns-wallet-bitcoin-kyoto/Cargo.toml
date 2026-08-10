@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+documentation = "https://docs.rs/hns-wallet-bitcoin-kyoto"
+readme = "README.md"
+publish = ["crates-io"]
 
 [dependencies]
 bdk_kyoto.workspace = true

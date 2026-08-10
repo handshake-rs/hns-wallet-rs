@@ -191,8 +191,8 @@ without truncation. A nonempty persisted set remains invalid without HNS
 namespace, Accounts, Names, and a nonempty account binding.
 
 Non-Names permission prompts and `hns_requestAccounts` carry `hnsNames: []`.
-This approval-v3 shape is unpublished; browser/mobile consumers must negotiate,
-adopt, preserve, and render it before the read composition is product-available.
+Browser/mobile consumers must negotiate, adopt, preserve, and render this
+approval-v3 shape before the read composition is product-available.
 Strict approval-v2 consumers reject the new field, while v3 consumers reject
 its omission.
 
@@ -248,8 +248,7 @@ origins, unauthorized capabilities, replays, request flooding, stale context,
 stale approval, locked wallet, and unavailable module/backend are distinct
 errors. Errors minimize account and policy disclosure.
 
-The earlier provider/ABI/service/host account-join tests are focused
-implementation evidence only. The new `production_followup_` synchronized
-runtime, scoped-permission, and public-projection regressions are source-only
-and have not been executed. Installed-browser and product chain-runtime
-qualification remain pending.
+The provider/ABI/service/host account-join, synchronized-runtime,
+scoped-permission, and public-projection regressions are included in the exact
+CI evidence recorded in `QUALIFICATION.md`. Installed-browser and product
+chain-runtime qualification remain pending.

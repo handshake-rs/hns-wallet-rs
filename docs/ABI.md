@@ -187,5 +187,6 @@ signature verification, durable rollback state, artifact hashing, and the
 release gate are not implemented here, so artifact/runtime availability stays
 false.
 
-Host and contract tests added with this tranche are source-only and were not
-executed.
+The host and contract regressions in this boundary passed the exact `ba9f013`
+workspace CI recorded in [`QUALIFICATION.md`](QUALIFICATION.md). Installed
+browser/mobile adoption and artifact-authenticity qualification remain open.

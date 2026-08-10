@@ -1,0 +1,176 @@
+# Releasing
+
+The `hns-wallet-rs` crates use one shared version and are published to
+crates.io. Crates.io releases are permanent: an uploaded version cannot be
+overwritten or deleted.
+
+## Public package allowlist
+
+The release script publishes only these packages, in dependency order:
+
+1. `hns-wallet-types`
+2. `hns-wallet-store`
+3. `hns-wallet-chain-api`
+4. `hns-wallet-ffi`
+5. `hns-wallet-provider`
+6. `hns-wallet-hns`
+7. `hns-wallet-market`
+8. `hns-wallet-shakedex`
+9. `hns-wallet-bitcoin-kyoto`
+10. `hns-wallet-ethereum`
+11. `hns-wallet-host`
+12. `hns-wallet-service`
+13. `hns-wallet-testkit`
+14. `hns-wallet-mobile`
+
+`release/public-crates.txt` is the machine-readable authority for this list.
+The cheap release validator fails if this document, the workspace package set,
+the crates.io publish allowlists, or the dependency order diverges from it.
+
+Every internal dependency has both a workspace path and the shared crates.io
+version. Cargo removes the path when it creates a normalized source package.
+Every package carries a README, exact workspace license copies, and a
+package-local changelog that points to the canonical shared release notes.
+`scripts/verify-release.py` checks those files, the shared version, required
+crates.io metadata, internal version requirements, immutable protocol source,
+dependency order, ABI release copies, and Ethereum contract artifact without
+compiling Rust or Solidity.
+
+## 0.1.0 release candidate
+
+Version `0.1.0` is the initial `hns-wallet-rs` release-candidate line. The
+canonical feature inventory is in `CHANGELOG.md`; source packaging, publication,
+or test success does not enable provider, value, settlement, or marketplace
+product gates. Registry and tag state are external facts and must be checked at
+release time rather than embedded as a claim in the source snapshot.
+
+Wallet source consumes the final immutable `hns-rs` release-candidate revision
+`abf11ff3b16920c08f3c0b6d32d2e1af7cbe37b2`. Before any wallet upload, all 17
+shared `hns-rs` `0.2.0` packages must be visible on crates.io, and every
+downloaded archive must identify that exact revision in
+`.cargo_vcs_info.json`. Dry-run preflight patches protocol dependencies to that
+Git revision and wallet dependencies to local workspace paths. Those patches
+are verification aids only; they are never used during an actual upload.
+If the protocol release-date preparation creates a later `hns-rs` source
+commit, stop and repin every wallet protocol authority to the actual published
+commit before qualifying or executing the wallet release.
+
+The `hns-wallet-ffi` package archive must contain byte-identical copies of
+`abi/contracts-v2.schema.json` and `abi/golden-vectors-v2.json`. The
+`hns-wallet-ethereum` archive must contain the Solidity source, compiler
+driver, pinned npm manifests, and deterministic `NativeEthHtlc` artifact. The
+archive verifier rejects a missing or divergent file. These public artifacts
+document and verify boundaries; they grant no runtime or deployment authority.
+
+## Release procedure
+
+1. Update the shared version in the root `Cargo.toml`, every internal dependency
+   version in `[workspace.dependencies]`, `CHANGELOG.md`, and
+   `release/CRATE-CHANGELOG.md`. Before an upload, replace `unreleased` with the
+   release date in both changelog authorities. Synchronize the package copies:
+
+   ```bash
+   ./scripts/sync-release-files.sh
+   ```
+
+   The validator rejects an execution attempt whose heading remains
+   `unreleased`.
+
+2. Run the cheap metadata, argument, and archive-inventory checks while
+   preparing the release source. Archive-only mode uses `cargo package
+   --no-verify`; it does not compile the packages:
+
+   ```bash
+   python3 scripts/verify-release.py --toolchain 1.89.0
+   ./scripts/check-publish-arguments.sh
+   ./scripts/publish.sh --archive-only
+   ```
+
+3. Inspect and commit the exact release source. Execution mode refuses a dirty
+   worktree.
+
+4. Qualify that exact commit with the complete locked gate, preferably in CI
+   after an authorized push. The routine gate performs one archive-only pass
+   after the workspace checks; it does not repeat 14 normalized compile checks:
+
+   ```bash
+   ./scripts/check.sh
+   ```
+
+   Do not repeat an identical expensive gate locally and in CI.
+
+5. After routine CI succeeds for the exact release candidate, manually dispatch
+   [`.github/workflows/release-preflight.yml`](../.github/workflows/release-preflight.yml)
+   and supply that qualified 40-character commit as `expected_commit`. The
+   workflow checks out and verifies that exact immutable commit. This isolated
+   workflow performs the 14 real normalized publish dry-runs and never receives
+   credentials or executes publication. The equivalent local command is:
+
+   ```bash
+   ./scripts/publish.sh --dry-run
+   ```
+
+   This performs Cargo's real publish dry-run for every package against local
+   dependency patches, then checks each `.crate` archive for the
+   common README/license/changelog/manifest inventory, removal of dependency
+   source selectors, and exact source-commit metadata. FFI and Ethereum receive
+   the additional artifact checks described above. To inspect one package
+   while preparing source, use:
+
+   ```bash
+   ./scripts/publish.sh --dry-run hns-wallet-ffi
+   ```
+
+   Partial selection is deliberately unavailable in execution mode.
+
+6. Confirm the `hns-rs` release completed, then stop and obtain explicit human
+   authorization for the irreversible wallet upload. Authentication,
+   publication, and tagging are never CI steps and are not implied by a
+   successful dry-run. Authenticate without placing a token in the repository:
+
+   ```bash
+   cargo login
+   ```
+
+7. Check the version again and perform the explicitly confirmed upload. The
+   confirmation must equal the workspace version:
+
+   ```bash
+   ./scripts/publish.sh --execute --confirm-publish 0.1.0
+   ```
+
+Execution mode first downloads all 17 required protocol archives and rejects
+any package whose `.cargo_vcs_info.json` does not identify the exact pinned
+`hns-rs` revision. It then creates and runs the custom inventory verifier over
+each wallet source package before any possible upload. Within one invocation,
+that archive is reused for post-upload or resume checksum verification instead
+of being packaged twice. Execute-mode archive validation rejects a
+`.cargo_vcs_info.json` record with `"dirty": true`, even if the worktree became
+dirty after the initial clean-source check.
+
+Execution is restartable, but it never skips a wallet package merely because an
+API record exists. For an already-published package/version, it downloads the
+crates.io archive and requires byte-for-byte SHA-256 identity plus the current
+release commit in both archives' `.cargo_vcs_info.json`. A mismatch aborts the
+release.
+
+New uploads use a 605-second propagation and cooldown interval before the next
+allowlisted crate by default. The command waits only after a successful new
+upload and only when another crate remains; verified resume skips and the final
+new upload do not sleep. Override the interval only when crates.io communicates
+a different non-negative limit:
+
+```bash
+PUBLISH_INTERVAL_SECONDS=605 \
+  ./scripts/publish.sh --execute --confirm-publish 0.1.0
+```
+
+After each cooldown, the script downloads the new archive and requires the
+same exact checksum and source-commit identity before attempting the next
+dependent package. If propagation is incomplete, it exits safely; rerun after
+the registry API exposes the package so the existing upload can be verified and
+the sequence resumed.
+
+After publication, push an annotated `vX.Y.Z` tag and confirm every package
+page and docs.rs build. Publication cannot be rolled back: yanking can
+discourage new resolution, but cannot delete or replace an uploaded version.

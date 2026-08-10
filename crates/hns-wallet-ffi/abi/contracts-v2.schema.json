@@ -1,0 +1,1986 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://handshake.rs/schemas/hns-wallet/contracts-v2.schema.json",
+  "title": "HNS wallet ABI and browser projection contracts",
+  "description": "Canonical machine-readable bundle for private wallet ABI v2 objects, public browser projections, and signed release manifests. Consumers should reference the exact named $defs root for their trust boundary.",
+  "$comment": "The private ABI frame schemas describe the JSON payload following the four-byte big-endian length prefix. The prefix and encoded byte ceilings are transport invariants and are not representable by JSON Schema.",
+  "oneOf": [
+    { "$ref": "#/$defs/privateWalletServiceFrameV2" },
+    { "$ref": "#/$defs/privateProviderCapabilitySnapshotV1" },
+    { "$ref": "#/$defs/publicApprovalProjectionV3" },
+    { "$ref": "#/$defs/publicProviderEventProjectionV1" },
+    { "$ref": "#/$defs/signedArtifactManifestV2" }
+  ],
+  "$defs": {
+    "uint8": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 255
+    },
+    "uint16": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535
+    },
+    "uint32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "uint64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "nonzeroUint64": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 18446744073709551615
+    },
+    "safeUint": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "positiveSafeUint": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991
+    },
+    "wireId16": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{21}[AQgw]$",
+      "not": { "const": "AAAAAAAAAAAAAAAAAAAAAA" },
+      "$comment": "Canonical nonzero 16-byte unpadded base64url. The final character restriction rejects noncanonical trailing bits."
+    },
+    "wireId32": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$",
+      "not": { "const": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+      "$comment": "Canonical nonzero 32-byte unpadded base64url. The final character restriction rejects noncanonical trailing bits."
+    },
+    "semanticId16": {
+      "type": "array",
+      "minItems": 16,
+      "maxItems": 16,
+      "items": { "$ref": "#/$defs/uint8" }
+    },
+    "semanticId32": {
+      "type": "array",
+      "minItems": 32,
+      "maxItems": 32,
+      "items": { "$ref": "#/$defs/uint8" }
+    },
+    "asciiString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[\\x00-\\x7f]+$"
+    },
+    "publicString": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^[\\x20-\\x7e]+$"
+    },
+    "publicOrigin": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[\\x20-\\x7e]+$",
+      "$comment": "The browser adapter requires exact URL-origin canonicalization, equality to its independently authenticated document origin, and a secure origin: HTTPS, or HTTP only for localhost, 127.0.0.0/8, or ::1. That URL-host predicate is enforced by the runtime rather than approximated here."
+    },
+    "lowerHexSha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "lowerHexDigest32": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "canonicalHnsName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 63,
+      "pattern": "^[a-z0-9](?:[a-z0-9_-]{0,61}[a-z0-9])?$",
+      "not": { "enum": ["example", "invalid", "local", "localhost", "test"] }
+    },
+    "hnsNameDisclosureV3": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "nameHash"],
+      "properties": {
+        "name": { "$ref": "#/$defs/canonicalHnsName" },
+        "nameHash": { "$ref": "#/$defs/lowerHexDigest32" }
+      },
+      "$comment": "The approval-schema-v3 validator uses the exact pinned hns-covenants rules and requires nameHash == SHA3-256(name)."
+    },
+    "hnsNameDisclosuresV3": {
+      "type": "array",
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/hnsNameDisclosureV3" },
+      "$comment": "Wire producers sort by (name, nameHash); the approval-schema-v3 validator also rejects duplicate names or hashes and the 16384-byte approval-frame ceiling remains authoritative."
+    },
+    "token128": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:+-]+$"
+    },
+    "artifactFileName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "baseUnits": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,38})$",
+      "$comment": "Consumers must also reject decimal values greater than 340282366920938463463374607431768211455; JSON Schema has no portable numeric ordering for decimal strings."
+    },
+    "nonzeroBaseUnits": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,38}$",
+      "$comment": "Consumers must also reject decimal values greater than 340282366920938463463374607431768211455."
+    },
+    "walletAsset": {
+      "enum": ["HNS", "BTC", "ETH"]
+    },
+    "moduleId": {
+      "enum": ["handshake", "bitcoin", "ethereum"]
+    },
+    "finalityModel": {
+      "enum": ["proof_of_work_confirmations", "ethereum_finalized_checkpoint"]
+    },
+    "permissionCapability": {
+      "enum": [
+        "accounts",
+        "balance",
+        "transactions",
+        "receive_target",
+        "send",
+        "names",
+        "name_transfer",
+        "name_finalize",
+        "typed_identity_signature",
+        "name_market",
+        "cross_chain_market",
+        "swap_settlement"
+      ]
+    },
+    "permissionCapabilities": {
+      "type": "array",
+      "maxItems": 12,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/permissionCapability" },
+      "$comment": "Wire producers emit these set values in the canonical order declared by hns-wallet-types; runtime validators enforce that ordering."
+    },
+    "nonemptyPermissionCapabilities": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 12,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/permissionCapability" },
+      "$comment": "Wire producers emit these set values in the canonical order declared by hns-wallet-types; runtime validators enforce that ordering."
+    },
+    "approvalWarning": {
+      "enum": [
+        "feeEstimateMayChange",
+        "nameTransferIsIrreversible",
+        "refundRequiresManualAction",
+        "settlementCanBeDelayed"
+      ]
+    },
+    "approvalWarnings": {
+      "type": "array",
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/approvalWarning" },
+      "$comment": "Wire producers emit warning sets in enum order; runtime validators enforce that ordering."
+    },
+    "providerMethod": {
+      "enum": [
+        "wallet_getCapabilities",
+        "wallet_getEnabledModules",
+        "wallet_enableModule",
+        "wallet_disableModule",
+        "wallet_requestPermissions",
+        "wallet_getPermissions",
+        "wallet_revokePermissions",
+        "wallet_lock",
+        "wallet_getStatus",
+        "hns_requestAccounts",
+        "hns_accounts",
+        "hns_getBalance",
+        "hns_getTransactions",
+        "hns_getReceiveAddress",
+        "hns_send",
+        "hns_getNames",
+        "hns_getName",
+        "hns_importKnownName",
+        "hns_transferName",
+        "hns_finalizeName",
+        "hns_signTypedMessage",
+        "asset_getAccount",
+        "asset_getBalance",
+        "asset_getTransactions",
+        "asset_getReceiveTarget",
+        "asset_send",
+        "nameMarket_listOffers",
+        "nameMarket_createFixedPriceOffer",
+        "nameMarket_cancelOffer",
+        "nameMarket_acceptOffer",
+        "nameMarket_getSession",
+        "nameMarket_finalizePurchase",
+        "nameMarket_recoverName",
+        "swap_getSupportedPairs",
+        "swap_getPriceRound",
+        "swap_listMarketIntents",
+        "swap_publishMarketIntent",
+        "swap_cancelMarketIntent",
+        "swap_requestMatch",
+        "swap_acceptFill",
+        "swap_getSession",
+        "swap_redeem",
+        "swap_refund"
+      ]
+    },
+    "providerMethods": {
+      "type": "array",
+      "maxItems": 43,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/providerMethod" },
+      "$comment": "Presence in this closed vocabulary does not imply runtime availability. The snapshot contains only methods supported by the negotiated runtime; hns_requestAccounts requires the service's atomic permission/account join and an explicit runtime account selector."
+    },
+    "approvalMethod": {
+      "enum": [
+        "wallet_enableModule",
+        "wallet_disableModule",
+        "wallet_requestPermissions",
+        "hns_requestAccounts",
+        "hns_send",
+        "asset_send",
+        "hns_transferName",
+        "hns_finalizeName",
+        "hns_signTypedMessage",
+        "nameMarket_createFixedPriceOffer",
+        "nameMarket_cancelOffer",
+        "nameMarket_acceptOffer",
+        "nameMarket_finalizePurchase",
+        "nameMarket_recoverName",
+        "swap_publishMarketIntent",
+        "swap_cancelMarketIntent",
+        "swap_requestMatch",
+        "swap_acceptFill",
+        "swap_redeem",
+        "swap_refund"
+      ]
+    },
+    "privateAmount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset", "base_units"],
+      "properties": {
+        "asset": { "$ref": "#/$defs/walletAsset" },
+        "base_units": { "$ref": "#/$defs/baseUnits" }
+      }
+    },
+    "privateNonzeroAmount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset", "base_units"],
+      "properties": {
+        "asset": { "$ref": "#/$defs/walletAsset" },
+        "base_units": { "$ref": "#/$defs/nonzeroBaseUnits" }
+      }
+    },
+    "publicAmount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset", "baseUnits"],
+      "properties": {
+        "asset": { "$ref": "#/$defs/walletAsset" },
+        "baseUnits": { "$ref": "#/$defs/baseUnits" }
+      }
+    },
+    "publicNonzeroAmount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asset", "baseUnits"],
+      "properties": {
+        "asset": { "$ref": "#/$defs/walletAsset" },
+        "baseUnits": { "$ref": "#/$defs/nonzeroBaseUnits" }
+      }
+    },
+    "providerBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authorityHandle",
+        "authorityRevision",
+        "walletSessionId",
+        "permissionGeneration"
+      ],
+      "properties": {
+        "authorityHandle": { "$ref": "#/$defs/wireId32" },
+        "authorityRevision": { "$ref": "#/$defs/nonzeroUint64" },
+        "walletSessionId": { "$ref": "#/$defs/wireId32" },
+        "permissionGeneration": { "$ref": "#/$defs/uint64" }
+      }
+    },
+    "providerBindingWithPermission": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authorityHandle",
+        "authorityRevision",
+        "walletSessionId",
+        "permissionGeneration"
+      ],
+      "properties": {
+        "authorityHandle": { "$ref": "#/$defs/wireId32" },
+        "authorityRevision": { "$ref": "#/$defs/nonzeroUint64" },
+        "walletSessionId": { "$ref": "#/$defs/wireId32" },
+        "permissionGeneration": { "$ref": "#/$defs/nonzeroUint64" }
+      }
+    },
+    "privateProviderCapabilitySnapshotV1": {
+      "$anchor": "privateProviderCapabilitySnapshotV1",
+      "title": "Private provider capability snapshot v1",
+      "description": "Wallet-owned authority-scoped negotiation result. Generation zero is valid only before the first permission grant or revocation; a revoked authority retains its nonzero tombstone generation. This is never projected to website code.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "providerSchemaVersion",
+        "approvalSchemaVersion",
+        "walletSessionId",
+        "permissionGeneration",
+        "methods"
+      ],
+      "properties": {
+        "providerSchemaVersion": { "const": 1 },
+        "approvalSchemaVersion": { "const": 3 },
+        "walletSessionId": { "$ref": "#/$defs/wireId32" },
+        "permissionGeneration": { "$ref": "#/$defs/uint64" },
+        "methods": { "$ref": "#/$defs/providerMethods" }
+      },
+      "$comment": "Within providerCapabilities, walletSessionId and permissionGeneration must equal the sibling private binding. Standard JSON Schema cannot express equality between sibling instance locations."
+    },
+    "hostPlatform": {
+      "enum": ["android", "ios", "chromiumNativeHost"]
+    },
+    "serviceCapability": {
+      "enum": [
+        "canonicalFraming",
+        "restartIsolation",
+        "opaqueAuthorityRegistry",
+        "persistentPermissions",
+        "structuredApprovals",
+        "typedEvents",
+        "walletOperations",
+        "providerDispatch",
+        "valueMovement",
+        "browserIntegration"
+      ]
+    },
+    "serviceLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outerFrameBytes",
+        "providerRequestBytes",
+        "providerResultBytes",
+        "providerEventBytes",
+        "approvalFrameBytes",
+        "approvalLifetimeMs"
+      ],
+      "properties": {
+        "outerFrameBytes": { "const": 1048576 },
+        "providerRequestBytes": { "const": 65536 },
+        "providerResultBytes": { "const": 262144 },
+        "providerEventBytes": { "const": 65536 },
+        "approvalFrameBytes": { "const": 16384 },
+        "approvalLifetimeMs": { "const": 90000 }
+      }
+    },
+    "hostHello": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "platform", "hostSessionId", "restartGeneration"],
+      "properties": {
+        "protocolVersion": { "const": 2 },
+        "platform": { "$ref": "#/$defs/hostPlatform" },
+        "hostSessionId": { "$ref": "#/$defs/wireId32" },
+        "restartGeneration": { "$ref": "#/$defs/nonzeroUint64" }
+      }
+    },
+    "serviceHello": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocolVersion",
+        "platform",
+        "hostSessionId",
+        "serviceSessionId",
+        "restartGeneration",
+        "capabilities",
+        "limits"
+      ],
+      "properties": {
+        "protocolVersion": { "const": 2 },
+        "platform": { "$ref": "#/$defs/hostPlatform" },
+        "hostSessionId": { "$ref": "#/$defs/wireId32" },
+        "serviceSessionId": { "$ref": "#/$defs/wireId32" },
+        "restartGeneration": { "$ref": "#/$defs/nonzeroUint64" },
+        "capabilities": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/serviceCapability" }
+        },
+        "limits": { "$ref": "#/$defs/serviceLimits" }
+      }
+    },
+    "providerNamespace": {
+      "enum": ["hns", "icann"]
+    },
+    "hostAuthorityFacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "origin",
+        "namespace",
+        "runtimeSessionId",
+        "runtimeGeneration",
+        "policyGeneration",
+        "navigationGeneration",
+        "decisionFingerprint",
+        "validUntilUnixMs"
+      ],
+      "properties": {
+        "origin": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[\\x00-\\x7f]+$"
+        },
+        "namespace": { "$ref": "#/$defs/providerNamespace" },
+        "runtimeSessionId": { "$ref": "#/$defs/wireId16" },
+        "runtimeGeneration": { "$ref": "#/$defs/nonzeroUint64" },
+        "policyGeneration": { "$ref": "#/$defs/nonzeroUint64" },
+        "navigationGeneration": { "$ref": "#/$defs/nonzeroUint64" },
+        "decisionFingerprint": { "$ref": "#/$defs/wireId32" },
+        "validUntilUnixMs": { "$ref": "#/$defs/nonzeroUint64" }
+      }
+    },
+    "approvalDecision": {
+      "enum": ["approve", "reject"]
+    },
+    "walletRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation"],
+          "properties": { "operation": { "const": "status" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "passphrase"],
+          "properties": {
+            "operation": { "const": "createWallet" },
+            "passphrase": { "type": "string", "minLength": 1, "maxLength": 1024 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "passphrase", "recoveryPhrase"],
+          "properties": {
+            "operation": { "const": "restoreWallet" },
+            "passphrase": { "type": "string", "minLength": 1, "maxLength": 1024 },
+            "recoveryPhrase": { "type": "string", "minLength": 1, "maxLength": 1024 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "passphrase"],
+          "properties": {
+            "operation": { "const": "unlock" },
+            "passphrase": { "type": "string", "minLength": 1, "maxLength": 1024 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation"],
+          "properties": { "operation": { "const": "lock" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation"],
+          "properties": { "operation": { "const": "listAccounts" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "module", "account"],
+          "properties": {
+            "operation": { "const": "balance" },
+            "module": { "$ref": "#/$defs/moduleId" },
+            "account": { "$ref": "#/$defs/semanticId16" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "module", "account"],
+          "properties": {
+            "operation": { "const": "receiveTarget" },
+            "module": { "$ref": "#/$defs/moduleId" },
+            "account": { "$ref": "#/$defs/semanticId16" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "module", "account"],
+          "properties": {
+            "operation": { "const": "transactionHistory" },
+            "module": { "$ref": "#/$defs/moduleId" },
+            "account": { "$ref": "#/$defs/semanticId16" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "module"],
+          "properties": {
+            "operation": { "const": "moduleStatus" },
+            "module": { "$ref": "#/$defs/moduleId" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "workflowId"],
+          "properties": {
+            "operation": { "const": "workflowStatus" },
+            "workflowId": { "$ref": "#/$defs/semanticId16" }
+          }
+        }
+      ]
+    },
+    "serviceRequest": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "authorityHandle", "authority"],
+          "properties": {
+            "operation": { "const": "registerAuthority" },
+            "authorityHandle": { "$ref": "#/$defs/wireId32" },
+            "authority": { "$ref": "#/$defs/hostAuthorityFacts" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "authorityHandle", "expectedAuthorityRevision", "authority"],
+          "properties": {
+            "operation": { "const": "replaceAuthority" },
+            "authorityHandle": { "$ref": "#/$defs/wireId32" },
+            "expectedAuthorityRevision": { "$ref": "#/$defs/nonzeroUint64" },
+            "authority": { "$ref": "#/$defs/hostAuthorityFacts" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "authorityHandle", "expectedAuthorityRevision"],
+          "properties": {
+            "operation": { "const": "revokeAuthority" },
+            "authorityHandle": { "$ref": "#/$defs/wireId32" },
+            "expectedAuthorityRevision": { "$ref": "#/$defs/nonzeroUint64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "authorityHandle", "authorityRevision"],
+          "properties": {
+            "operation": { "const": "providerCapabilities" },
+            "authorityHandle": { "$ref": "#/$defs/wireId32" },
+            "authorityRevision": { "$ref": "#/$defs/nonzeroUint64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operation",
+            "authorityHandle",
+            "authorityRevision",
+            "requestNonce",
+            "method",
+            "params"
+          ],
+          "properties": {
+            "operation": { "const": "providerRequest" },
+            "authorityHandle": { "$ref": "#/$defs/wireId32" },
+            "authorityRevision": { "$ref": "#/$defs/nonzeroUint64" },
+            "requestNonce": { "$ref": "#/$defs/nonzeroUint64" },
+            "method": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 96,
+              "pattern": "^[\\x00-\\x7f]+$"
+            },
+            "params": true
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "operation",
+            "authorityHandle",
+            "authorityRevision",
+            "approvalId",
+            "decision"
+          ],
+          "properties": {
+            "operation": { "const": "approvalDecision" },
+            "authorityHandle": { "$ref": "#/$defs/wireId32" },
+            "authorityRevision": { "$ref": "#/$defs/nonzeroUint64" },
+            "approvalId": { "$ref": "#/$defs/wireId16" },
+            "decision": { "$ref": "#/$defs/approvalDecision" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "request"],
+          "properties": {
+            "operation": { "const": "wallet" },
+            "request": { "$ref": "#/$defs/walletRequest" }
+          }
+        }
+      ]
+    },
+    "privateApprovalSummary": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "capabilities", "hnsNames"],
+          "properties": {
+            "kind": { "const": "permissions" },
+            "capabilities": { "$ref": "#/$defs/nonemptyPermissionCapabilities" },
+            "hnsNames": { "$ref": "#/$defs/hnsNameDisclosuresV3" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "capabilities": { "not": { "contains": { "const": "names" } } } } },
+              "then": { "properties": { "hnsNames": { "maxItems": 0 } } }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "module", "action"],
+          "properties": {
+            "kind": { "const": "moduleEnablement" },
+            "module": { "$ref": "#/$defs/moduleId" },
+            "action": { "enum": ["enable", "disable"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "amount", "recipient", "maximumFee", "chain", "finality", "warnings"],
+          "properties": {
+            "kind": { "const": "send" },
+            "amount": { "$ref": "#/$defs/privateNonzeroAmount" },
+            "recipient": { "$ref": "#/$defs/asciiString" },
+            "maximumFee": { "$ref": "#/$defs/privateAmount" },
+            "chain": { "$ref": "#/$defs/moduleId" },
+            "finality": { "$ref": "#/$defs/finalityModel" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "recipient", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "nameTransfer" },
+            "name": { "$ref": "#/$defs/asciiString" },
+            "recipient": { "$ref": "#/$defs/asciiString" },
+            "maximumFee": { "$ref": "#/$defs/privateAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "recipient", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "nameFinalize" },
+            "name": { "$ref": "#/$defs/asciiString" },
+            "recipient": { "$ref": "#/$defs/asciiString" },
+            "maximumFee": { "$ref": "#/$defs/privateAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "messageType", "messageDigest"],
+          "properties": {
+            "kind": { "const": "typedSignature" },
+            "messageType": { "$ref": "#/$defs/asciiString" },
+            "messageDigest": { "$ref": "#/$defs/asciiString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "action", "name", "listingId", "price", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "nameMarketOffer" },
+            "action": { "enum": ["create", "cancel", "recover"] },
+            "name": { "$ref": "#/$defs/asciiString" },
+            "listingId": {
+              "oneOf": [{ "$ref": "#/$defs/asciiString" }, { "type": "null" }]
+            },
+            "price": { "$ref": "#/$defs/privateNonzeroAmount" },
+            "maximumFee": { "$ref": "#/$defs/privateAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "listingId", "payment", "recipient", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "nameMarketPurchase" },
+            "name": { "$ref": "#/$defs/asciiString" },
+            "listingId": { "$ref": "#/$defs/asciiString" },
+            "payment": { "$ref": "#/$defs/privateNonzeroAmount" },
+            "recipient": { "$ref": "#/$defs/asciiString" },
+            "maximumFee": { "$ref": "#/$defs/privateAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "action", "marketIntentId", "offered", "requestedAsset", "priceRound", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "marketIntent" },
+            "action": { "enum": ["publish", "cancel"] },
+            "marketIntentId": {
+              "oneOf": [{ "$ref": "#/$defs/asciiString" }, { "type": "null" }]
+            },
+            "offered": { "$ref": "#/$defs/privateNonzeroAmount" },
+            "requestedAsset": { "$ref": "#/$defs/walletAsset" },
+            "priceRound": { "$ref": "#/$defs/asciiString" },
+            "maximumFee": { "$ref": "#/$defs/privateAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "marketIntentId", "fillId", "offered", "expected", "priceRound", "refundTimeoutUnixMs", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "fillAcceptance" },
+            "marketIntentId": { "$ref": "#/$defs/asciiString" },
+            "fillId": { "$ref": "#/$defs/asciiString" },
+            "offered": { "$ref": "#/$defs/privateNonzeroAmount" },
+            "expected": { "$ref": "#/$defs/privateNonzeroAmount" },
+            "priceRound": { "$ref": "#/$defs/asciiString" },
+            "refundTimeoutUnixMs": { "$ref": "#/$defs/nonzeroUint64" },
+            "maximumFee": { "$ref": "#/$defs/privateAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "swapSessionId", "amount", "recipient", "maximumFee", "finality", "warnings"],
+          "properties": {
+            "kind": { "const": "swapRedeem" },
+            "swapSessionId": { "$ref": "#/$defs/asciiString" },
+            "amount": { "$ref": "#/$defs/privateNonzeroAmount" },
+            "recipient": { "$ref": "#/$defs/asciiString" },
+            "maximumFee": { "$ref": "#/$defs/privateAmount" },
+            "finality": { "$ref": "#/$defs/finalityModel" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "swapSessionId", "amount", "recipient", "maximumFee", "refundAvailableAtUnixMs", "warnings"],
+          "properties": {
+            "kind": { "const": "swapRefund" },
+            "swapSessionId": { "$ref": "#/$defs/asciiString" },
+            "amount": { "$ref": "#/$defs/privateNonzeroAmount" },
+            "recipient": { "$ref": "#/$defs/asciiString" },
+            "maximumFee": { "$ref": "#/$defs/privateAmount" },
+            "refundAvailableAtUnixMs": { "$ref": "#/$defs/nonzeroUint64" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        }
+      ]
+    },
+    "privateApprovalPrompt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approvalId", "binding", "origin", "method", "expiresAtUnixMs", "summary"],
+      "properties": {
+        "approvalId": { "$ref": "#/$defs/wireId16" },
+        "binding": { "$ref": "#/$defs/providerBinding" },
+        "origin": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[\\x00-\\x7f]+$"
+        },
+        "method": { "$ref": "#/$defs/approvalMethod" },
+        "expiresAtUnixMs": { "$ref": "#/$defs/nonzeroUint64" },
+        "summary": { "$ref": "#/$defs/privateApprovalSummary" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "method": { "const": "hns_requestAccounts" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "const": ["accounts"] }, "hnsNames": { "maxItems": 0 } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "wallet_requestPermissions" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "not": { "contains": { "const": "accounts" } } } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "wallet_enableModule" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "moduleEnablement" }, "action": { "const": "enable" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "wallet_disableModule" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "moduleEnablement" }, "action": { "const": "disable" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "enum": ["hns_send", "asset_send"] } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "send" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "hns_transferName" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameTransfer" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "hns_finalizeName" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameFinalize" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "hns_signTypedMessage" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "typedSignature" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "nameMarket_createFixedPriceOffer" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameMarketOffer" }, "action": { "const": "create" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "nameMarket_cancelOffer" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameMarketOffer" }, "action": { "const": "cancel" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "nameMarket_recoverName" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameMarketOffer" }, "action": { "const": "recover" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "enum": ["nameMarket_acceptOffer", "nameMarket_finalizePurchase"] } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameMarketPurchase" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "swap_publishMarketIntent" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "marketIntent" }, "action": { "const": "publish" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "swap_cancelMarketIntent" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "marketIntent" }, "action": { "const": "cancel" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "enum": ["swap_requestMatch", "swap_acceptFill"] } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "fillAcceptance" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "swap_redeem" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "swapRedeem" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "swap_refund" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "swapRefund" } } } } }
+        }
+      ],
+      "$comment": "expiresAtUnixMs must be greater than the verifier clock and no more than 90000 ms in the future. Expected-request parameter equality is enforced by the runtime projection validator."
+    },
+    "walletRuntimeStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["locked", "activeWallet", "enabledModules", "mainnetSettlementEnabled"],
+      "properties": {
+        "locked": { "type": "boolean" },
+        "activeWallet": {
+          "oneOf": [{ "$ref": "#/$defs/semanticId16" }, { "type": "null" }]
+        },
+        "enabledModules": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/moduleId" }
+        },
+        "mainnetSettlementEnabled": { "type": "boolean" }
+      }
+    },
+    "accountSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["accountId", "module", "label", "receiveDisplay"],
+      "properties": {
+        "accountId": { "$ref": "#/$defs/semanticId16" },
+        "module": { "$ref": "#/$defs/moduleId" },
+        "label": { "$ref": "#/$defs/asciiString" },
+        "receiveDisplay": {
+          "oneOf": [{ "$ref": "#/$defs/asciiString" }, { "type": "null" }]
+        }
+      }
+    },
+    "receiveTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module", "account", "display", "derivation_index"],
+      "properties": {
+        "module": { "$ref": "#/$defs/moduleId" },
+        "account": { "$ref": "#/$defs/semanticId16" },
+        "display": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "derivation_index": { "$ref": "#/$defs/uint32" }
+      }
+    },
+    "syncStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "validated_height", "scanned_height", "target_height", "last_error"],
+      "properties": {
+        "phase": { "enum": ["disabled", "starting", "headers", "filters", "wallet_scan", "ready", "degraded"] },
+        "validated_height": { "$ref": "#/$defs/uint64" },
+        "scanned_height": { "$ref": "#/$defs/uint64" },
+        "target_height": {
+          "oneOf": [{ "$ref": "#/$defs/uint64" }, { "type": "null" }]
+        },
+        "last_error": {
+          "oneOf": [{ "type": "string" }, { "type": "null" }]
+        }
+      }
+    },
+    "transactionSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["module", "txid", "status", "net_amount", "fee", "block_height", "first_seen_unix", "confirmation_count"],
+      "properties": {
+        "module": { "$ref": "#/$defs/moduleId" },
+        "txid": { "$ref": "#/$defs/semanticId32" },
+        "status": { "enum": ["prepared", "authorized", "broadcast", "mempool", "confirmed", "replaced", "conflicted", "reorged", "dropped", "failed"] },
+        "net_amount": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["negative", "magnitude"],
+          "properties": {
+            "negative": { "type": "boolean" },
+            "magnitude": { "$ref": "#/$defs/baseUnits" }
+          }
+        },
+        "fee": {
+          "oneOf": [{ "$ref": "#/$defs/baseUnits" }, { "type": "null" }]
+        },
+        "block_height": {
+          "oneOf": [{ "$ref": "#/$defs/uint64" }, { "type": "null" }]
+        },
+        "first_seen_unix": {
+          "oneOf": [{ "$ref": "#/$defs/uint64" }, { "type": "null" }]
+        },
+        "confirmation_count": { "$ref": "#/$defs/uint32" }
+      }
+    },
+    "workflowSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workflowId", "state", "nextAction", "terminal"],
+      "properties": {
+        "workflowId": { "$ref": "#/$defs/semanticId16" },
+        "state": { "$ref": "#/$defs/asciiString" },
+        "nextAction": {
+          "oneOf": [{ "$ref": "#/$defs/asciiString" }, { "type": "null" }]
+        },
+        "terminal": { "type": "boolean" }
+      }
+    },
+    "walletResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "status"],
+          "properties": {
+            "result": { "const": "status" },
+            "status": { "$ref": "#/$defs/walletRuntimeStatus" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "walletId"],
+          "properties": {
+            "result": { "const": "walletCreated" },
+            "walletId": { "$ref": "#/$defs/semanticId16" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "walletId"],
+          "properties": {
+            "result": { "const": "walletRestored" },
+            "walletId": { "$ref": "#/$defs/semanticId16" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result"],
+          "properties": { "result": { "const": "locked" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result"],
+          "properties": { "result": { "const": "unlocked" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "accounts"],
+          "properties": {
+            "result": { "const": "accounts" },
+            "accounts": {
+              "type": "array",
+              "maxItems": 128,
+              "items": { "$ref": "#/$defs/accountSummary" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "amount"],
+          "properties": {
+            "result": { "const": "balance" },
+            "amount": { "$ref": "#/$defs/privateAmount" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "target"],
+          "properties": {
+            "result": { "const": "receiveTarget" },
+            "target": { "$ref": "#/$defs/receiveTarget" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "transactions"],
+          "properties": {
+            "result": { "const": "transactionHistory" },
+            "transactions": {
+              "type": "array",
+              "maxItems": 128,
+              "items": { "$ref": "#/$defs/transactionSummary" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "status"],
+          "properties": {
+            "result": { "const": "moduleStatus" },
+            "status": { "$ref": "#/$defs/syncStatus" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "summary"],
+          "properties": {
+            "result": { "const": "workflow" },
+            "summary": { "$ref": "#/$defs/workflowSummary" }
+          }
+        }
+      ]
+    },
+    "serviceFailure": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "unsupportedCapability"],
+          "properties": {
+            "code": { "const": "unsupportedCapability" },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^[\\x00-\\x7f]+$"
+            },
+            "unsupportedCapability": { "$ref": "#/$defs/serviceCapability" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["code", "message", "unsupportedCapability"],
+          "properties": {
+            "code": {
+              "enum": [
+                "invalidFrame",
+                "versionMismatch",
+                "sessionMismatch",
+                "sequenceMismatch",
+                "authorityUnknown",
+                "authorityStale",
+                "permissionDenied",
+                "approvalStale",
+                "walletLocked",
+                "rateLimited",
+                "replay",
+                "invalidRequest",
+                "persistenceFailure",
+                "runtimeFailure"
+              ]
+            },
+            "message": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024,
+              "pattern": "^[\\x00-\\x7f]+$"
+            },
+            "unsupportedCapability": { "type": "null" }
+          }
+        }
+      ]
+    },
+    "serviceResponse": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "authorityHandle", "authorityRevision"],
+          "properties": {
+            "result": { "const": "authorityRegistered" },
+            "authorityHandle": { "$ref": "#/$defs/wireId32" },
+            "authorityRevision": { "$ref": "#/$defs/nonzeroUint64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "authorityHandle", "authorityRevision"],
+          "properties": {
+            "result": { "const": "authorityReplaced" },
+            "authorityHandle": { "$ref": "#/$defs/wireId32" },
+            "authorityRevision": { "$ref": "#/$defs/nonzeroUint64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "authorityHandle"],
+          "properties": {
+            "result": { "const": "authorityRevoked" },
+            "authorityHandle": { "$ref": "#/$defs/wireId32" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "binding", "capabilities"],
+          "properties": {
+            "result": { "const": "providerCapabilities" },
+            "binding": { "$ref": "#/$defs/providerBinding" },
+            "capabilities": { "$ref": "#/$defs/privateProviderCapabilitySnapshotV1" }
+          },
+          "$comment": "The binding and capability snapshot wallet session and permission generation must be equal."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "binding", "value"],
+          "properties": {
+            "result": { "const": "providerResult" },
+            "binding": { "$ref": "#/$defs/providerBinding" },
+            "value": true
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "approval"],
+          "properties": {
+            "result": { "const": "approvalRequired" },
+            "approval": { "$ref": "#/$defs/privateApprovalPrompt" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "approvalId"],
+          "properties": {
+            "result": { "const": "approvalRejected" },
+            "approvalId": { "$ref": "#/$defs/wireId16" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "response"],
+          "properties": {
+            "result": { "const": "wallet" },
+            "response": { "$ref": "#/$defs/walletResponse" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "failure"],
+          "properties": {
+            "result": { "const": "failure" },
+            "failure": { "$ref": "#/$defs/serviceFailure" }
+          }
+        }
+      ]
+    },
+    "privateProviderEventPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event", "permissionGeneration"],
+          "properties": {
+            "event": { "const": "connect" },
+            "permissionGeneration": { "$ref": "#/$defs/nonzeroUint64" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event", "reason"],
+          "properties": {
+            "event": { "const": "disconnect" },
+            "reason": { "enum": ["authorityRevoked", "authorityExpired", "navigationChanged", "policyChanged", "walletSessionChanged", "serviceRestarted"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event", "permissionGeneration", "capabilities"],
+          "properties": {
+            "event": { "const": "permissionsChanged" },
+            "permissionGeneration": { "$ref": "#/$defs/nonzeroUint64" },
+            "capabilities": { "$ref": "#/$defs/permissionCapabilities" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event", "modules"],
+          "properties": {
+            "event": { "enum": ["modulesChanged", "accountsChanged", "balancesChanged", "transactionsChanged"] },
+            "modules": {
+              "type": "array",
+              "maxItems": 3,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/moduleId" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event", "names"],
+          "properties": {
+            "event": { "const": "namesChanged" },
+            "names": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/asciiString" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event", "listingIds"],
+          "properties": {
+            "event": { "const": "nameMarketChanged" },
+            "listingIds": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/asciiString" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event", "pairs"],
+          "properties": {
+            "event": { "const": "priceRoundChanged" },
+            "pairs": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/asciiString" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event", "marketIntentIds"],
+          "properties": {
+            "event": { "const": "marketIntentChanged" },
+            "marketIntentIds": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/asciiString" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event", "swapSessionIds"],
+          "properties": {
+            "event": { "const": "swapSessionChanged" },
+            "swapSessionIds": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/asciiString" } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["event"],
+          "properties": { "event": { "const": "walletLocked" } }
+        }
+      ]
+    },
+    "providerEventEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocolVersion",
+        "hostSessionId",
+        "serviceSessionId",
+        "restartGeneration",
+        "channelSequence",
+        "binding",
+        "eventSequence",
+        "payload"
+      ],
+      "properties": {
+        "protocolVersion": { "const": 2 },
+        "hostSessionId": { "$ref": "#/$defs/wireId32" },
+        "serviceSessionId": { "$ref": "#/$defs/wireId32" },
+        "restartGeneration": { "$ref": "#/$defs/nonzeroUint64" },
+        "channelSequence": { "$ref": "#/$defs/nonzeroUint64" },
+        "binding": { "$ref": "#/$defs/providerBinding" },
+        "eventSequence": { "$ref": "#/$defs/nonzeroUint64" },
+        "payload": { "$ref": "#/$defs/privateProviderEventPayload" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "payload": {
+                "properties": { "event": { "not": { "const": "disconnect" } } },
+                "required": ["event"]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "binding": { "$ref": "#/$defs/providerBindingWithPermission" }
+            }
+          }
+        }
+      ],
+      "$comment": "For connect and permissionsChanged, payload.permissionGeneration must equal binding.permissionGeneration. This cross-instance equality is enforced by hns-wallet-ffi."
+    },
+    "requestEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "hostSessionId", "serviceSessionId", "restartGeneration", "channelSequence", "requestId", "body"],
+      "properties": {
+        "protocolVersion": { "const": 2 },
+        "hostSessionId": { "$ref": "#/$defs/wireId32" },
+        "serviceSessionId": { "$ref": "#/$defs/wireId32" },
+        "restartGeneration": { "$ref": "#/$defs/nonzeroUint64" },
+        "channelSequence": { "$ref": "#/$defs/nonzeroUint64" },
+        "requestId": { "$ref": "#/$defs/wireId16" },
+        "body": { "$ref": "#/$defs/serviceRequest" }
+      }
+    },
+    "responseEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocolVersion", "hostSessionId", "serviceSessionId", "restartGeneration", "channelSequence", "requestId", "body"],
+      "properties": {
+        "protocolVersion": { "const": 2 },
+        "hostSessionId": { "$ref": "#/$defs/wireId32" },
+        "serviceSessionId": { "$ref": "#/$defs/wireId32" },
+        "restartGeneration": { "$ref": "#/$defs/nonzeroUint64" },
+        "channelSequence": { "$ref": "#/$defs/nonzeroUint64" },
+        "requestId": { "$ref": "#/$defs/wireId16" },
+        "body": { "$ref": "#/$defs/serviceResponse" }
+      }
+    },
+    "privateWalletServiceFrameV2": {
+      "$anchor": "privateWalletServiceFrameV2",
+      "title": "Private wallet-service ABI v2 JSON frame payload",
+      "description": "Private host/service transport only. These objects must never be accepted from or projected into website code.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["frameType", "hello"],
+          "properties": {
+            "frameType": { "const": "hello" },
+            "hello": { "$ref": "#/$defs/hostHello" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["frameType", "envelope"],
+          "properties": {
+            "frameType": { "const": "request" },
+            "envelope": { "$ref": "#/$defs/requestEnvelope" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["frameType", "hello"],
+          "properties": {
+            "frameType": { "const": "hello" },
+            "hello": { "$ref": "#/$defs/serviceHello" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["frameType", "envelope"],
+          "properties": {
+            "frameType": { "const": "response" },
+            "envelope": { "$ref": "#/$defs/responseEnvelope" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["frameType", "event"],
+          "properties": {
+            "frameType": { "const": "event" },
+            "event": { "$ref": "#/$defs/providerEventEnvelope" }
+          }
+        }
+      ]
+    },
+    "publicApprovalSummaryV3": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "capabilities", "hnsNames"],
+          "properties": {
+            "kind": { "const": "permissions" },
+            "capabilities": { "$ref": "#/$defs/nonemptyPermissionCapabilities" },
+            "hnsNames": { "$ref": "#/$defs/hnsNameDisclosuresV3" }
+          },
+          "allOf": [
+            {
+              "if": { "properties": { "capabilities": { "not": { "contains": { "const": "names" } } } } },
+              "then": { "properties": { "hnsNames": { "maxItems": 0 } } }
+            }
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "module", "action"],
+          "properties": {
+            "kind": { "const": "moduleEnablement" },
+            "module": { "$ref": "#/$defs/moduleId" },
+            "action": { "enum": ["enable", "disable"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "amount", "recipient", "maximumFee", "chain", "finality", "warnings"],
+          "properties": {
+            "kind": { "const": "send" },
+            "amount": { "$ref": "#/$defs/publicNonzeroAmount" },
+            "recipient": { "$ref": "#/$defs/publicString" },
+            "maximumFee": { "$ref": "#/$defs/publicAmount" },
+            "chain": { "$ref": "#/$defs/moduleId" },
+            "finality": { "$ref": "#/$defs/finalityModel" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "recipient", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "nameTransfer" },
+            "name": { "$ref": "#/$defs/publicString" },
+            "recipient": { "$ref": "#/$defs/publicString" },
+            "maximumFee": { "$ref": "#/$defs/publicAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "recipient", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "nameFinalize" },
+            "name": { "$ref": "#/$defs/publicString" },
+            "recipient": { "$ref": "#/$defs/publicString" },
+            "maximumFee": { "$ref": "#/$defs/publicAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "messageType", "messageDigest"],
+          "properties": {
+            "kind": { "const": "typedSignature" },
+            "messageType": { "$ref": "#/$defs/publicString" },
+            "messageDigest": { "$ref": "#/$defs/publicString" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "action", "name", "listingId", "price", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "nameMarketOffer" },
+            "action": { "enum": ["create", "cancel", "recover"] },
+            "name": { "$ref": "#/$defs/publicString" },
+            "listingId": {
+              "oneOf": [{ "$ref": "#/$defs/publicString" }, { "type": "null" }]
+            },
+            "price": { "$ref": "#/$defs/publicNonzeroAmount" },
+            "maximumFee": { "$ref": "#/$defs/publicAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "name", "listingId", "payment", "recipient", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "nameMarketPurchase" },
+            "name": { "$ref": "#/$defs/publicString" },
+            "listingId": { "$ref": "#/$defs/publicString" },
+            "payment": { "$ref": "#/$defs/publicNonzeroAmount" },
+            "recipient": { "$ref": "#/$defs/publicString" },
+            "maximumFee": { "$ref": "#/$defs/publicAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "action", "marketIntentId", "offered", "requestedAsset", "priceRound", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "marketIntent" },
+            "action": { "enum": ["publish", "cancel"] },
+            "marketIntentId": {
+              "oneOf": [{ "$ref": "#/$defs/publicString" }, { "type": "null" }]
+            },
+            "offered": { "$ref": "#/$defs/publicNonzeroAmount" },
+            "requestedAsset": { "$ref": "#/$defs/walletAsset" },
+            "priceRound": { "$ref": "#/$defs/publicString" },
+            "maximumFee": { "$ref": "#/$defs/publicAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "marketIntentId", "fillId", "offered", "expected", "priceRound", "refundTimeoutUnixMs", "maximumFee", "warnings"],
+          "properties": {
+            "kind": { "const": "fillAcceptance" },
+            "marketIntentId": { "$ref": "#/$defs/publicString" },
+            "fillId": { "$ref": "#/$defs/publicString" },
+            "offered": { "$ref": "#/$defs/publicNonzeroAmount" },
+            "expected": { "$ref": "#/$defs/publicNonzeroAmount" },
+            "priceRound": { "$ref": "#/$defs/publicString" },
+            "refundTimeoutUnixMs": { "$ref": "#/$defs/positiveSafeUint" },
+            "maximumFee": { "$ref": "#/$defs/publicAmount" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "swapSessionId", "amount", "recipient", "maximumFee", "finality", "warnings"],
+          "properties": {
+            "kind": { "const": "swapRedeem" },
+            "swapSessionId": { "$ref": "#/$defs/publicString" },
+            "amount": { "$ref": "#/$defs/publicNonzeroAmount" },
+            "recipient": { "$ref": "#/$defs/publicString" },
+            "maximumFee": { "$ref": "#/$defs/publicAmount" },
+            "finality": { "$ref": "#/$defs/finalityModel" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "swapSessionId", "amount", "recipient", "maximumFee", "refundAvailableAtUnixMs", "warnings"],
+          "properties": {
+            "kind": { "const": "swapRefund" },
+            "swapSessionId": { "$ref": "#/$defs/publicString" },
+            "amount": { "$ref": "#/$defs/publicNonzeroAmount" },
+            "recipient": { "$ref": "#/$defs/publicString" },
+            "maximumFee": { "$ref": "#/$defs/publicAmount" },
+            "refundAvailableAtUnixMs": { "$ref": "#/$defs/positiveSafeUint" },
+            "warnings": { "$ref": "#/$defs/approvalWarnings" }
+          }
+        }
+      ]
+    },
+    "publicApprovalProjectionV3": {
+      "$anchor": "publicApprovalProjectionV3",
+      "title": "Public approval projection v3",
+      "description": "Browser-owned, display-complete projection of the private approval. It deliberately excludes provider bindings, host/service sessions, authority handles, request nonces, secret material, and arbitrary display lines.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "approvalId", "method", "origin", "expiresAtUnixMs", "summary"],
+      "properties": {
+        "schemaVersion": { "const": 3 },
+        "approvalId": { "$ref": "#/$defs/wireId16" },
+        "method": { "$ref": "#/$defs/approvalMethod" },
+        "origin": { "$ref": "#/$defs/publicOrigin" },
+        "expiresAtUnixMs": { "$ref": "#/$defs/positiveSafeUint" },
+        "summary": { "$ref": "#/$defs/publicApprovalSummaryV3" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "method": { "const": "hns_requestAccounts" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "const": ["accounts"] }, "hnsNames": { "maxItems": 0 } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "wallet_requestPermissions" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "permissions" }, "capabilities": { "not": { "contains": { "const": "accounts" } } } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "wallet_enableModule" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "moduleEnablement" }, "action": { "const": "enable" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "wallet_disableModule" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "moduleEnablement" }, "action": { "const": "disable" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "enum": ["hns_send", "asset_send"] } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "send" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "hns_transferName" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameTransfer" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "hns_finalizeName" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameFinalize" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "hns_signTypedMessage" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "typedSignature" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "nameMarket_createFixedPriceOffer" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameMarketOffer" }, "action": { "const": "create" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "nameMarket_cancelOffer" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameMarketOffer" }, "action": { "const": "cancel" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "nameMarket_recoverName" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameMarketOffer" }, "action": { "const": "recover" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "enum": ["nameMarket_acceptOffer", "nameMarket_finalizePurchase"] } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameMarketPurchase" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "swap_publishMarketIntent" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "marketIntent" }, "action": { "const": "publish" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "swap_cancelMarketIntent" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "marketIntent" }, "action": { "const": "cancel" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "enum": ["swap_requestMatch", "swap_acceptFill"] } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "fillAcceptance" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "swap_redeem" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "swapRedeem" } } } } }
+        },
+        {
+          "if": { "properties": { "method": { "const": "swap_refund" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "swapRefund" } } } } }
+        }
+      ],
+      "$comment": "The verifier also checks expiry against its current clock (maximum lifetime 90000 ms), exact origin/request binding, requested parameters, amount/fee asset equality, chain/finality mapping, and u128 upper bounds."
+    },
+    "publicEventPayload": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["permissionGeneration"],
+          "properties": { "permissionGeneration": { "$ref": "#/$defs/positiveSafeUint" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["reason"],
+          "properties": { "reason": { "enum": ["authorityRevoked", "authorityExpired", "navigationChanged", "policyChanged", "walletSessionChanged", "serviceRestarted"] } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["permissionGeneration", "capabilities"],
+          "properties": {
+            "permissionGeneration": { "$ref": "#/$defs/positiveSafeUint" },
+            "capabilities": { "$ref": "#/$defs/permissionCapabilities" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["modules"],
+          "properties": {
+            "modules": {
+              "type": "array",
+              "maxItems": 3,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/moduleId" }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["names"],
+          "properties": { "names": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/publicString" } } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["listingIds"],
+          "properties": { "listingIds": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/publicString" } } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["pairs"],
+          "properties": { "pairs": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/publicString" } } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["marketIntentIds"],
+          "properties": { "marketIntentIds": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/publicString" } } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["swapSessionIds"],
+          "properties": { "swapSessionIds": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/publicString" } } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false
+        }
+      ]
+    },
+    "publicProviderEventProjectionV1": {
+      "$anchor": "publicProviderEventProjectionV1",
+      "title": "Public provider event projection v1",
+      "description": "Normalized website-facing event projection. Private ABI sessions, sequences, authority handles/revisions, wallet sessions, and binding objects are deliberately absent. Chromium carries this normalized object inside its separately validated channel/direction wrapper; this root does not describe that enclosing extension window message.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "event", "payload"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "event" },
+        "event": {
+          "enum": [
+            "connect",
+            "disconnect",
+            "permissionsChanged",
+            "modulesChanged",
+            "accountsChanged",
+            "balancesChanged",
+            "transactionsChanged",
+            "namesChanged",
+            "nameMarketChanged",
+            "priceRoundChanged",
+            "marketIntentChanged",
+            "swapSessionChanged",
+            "walletLocked"
+          ]
+        },
+        "payload": { "$ref": "#/$defs/publicEventPayload" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "event": { "const": "connect" } } },
+          "then": { "properties": { "payload": { "required": ["permissionGeneration"], "maxProperties": 1, "properties": { "permissionGeneration": { "$ref": "#/$defs/positiveSafeUint" } } } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "disconnect" } } },
+          "then": { "properties": { "payload": { "required": ["reason"], "maxProperties": 1, "properties": { "reason": { "enum": ["authorityRevoked", "authorityExpired", "navigationChanged", "policyChanged", "walletSessionChanged", "serviceRestarted"] } } } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "permissionsChanged" } } },
+          "then": { "properties": { "payload": { "required": ["permissionGeneration", "capabilities"], "maxProperties": 2 } } }
+        },
+        {
+          "if": { "properties": { "event": { "enum": ["modulesChanged", "accountsChanged", "balancesChanged", "transactionsChanged"] } } },
+          "then": { "properties": { "payload": { "required": ["modules"], "maxProperties": 1 } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "namesChanged" } } },
+          "then": { "properties": { "payload": { "required": ["names"], "maxProperties": 1 } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "nameMarketChanged" } } },
+          "then": { "properties": { "payload": { "required": ["listingIds"], "maxProperties": 1 } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "priceRoundChanged" } } },
+          "then": { "properties": { "payload": { "required": ["pairs"], "maxProperties": 1 } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "marketIntentChanged" } } },
+          "then": { "properties": { "payload": { "required": ["marketIntentIds"], "maxProperties": 1 } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "swapSessionChanged" } } },
+          "then": { "properties": { "payload": { "required": ["swapSessionIds"], "maxProperties": 1 } } }
+        },
+        {
+          "if": { "properties": { "event": { "const": "walletLocked" } } },
+          "then": { "properties": { "payload": { "maxProperties": 0 } } }
+        }
+      ]
+    },
+    "signedArtifactManifestV2": {
+      "$anchor": "signedArtifactManifestV2",
+      "title": "Signed wallet artifact manifest v2",
+      "description": "Strict release metadata for an independently built wallet-service artifact. Structural validity and a well-shaped signature do not establish authenticity or runtime availability.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["manifestSchemaVersion", "target", "source", "release", "antiRollback", "signature"],
+      "properties": {
+        "manifestSchemaVersion": { "const": 2 },
+        "target": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["artifactKind", "targetTriple", "executableFormat", "walletAbiVersion", "serviceProtocolVersion", "providerSchemaVersion", "approvalSchemaVersion", "maximumFrameBytes", "capabilities"],
+          "properties": {
+            "artifactKind": { "const": "walletService" },
+            "targetTriple": { "$ref": "#/$defs/token128" },
+            "executableFormat": { "enum": ["elf", "machO", "pe"] },
+            "walletAbiVersion": { "const": 2 },
+            "serviceProtocolVersion": { "const": 2 },
+            "providerSchemaVersion": { "const": 1 },
+            "approvalSchemaVersion": { "const": 3 },
+            "maximumFrameBytes": { "const": 1048576 },
+            "capabilities": {
+              "type": "array",
+              "maxItems": 10,
+              "uniqueItems": true,
+              "items": { "$ref": "#/$defs/serviceCapability" }
+            }
+          }
+        },
+        "source": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["repository", "commitId", "treeId", "sourceArchiveSha256", "dirty"],
+          "properties": {
+            "repository": { "type": "string", "format": "uri", "maxLength": 512 },
+            "commitId": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+            "treeId": { "type": "string", "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$" },
+            "sourceArchiveSha256": { "$ref": "#/$defs/lowerHexSha256" },
+            "dirty": { "const": false }
+          }
+        },
+        "release": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["releaseId", "version", "artifact", "artifactSha256", "artifactSizeBytes", "publishedAtUnixMs"],
+          "properties": {
+            "releaseId": { "$ref": "#/$defs/token128" },
+            "version": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$" },
+            "artifact": { "$ref": "#/$defs/artifactFileName" },
+            "artifactSha256": { "$ref": "#/$defs/lowerHexSha256" },
+            "artifactSizeBytes": { "type": "integer", "minimum": 1, "maximum": 536870912 },
+            "publishedAtUnixMs": { "$ref": "#/$defs/positiveSafeUint" }
+          }
+        },
+        "antiRollback": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["releaseLine", "sequence", "previousManifestSha256", "notBeforeUnixMs", "expiresAtUnixMs"],
+          "properties": {
+            "releaseLine": { "$ref": "#/$defs/token128" },
+            "sequence": { "$ref": "#/$defs/positiveSafeUint" },
+            "previousManifestSha256": {
+              "oneOf": [{ "$ref": "#/$defs/lowerHexSha256" }, { "type": "null" }]
+            },
+            "notBeforeUnixMs": { "$ref": "#/$defs/positiveSafeUint" },
+            "expiresAtUnixMs": {
+              "oneOf": [{ "$ref": "#/$defs/positiveSafeUint" }, { "type": "null" }]
+            }
+          },
+          "$comment": "The verifier must durably retain an accepted high-water sequence per releaseLine, require strictly increasing sequence, and bind previousManifestSha256 to the prior accepted manifest except for an explicitly trusted genesis."
+        },
+        "signature": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["algorithm", "keyId", "payloadCanonicalization", "signedPayloadSha256", "value"],
+          "properties": {
+            "algorithm": { "const": "ed25519" },
+            "keyId": { "$ref": "#/$defs/token128" },
+            "payloadCanonicalization": { "const": "JCS-RFC8785" },
+            "signedPayloadSha256": { "$ref": "#/$defs/lowerHexSha256" },
+            "value": { "type": "string", "pattern": "^[A-Za-z0-9_-]{85}[AQgw]$" }
+          },
+          "$comment": "The signed payload is the RFC 8785 canonical form of the complete manifest with the signature member omitted. keyId selects verifier-owned trust configuration; no public or trusted key is accepted from this manifest."
+        }
+      }
+    }
+  }
+}

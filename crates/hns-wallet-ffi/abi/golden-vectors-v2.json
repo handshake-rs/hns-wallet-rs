@@ -1,0 +1,644 @@
+{
+  "vectorSetVersion": 1,
+  "contractBundle": "contracts-v2.schema.json",
+  "maximumEncodedBytes": 262144,
+  "runtimeAvailabilityClaimed": false,
+  "description": "Bounded structural vectors for private ABI v2, private capability snapshot v1, public approval v3, public event v1, and signed artifact manifest v2. Values under valid are contract examples, not evidence that a runtime, release, signer, or trust root exists.",
+  "valid": {
+    "privateFrames": [
+      {
+        "name": "hostHello",
+        "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
+        "value": {
+          "frameType": "hello",
+          "hello": {
+            "protocolVersion": 2,
+            "platform": "chromiumNativeHost",
+            "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            "restartGeneration": 1
+          }
+        }
+      },
+      {
+        "name": "serviceHello",
+        "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
+        "value": {
+          "frameType": "hello",
+          "hello": {
+            "protocolVersion": 2,
+            "platform": "chromiumNativeHost",
+            "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            "serviceSessionId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+            "restartGeneration": 1,
+            "capabilities": [],
+            "limits": {
+              "outerFrameBytes": 1048576,
+              "providerRequestBytes": 65536,
+              "providerResultBytes": 262144,
+              "providerEventBytes": 65536,
+              "approvalFrameBytes": 16384,
+              "approvalLifetimeMs": 90000
+            }
+          }
+        }
+      },
+      {
+        "name": "requestFrame",
+        "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
+        "value": {
+          "frameType": "request",
+          "envelope": {
+            "protocolVersion": 2,
+            "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            "serviceSessionId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+            "restartGeneration": 1,
+            "channelSequence": 1,
+            "requestId": "AQEBAQEBAQEBAQEBAQEBAQ",
+            "body": {
+              "operation": "providerCapabilities",
+              "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+              "authorityRevision": 1
+            }
+          }
+        }
+      },
+      {
+        "name": "responseFrame",
+        "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
+        "value": {
+          "frameType": "response",
+          "envelope": {
+            "protocolVersion": 2,
+            "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            "serviceSessionId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+            "restartGeneration": 1,
+            "channelSequence": 1,
+            "requestId": "AQEBAQEBAQEBAQEBAQEBAQ",
+            "body": {
+              "result": "failure",
+              "failure": {
+                "code": "unsupportedCapability",
+                "message": "requested wallet capability is not available",
+                "unsupportedCapability": "providerDispatch"
+              }
+            }
+          }
+        }
+      },
+      {
+        "name": "generationZeroDisconnectEventFrame",
+        "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
+        "value": {
+          "frameType": "event",
+          "event": {
+            "protocolVersion": 2,
+            "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            "serviceSessionId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+            "restartGeneration": 1,
+            "channelSequence": 2,
+            "binding": {
+              "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+              "authorityRevision": 1,
+              "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+              "permissionGeneration": 0
+            },
+            "eventSequence": 1,
+            "payload": {
+              "event": "disconnect",
+              "reason": "authorityRevoked"
+            }
+          }
+        }
+      }
+    ],
+    "serviceRequests": [
+      {
+        "name": "registerAuthority",
+        "schemaPointer": "#/$defs/serviceRequest",
+        "value": {
+          "operation": "registerAuthority",
+          "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "authority": {
+            "origin": "http://127.0.0.1:8080",
+            "namespace": "hns",
+            "runtimeSessionId": "AQEBAQEBAQEBAQEBAQEBAQ",
+            "runtimeGeneration": 1,
+            "policyGeneration": 1,
+            "navigationGeneration": 1,
+            "decisionFingerprint": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+            "validUntilUnixMs": 200000
+          }
+        }
+      },
+      {
+        "name": "replaceAuthority",
+        "schemaPointer": "#/$defs/serviceRequest",
+        "value": {
+          "operation": "replaceAuthority",
+          "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "expectedAuthorityRevision": 1,
+          "authority": {
+            "origin": "https://wallet.example",
+            "namespace": "hns",
+            "runtimeSessionId": "AQEBAQEBAQEBAQEBAQEBAQ",
+            "runtimeGeneration": 2,
+            "policyGeneration": 1,
+            "navigationGeneration": 2,
+            "decisionFingerprint": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+            "validUntilUnixMs": 200000
+          }
+        }
+      },
+      {
+        "name": "revokeAuthority",
+        "schemaPointer": "#/$defs/serviceRequest",
+        "value": {
+          "operation": "revokeAuthority",
+          "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "expectedAuthorityRevision": 2
+        }
+      },
+      {
+        "name": "providerCapabilities",
+        "schemaPointer": "#/$defs/serviceRequest",
+        "value": {
+          "operation": "providerCapabilities",
+          "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "authorityRevision": 1
+        }
+      },
+      {
+        "name": "providerRequest",
+        "schemaPointer": "#/$defs/serviceRequest",
+        "value": {
+          "operation": "providerRequest",
+          "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "authorityRevision": 1,
+          "requestNonce": 1,
+          "method": "wallet_getStatus",
+          "params": null
+        }
+      },
+      {
+        "name": "approvalDecision",
+        "schemaPointer": "#/$defs/serviceRequest",
+        "value": {
+          "operation": "approvalDecision",
+          "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+          "authorityRevision": 1,
+          "approvalId": "AgICAgICAgICAgICAgICAg",
+          "decision": "approve"
+        }
+      },
+      {
+        "name": "wallet",
+        "schemaPointer": "#/$defs/serviceRequest",
+        "value": {
+          "operation": "wallet",
+          "request": { "operation": "status" }
+        }
+      }
+    ],
+    "walletRequests": [
+      { "name": "status", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "status" } },
+      { "name": "createWallet", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "createWallet", "passphrase": "correct horse battery staple" } },
+      { "name": "restoreWallet", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "restoreWallet", "passphrase": "correct horse battery staple", "recoveryPhrase": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about" } },
+      { "name": "unlock", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "unlock", "passphrase": "correct horse battery staple" } },
+      { "name": "lock", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "lock" } },
+      { "name": "listAccounts", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "listAccounts" } },
+      { "name": "balance", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "balance", "module": "handshake", "account": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] } },
+      { "name": "receiveTarget", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "receiveTarget", "module": "bitcoin", "account": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] } },
+      { "name": "transactionHistory", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "transactionHistory", "module": "ethereum", "account": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] } },
+      { "name": "moduleStatus", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "moduleStatus", "module": "handshake" } },
+      { "name": "workflowStatus", "schemaPointer": "#/$defs/walletRequest", "value": { "operation": "workflowStatus", "workflowId": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2] } }
+    ],
+    "serviceResponses": [
+      {
+        "name": "authorityRegistered",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": { "result": "authorityRegistered", "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM", "authorityRevision": 1 }
+      },
+      {
+        "name": "authorityReplaced",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": { "result": "authorityReplaced", "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM", "authorityRevision": 2 }
+      },
+      {
+        "name": "authorityRevoked",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": { "result": "authorityRevoked", "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM" }
+      },
+      {
+        "name": "providerCapabilitiesGenerationZero",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": {
+          "result": "providerCapabilities",
+          "binding": {
+            "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+            "authorityRevision": 1,
+            "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            "permissionGeneration": 0
+          },
+          "capabilities": {
+            "providerSchemaVersion": 1,
+            "approvalSchemaVersion": 3,
+            "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            "permissionGeneration": 0,
+            "methods": ["hns_requestAccounts", "hns_accounts"]
+          }
+        }
+      },
+      {
+        "name": "providerResultNonzeroTombstone",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": {
+          "result": "providerResult",
+          "binding": {
+            "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+            "authorityRevision": 1,
+            "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+            "permissionGeneration": 8
+          },
+          "value": { "permissionGeneration": 8, "capabilities": [], "accounts": [] }
+        }
+      },
+      {
+        "name": "approvalRequired",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": {
+          "result": "approvalRequired",
+          "approval": {
+            "approvalId": "AgICAgICAgICAgICAgICAg",
+            "binding": {
+              "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+              "authorityRevision": 1,
+              "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+              "permissionGeneration": 0
+            },
+            "origin": "https://wallet.example",
+            "method": "hns_requestAccounts",
+            "expiresAtUnixMs": 200000,
+            "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [] }
+          }
+        }
+      },
+      {
+        "name": "approvalRejected",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": { "result": "approvalRejected", "approvalId": "AgICAgICAgICAgICAgICAg" }
+      },
+      {
+        "name": "namePermissionApprovalRequired",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": {
+          "result": "approvalRequired",
+          "approval": {
+            "approvalId": "AgICAgICAgICAgICAgICAg",
+            "binding": {
+              "authorityHandle": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+              "authorityRevision": 1,
+              "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+              "permissionGeneration": 1
+            },
+            "origin": "https://wallet.example",
+            "method": "wallet_requestPermissions",
+            "expiresAtUnixMs": 200000,
+            "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] }
+          }
+        }
+      },
+      {
+        "name": "wallet",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": {
+          "result": "wallet",
+          "response": {
+            "result": "status",
+            "status": {
+              "locked": true,
+              "activeWallet": null,
+              "enabledModules": [],
+              "mainnetSettlementEnabled": false
+            }
+          }
+        }
+      },
+      {
+        "name": "failure",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": {
+          "result": "failure",
+          "failure": {
+            "code": "unsupportedCapability",
+            "message": "requested wallet capability is not available",
+            "unsupportedCapability": "providerDispatch"
+          }
+        }
+      }
+    ],
+    "walletResponses": [
+      { "name": "status", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "status", "status": { "locked": true, "activeWallet": null, "enabledModules": [], "mainnetSettlementEnabled": false } } },
+      { "name": "walletCreated", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "walletCreated", "walletId": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] } },
+      { "name": "walletRestored", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "walletRestored", "walletId": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1] } },
+      { "name": "locked", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "locked" } },
+      { "name": "unlocked", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "unlocked" } },
+      { "name": "accounts", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "accounts", "accounts": [{ "accountId": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "module": "handshake", "label": "Primary HNS", "receiveDisplay": null }] } },
+      { "name": "balance", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "balance", "amount": { "asset": "HNS", "base_units": "42" } } },
+      { "name": "receiveTarget", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "receiveTarget", "target": { "module": "bitcoin", "account": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "display": "bc1qexample", "derivation_index": 7 } } },
+      { "name": "transactionHistory", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "transactionHistory", "transactions": [{ "module": "handshake", "txid": [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1], "status": "confirmed", "net_amount": { "negative": false, "magnitude": "42" }, "fee": "1", "block_height": 100, "first_seen_unix": 1000, "confirmation_count": 6 }] } },
+      { "name": "moduleStatus", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "moduleStatus", "status": { "phase": "ready", "validated_height": 100, "scanned_height": 100, "target_height": 100, "last_error": null } } },
+      { "name": "workflow", "schemaPointer": "#/$defs/walletResponse", "value": { "result": "workflow", "summary": { "workflowId": [2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2], "state": "awaiting-confirmation", "nextAction": null, "terminal": false } } }
+    ],
+    "privateCapabilitySnapshots": [
+      {
+        "name": "freshAuthorityGenerationZero",
+        "schemaPointer": "#/$defs/privateProviderCapabilitySnapshotV1",
+        "value": {
+          "providerSchemaVersion": 1,
+          "approvalSchemaVersion": 3,
+          "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+          "permissionGeneration": 0,
+          "methods": []
+        }
+      },
+      {
+        "name": "revokedAuthorityNonzeroTombstone",
+        "schemaPointer": "#/$defs/privateProviderCapabilitySnapshotV1",
+        "value": {
+          "providerSchemaVersion": 1,
+          "approvalSchemaVersion": 3,
+          "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+          "permissionGeneration": 8,
+          "methods": []
+        }
+      }
+    ],
+    "publicApprovals": [
+      {
+        "name": "permissions",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [] } }
+      },
+      {
+        "name": "hnsAccountJoin",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [] } }
+      },
+      {
+        "name": "hnsNamePermission",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
+      },
+      {
+        "name": "moduleEnablement",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_enableModule", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "moduleEnablement", "module": "bitcoin", "action": "enable" } }
+      },
+      {
+        "name": "send",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_send", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "send", "amount": { "asset": "HNS", "baseUnits": "1000" }, "recipient": "hs1qrecipient", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "chain": "handshake", "finality": "proof_of_work_confirmations", "warnings": ["feeEstimateMayChange"] } }
+      },
+      {
+        "name": "nameTransfer",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_transferName", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameTransfer", "name": "example", "recipient": "hs1qrecipient", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["nameTransferIsIrreversible"] } }
+      },
+      {
+        "name": "nameFinalize",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_finalizeName", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameFinalize", "name": "example", "recipient": "hs1qrecipient", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["nameTransferIsIrreversible"] } }
+      },
+      {
+        "name": "typedSignature",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_signTypedMessage", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "typedSignature", "messageType": "HandshakeLogin", "messageDigest": "0123456789abcdef" } }
+      },
+      {
+        "name": "nameMarketOffer",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "nameMarket_createFixedPriceOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameMarketOffer", "action": "create", "name": "example", "listingId": null, "price": { "asset": "HNS", "baseUnits": "5000" }, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": [] } }
+      },
+      {
+        "name": "nameMarketPurchase",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "nameMarket_acceptOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameMarketPurchase", "name": "example", "listingId": "listing-1", "payment": { "asset": "HNS", "baseUnits": "5000" }, "recipient": "hs1qseller", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["settlementCanBeDelayed"] } }
+      },
+      {
+        "name": "marketIntent",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_publishMarketIntent", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "marketIntent", "action": "publish", "marketIntentId": null, "offered": { "asset": "HNS", "baseUnits": "1000" }, "requestedAsset": "BTC", "priceRound": "HNS-BTC-100", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["settlementCanBeDelayed"] } }
+      },
+      {
+        "name": "fillAcceptance",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_acceptFill", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "fillAcceptance", "marketIntentId": "intent-1", "fillId": "fill-1", "offered": { "asset": "HNS", "baseUnits": "1000" }, "expected": { "asset": "BTC", "baseUnits": "20" }, "priceRound": "HNS-BTC-100", "refundTimeoutUnixMs": 300000, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["refundRequiresManualAction", "settlementCanBeDelayed"] } }
+      },
+      {
+        "name": "swapRedeem",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_redeem", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "swapRedeem", "swapSessionId": "swap-1", "amount": { "asset": "BTC", "baseUnits": "20" }, "recipient": "bc1qrecipient", "maximumFee": { "asset": "BTC", "baseUnits": "1" }, "finality": "proof_of_work_confirmations", "warnings": ["settlementCanBeDelayed"] } }
+      },
+      {
+        "name": "swapRefund",
+        "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_refund", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "swapRefund", "swapSessionId": "swap-1", "amount": { "asset": "ETH", "baseUnits": "20" }, "recipient": "0x0123456789abcdef", "maximumFee": { "asset": "ETH", "baseUnits": "1" }, "refundAvailableAtUnixMs": 300000, "warnings": ["refundRequiresManualAction"] } }
+      }
+    ],
+    "publicEvents": [
+      { "name": "connect", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "connect", "payload": { "permissionGeneration": 1 } } },
+      { "name": "disconnect", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "disconnect", "payload": { "reason": "authorityRevoked" } } },
+      { "name": "permissionsChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "permissionsChanged", "payload": { "permissionGeneration": 2, "capabilities": ["accounts", "balance"] } } },
+      { "name": "modulesChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "modulesChanged", "payload": { "modules": ["handshake"] } } },
+      { "name": "accountsChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "accountsChanged", "payload": { "modules": ["handshake", "bitcoin"] } } },
+      { "name": "balancesChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "balancesChanged", "payload": { "modules": ["bitcoin"] } } },
+      { "name": "transactionsChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "transactionsChanged", "payload": { "modules": ["ethereum"] } } },
+      { "name": "namesChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "namesChanged", "payload": { "names": ["example"] } } },
+      { "name": "nameMarketChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "nameMarketChanged", "payload": { "listingIds": ["listing-1"] } } },
+      { "name": "priceRoundChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "priceRoundChanged", "payload": { "pairs": ["HNS-BTC"] } } },
+      { "name": "marketIntentChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "marketIntentChanged", "payload": { "marketIntentIds": ["intent-1"] } } },
+      { "name": "swapSessionChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "swapSessionChanged", "payload": { "swapSessionIds": ["swap-1"] } } },
+      { "name": "walletLocked", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "walletLocked", "payload": {} } }
+    ],
+    "signedArtifactManifests": [
+      {
+        "name": "structurallyValidAuthenticityUnproven",
+        "schemaPointer": "#/$defs/signedArtifactManifestV2",
+        "value": {
+          "manifestSchemaVersion": 2,
+          "target": {
+            "artifactKind": "walletService",
+            "targetTriple": "x86_64-unknown-linux-gnu",
+            "executableFormat": "elf",
+            "walletAbiVersion": 2,
+            "serviceProtocolVersion": 2,
+            "providerSchemaVersion": 1,
+            "approvalSchemaVersion": 3,
+            "maximumFrameBytes": 1048576,
+            "capabilities": []
+          },
+          "source": {
+            "repository": "https://github.com/handshake-rs/hns-wallet-rs",
+            "commitId": "1111111111111111111111111111111111111111",
+            "treeId": "2222222222222222222222222222222222222222",
+            "sourceArchiveSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "dirty": false
+          },
+          "release": {
+            "releaseId": "wallet-service-0.1.0-linux-x86_64",
+            "version": "0.1.0",
+            "artifact": "hns-wallet-service",
+            "artifactSha256": "4444444444444444444444444444444444444444444444444444444444444444",
+            "artifactSizeBytes": 1048576,
+            "publishedAtUnixMs": 200000
+          },
+          "antiRollback": {
+            "releaseLine": "wallet-service-stable",
+            "sequence": 1,
+            "previousManifestSha256": null,
+            "notBeforeUnixMs": 200000,
+            "expiresAtUnixMs": null
+          },
+          "signature": {
+            "algorithm": "ed25519",
+            "keyId": "wallet-release-2026",
+            "payloadCanonicalization": "JCS-RFC8785",
+            "signedPayloadSha256": "5555555555555555555555555555555555555555555555555555555555555555",
+            "value": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ"
+          }
+        }
+      }
+    ]
+  },
+  "runtimeInvalid": [
+    {
+      "name": "publicApprovalUnsortedHnsNames",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "JSON Schema cannot express canonical array order; approval-schema-v3 validators reject disclosures not sorted by (name, nameHash)",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "beta", "nameHash": "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f" }, { "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
+    },
+    {
+      "name": "publicApprovalMismatchedHnsNameHash",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "JSON Schema cannot recompute SHA3-256; the pinned hns-covenants approval-schema-v3 validator rejects a structurally valid but mismatched pair",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f" }] } }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "privateFrameWrongVersion",
+      "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
+      "reason": "ABI v1 has no compatibility decoder",
+      "value": { "frameType": "hello", "hello": { "protocolVersion": 1, "platform": "android", "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "restartGeneration": 1 } }
+    },
+    {
+      "name": "privateFrameUnknownField",
+      "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
+      "reason": "private frames reject unknown fields",
+      "value": { "frameType": "hello", "hello": { "protocolVersion": 2, "platform": "android", "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "restartGeneration": 1, "available": true } }
+    },
+    {
+      "name": "privateFrameAllZeroSession",
+      "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
+      "reason": "wire IDs reject the all-zero sentinel",
+      "value": { "frameType": "hello", "hello": { "protocolVersion": 2, "platform": "ios", "hostSessionId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "restartGeneration": 1 } }
+    },
+    {
+      "name": "privateSnapshotUnknownMethod",
+      "schemaPointer": "#/$defs/privateProviderCapabilitySnapshotV1",
+      "reason": "the method vocabulary is closed and availability is negotiated",
+      "value": { "providerSchemaVersion": 1, "approvalSchemaVersion": 3, "walletSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "permissionGeneration": 0, "methods": ["eth_sendTransaction"] }
+    },
+    {
+      "name": "publicApprovalLeaksPrivateBinding",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "private authority/session bindings never enter the public approval shape",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [] }, "binding": { "permissionGeneration": 0 } }
+    },
+    {
+      "name": "publicApprovalMissingHnsNames",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "approval-schema-v3 permission summaries require an explicit minimized HNS name disclosure list",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"] } }
+    },
+    {
+      "name": "publicApprovalNonNamesDisclosure",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "a permission prompt cannot disclose HNS names unless Names authority is requested",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
+    },
+    {
+      "name": "publicApprovalMalformedHnsNameHash",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "HNS disclosure hashes are exact lowercase 32-byte hexadecimal digests",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "271878F8A927B4566AC951FC815B18DFAD8D0302D61D11D80CBE15B7A3A056AF" }] } }
+    },
+    {
+      "name": "publicApprovalDuplicateHnsDisclosure",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "the disclosed concrete HNS authority set cannot contain duplicate entries",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["names"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }, { "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
+    },
+    {
+      "name": "publicApprovalAccountJoinLeaksNames",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "hns_requestAccounts never carries a name disclosure",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [{ "name": "alpha", "nameHash": "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af" }] } }
+    },
+    {
+      "name": "publicApprovalGenericAccountsAuthority",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "Accounts authority can be created only by the exact hns_requestAccounts join",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "wallet_requestPermissions", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [] } }
+    },
+    {
+      "name": "publicApprovalInexactHnsAccountJoin",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "hns_requestAccounts requires exactly the Accounts capability",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_requestAccounts", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["balance"], "hnsNames": [] } }
+    },
+    {
+      "name": "publicApprovalKindMethodMismatch",
+      "schemaPointer": "#/$defs/publicApprovalProjectionV3",
+      "reason": "approval method and display-complete summary kind must agree",
+      "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "hns_transferName", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "permissions", "capabilities": ["accounts"], "hnsNames": [] } }
+    },
+    {
+      "name": "publicEventGenerationZeroConnect",
+      "schemaPointer": "#/$defs/publicProviderEventProjectionV1",
+      "reason": "connect and permissionsChanged are emitted only after a grant",
+      "value": { "schemaVersion": 1, "kind": "event", "event": "connect", "payload": { "permissionGeneration": 0 } }
+    },
+    {
+      "name": "publicEventCrossKindPayload",
+      "schemaPointer": "#/$defs/publicProviderEventProjectionV1",
+      "reason": "connect cannot carry the permissionsChanged capability list",
+      "value": { "schemaVersion": 1, "kind": "event", "event": "connect", "payload": { "permissionGeneration": 1, "capabilities": ["accounts"] } }
+    },
+    {
+      "name": "publicEventLeaksPrivateEnvelope",
+      "schemaPointer": "#/$defs/publicProviderEventProjectionV1",
+      "reason": "public events exclude wallet sessions and private event routing",
+      "value": { "schemaVersion": 1, "kind": "event", "event": "walletLocked", "payload": {}, "serviceSessionId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI" }
+    },
+    {
+      "name": "manifestEmbedsTrustedKey",
+      "schemaPointer": "#/$defs/signedArtifactManifestV2",
+      "reason": "trust roots are verifier-owned and cannot be supplied by the artifact",
+      "value": { "manifestSchemaVersion": 2, "target": {}, "source": {}, "release": {}, "antiRollback": {}, "signature": { "trustedPublicKey": "attacker-selected" } }
+    },
+    {
+      "name": "manifestRollbackSequenceZero",
+      "schemaPointer": "#/$defs/signedArtifactManifestV2",
+      "reason": "the signed release sequence is positive and statefully monotonic",
+      "value": {
+        "manifestSchemaVersion": 2,
+        "target": { "artifactKind": "walletService", "targetTriple": "x86_64-unknown-linux-gnu", "executableFormat": "elf", "walletAbiVersion": 2, "serviceProtocolVersion": 2, "providerSchemaVersion": 1, "approvalSchemaVersion": 3, "maximumFrameBytes": 1048576, "capabilities": [] },
+        "source": { "repository": "https://github.com/handshake-rs/hns-wallet-rs", "commitId": "1111111111111111111111111111111111111111", "treeId": "2222222222222222222222222222222222222222", "sourceArchiveSha256": "3333333333333333333333333333333333333333333333333333333333333333", "dirty": false },
+        "release": { "releaseId": "wallet-service-0.1.0-linux-x86_64", "version": "0.1.0", "artifact": "hns-wallet-service", "artifactSha256": "4444444444444444444444444444444444444444444444444444444444444444", "artifactSizeBytes": 1048576, "publishedAtUnixMs": 200000 },
+        "antiRollback": { "releaseLine": "wallet-service-stable", "sequence": 0, "previousManifestSha256": null, "notBeforeUnixMs": 200000, "expiresAtUnixMs": null },
+        "signature": { "algorithm": "ed25519", "keyId": "wallet-release-2026", "payloadCanonicalization": "JCS-RFC8785", "signedPayloadSha256": "5555555555555555555555555555555555555555555555555555555555555555", "value": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ" }
+      }
+    }
+  ]
+}

@@ -11,3 +11,6 @@ single-account controls. It has no WebView/provider entry point, chain backend,
 value action, marketplace transport, or release-gate authority. Android
 Keystore and iOS Keychain integration remain responsibilities of the embedding
 applications; raw database keys must never enter website content.
+
+See the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)
+for generated-binding progress, target qualification, and release status.

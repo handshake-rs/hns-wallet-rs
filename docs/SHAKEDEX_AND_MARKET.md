@@ -9,7 +9,7 @@ post-lock buyer fulfillment, seller recovery, and the seller-script FINALIZE
 that follows either signed TRANSFER parent, but every authorization and
 submission entrypoint remains release-gated. The wallet dependency boundary
 consumes the canonical V2 `hns-swap` and
-`hns-marketplace-protocol` source from the same immutable revision `b33b346`.
+`hns-marketplace-protocol` source from the same immutable revision `abf11ff`.
 It does not reproduce listing hashes, signatures, Shakedex scripts, presigns,
 cancellations, or Denuo envelopes.
 
@@ -199,10 +199,9 @@ seller recovery, and seller-script FINALIZE. The fixed release gates remain
 `false`. Product-owned coin selection, product/startup orchestration, live
 Denuo/provider/trusted-UI integration, and complete
 regtest/restart/reorg/product qualification are still required before any gate
-can change. At exact local source revision
-`9d0cbeb8e59dcd74c189ec973b218a9f3afe167e`, one combined filter passed the six
-new `production_next_` FINALIZE tests plus the HNS purpose-separation test—seven
-tests total—with zero failures. Reverse Dutch is deferred.
+can change. The current regressions are covered by the exact CI evidence in
+`QUALIFICATION.md`; focused historical runs do not replace product or network
+qualification. Reverse Dutch is deferred.
 
 ## Market intents and sessions
 

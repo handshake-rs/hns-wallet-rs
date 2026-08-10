@@ -8,7 +8,9 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Platform-neutral native wallet controller for Android and iOS Handshake applications"
+documentation = "https://docs.rs/hns-wallet-mobile"
 readme = "README.md"
+publish = ["crates-io"]
 
 [dependencies]
 hns-wallet-ffi.workspace = true

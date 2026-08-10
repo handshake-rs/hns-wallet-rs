@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+documentation = "https://docs.rs/hns-wallet-chain-api"
+readme = "README.md"
+publish = ["crates-io"]
 
 [dependencies]
 hns-wallet-types.workspace = true
