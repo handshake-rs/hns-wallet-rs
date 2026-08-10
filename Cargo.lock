@@ -980,6 +980,7 @@ dependencies = [
  "hmac",
  "hns-wallet-types",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

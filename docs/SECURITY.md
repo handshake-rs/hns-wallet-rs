@@ -98,12 +98,37 @@ composition. Both value gates remain false.
 
 This is authenticated record encryption, not whole-file encryption. Table
 names, row counts, indexes, selected authenticated metadata, filenames, SQLite
-journals, and access patterns may be visible. On Linux, persistent opening
-requires an owner-only regular file in an owner-only directory and rejects
-symlink traversal. Other persistent platforms fail closed until an equivalent
-native policy is implemented. A product integration must wrap the database key
-with Android Keystore/iOS Keychain/OS secure storage and protect backups; that
-wrapping is not implemented in this repo.
+journals, and access patterns may be visible. On Linux, Android, and iOS,
+the source policy requires a process-effective-UID-owned `0700` directory and a
+same-owner, single-link regular `0600` database. Creation fails on any existing
+database or SQLite sidecar name and precreates `0600` through a file handle
+before SQLite opens without create permission. An armed identity guard attempts
+to clean a failed attempt only while the database still names the
+invocation-created inode, and attempts to remove only preflight-absent sidecars that are regular,
+same-effective-UID, and single-link. Opening an existing database first
+recognizes its schema anchors and four structurally exact required metadata
+rows through a read-only, query-only connection; non-wallet and incomplete
+schema-v1 databases are not
+switched to WAL or migrated. Selected-entry symlinks are rejected, system
+ancestor aliases are canonicalized, and device/inode identity is compared
+around recognition and the write-capable no-follow open.
+
+Non-writable system-owned prefix components are host-trusted. Generic Unix and
+iOS reject unowned group/world-writable prefix components unless a sticky
+directory protects a root- or effective-UID-owned child. Only the Android
+target admits the additional UID-1000, group-writable but non-world-writable
+app-data prefix, relying on SELinux/app-data-root containment. The same-UID
+suffix cannot change owner or be group/world writable, except for a sticky
+directory protecting a same-owner child. This is not a custom-VFS guarantee
+against root, same-UID, or the accepted host-platform prefix.
+
+Only Linux execution is recorded. Android/iOS target and runtime qualification
+remains required. Mobile hosts must prove app-sandbox membership, ACL policy,
+Apple Data Protection where applicable, and backup exclusion; UID/mode checks
+cannot establish them. Shared/external storage is not eligible. Non-Unix
+persistent opening fails closed. A product integration must still wrap the
+database key with Android Keystore/iOS Keychain/OS secure storage; that wrapping
+is not implemented in this repo.
 
 Recovery-phrase display remains a dedicated high-risk native/mobile concern and
 is absent from the private service/provider ABI. Logs and ordinary `Debug`

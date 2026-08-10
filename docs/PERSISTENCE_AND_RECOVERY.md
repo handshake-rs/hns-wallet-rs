@@ -440,10 +440,17 @@ safe archival is also pending, so the fixed lifetime caps fail closed.
 
 ## Migrations and backups
 
-Opening a database with a newer schema fails. Schema upgrades are transactional.
-After plaintext rows are encrypted and deleted, unlock records a checkpoint,
-truncates the WAL, clears the marker, and truncates again; an interrupted
-checkpoint is retried on the next unlock before state is returned.
+Opening first uses a read-only, no-follow, query-only connection to recognize
+nonzero current-or-legacy wallet schema anchors and all four structurally exact
+initialization metadata rows. A non-wallet SQLite database or an incomplete
+schema-v1 wallet returns
+`NotInitialized` before WAL configuration or migration. After the same file is
+opened for writing, the immutable metadata snapshot is checked before
+configuration and again after the transactional migration. A newer recognized
+wallet schema fails closed. After plaintext rows are encrypted and deleted,
+unlock records a checkpoint, truncates the WAL, clears the marker, and
+truncates again; an interrupted checkpoint is retried on the next unlock before
+state is returned.
 
 The encrypted `ShakedexValue` payload keeps its internal schema version at v1
 and adds script FINALIZE as a new tagged structural-plan variant. The new
@@ -459,10 +466,48 @@ authority binding were not authenticated. Populated legacy funds-bearing entity
 tables fail closed with `LegacyEntityMigrationRequired`; a dedicated import tool
 must map them without ambiguity before unlock.
 
-On Linux, persistent database opening requires an owner-only regular file in an
-owner-only directory and uses SQLite's no-follow flag. Non-Linux persistent
-opening intentionally fails until an equivalent native secure-open and
-ownership policy exists. In-memory stores remain available for bounded tests.
+The Unix source, including Linux, Android, and iOS targets, requires a dedicated
+directory owned by the process effective UID with exact mode `0700`. An
+existing database must be a regular, single-link file under the same UID with
+exact mode `0600`. Creation requires the path to be absent, atomically
+precreates the file with create-new semantics, sets `0600` through the open
+file handle, and then asks SQLite to open it without create permission. The
+database and its `-wal`, `-shm`, and `-journal` names must all be absent before
+creation. An armed guard retains the created database identity until the four
+initialization metadata rows commit. On failure it attempts to remove the
+database only if the path still names that same regular, same-effective-UID,
+single-link inode, and attempts to remove only regular, same-effective-UID,
+single-link sidecars that
+were absent at preflight. An identity replacement or unowned artifact is
+preserved rather than guessed away. A failed create never configures or
+migrates a pre-existing database or sidecar.
+
+The selected directory and database entry may not be symlinks. System-level
+ancestor aliases are canonicalized once. The prefix above the first directory
+owned by the effective UID is an explicit native-host/platform trust boundary;
+non-writable system-owned components in that prefix are host-trusted. Generic
+Unix and iOS reject an unowned group- or world-writable prefix component unless
+the sticky-directory rule protects a root- or effective-UID-owned next entry.
+Only an Android build selects the additional app-data policy: a group-writable,
+non-world-writable prefix directory owned by Android system UID 1000 is
+accepted, relying on Android SELinux and app-data-root containment. From the
+first process-owned directory through the selected `0700` directory, ownership
+may not change and group/world write is rejected. A sticky writable directory
+is accepted only when its next child is also owned by the effective UID, so
+sticky rename protection actually applies. The database device/inode and
+single-link identity are compared around both read-only recognition and
+SQLite's write-capable no-follow open. Root, the same effective UID, and the
+accepted host-platform prefix remain trusted; this is not a descriptor-bound
+custom VFS and does not claim protection from those principals.
+
+This policy has been executed on Linux only. Android and iOS target builds and
+runtime filesystem tests remain release requirements. A mobile host must
+provide the path inside its app sandbox and separately enforce sandbox
+membership, ACL policy, Apple Data Protection where applicable, backup
+exclusion, and Android Keystore/iOS Keychain key wrapping. UID/mode checks do
+not prove those properties. Shared/external storage is not eligible. Non-Unix
+persistent opening remains fail-closed. In-memory stores remain available for
+bounded tests.
 The shared process handle has no diagnostic representation and exposes the
 store only through bounded locked closures. Detecting a poisoned shared lock
 clears the record key before reporting failure. The service-specific persistent

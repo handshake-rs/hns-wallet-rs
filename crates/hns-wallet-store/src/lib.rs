@@ -3,8 +3,8 @@
 
 use std::collections::BTreeSet;
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -385,15 +385,32 @@ impl WalletStore {
         passphrase: &str,
         kdf: KdfConfig,
     ) -> Result<Self, StoreError> {
+        Self::create_with_kdf_after_migration(path, passphrase, kdf, |_| Ok(()))
+    }
+
+    fn create_with_kdf_after_migration(
+        path: impl AsRef<Path>,
+        passphrase: &str,
+        kdf: KdfConfig,
+        after_migration: impl FnOnce(&Connection) -> Result<(), StoreError>,
+    ) -> Result<Self, StoreError> {
         validate_passphrase(passphrase)?;
         kdf.validate()?;
-        let path = path.as_ref();
-        validate_wallet_location(path, true)?;
-        let connection = open_wallet_connection(path, true)?;
-        harden_wallet_file(path)?;
-        validate_wallet_location(path, false)?;
+        let location = validate_wallet_location(path.as_ref(), WalletPathRequirement::Missing)?;
+        let mut created_file = if is_in_memory(&location.path) {
+            None
+        } else {
+            Some(create_new_wallet_file(&location.path)?)
+        };
+        let connection = open_wallet_connection(&location.path)?;
+        if let Some(created_file) = created_file.as_ref() {
+            let reopened_location =
+                validate_wallet_location(&location.path, WalletPathRequirement::Existing)?;
+            validate_created_wallet_location(created_file, &reopened_location)?;
+        }
         configure(&connection)?;
         migrate(&connection)?;
+        after_migration(&connection)?;
         if meta(&connection, "database_id")?.is_some() {
             return Err(StoreError::AlreadyInitialized);
         }
@@ -418,6 +435,9 @@ impl WalletStore {
         set_meta(&transaction, "kdf_config", &kdf_json)?;
         set_meta(&transaction, "key_check", &sentinel)?;
         transaction.commit()?;
+        if let Some(created_file) = created_file.as_mut() {
+            created_file.disarm();
+        }
 
         Ok(Self {
             connection,
@@ -429,21 +449,32 @@ impl WalletStore {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
-        let path = path.as_ref();
-        validate_wallet_location(path, false)?;
-        let connection = open_wallet_connection(path, false)?;
+        let location = validate_wallet_location(path.as_ref(), WalletPathRequirement::Existing)?;
+        let recognition_connection = open_wallet_connection_read_only(&location.path)?;
+        let recognized_location =
+            validate_wallet_location(&location.path, WalletPathRequirement::Existing)?;
+        validate_wallet_location_identity(&location, &recognized_location)?;
+        let recognized_metadata = recognize_wallet_database(&recognition_connection)?;
+        drop(recognition_connection);
+
+        let connection = open_wallet_connection(&location.path)?;
+        let reopened_location =
+            validate_wallet_location(&location.path, WalletPathRequirement::Existing)?;
+        validate_wallet_location_identity(&location, &reopened_location)?;
+        if recognize_wallet_database(&connection)? != recognized_metadata {
+            return Err(StoreError::CorruptMetadata);
+        }
         configure(&connection)?;
         migrate(&connection)?;
-        let database_id =
-            exact_array::<DATABASE_ID_BYTES>(required_meta(&connection, "database_id")?)?;
-        let salt = exact_array::<SALT_BYTES>(required_meta(&connection, "kdf_salt")?)?;
-        let kdf: KdfConfig = serde_json::from_slice(&required_meta(&connection, "kdf_config")?)?;
-        kdf.validate()?;
+        let metadata = load_wallet_metadata(&connection)?;
+        if metadata != recognized_metadata {
+            return Err(StoreError::CorruptMetadata);
+        }
         Ok(Self {
             connection,
-            database_id,
-            salt,
-            kdf,
+            database_id: metadata.database_id,
+            salt: metadata.salt,
+            kdf: metadata.kdf,
             key: None,
         })
     }
@@ -2548,71 +2579,523 @@ fn is_in_memory(path: &Path) -> bool {
     path == Path::new(":memory:")
 }
 
-fn open_wallet_connection(path: &Path, create: bool) -> Result<Connection, StoreError> {
+fn open_wallet_connection(path: &Path) -> Result<Connection, StoreError> {
     if is_in_memory(path) {
         return Connection::open_in_memory().map_err(StoreError::from);
     }
-    let mut flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    if create {
-        flags |= OpenFlags::SQLITE_OPEN_CREATE;
-    }
     Connection::open_with_flags(path, flags).map_err(StoreError::from)
 }
 
-#[cfg(target_os = "linux")]
-fn validate_wallet_location(path: &Path, allow_missing: bool) -> Result<(), StoreError> {
-    if is_in_memory(path) {
-        return Ok(());
-    }
-    let process_uid = std::fs::metadata("/proc/self")?.uid();
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let parent_metadata = std::fs::symlink_metadata(parent)?;
-    if !parent_metadata.is_dir()
-        || parent_metadata.uid() != process_uid
-        || parent_metadata.mode() & 0o077 != 0
+fn open_wallet_connection_read_only(path: &Path) -> Result<Connection, StoreError> {
+    let connection = if is_in_memory(path) {
+        Connection::open_in_memory()?
+    } else {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+        Connection::open_with_flags(path, flags)?
+    };
+    connection.execute_batch("PRAGMA trusted_schema=OFF; PRAGMA query_only=ON;")?;
+    Ok(connection)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalletPathRequirement {
+    Missing,
+    Existing,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnixBoundaryKind {
+    Directory,
+    RegularFile,
+    Other,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UnixBoundaryMetadata {
+    kind: UnixBoundaryKind,
+    uid: u32,
+    mode: u32,
+    dev: u64,
+    ino: u64,
+    nlink: u64,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnixAncestorPolicy {
+    Strict,
+    AndroidSystemUid1000,
+}
+
+#[cfg(unix)]
+const fn active_unix_ancestor_policy() -> UnixAncestorPolicy {
+    #[cfg(target_os = "android")]
     {
-        return Err(StoreError::UnsafeFilesystemBoundary);
+        UnixAncestorPolicy::AndroidSystemUid1000
     }
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata)
-            if metadata.file_type().is_file()
-                && metadata.uid() == process_uid
-                && metadata.mode() & 0o077 == 0 =>
-        {
-            Ok(())
-        }
-        Ok(_) => Err(StoreError::UnsafeFilesystemBoundary),
-        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(StoreError::Io(error)),
+    #[cfg(not(target_os = "android"))]
+    {
+        UnixAncestorPolicy::Strict
     }
 }
 
-#[cfg(not(target_os = "linux"))]
-fn validate_wallet_location(path: &Path, _: bool) -> Result<(), StoreError> {
+#[cfg(unix)]
+fn unix_boundary_metadata(metadata: &std::fs::Metadata) -> UnixBoundaryMetadata {
+    let file_type = metadata.file_type();
+    let kind = if file_type.is_dir() {
+        UnixBoundaryKind::Directory
+    } else if file_type.is_file() {
+        UnixBoundaryKind::RegularFile
+    } else {
+        UnixBoundaryKind::Other
+    };
+    UnixBoundaryMetadata {
+        kind,
+        uid: metadata.uid(),
+        mode: metadata.mode() & 0o7777,
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        nlink: metadata.nlink(),
+    }
+}
+
+#[cfg(unix)]
+fn validate_unix_ancestor_chain(
+    ancestors: &[UnixBoundaryMetadata],
+    process_uid: u32,
+    policy: UnixAncestorPolicy,
+) -> Result<(), StoreError> {
+    if ancestors.is_empty() {
+        return Err(StoreError::UnsafeFilesystemBoundary);
+    }
+    for ancestor in ancestors {
+        if ancestor.kind != UnixBoundaryKind::Directory {
+            return Err(StoreError::UnsafeFilesystemBoundary);
+        }
+    }
+
+    // The native host chooses the path and therefore owns the non-writable
+    // platform prefix above the first process-owned directory. Android app
+    // sandboxes additionally traverse uid-1000 platform directories that can
+    // be group-writable; that exception is compiled only for Android and still
+    // rejects world-writable entries. Once the path enters the process-owned
+    // suffix, ownership may not change again.
+    let trusted_suffix = ancestors
+        .iter()
+        .position(|ancestor| ancestor.uid == process_uid)
+        .ok_or(StoreError::UnsafeFilesystemBoundary)?;
+    for (index, ancestor) in ancestors[..trusted_suffix].iter().enumerate() {
+        if ancestor.mode & 0o022 != 0 {
+            let sticky = ancestor.mode & 0o1000 != 0;
+            let trusted_child = ancestors
+                .get(index + 1)
+                .is_some_and(|child| child.uid == 0 || child.uid == process_uid);
+            let android_platform_group_write = policy == UnixAncestorPolicy::AndroidSystemUid1000
+                && ancestor.uid == 1_000
+                && ancestor.mode & 0o020 != 0
+                && ancestor.mode & 0o002 == 0;
+            if (!sticky || !trusted_child) && !android_platform_group_write {
+                return Err(StoreError::UnsafeFilesystemBoundary);
+            }
+        }
+    }
+    for (offset, ancestor) in ancestors[trusted_suffix..].iter().enumerate() {
+        if ancestor.uid != process_uid {
+            return Err(StoreError::UnsafeFilesystemBoundary);
+        }
+        if ancestor.mode & 0o022 != 0 {
+            let sticky = ancestor.mode & 0o1000 != 0;
+            let trusted_child = ancestors
+                .get(trusted_suffix + offset + 1)
+                .is_some_and(|child| child.uid == process_uid);
+            if !sticky || !trusted_child {
+                return Err(StoreError::UnsafeFilesystemBoundary);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_wallet_directory(
+    directory: UnixBoundaryMetadata,
+    process_uid: u32,
+) -> Result<(), StoreError> {
+    if directory.kind != UnixBoundaryKind::Directory
+        || directory.uid != process_uid
+        || directory.mode != 0o700
+    {
+        return Err(StoreError::UnsafeFilesystemBoundary);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_wallet_file(
+    file: UnixBoundaryMetadata,
+    process_uid: u32,
+) -> Result<(), StoreError> {
+    if file.kind != UnixBoundaryKind::RegularFile
+        || file.uid != process_uid
+        || file.mode != 0o600
+        || file.nlink != 1
+    {
+        return Err(StoreError::UnsafeFilesystemBoundary);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_unix_file_identity(
+    expected: UnixBoundaryMetadata,
+    actual: UnixBoundaryMetadata,
+) -> Result<(), StoreError> {
+    if expected.kind != UnixBoundaryKind::RegularFile
+        || actual.kind != UnixBoundaryKind::RegularFile
+        || expected.dev != actual.dev
+        || expected.ino != actual.ino
+        || expected.nlink != 1
+        || actual.nlink != 1
+    {
+        return Err(StoreError::UnsafeFilesystemBoundary);
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ValidatedWalletLocation {
+    path: PathBuf,
+    #[cfg(unix)]
+    file: Option<UnixBoundaryMetadata>,
+}
+
+#[cfg(unix)]
+struct CreatedWalletFile {
+    file: std::fs::File,
+    path: PathBuf,
+    identity: Option<UnixBoundaryMetadata>,
+    process_uid: u32,
+    armed: bool,
+}
+
+#[cfg(not(unix))]
+struct CreatedWalletFile;
+
+#[cfg(unix)]
+impl CreatedWalletFile {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(not(unix))]
+impl CreatedWalletFile {
+    fn disarm(&mut self) {}
+}
+
+#[cfg(unix)]
+impl Drop for CreatedWalletFile {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let expected = self.identity.or_else(|| {
+            self.file
+                .metadata()
+                .ok()
+                .map(|metadata| unix_boundary_metadata(&metadata))
+        });
+        let Some(expected) = expected else {
+            return;
+        };
+        if !unix_cleanup_file_is_owned(expected, self.process_uid) {
+            return;
+        }
+        let Ok(actual) = std::fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        let actual = unix_boundary_metadata(&actual);
+        if !unix_cleanup_file_is_owned(actual, self.process_uid)
+            || validate_unix_file_identity(expected, actual).is_err()
+        {
+            return;
+        }
+
+        // Absence was checked before the database was created. Within the
+        // owner-private parent, only regular, same-euid, single-link artifacts
+        // can therefore be attributed to this initialization attempt.
+        for sidecar in sqlite_sidecar_paths(&self.path) {
+            let Ok(metadata) = std::fs::symlink_metadata(&sidecar) else {
+                continue;
+            };
+            if unix_cleanup_file_is_owned(unix_boundary_metadata(&metadata), self.process_uid) {
+                let _ = std::fs::remove_file(sidecar);
+            }
+        }
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn unix_cleanup_file_is_owned(file: UnixBoundaryMetadata, process_uid: u32) -> bool {
+    file.kind == UnixBoundaryKind::RegularFile && file.uid == process_uid && file.nlink == 1
+}
+
+#[cfg(unix)]
+fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 3] {
+    ["-wal", "-shm", "-journal"].map(|suffix| {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        PathBuf::from(sidecar)
+    })
+}
+
+#[cfg(unix)]
+fn preflight_sqlite_sidecars(path: &Path) -> Result<(), StoreError> {
+    for sidecar in sqlite_sidecar_paths(path) {
+        match std::fs::symlink_metadata(sidecar) {
+            Ok(_) => return Err(StoreError::DatabaseExists),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(StoreError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_wallet_location(
+    path: &Path,
+    requirement: WalletPathRequirement,
+) -> Result<ValidatedWalletLocation, StoreError> {
     if is_in_memory(path) {
-        Ok(())
+        return Ok(ValidatedWalletLocation {
+            path: path.to_path_buf(),
+            file: None,
+        });
+    }
+    let file_name = path
+        .file_name()
+        .ok_or(StoreError::UnsafeFilesystemBoundary)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let supplied_parent_metadata = std::fs::symlink_metadata(parent)?;
+    if supplied_parent_metadata.file_type().is_symlink() {
+        return Err(StoreError::UnsafeFilesystemBoundary);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(StoreError::UnsafeFilesystemBoundary);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(StoreError::Io(error)),
+    }
+
+    // Mobile platforms can expose a sandbox through a system-owned ancestor
+    // alias (for example, /var on Apple platforms). Resolve that alias once,
+    // then use only the resolved owner-private directory for the SQLite open.
+    // The selected parent itself and the database entry may not be symlinks.
+    let canonical_parent = std::fs::canonicalize(parent)?;
+    let canonical_path = canonical_parent.join(file_name);
+    let process_uid = rustix::process::geteuid().as_raw();
+
+    let mut ancestor_paths = canonical_parent.ancestors().collect::<Vec<_>>();
+    ancestor_paths.reverse();
+    let ancestor_metadata = ancestor_paths
+        .into_iter()
+        .map(std::fs::symlink_metadata)
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .map(unix_boundary_metadata)
+        .collect::<Vec<_>>();
+    validate_unix_ancestor_chain(
+        &ancestor_metadata,
+        process_uid,
+        active_unix_ancestor_policy(),
+    )?;
+    validate_unix_wallet_directory(
+        *ancestor_metadata
+            .last()
+            .ok_or(StoreError::UnsafeFilesystemBoundary)?,
+        process_uid,
+    )?;
+
+    let file_metadata = match std::fs::symlink_metadata(&canonical_path) {
+        Ok(metadata) => Some(unix_boundary_metadata(&metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(StoreError::Io(error)),
+    };
+    match (requirement, file_metadata) {
+        (WalletPathRequirement::Missing, None) => Ok(ValidatedWalletLocation {
+            path: canonical_path,
+            file: None,
+        }),
+        (WalletPathRequirement::Missing, Some(file)) => {
+            validate_unix_wallet_file(file, process_uid)?;
+            Err(StoreError::DatabaseExists)
+        }
+        (WalletPathRequirement::Existing, Some(file)) => {
+            validate_unix_wallet_file(file, process_uid)?;
+            Ok(ValidatedWalletLocation {
+                path: canonical_path,
+                file: Some(file),
+            })
+        }
+        (WalletPathRequirement::Existing, None) => Err(StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "wallet database does not exist",
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+fn validate_wallet_location(
+    path: &Path,
+    _: WalletPathRequirement,
+) -> Result<ValidatedWalletLocation, StoreError> {
+    if is_in_memory(path) {
+        Ok(ValidatedWalletLocation {
+            path: path.to_path_buf(),
+        })
     } else {
         Err(StoreError::UnsupportedFilesystemBoundary)
     }
 }
 
 #[cfg(unix)]
-fn harden_wallet_file(path: &Path) -> Result<(), StoreError> {
-    if !is_in_memory(path) {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+fn create_new_wallet_file(path: &Path) -> Result<CreatedWalletFile, StoreError> {
+    preflight_sqlite_sidecars(path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                StoreError::DatabaseExists
+            } else {
+                StoreError::Io(error)
+            }
+        })?;
+    let process_uid = rustix::process::geteuid().as_raw();
+    let mut created = CreatedWalletFile {
+        file,
+        path: path.to_path_buf(),
+        identity: None,
+        process_uid,
+        armed: true,
+    };
+    created
+        .file
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let identity = unix_boundary_metadata(&created.file.metadata()?);
+    created.identity = Some(identity);
+    validate_unix_wallet_file(identity, process_uid)?;
+    let path_identity = unix_boundary_metadata(&std::fs::symlink_metadata(path)?);
+    validate_unix_wallet_file(path_identity, process_uid)?;
+    validate_unix_file_identity(identity, path_identity)?;
+    Ok(created)
 }
 
 #[cfg(not(unix))]
-fn harden_wallet_file(path: &Path) -> Result<(), StoreError> {
-    if is_in_memory(path) {
-        Ok(())
-    } else {
-        Err(StoreError::UnsupportedFilesystemBoundary)
+fn create_new_wallet_file(_: &Path) -> Result<CreatedWalletFile, StoreError> {
+    Err(StoreError::UnsupportedFilesystemBoundary)
+}
+
+fn validate_wallet_location_identity(
+    expected: &ValidatedWalletLocation,
+    actual: &ValidatedWalletLocation,
+) -> Result<(), StoreError> {
+    if expected.path != actual.path {
+        return Err(StoreError::UnsafeFilesystemBoundary);
     }
+    #[cfg(unix)]
+    match (expected.file, actual.file) {
+        (Some(expected), Some(actual)) => validate_unix_file_identity(expected, actual),
+        (None, None) if is_in_memory(&expected.path) => Ok(()),
+        _ => Err(StoreError::UnsafeFilesystemBoundary),
+    }
+    #[cfg(not(unix))]
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_created_wallet_location(
+    created: &CreatedWalletFile,
+    actual: &ValidatedWalletLocation,
+) -> Result<(), StoreError> {
+    if created.path != actual.path {
+        return Err(StoreError::UnsafeFilesystemBoundary);
+    }
+    let identity = created
+        .identity
+        .ok_or(StoreError::UnsafeFilesystemBoundary)?;
+    let actual = actual.file.ok_or(StoreError::UnsafeFilesystemBoundary)?;
+    validate_unix_file_identity(identity, actual)
+}
+
+#[cfg(not(unix))]
+fn validate_created_wallet_location(
+    _: &CreatedWalletFile,
+    _: &ValidatedWalletLocation,
+) -> Result<(), StoreError> {
+    Err(StoreError::UnsupportedFilesystemBoundary)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct WalletMetadata {
+    database_id: [u8; DATABASE_ID_BYTES],
+    salt: [u8; SALT_BYTES],
+    kdf: KdfConfig,
+    key_check: Vec<u8>,
+}
+
+fn recognize_wallet_database(connection: &Connection) -> Result<WalletMetadata, StoreError> {
+    let schema_version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema_version == 0 {
+        return Err(StoreError::NotInitialized);
+    }
+    let schema_anchors: usize = connection.query_row(
+        "SELECT COUNT(*) FROM sqlite_schema
+         WHERE type='table' AND name IN ('wallet_meta', 'secrets', 'workflows')",
+        [],
+        |row| row.get(0),
+    )?;
+    if schema_anchors != 3 {
+        return Err(StoreError::NotInitialized);
+    }
+    let metadata = load_wallet_metadata(connection)?;
+    if schema_version > SCHEMA_VERSION {
+        return Err(StoreError::NewerSchema(schema_version));
+    }
+    Ok(metadata)
+}
+
+fn load_wallet_metadata(connection: &Connection) -> Result<WalletMetadata, StoreError> {
+    let database_id = exact_array::<DATABASE_ID_BYTES>(required_meta(connection, "database_id")?)?;
+    let salt = exact_array::<SALT_BYTES>(required_meta(connection, "kdf_salt")?)?;
+    let kdf: KdfConfig = serde_json::from_slice(&required_meta(connection, "kdf_config")?)?;
+    kdf.validate()?;
+    let key_check = required_meta(connection, "key_check")?;
+    if key_check.len() != NONCE_BYTES + SENTINEL.len() + 16 {
+        return Err(StoreError::CorruptMetadata);
+    }
+    Ok(WalletMetadata {
+        database_id,
+        salt,
+        kdf,
+        key_check,
+    })
 }
 
 fn configure(connection: &Connection) -> Result<(), StoreError> {
@@ -3243,6 +3726,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("wallet store is already initialized")]
     AlreadyInitialized,
+    #[error("wallet database path already exists")]
+    DatabaseExists,
     #[error("wallet store is not initialized")]
     NotInitialized,
     #[error("wallet store is locked")]
@@ -3327,6 +3812,711 @@ pub enum StoreError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    fn unix_private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::var_os("HNS_WALLET_STORE_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let directory = tempfile::Builder::new()
+            .prefix("hns-wallet-store-")
+            .tempdir_in(root)
+            .expect("private Unix test directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private Unix test directory mode");
+        directory
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_wallet_boundary_policy_is_exact_and_platform_independent() {
+        const UID: u32 = 10_123;
+        let private_directory = UnixBoundaryMetadata {
+            kind: UnixBoundaryKind::Directory,
+            uid: UID,
+            mode: 0o700,
+            dev: 1,
+            ino: 2,
+            nlink: 2,
+        };
+        let private_file = UnixBoundaryMetadata {
+            kind: UnixBoundaryKind::RegularFile,
+            uid: UID,
+            mode: 0o600,
+            dev: 1,
+            ino: 3,
+            nlink: 1,
+        };
+        assert!(validate_unix_wallet_directory(private_directory, UID).is_ok());
+        assert!(validate_unix_wallet_file(private_file, UID).is_ok());
+
+        for unsafe_parent in [
+            UnixBoundaryMetadata {
+                mode: 0o750,
+                ..private_directory
+            },
+            UnixBoundaryMetadata {
+                uid: UID + 1,
+                ..private_directory
+            },
+            UnixBoundaryMetadata {
+                kind: UnixBoundaryKind::Other,
+                ..private_directory
+            },
+        ] {
+            assert!(matches!(
+                validate_unix_wallet_directory(unsafe_parent, UID),
+                Err(StoreError::UnsafeFilesystemBoundary)
+            ));
+        }
+        for unsafe_file in [
+            UnixBoundaryMetadata {
+                mode: 0o640,
+                ..private_file
+            },
+            UnixBoundaryMetadata {
+                uid: UID + 1,
+                ..private_file
+            },
+            UnixBoundaryMetadata {
+                kind: UnixBoundaryKind::Other,
+                ..private_file
+            },
+            UnixBoundaryMetadata {
+                nlink: 2,
+                ..private_file
+            },
+        ] {
+            assert!(matches!(
+                validate_unix_wallet_file(unsafe_file, UID),
+                Err(StoreError::UnsafeFilesystemBoundary)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_ancestor_policy_rejects_untrusted_rename_boundaries() {
+        const UID: u32 = 10_123;
+        const STRICT: UnixAncestorPolicy = UnixAncestorPolicy::Strict;
+        const ANDROID: UnixAncestorPolicy = UnixAncestorPolicy::AndroidSystemUid1000;
+        let root = UnixBoundaryMetadata {
+            kind: UnixBoundaryKind::Directory,
+            uid: 0,
+            mode: 0o755,
+            dev: 1,
+            ino: 1,
+            nlink: 2,
+        };
+        let sticky_root = UnixBoundaryMetadata {
+            mode: 0o1777,
+            ..root
+        };
+        let private = UnixBoundaryMetadata {
+            uid: UID,
+            mode: 0o700,
+            ino: 2,
+            ..root
+        };
+        let owned_ancestor = UnixBoundaryMetadata {
+            uid: UID,
+            mode: 0o755,
+            ino: 3,
+            ..root
+        };
+
+        assert!(validate_unix_ancestor_chain(&[root, private], UID, STRICT).is_ok());
+        assert!(validate_unix_ancestor_chain(&[sticky_root, private], UID, STRICT).is_ok());
+        assert!(matches!(
+            validate_unix_ancestor_chain(
+                &[
+                    UnixBoundaryMetadata {
+                        mode: 0o777,
+                        ..root
+                    },
+                    private,
+                ],
+                UID,
+                STRICT,
+            ),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+        assert!(matches!(
+            validate_unix_ancestor_chain(
+                &[
+                    UnixBoundaryMetadata {
+                        mode: 0o775,
+                        ..root
+                    },
+                    private,
+                ],
+                UID,
+                STRICT,
+            ),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+
+        let android_app_data_chain = [
+            root,
+            UnixBoundaryMetadata {
+                uid: 1_000,
+                mode: 0o771,
+                ino: 4,
+                ..root
+            },
+            UnixBoundaryMetadata {
+                uid: 1_000,
+                mode: 0o511,
+                ino: 5,
+                ..root
+            },
+            UnixBoundaryMetadata {
+                uid: 1_000,
+                mode: 0o771,
+                ino: 6,
+                ..root
+            },
+            private,
+        ];
+        assert!(matches!(
+            validate_unix_ancestor_chain(&android_app_data_chain, UID, STRICT),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+        assert!(validate_unix_ancestor_chain(&android_app_data_chain, UID, ANDROID).is_ok());
+        for unsafe_android_prefix in [
+            UnixBoundaryMetadata {
+                uid: 1_001,
+                mode: 0o771,
+                ino: 7,
+                ..root
+            },
+            UnixBoundaryMetadata {
+                uid: 1_000,
+                mode: 0o773,
+                ino: 8,
+                ..root
+            },
+        ] {
+            assert!(matches!(
+                validate_unix_ancestor_chain(&[root, unsafe_android_prefix, private], UID, ANDROID,),
+                Err(StoreError::UnsafeFilesystemBoundary)
+            ));
+        }
+
+        assert!(
+            validate_unix_ancestor_chain(&[root, owned_ancestor, private], UID, STRICT).is_ok()
+        );
+        assert!(
+            validate_unix_ancestor_chain(
+                &[
+                    root,
+                    UnixBoundaryMetadata {
+                        mode: 0o1777,
+                        ..owned_ancestor
+                    },
+                    private,
+                ],
+                UID,
+                STRICT,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            validate_unix_ancestor_chain(
+                &[
+                    root,
+                    UnixBoundaryMetadata {
+                        mode: 0o777,
+                        ..owned_ancestor
+                    },
+                    private,
+                ],
+                UID,
+                STRICT,
+            ),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+        assert!(matches!(
+            validate_unix_ancestor_chain(
+                &[
+                    root,
+                    owned_ancestor,
+                    UnixBoundaryMetadata {
+                        uid: UID + 1,
+                        mode: 0o555,
+                        ..private
+                    },
+                ],
+                UID,
+                STRICT,
+            ),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+        assert!(matches!(
+            validate_unix_ancestor_chain(
+                &[
+                    root,
+                    UnixBoundaryMetadata {
+                        uid: UID + 1,
+                        mode: 0o555,
+                        ..private
+                    },
+                ],
+                UID,
+                STRICT,
+            ),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_file_identity_rejects_inode_changes_and_hard_links() {
+        let identity = UnixBoundaryMetadata {
+            kind: UnixBoundaryKind::RegularFile,
+            uid: 10_123,
+            mode: 0o600,
+            dev: 7,
+            ino: 11,
+            nlink: 1,
+        };
+        assert!(validate_unix_file_identity(identity, identity).is_ok());
+        for changed in [
+            UnixBoundaryMetadata { dev: 8, ..identity },
+            UnixBoundaryMetadata {
+                ino: 12,
+                ..identity
+            },
+            UnixBoundaryMetadata {
+                nlink: 2,
+                ..identity
+            },
+        ] {
+            assert!(matches!(
+                validate_unix_file_identity(identity, changed),
+                Err(StoreError::UnsafeFilesystemBoundary)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_wallet_location_canonicalizes_ancestor_aliases_only() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let directory = unix_private_tempdir();
+        let physical_root = directory.path().join("physical");
+        let container = physical_root.join("container");
+        let private_directory = container.join("wallet-private");
+        std::fs::create_dir_all(&private_directory).expect("physical private directory");
+        for owned_ancestor in [&physical_root, &container] {
+            std::fs::set_permissions(owned_ancestor, std::fs::Permissions::from_mode(0o700))
+                .expect("private owned ancestor mode");
+        }
+        std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o700))
+            .expect("private directory mode");
+        let ancestor_alias = directory.path().join("system-alias");
+        symlink(&physical_root, &ancestor_alias).expect("system-style ancestor alias");
+
+        let supplied_database = ancestor_alias
+            .join("container")
+            .join("wallet-private")
+            .join("wallet.sqlite3");
+        let physical_database = private_directory.join("wallet.sqlite3");
+        assert_eq!(
+            validate_wallet_location(&supplied_database, WalletPathRequirement::Missing)
+                .expect("missing create target")
+                .path,
+            physical_database
+        );
+        std::fs::write(&physical_database, []).expect("empty database fixture");
+        std::fs::set_permissions(&physical_database, std::fs::Permissions::from_mode(0o600))
+            .expect("private database mode");
+        assert_eq!(
+            validate_wallet_location(&supplied_database, WalletPathRequirement::Existing)
+                .expect("existing database")
+                .path,
+            physical_database
+        );
+
+        let database_alias = private_directory.join("wallet-link.sqlite3");
+        symlink(&physical_database, &database_alias).expect("database alias");
+        assert!(matches!(
+            validate_wallet_location(&database_alias, WalletPathRequirement::Existing),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+
+        let parent_alias = directory.path().join("wallet-parent-link");
+        symlink(&private_directory, &parent_alias).expect("parent alias");
+        assert!(matches!(
+            validate_wallet_location(
+                &parent_alias.join("wallet.sqlite3"),
+                WalletPathRequirement::Existing,
+            ),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+
+        std::fs::set_permissions(&private_directory, std::fs::Permissions::from_mode(0o750))
+            .expect("unsafe parent mode fixture");
+        assert!(matches!(
+            validate_wallet_location(&supplied_database, WalletPathRequirement::Existing),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_create_rejects_existing_file_without_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = unix_private_tempdir();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private directory mode");
+        let database = directory.path().join("wallet.sqlite3");
+        let sentinel = b"existing non-wallet bytes";
+        std::fs::write(&database, sentinel).expect("existing database fixture");
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("existing database mode");
+
+        assert!(matches!(
+            WalletStore::create_with_kdf(
+                &database,
+                "existing-file-passphrase",
+                KdfConfig::testing(),
+            ),
+            Err(StoreError::DatabaseExists)
+        ));
+        assert_eq!(
+            std::fs::read(&database).expect("unchanged existing database"),
+            sentinel
+        );
+        assert!(!directory.path().join("wallet.sqlite3-wal").exists());
+        assert!(!directory.path().join("wallet.sqlite3-shm").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_failed_create_cleans_owned_artifacts_and_allows_retry() {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("wallet.sqlite3");
+        let sidecars = sqlite_sidecar_paths(&database);
+
+        for sidecar in &sidecars {
+            std::fs::write(sidecar, b"pre-existing sidecar").expect("sidecar fixture");
+            std::fs::set_permissions(sidecar, std::fs::Permissions::from_mode(0o600))
+                .expect("sidecar mode");
+            assert!(matches!(
+                WalletStore::create_with_kdf(
+                    &database,
+                    "cleanup-retry-passphrase",
+                    KdfConfig::testing(),
+                ),
+                Err(StoreError::DatabaseExists)
+            ));
+            assert!(!database.exists());
+            assert_eq!(
+                std::fs::read(sidecar).expect("preserved sidecar"),
+                b"pre-existing sidecar"
+            );
+            std::fs::remove_file(sidecar).expect("remove sidecar fixture");
+        }
+
+        assert!(matches!(
+            WalletStore::create_with_kdf_after_migration(
+                &database,
+                "cleanup-retry-passphrase",
+                KdfConfig::testing(),
+                |_| {
+                    for sidecar in &sidecars {
+                        if !sidecar.exists() {
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .mode(0o600)
+                                .open(sidecar)
+                                .expect("invocation-owned sidecar fixture");
+                        }
+                    }
+                    Err(StoreError::CorruptMetadata)
+                },
+            ),
+            Err(StoreError::CorruptMetadata)
+        ));
+        assert!(!database.exists());
+        for sidecar in &sidecars {
+            assert!(!sidecar.exists());
+        }
+
+        let store = WalletStore::create_with_kdf(
+            &database,
+            "cleanup-retry-passphrase",
+            KdfConfig::testing(),
+        )
+        .expect("retry clean creation");
+        drop(store);
+        let mut reopened = WalletStore::open(&database).expect("open retried wallet");
+        reopened
+            .unlock("cleanup-retry-passphrase")
+            .expect("unlock retried wallet");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_cleanup_guard_preserves_replaced_database_identity() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("wallet.sqlite3");
+        let created = create_new_wallet_file(&database).expect("armed creation guard");
+        std::fs::remove_file(&database).expect("unlink original database");
+        std::fs::write(&database, b"replacement database").expect("replacement database");
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("replacement mode");
+        let sidecar = sqlite_sidecar_paths(&database)[2].clone();
+        std::fs::write(&sidecar, b"replacement sidecar").expect("replacement sidecar");
+        std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o600))
+            .expect("replacement sidecar mode");
+
+        drop(created);
+        assert_eq!(
+            std::fs::read(&database).expect("preserved replacement database"),
+            b"replacement database"
+        );
+        assert_eq!(
+            std::fs::read(&sidecar).expect("preserved replacement sidecar"),
+            b"replacement sidecar"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_open_rejects_non_wallet_without_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("foreign.sqlite3");
+        let connection = Connection::open(&database).expect("foreign SQLite database");
+        connection
+            .execute_batch(
+                "CREATE TABLE foreign_records(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO foreign_records(value) VALUES('unchanged');
+                 PRAGMA user_version=1;",
+            )
+            .expect("foreign schema");
+        drop(connection);
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("foreign database mode");
+        let before = std::fs::read(&database).expect("foreign bytes before open");
+
+        assert!(matches!(
+            WalletStore::open(&database),
+            Err(StoreError::NotInitialized)
+        ));
+        assert_eq!(
+            std::fs::read(&database).expect("foreign bytes after open"),
+            before
+        );
+        for sidecar in sqlite_sidecar_paths(&database) {
+            assert!(!sidecar.exists());
+        }
+        let connection = open_wallet_connection_read_only(&database).expect("inspect foreign DB");
+        assert_eq!(
+            connection
+                .query_row::<u32, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .expect("foreign schema version"),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row::<String, _, _>("PRAGMA journal_mode", [], |row| row.get(0))
+                .expect("foreign journal mode"),
+            "delete"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_open_rejects_partial_v1_wallet_without_mutation() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("partial-wallet.sqlite3");
+        let connection = Connection::open(&database).expect("partial wallet database");
+        connection.execute_batch(SCHEMA_V1).expect("schema v1");
+        drop(connection);
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("partial wallet mode");
+        let before = std::fs::read(&database).expect("partial wallet bytes before open");
+
+        assert!(matches!(
+            WalletStore::open(&database),
+            Err(StoreError::NotInitialized)
+        ));
+        assert_eq!(
+            std::fs::read(&database).expect("partial wallet bytes after open"),
+            before
+        );
+        for sidecar in sqlite_sidecar_paths(&database) {
+            assert!(!sidecar.exists());
+        }
+        let connection = open_wallet_connection_read_only(&database).expect("inspect partial DB");
+        assert_eq!(
+            connection
+                .query_row::<u32, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .expect("partial schema version"),
+            1
+        );
+        let has_v2_table: bool = connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_schema
+                    WHERE type='table' AND name='encrypted_entities'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("partial schema inspection");
+        assert!(!has_v2_table);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_open_recognizes_and_migrates_initialized_v1_wallet() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const PASSPHRASE: &str = "initialized-v1-passphrase";
+        let source = WalletStore::create_in_memory(PASSPHRASE).expect("metadata source");
+        let metadata = ["database_id", "kdf_salt", "kdf_config", "key_check"].map(|key| {
+            (
+                key,
+                required_meta(&source.connection, key).expect("source metadata"),
+            )
+        });
+
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("legacy-wallet.sqlite3");
+        let connection = Connection::open(&database).expect("legacy wallet database");
+        connection.execute_batch(SCHEMA_V1).expect("schema v1");
+        let transaction = connection
+            .unchecked_transaction()
+            .expect("metadata transaction");
+        for (key, value) in metadata {
+            set_meta(&transaction, key, &value).expect("legacy metadata");
+        }
+        transaction.commit().expect("commit legacy metadata");
+        drop(connection);
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600))
+            .expect("legacy wallet mode");
+
+        let mut opened = WalletStore::open(&database).expect("recognized legacy wallet");
+        assert!(opened.is_locked());
+        assert_eq!(
+            opened
+                .connection
+                .query_row::<u32, _, _>("PRAGMA user_version", [], |row| row.get(0))
+                .expect("migrated schema version"),
+            SCHEMA_VERSION
+        );
+        opened.unlock(PASSPHRASE).expect("unlock migrated wallet");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_open_rejects_malformed_key_check_without_mutation() {
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("malformed-key-check.sqlite3");
+        let store = WalletStore::create_with_kdf(
+            &database,
+            "malformed-key-check-passphrase",
+            KdfConfig::testing(),
+        )
+        .expect("create wallet fixture");
+        let mut malformed = required_meta(&store.connection, "key_check").expect("key check");
+        malformed.push(0);
+        store
+            .connection
+            .execute(
+                "UPDATE wallet_meta SET value=?1 WHERE key='key_check'",
+                params![malformed],
+            )
+            .expect("write malformed key check");
+        store
+            .connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .expect("checkpoint malformed fixture");
+        drop(store);
+
+        let before = std::fs::read(&database).expect("wallet bytes before rejected open");
+        assert!(matches!(
+            WalletStore::open(&database),
+            Err(StoreError::CorruptMetadata)
+        ));
+        assert_eq!(
+            std::fs::read(&database).expect("wallet bytes after rejected open"),
+            before
+        );
+        for sidecar in sqlite_sidecar_paths(&database) {
+            assert!(!sidecar.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_wallet_database_hard_links_are_rejected() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = unix_private_tempdir();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private directory mode");
+        let source = directory.path().join("source.sqlite3");
+        let database = directory.path().join("wallet.sqlite3");
+        std::fs::write(&source, []).expect("hard-link source");
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600))
+            .expect("hard-link source mode");
+        std::fs::hard_link(&source, &database).expect("database hard link");
+
+        assert!(matches!(
+            validate_wallet_location(&database, WalletPathRequirement::Existing),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+        assert!(matches!(
+            validate_wallet_location(&database, WalletPathRequirement::Missing),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_create_atomically_sets_mode_and_reopens() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let directory = unix_private_tempdir();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private directory mode");
+        let database = directory.path().join("wallet.sqlite3");
+        let store = WalletStore::create_with_kdf(
+            &database,
+            "create-reopen-passphrase",
+            KdfConfig::testing(),
+        )
+        .expect("create wallet database");
+        let metadata = std::fs::symlink_metadata(&database).expect("created database metadata");
+        assert!(metadata.file_type().is_file());
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.uid(), rustix::process::geteuid().as_raw());
+        assert_eq!(metadata.nlink(), 1);
+        drop(store);
+
+        let mut reopened = WalletStore::open(&database).expect("reopen wallet database");
+        assert!(reopened.is_locked());
+        reopened
+            .unlock("create-reopen-passphrase")
+            .expect("unlock reopened wallet database");
+    }
 
     #[test]
     fn secrets_require_unlock_and_ciphertext_does_not_contain_cleartext() {
@@ -3585,7 +4775,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         const PASSPHRASE: &str = "production-tranche-terminal-release";
-        let directory = tempfile::tempdir().expect("private wallet directory");
+        let directory = unix_private_tempdir();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private wallet directory permissions");
         let database = directory.path().join("wallet.sqlite3");

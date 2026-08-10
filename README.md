@@ -16,7 +16,18 @@ adapters.
 The checked-in service executable now requires an explicit existing wallet
 database, opens it through the platform filesystem checks in a locked state,
 and shares one decrypted-key authority between runtime control and encrypted
-provider permissions. ABI wallet status/unlock/lock and a narrow provider
+provider permissions. Linux, Android, and iOS persistent paths are eligible
+in source only through a process-owned `0700` directory and a regular,
+single-link `0600` database. Creation requires an absent path and atomically
+precreates that file before SQLite opens it without create permission. The
+selected entries may not be symlinks, and the file identity is checked around
+SQLite's no-follow open. This policy has been executed on Linux; Android and
+iOS target/runtime qualification remains required. The mobile host must still
+establish the app sandbox, ACL and data-protection policy, backup exclusion,
+and Keystore/Keychain key wrapping. Generated mobile bindings remain absent,
+and no value/provider release gate is enabled.
+
+ABI wallet status/unlock/lock and a narrow provider
 control surface are implemented. One library composition can bind an exact
 pre-existing HNS account selector to that identical shared authority and add
 `hns_requestAccounts`/`hns_accounts`. A second library composition adds live,
