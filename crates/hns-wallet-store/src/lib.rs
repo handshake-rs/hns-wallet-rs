@@ -34,6 +34,8 @@ pub const MAX_REPLAY_LIFETIME_SECONDS: u64 = 86_400;
 pub const MAX_APPROVAL_LIFETIME_SECONDS: u64 = 3_600;
 pub const MAX_ENTITY_BATCH_OPERATIONS: usize = 16_384;
 pub const MAX_PASSPHRASE_BYTES: usize = 1_024;
+/// Exact output size of `bip39::Mnemonic::to_seed_normalized`.
+pub const RECOVERY_SEED_BYTES: usize = 64;
 
 const DATABASE_ID_BYTES: usize = 16;
 const SALT_BYTES: usize = 16;
@@ -380,6 +382,54 @@ impl WalletStore {
         Self::create_with_kdf(path, passphrase, KdfConfig::default())
     }
 
+    /// Creates a new wallet database and runs one product initializer before
+    /// releasing the new-file cleanup guard.
+    ///
+    /// The callback receives the same unlocked store that is returned on
+    /// success. If it returns an error, the store connection is closed and the
+    /// creation guard removes only the database and sidecars attributable to
+    /// this invocation. Product initialization should still use an atomic
+    /// store operation so a process interruption cannot expose partial rows.
+    pub fn create_with_initializer<T>(
+        path: impl AsRef<Path>,
+        passphrase: &str,
+        initializer: impl FnOnce(&mut Self) -> Result<T, StoreError>,
+    ) -> Result<(Self, T), StoreError> {
+        Self::create_with_kdf_and_initializer(
+            path,
+            passphrase,
+            KdfConfig::default(),
+            |_| Ok(()),
+            initializer,
+        )
+    }
+
+    /// Creates a new wallet database and transfers ownership of its unlocked
+    /// store into a fallible product constructor before releasing the
+    /// new-file cleanup guard.
+    ///
+    /// This is the product-facing counterpart to `create_with_initializer`:
+    /// the callback may return a controller or service that owns the store.
+    /// Store setup and final identity-validation failures convert into the
+    /// product's error type. If product construction fails after committing
+    /// bootstrap records, the still-armed guard removes only artifacts owned
+    /// by this creation attempt.
+    pub fn create_with_owned_initializer<T, E>(
+        path: impl AsRef<Path>,
+        passphrase: &str,
+        initializer: impl FnOnce(Self) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        Self::create_with_kdf_and_owned_initializer(
+            path,
+            passphrase,
+            KdfConfig::default(),
+            initializer,
+        )
+    }
+
     fn create_with_kdf(
         path: impl AsRef<Path>,
         passphrase: &str,
@@ -394,10 +444,58 @@ impl WalletStore {
         kdf: KdfConfig,
         after_migration: impl FnOnce(&Connection) -> Result<(), StoreError>,
     ) -> Result<Self, StoreError> {
+        let (store, ()) =
+            Self::create_with_kdf_and_initializer(path, passphrase, kdf, after_migration, |_| {
+                Ok(())
+            })?;
+        Ok(store)
+    }
+
+    fn create_with_kdf_and_initializer<T>(
+        path: impl AsRef<Path>,
+        passphrase: &str,
+        kdf: KdfConfig,
+        after_migration: impl FnOnce(&Connection) -> Result<(), StoreError>,
+        initializer: impl FnOnce(&mut Self) -> Result<T, StoreError>,
+    ) -> Result<(Self, T), StoreError> {
+        let (mut store, mut created_file, path) =
+            Self::create_pending_with_kdf(path, passphrase, kdf, after_migration)?;
+        let initialized = initializer(&mut store)?;
+        complete_wallet_creation(&mut created_file, &path)?;
+        Ok((store, initialized))
+    }
+
+    fn create_with_kdf_and_owned_initializer<T, E>(
+        path: impl AsRef<Path>,
+        passphrase: &str,
+        kdf: KdfConfig,
+        initializer: impl FnOnce(Self) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let (store, mut created_file, path) =
+            Self::create_pending_with_kdf(path, passphrase, kdf, |_| Ok(())).map_err(E::from)?;
+        let initialized = initializer(store)?;
+        if let Err(error) = complete_wallet_creation(&mut created_file, &path) {
+            // A successful product may now own the only live SQLite
+            // connection. Close it before the armed guard attempts cleanup.
+            drop(initialized);
+            return Err(E::from(error));
+        }
+        Ok(initialized)
+    }
+
+    fn create_pending_with_kdf(
+        path: impl AsRef<Path>,
+        passphrase: &str,
+        kdf: KdfConfig,
+        after_migration: impl FnOnce(&Connection) -> Result<(), StoreError>,
+    ) -> Result<(Self, Option<CreatedWalletFile>, PathBuf), StoreError> {
         validate_passphrase(passphrase)?;
         kdf.validate()?;
         let location = validate_wallet_location(path.as_ref(), WalletPathRequirement::Missing)?;
-        let mut created_file = if is_in_memory(&location.path) {
+        let created_file = if is_in_memory(&location.path) {
             None
         } else {
             Some(create_new_wallet_file(&location.path)?)
@@ -435,17 +533,15 @@ impl WalletStore {
         set_meta(&transaction, "kdf_config", &kdf_json)?;
         set_meta(&transaction, "key_check", &sentinel)?;
         transaction.commit()?;
-        if let Some(created_file) = created_file.as_mut() {
-            created_file.disarm();
-        }
 
-        Ok(Self {
+        let store = Self {
             connection,
             database_id,
             salt,
             kdf,
             key: Some(key),
-        })
+        };
+        Ok((store, created_file, location.path))
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
@@ -560,6 +656,194 @@ impl WalletStore {
              updated_at_unix=excluded.updated_at_unix",
             params![id, kind.label(), encrypted, updated_at_unix],
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically initializes the immutable recovery seed and the first wallet
+    /// account record. Both namespaces must be empty and both target IDs must
+    /// be absent. The immediate transaction serializes competing initializers;
+    /// a failure before commit leaves neither row behind.
+    pub fn initialize_recovery_seed_and_wallet_account<T: Serialize>(
+        &mut self,
+        recovery_seed_id: &[u8],
+        recovery_seed: &[u8],
+        wallet_account_id: &[u8],
+        wallet_account: &T,
+        updated_at_unix: u64,
+    ) -> Result<u64, StoreError> {
+        self.initialize_recovery_seed_and_wallet_account_with_hook(
+            recovery_seed_id,
+            recovery_seed,
+            wallet_account_id,
+            wallet_account,
+            updated_at_unix,
+            || Ok(()),
+        )
+    }
+
+    fn initialize_recovery_seed_and_wallet_account_with_hook<T: Serialize>(
+        &mut self,
+        recovery_seed_id: &[u8],
+        recovery_seed: &[u8],
+        wallet_account_id: &[u8],
+        wallet_account: &T,
+        updated_at_unix: u64,
+        after_seed_write: impl FnOnce() -> Result<(), StoreError>,
+    ) -> Result<u64, StoreError> {
+        validate_id(recovery_seed_id)?;
+        validate_id(wallet_account_id)?;
+        if recovery_seed.len() != RECOVERY_SEED_BYTES {
+            return Err(StoreError::InvalidRecoverySeed);
+        }
+        let encoded_account = Zeroizing::new(serde_json::to_vec(wallet_account)?);
+        if encoded_account.is_empty() || encoded_account.len() > MAX_STATE_BYTES {
+            return Err(StoreError::RecordTooLarge);
+        }
+
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let current_seed: Option<(String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT kind, encrypted_value FROM secrets WHERE id=?1",
+                params![recovery_seed_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((kind, encrypted)) = current_seed {
+            if kind != SecretKind::RecoverySeed.label() {
+                return Err(StoreError::KindMismatch);
+            }
+            decrypt_record(
+                key,
+                &self.database_id,
+                SecretKind::RecoverySeed.label(),
+                recovery_seed_id,
+                &encrypted,
+            )?;
+            return Err(StoreError::BootstrapConflict);
+        }
+
+        let recovery_seed_count: u64 = transaction.query_row(
+            "SELECT COUNT(*) FROM secrets WHERE kind=?1",
+            params![SecretKind::RecoverySeed.label()],
+            |row| row.get(0),
+        )?;
+        if recovery_seed_count != 0 {
+            return Err(StoreError::BootstrapConflict);
+        }
+
+        if let Some(actual) = authenticated_entity_revision(
+            &transaction,
+            key,
+            &self.database_id,
+            EntityKind::WalletAccount,
+            wallet_account_id,
+        )? {
+            return Err(StoreError::StaleRevision {
+                expected: 0,
+                actual,
+            });
+        }
+        let wallet_account_count: u64 = transaction.query_row(
+            "SELECT COUNT(*) FROM encrypted_entities WHERE entity_kind=?1",
+            params![EntityKind::WalletAccount.label()],
+            |row| row.get(0),
+        )?;
+        if wallet_account_count != 0 {
+            return Err(StoreError::BootstrapConflict);
+        }
+
+        let account_revision = 1_u64;
+        let encrypted_seed = encrypt_record(
+            key,
+            &self.database_id,
+            SecretKind::RecoverySeed.label(),
+            recovery_seed_id,
+            recovery_seed,
+        )?;
+        let encrypted_account = encrypt_record(
+            key,
+            &self.database_id,
+            &entity_label(EntityKind::WalletAccount),
+            &revisioned_aad_id(wallet_account_id, account_revision, updated_at_unix, None)?,
+            &encoded_account,
+        )?;
+
+        transaction.execute(
+            "INSERT INTO secrets(id, kind, encrypted_value, updated_at_unix)
+             VALUES(?1, ?2, ?3, ?4)",
+            params![
+                recovery_seed_id,
+                SecretKind::RecoverySeed.label(),
+                encrypted_seed,
+                updated_at_unix,
+            ],
+        )?;
+        after_seed_write()?;
+        transaction.execute(
+            "INSERT INTO encrypted_entities(
+                 entity_kind, record_id, revision, encrypted_value, updated_at_unix
+             ) VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![
+                EntityKind::WalletAccount.label(),
+                wallet_account_id,
+                account_revision,
+                encrypted_account,
+                updated_at_unix,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(account_revision)
+    }
+
+    /// Authenticates that `recovery_seed_id` is the only recovery seed in this
+    /// database. Native products use this with their exact one-account check
+    /// so an interrupted or legacy partial bootstrap is never silently
+    /// accepted as a complete mobile wallet.
+    pub fn validate_single_recovery_seed(
+        &mut self,
+        recovery_seed_id: &[u8],
+    ) -> Result<(), StoreError> {
+        validate_id(recovery_seed_id)?;
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: Option<(String, Vec<u8>)> = transaction
+            .query_row(
+                "SELECT kind, encrypted_value FROM secrets WHERE id=?1",
+                params![recovery_seed_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((kind, encrypted)) = current else {
+            return Err(StoreError::BootstrapConflict);
+        };
+        if kind != SecretKind::RecoverySeed.label() {
+            return Err(StoreError::KindMismatch);
+        }
+        let seed = decrypt_record(
+            key,
+            &self.database_id,
+            SecretKind::RecoverySeed.label(),
+            recovery_seed_id,
+            &encrypted,
+        )?;
+        if seed.len() != RECOVERY_SEED_BYTES {
+            return Err(StoreError::InvalidRecoverySeed);
+        }
+        let recovery_seed_count: u64 = transaction.query_row(
+            "SELECT COUNT(*) FROM secrets WHERE kind=?1",
+            params![SecretKind::RecoverySeed.label()],
+            |row| row.get(0),
+        )?;
+        if recovery_seed_count != 1 {
+            return Err(StoreError::BootstrapConflict);
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -2306,6 +2590,18 @@ impl WalletStore {
     }
 }
 
+fn complete_wallet_creation(
+    created_file: &mut Option<CreatedWalletFile>,
+    path: &Path,
+) -> Result<(), StoreError> {
+    if let Some(created_file) = created_file.as_mut() {
+        let completed_location = validate_wallet_location(path, WalletPathRequirement::Existing)?;
+        validate_created_wallet_location(created_file, &completed_location)?;
+        created_file.disarm();
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StoredWorkflow<T> {
     pub id: WorkflowId,
@@ -3746,6 +4042,10 @@ pub enum StoreError {
     KindMismatch,
     #[error("wallet recovery seed is immutable and cannot be deleted or replaced")]
     ProtectedSecret,
+    #[error("wallet recovery seed must be exactly 64 bytes")]
+    InvalidRecoverySeed,
+    #[error("wallet seed/account bootstrap conflicts with existing initialization state")]
+    BootstrapConflict,
     #[error("a workflow identifier cannot change workflow kind")]
     WorkflowKindMismatch,
     #[error("record identifier is invalid")]
@@ -3812,6 +4112,26 @@ pub enum StoreError {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    struct OwnedWalletProduct {
+        store: WalletStore,
+        account_revision: u64,
+    }
+
+    #[cfg(unix)]
+    #[derive(Debug, Eq, PartialEq)]
+    enum OwnedWalletProductError {
+        Store,
+        Negotiation,
+    }
+
+    #[cfg(unix)]
+    impl From<StoreError> for OwnedWalletProductError {
+        fn from(_: StoreError) -> Self {
+            Self::Store
+        }
+    }
 
     #[cfg(unix)]
     fn unix_private_tempdir() -> tempfile::TempDir {
@@ -4266,6 +4586,153 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unix_failed_product_initializer_keeps_creation_cleanup_armed() {
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("wallet.sqlite3");
+
+        assert!(matches!(
+            WalletStore::create_with_kdf_and_initializer(
+                &database,
+                "product-initializer-passphrase",
+                KdfConfig::testing(),
+                |_| Ok(()),
+                |store| {
+                    store.initialize_recovery_seed_and_wallet_account(
+                        &[61_u8; 16],
+                        &[62_u8; 64],
+                        &[63_u8; 32],
+                        &json!({"account": 63}),
+                        1,
+                    )?;
+                    Err::<(), _>(StoreError::CorruptMetadata)
+                },
+            ),
+            Err(StoreError::CorruptMetadata)
+        ));
+        assert!(!database.exists());
+        for sidecar in sqlite_sidecar_paths(&database) {
+            assert!(!sidecar.exists());
+        }
+
+        let (store, revision) = WalletStore::create_with_kdf_and_initializer(
+            &database,
+            "product-initializer-passphrase",
+            KdfConfig::testing(),
+            |_| Ok(()),
+            |store| {
+                store.initialize_recovery_seed_and_wallet_account(
+                    &[61_u8; 16],
+                    &[62_u8; 64],
+                    &[63_u8; 32],
+                    &json!({"account": 63}),
+                    2,
+                )
+            },
+        )
+        .expect("retry complete product initialization");
+        assert_eq!(revision, 1);
+        drop(store);
+
+        let mut reopened = WalletStore::open(&database).expect("reopen initialized wallet");
+        reopened
+            .unlock("product-initializer-passphrase")
+            .expect("unlock initialized wallet");
+        assert!(
+            reopened
+                .get_secret(&[61_u8; 16], SecretKind::RecoverySeed)
+                .expect("read initialized seed")
+                .is_some()
+        );
+        assert!(
+            reopened
+                .wallet_account::<serde_json::Value>(&[63_u8; 32])
+                .expect("read initialized account")
+                .is_some()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_owned_product_initializer_cleans_failure_and_returns_live_success() {
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("wallet.sqlite3");
+        let passphrase = "owned-product-initializer-passphrase";
+
+        let failure: Result<OwnedWalletProduct, OwnedWalletProductError> =
+            WalletStore::create_with_kdf_and_owned_initializer(
+                &database,
+                passphrase,
+                KdfConfig::testing(),
+                |mut store| {
+                    let account_revision = store
+                        .initialize_recovery_seed_and_wallet_account(
+                            &[71_u8; 16],
+                            &[72_u8; RECOVERY_SEED_BYTES],
+                            &[73_u8; 32],
+                            &json!({"account": 73}),
+                            1,
+                        )
+                        .map_err(OwnedWalletProductError::from)?;
+                    let _product = OwnedWalletProduct {
+                        store,
+                        account_revision,
+                    };
+                    Err(OwnedWalletProductError::Negotiation)
+                },
+            );
+        assert!(matches!(failure, Err(OwnedWalletProductError::Negotiation)));
+        assert!(!database.exists());
+        for sidecar in sqlite_sidecar_paths(&database) {
+            assert!(!sidecar.exists());
+        }
+
+        let mut product: OwnedWalletProduct = WalletStore::create_with_kdf_and_owned_initializer(
+            &database,
+            passphrase,
+            KdfConfig::testing(),
+            |mut store| {
+                let account_revision = store
+                    .initialize_recovery_seed_and_wallet_account(
+                        &[71_u8; 16],
+                        &[72_u8; RECOVERY_SEED_BYTES],
+                        &[73_u8; 32],
+                        &json!({"account": 73}),
+                        2,
+                    )
+                    .map_err(OwnedWalletProductError::from)?;
+                Ok::<_, OwnedWalletProductError>(OwnedWalletProduct {
+                    store,
+                    account_revision,
+                })
+            },
+        )
+        .expect("owned product initialization");
+        assert_eq!(product.account_revision, 1);
+        assert!(database.exists());
+        product
+            .store
+            .validate_single_recovery_seed(&[71_u8; 16])
+            .expect("product-owned store remains live");
+        assert!(
+            product
+                .store
+                .wallet_account::<serde_json::Value>(&[73_u8; 32])
+                .expect("read product-owned account")
+                .is_some()
+        );
+        drop(product);
+
+        let mut reopened = WalletStore::open(&database).expect("reopen owned product wallet");
+        reopened
+            .unlock(passphrase)
+            .expect("unlock owned product wallet");
+        reopened
+            .validate_single_recovery_seed(&[71_u8; 16])
+            .expect("validate reopened product seed");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn unix_cleanup_guard_preserves_replaced_database_identity() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -4555,6 +5022,190 @@ mod tests {
             store.get_secret(b"seed", SecretKind::RecoverySeed),
             Err(StoreError::Locked)
         ));
+    }
+
+    #[test]
+    fn seed_and_initial_account_commit_together_or_not_at_all() {
+        let mut store = WalletStore::create_in_memory("atomic bootstrap passphrase")
+            .expect("create encrypted store");
+        let seed_id = [41_u8; 16];
+        let account_id = [42_u8; 32];
+        let account = json!({"wallet": 41, "account": 42});
+
+        assert!(matches!(
+            store.initialize_recovery_seed_and_wallet_account_with_hook(
+                &seed_id,
+                &[43_u8; 64],
+                &account_id,
+                &account,
+                7,
+                || Err(StoreError::CorruptMetadata),
+            ),
+            Err(StoreError::CorruptMetadata)
+        ));
+        assert!(
+            store
+                .get_secret(&seed_id, SecretKind::RecoverySeed)
+                .expect("read rolled-back seed")
+                .is_none()
+        );
+        assert!(
+            store
+                .wallet_account::<serde_json::Value>(&account_id)
+                .expect("read rolled-back account")
+                .is_none()
+        );
+
+        let revision = store
+            .initialize_recovery_seed_and_wallet_account(
+                &seed_id,
+                &[43_u8; 64],
+                &account_id,
+                &account,
+                8,
+            )
+            .expect("atomic bootstrap");
+        assert_eq!(revision, 1);
+        assert_eq!(
+            store
+                .get_secret(&seed_id, SecretKind::RecoverySeed)
+                .expect("read seed")
+                .expect("seed present")
+                .as_slice(),
+            &[43_u8; 64]
+        );
+        let stored = store
+            .wallet_account::<serde_json::Value>(&account_id)
+            .expect("read account")
+            .expect("account present");
+        assert_eq!(stored.revision, 1);
+        assert_eq!(stored.value, account);
+        store
+            .validate_single_recovery_seed(&seed_id)
+            .expect("one exact authenticated recovery seed");
+
+        store
+            .put_secret(&[44_u8; 16], SecretKind::RecoverySeed, &[45_u8; 64], 9)
+            .expect("second seed fixture");
+        assert!(matches!(
+            store.validate_single_recovery_seed(&seed_id),
+            Err(StoreError::BootstrapConflict)
+        ));
+    }
+
+    #[test]
+    fn single_recovery_seed_validation_rejects_malformed_plaintext_length() {
+        for (case, length) in [63_usize, 65].into_iter().enumerate() {
+            let mut store = WalletStore::create_in_memory(&format!("seed length case {case}"))
+                .expect("malformed seed store");
+            let seed_id = [81_u8 + case as u8; 16];
+            store
+                .put_secret(&seed_id, SecretKind::RecoverySeed, &vec![82_u8; length], 1)
+                .expect("malformed seed fixture");
+            assert!(matches!(
+                store.validate_single_recovery_seed(&seed_id),
+                Err(StoreError::InvalidRecoverySeed)
+            ));
+        }
+
+        let mut initializer_store =
+            WalletStore::create_in_memory("malformed initializer seed store")
+                .expect("initializer store");
+        assert!(matches!(
+            initializer_store.initialize_recovery_seed_and_wallet_account(
+                &[84_u8; 16],
+                &[85_u8; RECOVERY_SEED_BYTES - 1],
+                &[86_u8; 32],
+                &json!({"account": 86}),
+                1,
+            ),
+            Err(StoreError::InvalidRecoverySeed)
+        ));
+        assert!(
+            initializer_store
+                .get_secret(&[84_u8; 16], SecretKind::RecoverySeed)
+                .expect("read rejected seed")
+                .is_none()
+        );
+        assert!(
+            initializer_store
+                .wallet_account::<serde_json::Value>(&[86_u8; 32])
+                .expect("read rejected account")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn seed_and_initial_account_reject_partial_or_duplicate_state() {
+        let seed_id = [51_u8; 16];
+        let account_id = [52_u8; 32];
+        let account = json!({"wallet": 51, "account": 52});
+
+        let mut seed_only =
+            WalletStore::create_in_memory("seed-only passphrase").expect("create seed-only store");
+        seed_only
+            .put_secret(&seed_id, SecretKind::RecoverySeed, &[53_u8; 64], 1)
+            .expect("seed fixture");
+        assert!(matches!(
+            seed_only.initialize_recovery_seed_and_wallet_account(
+                &seed_id,
+                &[53_u8; 64],
+                &account_id,
+                &account,
+                2,
+            ),
+            Err(StoreError::BootstrapConflict)
+        ));
+        assert!(
+            seed_only
+                .wallet_account::<serde_json::Value>(&account_id)
+                .expect("read absent account")
+                .is_none()
+        );
+
+        let mut account_only = WalletStore::create_in_memory("account-only passphrase")
+            .expect("create account-only store");
+        account_only
+            .save_wallet_account(&account_id, 0, &account, 1)
+            .expect("account fixture");
+        assert!(matches!(
+            account_only.initialize_recovery_seed_and_wallet_account(
+                &seed_id,
+                &[53_u8; 64],
+                &account_id,
+                &account,
+                2,
+            ),
+            Err(StoreError::StaleRevision {
+                expected: 0,
+                actual: 1,
+            })
+        ));
+        assert!(
+            account_only
+                .get_secret(&seed_id, SecretKind::RecoverySeed)
+                .expect("read absent seed")
+                .is_none()
+        );
+
+        let other_seed_id = [54_u8; 16];
+        let other_account_id = [55_u8; 32];
+        assert!(matches!(
+            seed_only.initialize_recovery_seed_and_wallet_account(
+                &other_seed_id,
+                &[56_u8; 64],
+                &other_account_id,
+                &account,
+                3,
+            ),
+            Err(StoreError::BootstrapConflict)
+        ));
+        assert!(
+            seed_only
+                .get_secret(&other_seed_id, SecretKind::RecoverySeed)
+                .expect("read absent second seed")
+                .is_none()
+        );
     }
 
     #[test]

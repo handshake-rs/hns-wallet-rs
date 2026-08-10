@@ -61,6 +61,29 @@ The store rejects empty passphrases and inputs larger than 1,024 bytes at its
 own API boundary; this is a resource/safety bound, not a substitute for device
 key wrapping or a password-strength policy.
 
+Native HNS bootstrap keeps its 24-word mnemonic in a zeroizing BIP-39 value and
+exposes text only through the dedicated recovery-display wrapper. It generates
+a nonzero random local account ID, fixes the HD account component to zero, and
+constructs only a non-value, non-settlement account from an explicit network
+and restore birthday. The encrypted, exactly 64-byte BIP-39 seed and initial
+authenticated `WalletAccount` are inserted under one immediate transaction
+with both namespaces required empty. Reopen authenticates the selected seed,
+requires that exact plaintext length, and requires a singleton recovery-seed
+namespace. Duplicate, malformed, or partial initialization is an error; the
+initializer never fills in whichever half is missing.
+
+The borrowed create-with-initializer boundary keeps the identity-safe new-file
+cleanup guard armed through its callback. The owned form transfers
+`WalletStore` into the fallible store-owning product constructor and keeps the
+guard armed through service/controller negotiation; its error may be any
+`E: From<StoreError>`. A returned construction failure drops the product and
+removes the attributable new database before any recovery phrase is returned.
+A hard process termination cannot run RAII cleanup, so a metadata-only file is
+detected as incomplete rather than treated as authority to insert a seed or
+account later. Termination after the atomic bootstrap commit but before phrase
+display remains a product-level delivery/acknowledgement problem and is not
+solved by the cleanup guard.
+
 The persistent subprocess gives runtime control and provider persistence clones
 of one non-debuggable `SharedWalletStore`; it does not open a second unlocked
 permission connection or retain a second derived record key. Construction

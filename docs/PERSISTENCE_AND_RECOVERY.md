@@ -53,6 +53,29 @@ Duplicate `(entity kind, record ID)` operations and stale writers fail before a
 partial batch becomes visible. Secret record IDs cannot change kinds; recovery
 seed bytes are additionally immutable once inserted.
 
+The native HNS create/restore bootstrap has a narrower atomic initializer. It
+accepts exactly the 64-byte output of BIP-39 seed derivation and one exact
+initial `WalletAccount`, requires both the recovery-seed and wallet-account
+namespaces to be empty, and checks the target seed ID and account revision-zero
+absence under one immediate transaction. Both ciphertexts are prepared before
+the first insert. A malformed seed length, stale account, duplicate seed,
+seed-only state, account-only state, encryption error, or injected failure
+rolls the transaction back, so neither record can survive alone. Reopen
+validation authenticates the selected seed, requires its plaintext length to
+equal `RECOVERY_SEED_BYTES` (64), and still requires exactly one recovery-seed
+row. This is intentionally distinct from the compatible legacy seed-only
+`create_wallet` and `restore_wallet` APIs.
+
+The HNS bootstrap helper generates or parses exactly 24 normalized English
+BIP-39 words. New profiles retain the established random `WalletId`; restored
+profiles retain the established mnemonic-derived `hns-wallet-id/v1` value. A
+fresh nonzero wallet-local `AccountId` is paired with stable HD account index
+zero. Network and restore birthday are explicit, while lookahead 100, two
+confirmations, 546 atomic-unit dust, and disabled value/settlement gates are
+fixed defaults. It constructs no backend and performs no node I/O. The phrase
+remains in a zeroizing mnemonic until it is consumed into the dedicated
+high-risk display wrapper.
+
 HNS Shakedex seller keys have a dedicated deletion-protected encrypted entity
 namespace. A legacy-defaulted WalletAccount gate starts as scan-required. The
 runtime CAS-saves a durable scanning fence before the first 32-byte script
@@ -473,14 +496,31 @@ exact mode `0600`. Creation requires the path to be absent, atomically
 precreates the file with create-new semantics, sets `0600` through the open
 file handle, and then asks SQLite to open it without create permission. The
 database and its `-wal`, `-shm`, and `-journal` names must all be absent before
-creation. An armed guard retains the created database identity until the four
-initialization metadata rows commit. On failure it attempts to remove the
-database only if the path still names that same regular, same-effective-UID,
-single-link inode, and attempts to remove only regular, same-effective-UID,
-single-link sidecars that
-were absent at preflight. An identity replacement or unowned artifact is
-preserved rather than guessed away. A failed create never configures or
-migrates a pre-existing database or sidecar.
+creation. Ordinary creation retains an armed guard until the four
+initialization metadata rows commit. `create_with_initializer` retains that
+same guard through one borrowed caller-supplied initializer.
+`create_with_owned_initializer` instead transfers the unlocked `WalletStore`
+into a fallible product constructor, accepts the product's richer
+`E: From<StoreError>` error, and retains the guard until the complete
+store-owning controller or service has been returned. Both variants recheck the
+created file identity before disarming. A returned constructor error therefore
+drops the product-owned store and attempts cleanup of the whole new database,
+including a seed/account transaction that may already have committed; under
+the validated unchanged identity, no invocation-owned durable seed remains
+when product construction fails before the recovery phrase is returned. On
+failure the guard removes the database only if the path still names that same
+regular, same-effective-UID, single-link inode, and attempts to remove only
+regular, same-effective-UID, single-link sidecars that were absent at preflight.
+An identity replacement or unowned artifact is preserved rather than guessed
+away. A failed create never configures or migrates a pre-existing database or
+sidecar. Abrupt process termination does not run the guard; startup must treat
+a recognized database without the exact seed/account bootstrap pair as
+incomplete and fail closed, not silently create the missing half. The mobile
+opener authenticates the selected wallet's seed, requires its exact 64-byte
+plaintext shape, and requires it to be the only recovery seed before accepting
+the single account. Avoiding loss on termination after a complete bootstrap
+commit but before phrase display requires a product-level
+display/acknowledgement recovery design; RAII alone cannot prove delivery.
 
 The selected directory and database entry may not be symlinks. System-level
 ancestor aliases are canonicalized once. The prefix above the first directory

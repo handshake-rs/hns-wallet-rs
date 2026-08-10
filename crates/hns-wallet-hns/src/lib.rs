@@ -140,6 +140,27 @@ impl HnsNetwork {
     }
 }
 
+/// Explicit chain policy for the one-account native-wallet bootstrap.
+///
+/// Account derivation, gap limits, confirmation policy, dust policy, and all
+/// value gates remain fixed by the reviewed wallet defaults. A product must
+/// choose the network and an honest restore birthday instead of inheriting a
+/// network-dependent implicit value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HnsBootstrapPolicy {
+    pub network: HnsNetwork,
+    pub birthday_height: u64,
+}
+
+impl HnsBootstrapPolicy {
+    pub const fn new(network: HnsNetwork, birthday_height: u64) -> Self {
+        Self {
+            network,
+            birthday_height,
+        }
+    }
+}
+
 fn shakedex_network_binding(network: HnsNetwork) -> Result<NetworkBinding, HnsWalletError> {
     let (_, genesis_hash) = name_workflow::expected_chain_identity(network)?;
     let magic = match network {
@@ -177,15 +198,50 @@ pub struct CreatedWallet {
     pub recovery_phrase: RecoveryPhrase,
 }
 
+fn generate_24_word_mnemonic() -> Result<Mnemonic, HnsWalletError> {
+    Mnemonic::generate_in(Language::English, 24).map_err(|_| HnsWalletError::Randomness)
+}
+
+/// Generates the random wallet-local identifier used by the existing create
+/// path. Recovery deliberately derives its identifier from the mnemonic
+/// instead, preserving the established wallet semantics.
+pub fn generate_wallet_id() -> Result<WalletId, HnsWalletError> {
+    let mut wallet_id = [0_u8; 16];
+    getrandom::fill(&mut wallet_id).map_err(|_| HnsWalletError::Randomness)?;
+    Ok(WalletId::new(wallet_id))
+}
+
+/// Generates a nonzero random account identifier. This identifier is local
+/// profile metadata; on-chain recovery is anchored by the stable account
+/// derivation index rather than this random value.
+pub fn generate_account_id() -> Result<AccountId, HnsWalletError> {
+    for _ in 0..16 {
+        let mut account_id = [0_u8; 16];
+        getrandom::fill(&mut account_id).map_err(|_| HnsWalletError::Randomness)?;
+        if account_id != [0_u8; 16] {
+            return Ok(AccountId::new(account_id));
+        }
+    }
+    Err(HnsWalletError::Randomness)
+}
+
+fn wallet_id_from_mnemonic(mnemonic: &Mnemonic) -> WalletId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hns-wallet-id/v1");
+    let seed = Zeroizing::new(mnemonic.to_seed_normalized(""));
+    hasher.update(seed.as_slice());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    WalletId::new(id)
+}
+
 pub fn create_wallet(
     store: &mut WalletStore,
     now_unix: u64,
 ) -> Result<CreatedWallet, HnsWalletError> {
-    let mnemonic =
-        Mnemonic::generate_in(Language::English, 24).map_err(|_| HnsWalletError::Randomness)?;
-    let mut wallet_id = [0_u8; 16];
-    getrandom::fill(&mut wallet_id).map_err(|_| HnsWalletError::Randomness)?;
-    let wallet_id = WalletId::new(wallet_id);
+    let mnemonic = generate_24_word_mnemonic()?;
+    let wallet_id = generate_wallet_id()?;
     store_seed(store, wallet_id, &mnemonic, now_unix)?;
     Ok(CreatedWallet {
         wallet_id,
@@ -200,13 +256,7 @@ pub fn restore_wallet(
 ) -> Result<WalletId, HnsWalletError> {
     let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)
         .map_err(|_| HnsWalletError::InvalidRecoveryPhrase)?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"hns-wallet-id/v1");
-    hasher.update(mnemonic.to_seed_normalized(""));
-    let digest: [u8; 32] = hasher.finalize().into();
-    let mut id = [0_u8; 16];
-    id.copy_from_slice(&digest[..16]);
-    let wallet_id = WalletId::new(id);
+    let wallet_id = wallet_id_from_mnemonic(&mnemonic);
     store_seed(store, wallet_id, &mnemonic, now_unix)?;
     Ok(wallet_id)
 }
@@ -1138,6 +1188,30 @@ pub struct HnsRuntimeConfig {
 }
 
 impl HnsRuntimeConfig {
+    /// Builds the fixed, non-value account configuration used by native
+    /// create/restore bootstrap. Network and restore birthday are explicit;
+    /// all other policy remains at conservative wallet defaults.
+    pub fn default_non_value(
+        wallet_id: WalletId,
+        account_id: AccountId,
+        policy: HnsBootstrapPolicy,
+    ) -> Result<Self, HnsWalletError> {
+        let config = Self {
+            wallet_id,
+            account_id,
+            account_derivation_index: 0,
+            network: policy.network,
+            birthday_height: policy.birthday_height,
+            restore_lookahead: DEFAULT_RESTORE_LOOKAHEAD,
+            minimum_confirmations: 2,
+            dust_threshold: BaseUnits::new(DEFAULT_DUST_THRESHOLD),
+            value_operations_enabled: false,
+            settlement_enabled: false,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn validate(&self) -> Result<(), HnsWalletError> {
         if self.account_id.as_bytes().iter().all(|byte| *byte == 0) {
             return Err(HnsWalletError::InvalidRuntimeConfiguration);
@@ -1201,6 +1275,125 @@ pub struct HnsAccountRecord {
     pub last_used_name: Option<u32>,
     #[serde(default)]
     pub last_used_shakedex: Option<u32>,
+}
+
+impl HnsAccountRecord {
+    /// Constructs an empty account projection for a configuration whose value
+    /// and settlement paths are both disabled. No backend or node is touched.
+    pub fn initial_non_value(config: HnsRuntimeConfig) -> Result<Self, HnsWalletError> {
+        config.validate()?;
+        if config.value_operations_enabled || config.settlement_enabled {
+            return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+        }
+        let scan_end = config
+            .restore_lookahead
+            .checked_sub(1)
+            .ok_or(HnsWalletError::InvalidLookahead)?;
+        Ok(Self {
+            config,
+            next_receive_index: 0,
+            next_change_index: 0,
+            next_name_index: 0,
+            next_shakedex_index: 0,
+            external_scan_end: scan_end,
+            internal_scan_end: scan_end,
+            name_scan_end: scan_end,
+            shakedex_scan_end: scan_end,
+            shakedex_scan_complete: false,
+            shakedex_scan_in_progress: false,
+            last_used_external: None,
+            last_used_internal: None,
+            last_used_name: None,
+            last_used_shakedex: None,
+        })
+    }
+}
+
+/// Prepared seed plus one exact HNS account for native create or restore.
+///
+/// The mnemonic remains in a zeroizing BIP-39 value and is omitted from
+/// `Debug`. Persistence encrypts the 64-byte recovery seed and the initial
+/// account record in one store transaction. This type performs no node I/O and
+/// cannot enable value or settlement operations.
+pub struct HnsWalletBootstrap {
+    mnemonic: Mnemonic,
+    wallet_id: WalletId,
+    account: HnsAccountRecord,
+}
+
+impl HnsWalletBootstrap {
+    /// Generates a new 24-word English mnemonic and a random wallet ID.
+    pub fn generate(policy: HnsBootstrapPolicy) -> Result<Self, HnsWalletError> {
+        let mnemonic = generate_24_word_mnemonic()?;
+        let wallet_id = generate_wallet_id()?;
+        Self::from_mnemonic(mnemonic, wallet_id, policy)
+    }
+
+    /// Parses exactly 24 normalized English BIP-39 words and derives the
+    /// recovery wallet ID using the existing `hns-wallet-id/v1` rule.
+    pub fn restore(phrase: &str, policy: HnsBootstrapPolicy) -> Result<Self, HnsWalletError> {
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)
+            .map_err(|_| HnsWalletError::InvalidRecoveryPhrase)?;
+        if mnemonic.word_count() != 24 {
+            return Err(HnsWalletError::InvalidRecoveryPhrase);
+        }
+        let wallet_id = wallet_id_from_mnemonic(&mnemonic);
+        Self::from_mnemonic(mnemonic, wallet_id, policy)
+    }
+
+    fn from_mnemonic(
+        mnemonic: Mnemonic,
+        wallet_id: WalletId,
+        policy: HnsBootstrapPolicy,
+    ) -> Result<Self, HnsWalletError> {
+        let account_id = generate_account_id()?;
+        let config = HnsRuntimeConfig::default_non_value(wallet_id, account_id, policy)?;
+        let account = HnsAccountRecord::initial_non_value(config)?;
+        Ok(Self {
+            mnemonic,
+            wallet_id,
+            account,
+        })
+    }
+
+    pub const fn wallet_id(&self) -> WalletId {
+        self.wallet_id
+    }
+
+    pub fn account_record(&self) -> &HnsAccountRecord {
+        &self.account
+    }
+
+    /// Atomically writes the immutable seed and initial account. The store
+    /// requires both relevant namespaces to be empty, so replaying bootstrap
+    /// or encountering seed-only/account-only state fails closed.
+    pub fn persist(&self, store: &mut WalletStore, now_unix: u64) -> Result<u64, StoreError> {
+        let seed = Zeroizing::new(self.mnemonic.to_seed_normalized(""));
+        store.initialize_recovery_seed_and_wallet_account(
+            self.wallet_id.as_bytes(),
+            seed.as_slice(),
+            &account_entity_id(&self.account.config),
+            &self.account,
+            now_unix,
+        )
+    }
+
+    /// Converts the mnemonic into the dedicated high-risk display wrapper.
+    /// Call this only after durable persistence succeeds.
+    pub fn into_recovery_phrase(self) -> RecoveryPhrase {
+        RecoveryPhrase(self.mnemonic.to_string())
+    }
+}
+
+impl fmt::Debug for HnsWalletBootstrap {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("HnsWalletBootstrap")
+            .field("mnemonic", &"[REDACTED]")
+            .field("wallet_id", &self.wallet_id)
+            .field("account", &self.account)
+            .finish()
+    }
 }
 
 /// Read-only selector for one exact pre-existing HNS account held by the same
@@ -7681,6 +7874,132 @@ mod tests {
             value_operations_enabled: false,
             settlement_enabled: false,
         }
+    }
+
+    fn twenty_four_word_phrase() -> String {
+        Mnemonic::from_entropy(&[0_u8; 32])
+            .expect("32-byte BIP-39 entropy")
+            .to_string()
+    }
+
+    #[test]
+    fn native_bootstrap_restores_one_non_value_account_atomically() {
+        let phrase = twenty_four_word_phrase();
+        assert_eq!(phrase.split_whitespace().count(), 24);
+        let policy = HnsBootstrapPolicy::new(HnsNetwork::Regtest, 123);
+        let bootstrap = HnsWalletBootstrap::restore(&phrase, policy).expect("prepare restore");
+
+        let mut legacy_store = WalletStore::create(":memory:", "legacy restore passphrase")
+            .expect("legacy restore store");
+        let legacy_wallet_id =
+            restore_wallet(&mut legacy_store, &phrase, 1).expect("legacy restore wallet ID");
+        assert_eq!(bootstrap.wallet_id(), legacy_wallet_id);
+
+        let account = bootstrap.account_record();
+        assert!(
+            account
+                .config
+                .account_id
+                .as_bytes()
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        assert_eq!(account.config.account_derivation_index, 0);
+        assert_eq!(account.config.network, HnsNetwork::Regtest);
+        assert_eq!(account.config.birthday_height, 123);
+        assert_eq!(account.config.restore_lookahead, DEFAULT_RESTORE_LOOKAHEAD);
+        assert_eq!(account.config.minimum_confirmations, 2);
+        assert_eq!(
+            account.config.dust_threshold,
+            BaseUnits::new(DEFAULT_DUST_THRESHOLD)
+        );
+        assert!(!account.config.value_operations_enabled);
+        assert!(!account.config.settlement_enabled);
+        assert_eq!(account.external_scan_end, DEFAULT_RESTORE_LOOKAHEAD - 1);
+        assert_eq!(account.internal_scan_end, DEFAULT_RESTORE_LOOKAHEAD - 1);
+        assert_eq!(account.name_scan_end, DEFAULT_RESTORE_LOOKAHEAD - 1);
+        assert_eq!(account.shakedex_scan_end, DEFAULT_RESTORE_LOOKAHEAD - 1);
+        assert!(!account.shakedex_scan_complete);
+        assert!(!format!("{bootstrap:?}").contains(&phrase));
+
+        let expected_account = account.clone();
+        let mut store = WalletStore::create(":memory:", "native bootstrap passphrase")
+            .expect("native bootstrap store");
+        assert_eq!(
+            bootstrap.persist(&mut store, 5).expect("persist bootstrap"),
+            1
+        );
+        let seed = store
+            .get_secret(bootstrap.wallet_id().as_bytes(), SecretKind::RecoverySeed)
+            .expect("read seed")
+            .expect("seed present");
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, &phrase)
+            .expect("parse fixture mnemonic");
+        assert_eq!(seed.as_slice(), mnemonic.to_seed_normalized("").as_slice());
+        let stored = store
+            .wallet_account::<HnsAccountRecord>(&account_entity_id(&expected_account.config))
+            .expect("read account")
+            .expect("account present");
+        assert_eq!(stored.revision, 1);
+        assert_eq!(stored.value, expected_account);
+
+        let displayed = bootstrap
+            .into_recovery_phrase()
+            .expose_for_dedicated_display();
+        assert_eq!(displayed, phrase);
+    }
+
+    #[test]
+    fn native_bootstrap_requires_24_words_and_rejects_replay() {
+        const TWELVE_WORD_PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let policy = HnsBootstrapPolicy::new(HnsNetwork::Testnet, 456);
+        assert!(matches!(
+            HnsWalletBootstrap::restore(TWELVE_WORD_PHRASE, policy),
+            Err(HnsWalletError::InvalidRecoveryPhrase)
+        ));
+
+        // The legacy seed-only API retains its historical support for valid
+        // BIP-39 word counts other than 24.
+        let mut legacy_store =
+            WalletStore::create(":memory:", "legacy twelve-word passphrase").expect("legacy store");
+        restore_wallet(&mut legacy_store, TWELVE_WORD_PHRASE, 1)
+            .expect("legacy twelve-word restore");
+
+        let phrase = twenty_four_word_phrase();
+        let first = HnsWalletBootstrap::restore(&phrase, policy).expect("first bootstrap");
+        let second = HnsWalletBootstrap::restore(&phrase, policy).expect("replayed bootstrap");
+        let mut store = WalletStore::create(":memory:", "replay bootstrap passphrase")
+            .expect("bootstrap store");
+        first.persist(&mut store, 2).expect("first persistence");
+        assert!(matches!(
+            second.persist(&mut store, 3),
+            Err(StoreError::BootstrapConflict)
+        ));
+        let accounts = store
+            .wallet_accounts::<HnsAccountRecord>(2)
+            .expect("complete account list");
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(&accounts[0].value, first.account_record());
+    }
+
+    #[test]
+    fn generated_native_bootstrap_uses_24_words_and_nonzero_account_id() {
+        let bootstrap =
+            HnsWalletBootstrap::generate(HnsBootstrapPolicy::new(HnsNetwork::Simnet, 0))
+                .expect("generated bootstrap");
+        assert!(
+            bootstrap
+                .account_record()
+                .config
+                .account_id
+                .as_bytes()
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+        let phrase = bootstrap
+            .into_recovery_phrase()
+            .expose_for_dedicated_display();
+        assert_eq!(phrase.split_whitespace().count(), 24);
     }
 
     fn test_derived_address(role: KeyRole, program: u8) -> DerivedHnsAddress {
