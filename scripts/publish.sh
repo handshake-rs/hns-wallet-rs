@@ -267,7 +267,14 @@ verify_archive_entry() {
     archive=$2
     archive_root=$3
     relative_path=$4
-    if ! tar -tf "$archive" | grep -Fqx "$archive_root/$relative_path"
+    ensure_release_tmp
+    archive_listing=$(mktemp "$release_tmp/archive-listing.XXXXXX")
+    if ! tar -tf "$archive" > "$archive_listing"
+    then
+        echo "error: unable to read normalized $package package archive" >&2
+        exit 1
+    fi
+    if ! grep -Fqx "$archive_root/$relative_path" "$archive_listing"
     then
         echo "error: normalized $package package omits $relative_path" >&2
         exit 1
@@ -281,8 +288,13 @@ verify_archive_copy() {
     relative_path=$4
     repository_path=$5
     verify_archive_entry "$package" "$archive" "$archive_root" "$relative_path"
-    if ! tar -xOf "$archive" "$archive_root/$relative_path" | \
-        cmp -s - "$repository_path"
+    archive_copy=$(mktemp "$release_tmp/archive-copy.XXXXXX")
+    if ! tar -xOf "$archive" "$archive_root/$relative_path" > "$archive_copy"
+    then
+        echo "error: unable to extract normalized $package $relative_path" >&2
+        exit 1
+    fi
+    if ! cmp -s "$archive_copy" "$repository_path"
     then
         echo "error: normalized $package $relative_path differs from $repository_path" >&2
         exit 1

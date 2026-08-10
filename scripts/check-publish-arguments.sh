@@ -6,6 +6,12 @@ cd "$repo_root"
 
 python3 scripts/test-verify-release.py
 
+if grep -Eq 'tar -(tf|xOf).*\|' scripts/publish.sh
+then
+    echo "error: archive verification must consume tar output before inspecting it" >&2
+    exit 1
+fi
+
 assert_rejected() {
     expected=$1
     shift

@@ -36,6 +36,9 @@ package-local changelog that references the canonical shared release notes.
 crates.io metadata, internal version requirements, immutable protocol source,
 dependency order, ABI release copies, and Ethereum contract artifact without
 compiling Rust or Solidity.
+Normalized archive inspection materializes complete tar listings and selected
+files before comparison so a successful match cannot hide an upstream tar read
+failure or emit a benign broken-pipe warning.
 
 ## 0.1.0 release source
 
