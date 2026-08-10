@@ -67,13 +67,13 @@ zeroize = { version = "1.8.1", features = ["derive"] }
 # Reviewed canonical Handshake protocol source. Every protocol crate is pinned
 # to one immutable revision; no mutable branch, tag, or sibling checkout is
 # allowed. This source adoption does not imply downstream release qualification.
-hns-covenants = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4331eee2265ebc43a28390517c24a958fa4b7733" }
-hns-marketplace-protocol = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4331eee2265ebc43a28390517c24a958fa4b7733" }
-hns-primitives = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4331eee2265ebc43a28390517c24a958fa4b7733" }
-hns-script = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4331eee2265ebc43a28390517c24a958fa4b7733" }
-hns-swap = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4331eee2265ebc43a28390517c24a958fa4b7733" }
-hns-transaction = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4331eee2265ebc43a28390517c24a958fa4b7733" }
-hns-urkel-proof = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "4331eee2265ebc43a28390517c24a958fa4b7733" }
+hns-covenants = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "b33b346780c8f6a9bb18a54390019486cdab0221" }
+hns-marketplace-protocol = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "b33b346780c8f6a9bb18a54390019486cdab0221" }
+hns-primitives = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "b33b346780c8f6a9bb18a54390019486cdab0221" }
+hns-script = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "b33b346780c8f6a9bb18a54390019486cdab0221" }
+hns-swap = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "b33b346780c8f6a9bb18a54390019486cdab0221" }
+hns-transaction = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "b33b346780c8f6a9bb18a54390019486cdab0221" }
+hns-urkel-proof = { version = "=0.2.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "b33b346780c8f6a9bb18a54390019486cdab0221" }
 
 # The only Bitcoin production synchronization implementation. The exact BDK
 # release is part of the encrypted changeset format contract.

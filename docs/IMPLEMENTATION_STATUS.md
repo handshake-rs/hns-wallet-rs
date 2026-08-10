@@ -59,7 +59,7 @@ Other exact blockers are:
 - name TRANSFER/FINALIZE source workflows consume fresh ephemeral authority and
   exact node action context, but their node/wallet restart/reorg/mempool/product
   qualification and provider/trusted-UI dispatch are not recorded;
-- canonical `hns-swap` 0.2 source is pinned to immutable revision `4331eee`, but
+- canonical `hns-swap` 0.2 source is pinned to immutable revision `b33b346`, but
   that protocol revision is unpublished and lacks consolidated qualification;
 - Android/iOS secure-path target/runtime qualification, host sandbox/ACL/data
   protection/backup policy, platform key wrapping, secure approval UI,
