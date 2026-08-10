@@ -31,7 +31,7 @@ pub use shakedex_key::{
 use name_workflow::{HnsInputReservationKind, HnsNameWorkflow};
 
 use core::fmt;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map::Entry};
 use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1650,23 +1650,12 @@ pub struct HnsChainCheckpoint {
     pub block_hash: [u8; 32],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HnsRecoveryState {
     pub checkpoints: Vec<HnsChainCheckpoint>,
     pub last_tip: Option<ChainTip>,
     pub last_common_ancestor: Option<u64>,
     pub last_reconciled_unix: u64,
-}
-
-impl Default for HnsRecoveryState {
-    fn default() -> Self {
-        Self {
-            checkpoints: Vec::new(),
-            last_tip: None,
-            last_common_ancestor: None,
-            last_reconciled_unix: 0,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1727,6 +1716,16 @@ struct HnsReadScan {
     indexed_coins: Vec<IndexedWalletCoin>,
     branch_scripts: [Vec<WalletAddressKey>; 3],
 }
+
+type RestoreScanResult = (
+    HnsAccountRecord,
+    u64,
+    SnapshotBinding,
+    MempoolSnapshotBinding,
+    Vec<DerivedHnsAddress>,
+    Vec<HistoryEntry>,
+    Vec<IndexedWalletCoin>,
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2594,6 +2593,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         })
     }
 
+    // These values comprise the complete atomic settlement snapshot and stay
+    // explicit to keep the persistence boundary straightforward to audit.
+    #[allow(clippy::too_many_arguments)]
     fn persist_prepared_settlement(
         &self,
         session_id: SessionId,
@@ -3209,18 +3211,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         expected_account_revision: u64,
         expected_tip: ChainTip,
         now_unix: u64,
-    ) -> Result<
-        (
-            HnsAccountRecord,
-            u64,
-            SnapshotBinding,
-            MempoolSnapshotBinding,
-            Vec<DerivedHnsAddress>,
-            Vec<HistoryEntry>,
-            Vec<IndexedWalletCoin>,
-        ),
-        HnsWalletError,
-    > {
+    ) -> Result<RestoreScanResult, HnsWalletError> {
         // Fence allocation before the first Shakedex discovery read. A stale
         // concurrent allocator or scan loses this WalletAccount CAS before it
         // can derive or commit a seller key. A failed/crashed scan leaves the
@@ -5149,7 +5140,7 @@ fn bounded_history(
             return Err(HnsWalletError::InvalidEvidence);
         }
         let key = (entry.txid, entry.script_index);
-        if let Some(previous) = unique.insert(key, entry.clone())
+        if let Some(previous) = unique.insert(key, entry)
             && previous != entry
         {
             return Err(HnsWalletError::InvalidEvidence);
@@ -5176,7 +5167,7 @@ fn coalesce_transaction_history(
                 previous.script_index = previous.script_index.min(entry.script_index);
             }
             None => {
-                transactions.insert(entry.txid, entry.clone());
+                transactions.insert(entry.txid, *entry);
             }
         }
     }
@@ -5319,7 +5310,7 @@ fn transaction_value_effect<B: HnsBackend>(
             continue;
         }
         let parent_id = TransactionHash::new(input.previous_output.transaction_hash.into_bytes());
-        if !raw_cache.contains_key(&parent_id) {
+        if let Entry::Vacant(entry) = raw_cache.entry(parent_id) {
             let evidence =
                 backend.get_transaction_evidence(parent_id, binding, Some(mempool_binding))?;
             if evidence.binding != binding || evidence.mempool != mempool_binding {
@@ -5336,7 +5327,7 @@ fn transaction_value_effect<B: HnsBackend>(
                 },
             };
             let parent = decode_transaction_for_id(&raw, parent_id)?;
-            raw_cache.insert(parent_id, parent);
+            entry.insert(parent);
         }
         let parent = raw_cache
             .get(&parent_id)
@@ -7521,6 +7512,9 @@ fn settlement_entity_id(config: &HnsRuntimeConfig, session_id: SessionId) -> [u8
     id
 }
 
+// All parameters contribute directly to the signed HTLC witness and remain
+// explicit so callers cannot accidentally reuse a partially bound context.
+#[allow(clippy::too_many_arguments)]
 fn sign_htlc_spend(
     store: &WalletStore,
     account: &HnsAccountRecord,
@@ -8113,7 +8107,8 @@ mod tests {
         assert_eq!(current.summary.owner_outpoint, Some(outpoint));
         assert_eq!(current.summary.value, 50_000);
         assert_eq!(
-            classify_name_ownership(Some(&current), Some(&[address.clone()])).expect("ownership"),
+            classify_name_ownership(Some(&current), Some(std::slice::from_ref(&address)))
+                .expect("ownership"),
             NameOwnershipStatus::WalletOwned {
                 derivation: address.derivation
             }
@@ -8211,7 +8206,8 @@ mod tests {
         let current =
             validate_test_name_view(&name, &state, &transaction, outpoint).expect("transfer view");
         assert_eq!(
-            classify_name_ownership(Some(&current), Some(&[owner.clone()])).expect("outgoing"),
+            classify_name_ownership(Some(&current), Some(std::slice::from_ref(&owner)))
+                .expect("outgoing"),
             NameOwnershipStatus::OutgoingTransfer {
                 owner_derivation: owner.derivation,
                 recipient: WalletAddressKey {
@@ -8221,7 +8217,8 @@ mod tests {
             }
         );
         assert_eq!(
-            classify_name_ownership(Some(&current), Some(&[recipient.clone()])).expect("incoming"),
+            classify_name_ownership(Some(&current), Some(std::slice::from_ref(&recipient)))
+                .expect("incoming"),
             NameOwnershipStatus::IncomingTransfer {
                 recipient_derivation: recipient.derivation,
                 current_owner: WalletAddressKey {
@@ -8781,13 +8778,15 @@ mod tests {
             locktime: 0,
         };
         let rate = BaseUnits::new(1_000);
-        let fee = canonical_policy_minimum_fee(&transaction, &[input_coin.clone()], rate)
-            .expect("minimum fee");
+        let fee =
+            canonical_policy_minimum_fee(&transaction, std::slice::from_ref(&input_coin), rate)
+                .expect("minimum fee");
         transaction.outputs[0].value = Dollarydoos::new(
             input_coin.value.get() - u64::try_from(fee.get()).expect("bounded fee"),
         );
-        let local = local_fee_policy_evidence(&transaction, &[input_coin.clone()], rate)
-            .expect("policy evidence");
+        let local =
+            local_fee_policy_evidence(&transaction, std::slice::from_ref(&input_coin), rate)
+                .expect("policy evidence");
         let binding = test_snapshot(8);
         let mempool = test_mempool(9);
         let mut quote = HnsTransactionFeeQuote {
@@ -8807,12 +8806,17 @@ mod tests {
             minimum_policy_fee_shortfall: BaseUnits::ZERO,
         };
         assert!(
-            validate_local_fee_quote_evidence(&transaction, &[input_coin.clone()], &quote).is_ok()
+            validate_local_fee_quote_evidence(
+                &transaction,
+                std::slice::from_ref(&input_coin),
+                &quote,
+            )
+            .is_ok()
         );
         assert!(matches!(
             validate_final_fee_quote(
                 &transaction.encode().expect("transaction"),
-                &[input_coin.clone()],
+                std::slice::from_ref(&input_coin),
                 &quote,
                 binding,
                 mempool,

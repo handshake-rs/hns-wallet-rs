@@ -1604,7 +1604,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn hns_shakedex_global_source_reservation_cas() {
+        // Bind this source-reservation regression to the release gate remaining
+        // closed; the assertion is intentionally compile-time visible.
         assert!(!HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED);
         let (_directory, mut store) = test_store();
         let first_scope = scope(1, 2, 3);

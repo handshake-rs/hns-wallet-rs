@@ -604,6 +604,10 @@ impl fmt::Debug for SignedEip1559Transaction {
 }
 
 impl PreparedEip1559Transaction {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the value-transfer boundary keeps its permit, replay scope, signer, recipient, value, and independent fee caps explicit for auditability"
+    )]
     pub fn native_transfer(
         _permit: &EthereumValueRuntimePermit,
         chain_id: u64,
@@ -1211,6 +1215,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "these compile-time release gates are asserted deliberately so a qualification flip requires an explicit test review"
+    )]
     fn runtime_gates_and_public_permit_acquisition_fail_closed() {
         assert!(!ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED);
         assert!(!ETHEREUM_VALUE_RUNTIME_RELEASE_QUALIFIED);

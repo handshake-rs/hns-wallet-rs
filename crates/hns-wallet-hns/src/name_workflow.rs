@@ -901,6 +901,9 @@ fn build_name_transition_transaction(
     Ok((transaction, resolved))
 }
 
+// The arguments are the complete consensus and fee-policy context for one
+// name transition and are intentionally kept explicit at this boundary.
+#[allow(clippy::too_many_arguments)]
 fn build_unsigned_name_operation(
     action: HnsNameAction,
     source: &TrackedHnsCoin,
@@ -1114,6 +1117,9 @@ fn validate_name_plan_transaction(
     Ok((transaction, tracked, canonical))
 }
 
+// Validation receives each independently authenticated context component so
+// no caller-created aggregate can bypass the field-by-field checks below.
+#[allow(clippy::too_many_arguments)]
 fn validate_name_action_context(
     config: &HnsRuntimeConfig,
     action: HnsNameAction,
@@ -1162,7 +1168,7 @@ fn validate_name_action_context(
             != reasons.contains(&NameActionIneligibility::OwnerSpentInMempool)
         || (context.lifecycle != HnsNameLifecycle::Closed)
             != reasons.contains(&NameActionIneligibility::LifecycleNotClosed)
-        || (!state.registered) != reasons.contains(&NameActionIneligibility::NameNotRegistered)
+        || state.registered == reasons.contains(&NameActionIneligibility::NameNotRegistered)
         || (state.expired && !reasons.contains(&NameActionIneligibility::NameExpiredAtCandidate))
     {
         return Err(HnsWalletError::InvalidEvidence);
@@ -1572,10 +1578,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             }
         };
 
-        if let Some((binding, mempool)) = required_snapshot {
-            if source.preparation_binding != binding || source.preparation_mempool != mempool {
-                return Err(HnsWalletError::StaleNodeSnapshot);
-            }
+        if let Some((binding, mempool)) = required_snapshot
+            && (source.preparation_binding != binding || source.preparation_mempool != mempool)
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
         }
         {
             let cache = self.cache_read()?;
@@ -2145,6 +2151,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         Ok(pending)
     }
 
+    // Persistence captures the full prepared-operation snapshot atomically;
+    // retaining explicit fields makes the saved security boundary auditable.
+    #[allow(clippy::too_many_arguments)]
     fn persist_prepared_name_operation(
         &self,
         account: HnsAccountRecord,
@@ -2499,6 +2508,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         )
     }
 
+    // Each value is separately checked against node evidence and cached
+    // bindings, so this domain validation boundary intentionally stays flat.
+    #[allow(clippy::too_many_arguments)]
     fn require_action_context(
         &self,
         config: &HnsRuntimeConfig,
@@ -2964,6 +2976,8 @@ mod tests {
         )
     }
 
+    // Test fixtures keep each coin attribute visible at the call site.
+    #[allow(clippy::too_many_arguments)]
     fn tracked_input(
         store: &WalletStore,
         account: &HnsAccountRecord,

@@ -282,7 +282,7 @@ fn hns_shakedex_transaction_plan_restart_cas() {
             verified_listing.authenticated(),
             &supplied_lock,
             &buyer_recipient,
-            &[buyer_coin.clone()],
+            std::slice::from_ref(&buyer_coin),
             TRANSACTION_FEE,
             &nonordinary_fulfillment
                 .encode()
@@ -310,7 +310,7 @@ fn hns_shakedex_transaction_plan_restart_cas() {
             verified_listing.authenticated(),
             &supplied_lock,
             &wrong_recipient,
-            &[buyer_coin.clone()],
+            std::slice::from_ref(&buyer_coin),
             TRANSACTION_FEE,
             &fulfillment_bytes,
         )
@@ -347,7 +347,7 @@ fn hns_shakedex_transaction_plan_restart_cas() {
         verify_signed_seller_recovery(
             &supplied_lock,
             &wrong_recipient,
-            &[recovery_coin.clone()],
+            std::slice::from_ref(&recovery_coin),
             TRANSACTION_FEE,
             &recovery_bytes,
         )
@@ -422,7 +422,7 @@ fn hns_shakedex_transaction_plan_restart_cas() {
             &current_state,
             BlockHash::new([0x66; 32]),
             &buyer_recipient,
-            &[finalize_coin.clone()],
+            std::slice::from_ref(&finalize_coin),
             TRANSACTION_FEE,
             &finalize_bytes,
         )
@@ -461,7 +461,7 @@ fn hns_shakedex_transaction_plan_restart_cas() {
     )
     .expect("seller lock plan");
     let seller_recovery = seller_locked
-        .with_recovery(&verified_recovery, &[recovery_coin.clone()])
+        .with_recovery(&verified_recovery, std::slice::from_ref(&recovery_coin))
         .expect("seller recovery plan");
     let buyer_offer = BuyerLockPlan::offer_verified(
         wallet_id,
@@ -538,7 +538,7 @@ fn hns_shakedex_transaction_plan_restart_cas() {
         .expect("aggregate restart validation");
     assert_eq!(restarted_value, value_workflow);
     let buyer_fulfillment = buyer_offer
-        .with_fulfillment(&verified_fulfillment, &[buyer_coin.clone()])
+        .with_fulfillment(&verified_fulfillment, std::slice::from_ref(&buyer_coin))
         .expect("buyer fulfillment plan");
 
     let (_cleanup, database, mut store) = test_store();

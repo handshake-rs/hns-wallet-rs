@@ -83,7 +83,7 @@ enum StructuralPlan {
         plan: SellerLockPlan,
     },
     ScriptFinalize {
-        parent: ShakedexScriptFinalizeParent,
+        parent: Box<ShakedexScriptFinalizeParent>,
         transfer: CurrentShakedexTransferEvidence,
     },
 }
@@ -797,7 +797,10 @@ impl ShakedexValueWorkflow {
             BaseUnits::new(u128::from(current_transfer.transfer_coin().value.get()));
         Self::prepared(
             ShakedexValueAction::SellerScriptFinalize,
-            StructuralPlan::ScriptFinalize { parent, transfer },
+            StructuralPlan::ScriptFinalize {
+                parent: Box::new(parent),
+                transfer,
+            },
             funding_reservation,
             current_transfer.transfer_coin(),
             prepared.funding_input_coins(),
@@ -1311,10 +1314,10 @@ impl ShakedexValueWorkflow {
         }
         let (plan_workflow_id, plan_action, plan_source, expected_value) =
             self.validate_structural_plan()?;
-        if let StructuralPlan::Buyer { plan } = &self.structural_plan {
-            if self.expires_at_unix > plan.authenticated_listing()?.expires_at_unix() {
-                return Err(ShakedexError::InvalidEvidence);
-            }
+        if let StructuralPlan::Buyer { plan } = &self.structural_plan
+            && self.expires_at_unix > plan.authenticated_listing()?.expires_at_unix()
+        {
+            return Err(ShakedexError::InvalidEvidence);
         }
         let (wallet_id, account_id) = self.wallet_and_account();
         let expected_purpose = match self.action {
@@ -3550,7 +3553,10 @@ mod tests {
             .expect("reservation evidence");
         ShakedexValueWorkflow::prepared(
             ShakedexValueAction::SellerScriptFinalize,
-            StructuralPlan::ScriptFinalize { parent, transfer },
+            StructuralPlan::ScriptFinalize {
+                parent: Box::new(parent),
+                transfer,
+            },
             reservation,
             &transfer_coin,
             &[finalize_coin],
@@ -3636,6 +3642,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "these compile-time release gates are asserted deliberately so a qualification flip requires an explicit test review"
+    )]
     fn production_next_script_finalize_restart_preserves_canonical_transfer_identity() {
         assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
         assert!(!HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED);

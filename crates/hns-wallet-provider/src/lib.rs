@@ -930,6 +930,9 @@ impl<S: ProviderStateStore> ProviderCore<S> {
     /// Persist one generation of origin/namespace permission authority with
     /// an exact account disclosure set. Account capability without a binding,
     /// or a binding without account capability, is never accepted.
+    // These fields form the explicit permission-grant boundary; grouping them
+    // would obscure the public API's security-relevant inputs.
+    #[allow(clippy::too_many_arguments)]
     pub fn grant_scoped_permissions(
         &mut self,
         handle: HostAuthorityHandleId,
@@ -1207,7 +1210,7 @@ fn validate_permission_identity(
         || permission
             .capabilities
             .contains(&PermissionCapability::Accounts)
-            != !permission.approved_accounts.is_empty()
+            == permission.approved_accounts.is_empty()
         || (!permission.approved_accounts.is_empty()
             && permission.namespace != SelectedNamespace::Hns)
         || (!permission.approved_names.is_empty()

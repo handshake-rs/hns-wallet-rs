@@ -268,6 +268,9 @@ pub enum WalletRequest {
     },
 }
 
+// Keep the payload inline: boxing would change this public Rust ABI wrapper,
+// while serde already bounds and validates the frame at the transport edge.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "frameType", rename_all = "camelCase", deny_unknown_fields)]
 pub enum HostFrame {
@@ -279,6 +282,8 @@ pub enum HostFrame {
     },
 }
 
+// Keep the payload inline to preserve the public frame representation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "frameType", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ServiceFrame {
@@ -347,6 +352,9 @@ impl ProviderCapabilitySnapshot {
     }
 }
 
+// Response variants mirror the stable wire schema and remain inline so callers
+// do not inherit an allocation solely to equalize enum variant sizes.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "camelCase", deny_unknown_fields)]
 pub enum ServiceResponse {

@@ -644,6 +644,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "these compile-time release gates are asserted deliberately so a qualification flip requires an explicit test review"
+    )]
     fn canonical_hns_v2_seller_entrypoints_remain_fail_closed() {
         assert!(!SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
         assert!(!SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);

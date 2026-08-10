@@ -35,6 +35,13 @@ pub const MAX_SERVICE_PENDING_APPROVALS: usize = 128;
 pub const MAX_PROVIDER_HNS_READ_ITEMS: usize = 128;
 pub const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
+type HnsReadPermissionExtension = (
+    BTreeSet<PermissionCapability>,
+    BTreeSet<hns_wallet_types::AccountId>,
+    BTreeSet<[u8; 32]>,
+    Option<u64>,
+);
+
 /// Execution boundary supplied by a wallet composition. Runtime method support
 /// is checked independently from the closed provider vocabulary, and value or
 /// browser capability is never inferred merely because protocol source exists.
@@ -578,7 +585,9 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsReadRuntime<B, 
                     transactions: snapshot.transactions,
                 })
             }
-            WalletRequest::ModuleStatus { module } if module == ModuleId::Handshake => {
+            WalletRequest::ModuleStatus {
+                module: ModuleId::Handshake,
+            } => {
                 let snapshot = self.synchronize()?;
                 Ok(WalletResponse::ModuleStatus {
                     status: hns_wallet_types::SyncStatus {
@@ -852,10 +861,10 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             .ok_or(ServiceError::SequenceExhausted)?;
         self.seen_request_ids.insert(envelope.request_id);
         self.request_order.push_back(envelope.request_id);
-        if self.request_order.len() > MAX_SEEN_REQUEST_IDS {
-            if let Some(expired) = self.request_order.pop_front() {
-                self.seen_request_ids.remove(&expired);
-            }
+        if self.request_order.len() > MAX_SEEN_REQUEST_IDS
+            && let Some(expired) = self.request_order.pop_front()
+        {
+            self.seen_request_ids.remove(&expired);
         }
         Ok(())
     }
@@ -1588,15 +1597,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         requested: BTreeSet<PermissionCapability>,
         pending_scope: Option<&PendingHnsPermissionScope>,
         now_unix_ms: u64,
-    ) -> Result<
-        (
-            BTreeSet<PermissionCapability>,
-            BTreeSet<hns_wallet_types::AccountId>,
-            BTreeSet<[u8; 32]>,
-            Option<u64>,
-        ),
-        ServiceFailure,
-    > {
+    ) -> Result<HnsReadPermissionExtension, ServiceFailure> {
         let account_scoped = self.hns_permission_request_is_account_scoped(&requested);
         if !account_scoped {
             if pending_scope.is_some() {
