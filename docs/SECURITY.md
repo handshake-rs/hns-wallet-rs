@@ -433,8 +433,8 @@ position; a sufficiently final authenticated competitor on any exact input may
 release the now-unspendable competing transaction. Released rows are never
 recreated, and later finality disagreement remains read-only
 `RecoveryRequired`. Product coin selection, live Denuo/provider/trusted-UI
-integration, execution of the seven new focused tests, and complete
-restart/reorg/regtest qualification remain pending.
+integration, and complete restart/reorg/regtest product qualification remain
+pending. The focused FINALIZE tests are included in exact `2229be8` source CI.
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
 `SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`,
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`,
@@ -456,11 +456,11 @@ settlement.
 
 Current cross-chain code is not qualified for live value. The concrete HNS node
 adapter and canonical HNS name-state/resource ownership source are present, but
-their consolidated qualification, a published canonical HNS settlement
-profile, consolidated qualification of the integrated HSD fee algebra and
-name-action context, Bitcoin supervisor qualification, embedded Helios proof
-construction/persistence, three-branch HNS restoration and Shakedex-key
-qualification, restart/reorg
+their exact source tests do not provide cross-process or product qualification.
+A published canonical HNS settlement profile, live qualification of the
+integrated HSD fee algebra and name-action context, Bitcoin supervisor network
+qualification, embedded Helios proof construction/persistence, three-branch HNS
+restoration and Shakedex-key product qualification, restart/reorg
 demonstrations, real-chain tests, resource benchmarks, and independent review
 remain blockers.
 

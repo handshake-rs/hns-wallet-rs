@@ -1,8 +1,9 @@
 # Releasing
 
-The `hns-wallet-rs` crates use one shared version and are published to
-crates.io. Crates.io releases are permanent: an uploaded version cannot be
-overwritten or deleted.
+The `hns-wallet-rs` crates use one shared version and are configured for
+dependency-ordered publication to crates.io. A dated source candidate, dry-run,
+or Git commit is not proof that any package or tag exists. Crates.io releases
+are permanent: an uploaded version cannot be overwritten or deleted.
 
 ## Public package allowlist
 
@@ -30,7 +31,7 @@ the crates.io publish allowlists, or the dependency order diverges from it.
 Every internal dependency has both a workspace path and the shared crates.io
 version. Cargo removes the path when it creates a normalized source package.
 Every package carries a README, exact workspace license copies, and a
-package-local changelog that points to the canonical shared release notes.
+package-local changelog that references the canonical shared release notes.
 `scripts/verify-release.py` checks those files, the shared version, required
 crates.io metadata, internal version requirements, immutable protocol source,
 dependency order, ABI release copies, and Ethereum contract artifact without
@@ -43,6 +44,12 @@ canonical feature inventory is in `CHANGELOG.md`; source packaging, publication,
 or test success does not enable provider, value, settlement, or marketplace
 product gates. Registry and tag state are external facts and must be checked at
 release time rather than embedded as a claim in the source snapshot.
+
+The checked-in `0.1.0` heading and package-local changelogs describe an
+unpublished candidate. Their plain `CHANGELOG.md` reference deliberately does
+not point at a tag that does not yet exist. Before an authorized upload, replace
+the candidate statement with release-source wording, synchronize every package
+copy, and let the execute-mode validator reject a stale candidate declaration.
 
 Wallet source consumes the final immutable `hns-rs` release revision
 `b24b66c382de53330ec21dd3137e056a2bea3e2d`. Before any wallet upload, all 17
@@ -65,15 +72,20 @@ document and verify boundaries; they grant no runtime or deployment authority.
 
 1. Update the shared version in the root `Cargo.toml`, every internal dependency
    version in `[workspace.dependencies]`, `CHANGELOG.md`, and
-   `release/CRATE-CHANGELOG.md`. Before an upload, replace `unreleased` with the
-   release date in both changelog authorities. Synchronize the package copies:
+   `release/CRATE-CHANGELOG.md`. Use one version-specific `unreleased` heading
+   while developing; do not add a generic `## Unreleased` section outside the
+   selected shared version. Before an upload, date that heading, move every
+   included change under it, and replace the root and package-template
+   unpublished-candidate statements with release-source wording. Synchronize
+   the package copies:
 
    ```bash
    ./scripts/sync-release-files.sh
    ```
 
-   The validator rejects an execution attempt whose heading remains
-   `unreleased`.
+   The validator rejects an execution attempt whose version heading remains
+   `unreleased`, whose root changelog retains a generic Unreleased section, or
+   whose package changelog still claims to be an unpublished candidate.
 
 2. Run the cheap metadata, argument, and archive-inventory checks while
    preparing the release source. Archive-only mode uses `cargo package

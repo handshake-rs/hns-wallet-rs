@@ -150,10 +150,12 @@ reads and writes v2 frames on inherited standard streams. The database path is
 trusted launcher configuration, never a website request; the passphrase is
 accepted only as the ABI-owned zeroizing unlock secret. A production Chromium
 launcher must supply private child pipes and a separately released signed
-artifact. Mobile may drive the same state machine in process after generated
-JNI/C bindings exist. Filesystem paths, process commands, raw signing, recovery
-output, private keys, database keys, preimages, and arbitrary contract calls are
-absent from the protocol.
+artifact. The downstream Android/iOS 0.5.9 candidate source now drives the
+trusted-native controller through separately maintained JNI/C wrappers; those
+wrappers are not a mobile provider, production backend, signed release, or
+installed-device qualification. Filesystem paths, process commands, raw signing,
+recovery output, private keys, database keys, preimages, and arbitrary contract
+calls are absent from the protocol.
 
 ## Machine-readable contracts
 
@@ -189,8 +191,8 @@ signature verification, durable rollback state, artifact hashing, and the
 release gate are not implemented here, so artifact/runtime availability stays
 false.
 
-The historical host and contract regression baseline passed the exact
-`ba9f013` workspace CI recorded in
-[`QUALIFICATION.md`](QUALIFICATION.md). Installed browser/mobile-provider
+The host and contract regressions passed exact `2229be8` workspace CI;
+the earlier `ba9f013` result remains a historical baseline. Exact run records
+are in [`QUALIFICATION.md`](QUALIFICATION.md). Installed browser/mobile-provider
 adoption and artifact-authenticity evidence belongs to downstream products and
 does not change this private ABI or any fixed availability gate.

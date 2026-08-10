@@ -24,12 +24,16 @@ selected entries may not be symlinks, and the file identity is checked around
 SQLite's no-follow open. This repository's portable filesystem regressions run
 on Linux; downstream mobile products own their target/runtime evidence, app
 sandbox, ACL and data-protection policy, backup exclusion, and
-Keystore/Keychain wrapping. A platform-neutral native controller now
-creates or restores exactly one non-value HNS account, opens only a complete
-seed/account bootstrap, and exposes status, unlock, lock, and account identity
-through a private ABI-v2 session. A separate backend-injected native read
-controller can now reuse that exact shared-store authority and return one
-bounded serializable balance/receive/history/known-name/module-status snapshot.
+Keystore/Keychain wrapping. The downstream Android/iOS 0.5.9 candidate source
+now contains platform key wrapping, JNI/C projection, native recovery and read
+screens, and off-UI-thread synchronization call sites; those separately
+maintained implementations are not package or installed-device evidence for
+this repository. A platform-neutral native controller creates or restores
+exactly one non-value HNS account, opens only a complete seed/account bootstrap,
+and exposes status, unlock, lock, and account identity through a private ABI-v2
+session. A separate backend-injected native read controller reuses that exact
+shared-store authority and returns one bounded serializable balance/receive/
+history/known-name/module-status snapshot.
 It obtains the durable epoch and exact tip through a script-free chain snapshot,
 binds height-zero evidence to the selected account network, and only then
 derives and queries wallet ScriptIds. The mobile crate re-exports the concrete
@@ -37,9 +41,10 @@ authenticated loopback adapter for downstream native composition, but it does
 not supply production device transport. Fresh history also needs archive raw
 transactions unless the authenticated wallet already cached them. A
 deadline-enforced, archive-capable (or durably indexed) device backend,
-platform bindings, native product screens, and installed-device qualification
-therefore remain downstream release requirements rather than authorities
-supplied by this crate, and no value/provider release gate is enabled.
+backend credential/index provisioning, and installed-device network/resource/
+restart qualification therefore remain downstream release requirements rather
+than authorities supplied by this crate, and no value/provider release gate is
+enabled.
 
 ABI wallet status/unlock/lock and a narrow provider
 control surface are implemented. One library composition can bind an exact
@@ -61,9 +66,9 @@ provider Names access is available. The native read controller is a distinct
 trusted-app surface: it minimizes only already-persisted known names and exposes
 no provider authority or name-import path. The checked-in executable still has
 no account-selection or backend inputs, so it remains the control-only runtime.
-The native controllers are library-only compositions; a production mobile
-wallet-index backend, shipped bindings, browser integration, and every value
-path remain unavailable here.
+The native controllers are library-only compositions. Downstream mobile
+candidate wrappers do not supply a production wallet-index backend or make the
+browser/provider integration and value paths available here.
 
 Current safety status: the production-hardening source boundary is implemented,
 but executable HNS, Bitcoin, and Ethereum value operations and all mainnet
@@ -109,14 +114,17 @@ TRANSFER authority; a harmless live binding advance is accepted only when the
 stable transfer/owner/state/renewal identity is unchanged, while the HNS
 runtime requires exact bindings within each immediate live fence. Persisted
 evidence never recreates authority. Every Shakedex and dependent HNS
-funding/value/fee gate remains `false`. The exact implementation predecessor
-`ba9f013a098679fe8e3d812a7e09020803e27d53` passed the complete CI and CodeQL
-workflows on 2026-08-10. That source evidence includes the synchronized account
-read and purpose-separation regressions but is not product, regtest, resource,
-or release-gate qualification. Release-source evidence is commit-scoped: the
-routine CI, CodeQL, and manual preflight records attached to one exact release
-commit are authoritative, while this historical result is retained as a
-baseline; see
+funding/value/fee gate remains `false`. Exact qualified implementation source
+`2229be849557d58a8eb723bcc03349f0f2df9796` passed its complete
+[CI](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31420628974),
+[CodeQL](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31420627924),
+and
+[14-crate normalized release preflight](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31424201574)
+on 2026-08-10. The earlier exact implementation commit
+`ba9f013a098679fe8e3d812a7e09020803e27d53` remains a historical CI/CodeQL
+baseline. These source results include the synchronized account-read,
+script-free initial binding, and purpose-separation regressions but are not
+product, regtest, installed-device, resource, or release-gate qualification; see
 [`docs/QUALIFICATION.md`](docs/QUALIFICATION.md).
 
 Bitcoin BDK state now uses the same encrypted shared SQLite authority as the

@@ -211,8 +211,9 @@ or an authenticated competing spender reaches that threshold under the same
 snapshot binding. The terminal workflow evidence and deletion of every
 protected row commit in one CAS transaction. Later reconciliation audits that
 terminal evidence without recreating reservations or rolling the workflow back;
-loss or change of terminal finality returns a recovery-required error. Product/
-startup integration and executed FINALIZE qualification remain pending, and
+loss or change of terminal finality returns a recovery-required error. Source
+FINALIZE regressions passed the exact `2229be8` workspace gate; product/startup,
+live-node, and multi-process restart/reorg qualification remain pending, and
 every release gate remains `false`.
 
 Approval bytes encode the exact prepared aggregate and CAS revision. The HNS
@@ -270,13 +271,18 @@ wallet reacquires again against the final fee quote's exact snapshot before it
 persists or submits signed bytes; changed source or FINALIZE renewal terms move
 the workflow to `ReapprovalRequired` for explicit cancellation and replacement.
 
-The concrete synchronous HNS adapter now speaks the authenticated loopback
-`hns-node-rs` wallet RPC v1 boundary, pinned to node commit `c1b633d1`. It
-derives canonical ScriptIds, enforces full chain/mempool bindings, and validates
-HTTP, JSON, transaction, spender, name, and HSD median-time evidence without
-giving the node signing authority. The complete enclosing product runtime and qualification
-evidence are still pending. `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` therefore
-remains false and HNS value capabilities are not advertised. See
+The concrete synchronous HNS adapter speaks the authenticated loopback
+`hns-node-rs` wallet RPC v1 boundary whose script-free `chain_snapshot` source
+was introduced at exact node commit
+`2b267ffe7fc6f9929063a18986a83b566d02ae6d`. Selected qualified node main
+`2712d1dbb74934038188637dccf27d58fbc39a48` contains that unchanged API. This is
+an exact compatibility pairing, not a Cargo dependency or claim that a node is
+embedded in the wallet. The adapter derives canonical ScriptIds, enforces full
+chain/mempool bindings, and validates HTTP, JSON, transaction, spender, name,
+and HSD median-time evidence without giving the node signing authority. Source
+CI passed for both counterparts; the complete enclosing product runtime and
+network qualification remain pending. `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED`
+therefore remains false and HNS value capabilities are not advertised. See
 [HNS_NODE_RPC.md](HNS_NODE_RPC.md) and
 [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
 

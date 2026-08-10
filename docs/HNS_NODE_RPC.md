@@ -5,7 +5,11 @@ authenticated `hns-node-rs` wallet RPC v1 contract, including its additive
 script-free chain-snapshot call. It implements `HnsBackend`; the node supplies
 canonical chain evidence and broadcast admission while the wallet alone derives
 keys, signs, approves, and persists workflows. The node never signs. Exact
-wallet/node commit pairing remains required qualification evidence.
+wallet/node commit pairing remains required qualification evidence. The
+script-free call was introduced at node source
+`2b267ffe7fc6f9929063a18986a83b566d02ae6d`; selected qualified node main
+`2712d1dbb74934038188637dccf27d58fbc39a48` contains that unchanged API. This
+records compatibility evidence and does not make the node a wallet dependency.
 
 ## Trusted configuration and transport
 
@@ -118,10 +122,11 @@ one complete reconciliation and one quote retry; there is no polling loop.
 
 The reviewed immutable `hns-script` 0.2 source now supplies transaction sigops,
 sigop-adjusted policy size, minimum-fee construction, and standard weight/
-sigop bounds directly to the wallet. No local formula is copied. This source
-has not passed consolidated wallet qualification, so
-`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains `false` and the wired quote
-path still cannot authorize value.
+sigop bounds directly to the wallet. No local formula is copied. The exact
+wallet source passed its complete locked CI gate, but multi-process node/wallet,
+restart/reorg, adversarial, product, and resource qualification remain open.
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` therefore remains `false` and the
+wired quote path still cannot authorize value.
 
 Confirmed coinbase identity is preserved exactly, but coinbase outputs are
 conservatively excluded from selection. No local maturity constant is invented;

@@ -3,22 +3,10 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
-## Unreleased
-
-- Added an injectable `MobileHnsReadController` composition which transfers or
-  opens one exact shared-store authority, performs bounded synchronized HNS
-  reads, and returns a minimized serializable balance/receive/history/known-name/
-  module-status snapshot. The existing lifecycle-only mobile controller API is
-  preserved. Reads obtain a script-free chain epoch/tip snapshot and reject its
-  bound height-zero block when it does not match the selected account network,
-  before deriving or transmitting any wallet ScriptId. The concrete
-  authenticated loopback node backend is re-exported for native composition;
-  no production device transport, provider, value, signing, settlement,
-  HNSA/HNSR, Shakedex, or marketplace gate is enabled.
-
 ## 0.1.0 - 2026-08-10
 
-Initial release source for the independent Handshake wallet boundary:
+Unpublished initial release candidate for the independent Handshake wallet
+boundary:
 
 - wallet-local identifiers, summaries, and capability-separated chain APIs;
 - authenticated encrypted SQLite persistence with one shared lock and key
@@ -28,6 +16,14 @@ Initial release source for the independent Handshake wallet boundary:
   and an in-process service composition;
 - atomic single-account mobile create, restore, open, unlock, lock, and status
   control without a WebView or value surface;
+- an injectable `MobileHnsReadController` which transfers or opens one exact
+  shared-store authority, performs bounded synchronized HNS reads, and returns a
+  minimized serializable balance/receive/history/known-name/module-status
+  snapshot while preserving the lifecycle-only controller API. Reads obtain a
+  script-free chain epoch/tip snapshot and reject a bound wrong-network genesis
+  before deriving or transmitting any wallet ScriptId. The authenticated
+  loopback backend is re-exported for native composition, but no production
+  device transport or product read gate is supplied here;
 - persistence-first Shakedex and chain-neutral market state machines whose live
   product and value gates remain disabled;
 - Kyoto-only Bitcoin state and a native-ETH policy/contract verification

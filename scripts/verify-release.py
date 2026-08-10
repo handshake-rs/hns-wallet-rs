@@ -91,6 +91,8 @@ def release_order(repo: Path) -> list[str]:
 
 def verify_release_document(repo: Path, order: list[str], version: str) -> None:
     document = (repo / "docs/releasing.md").read_text(encoding="utf-8")
+    if re.search(r"\bare\s+published\s+to\s+crates\.io\b", document):
+        fail("docs/releasing.md must not claim that candidate crates are published")
     documented = re.findall(r"^\d+\. `([^`]+)`$", document, flags=re.MULTILINE)
     if documented != order:
         fail("docs/releasing.md does not match release/public-crates.txt")
@@ -325,6 +327,8 @@ def verify_workspace(repo: Path, metadata: dict, order: list[str]) -> tuple[str,
     changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
     if "packages are unpublished" in changelog:
         fail("CHANGELOG.md contains a self-expiring registry-status claim")
+    if re.search(r"^## Unreleased$", changelog, re.MULTILINE):
+        fail("CHANGELOG.md must use the selected shared version for unreleased notes")
     headings = re.findall(
         rf"^## {re.escape(version)} - (unreleased|\d{{4}}-\d{{2}}-\d{{2}})$",
         changelog,
@@ -346,11 +350,10 @@ def verify_workspace(repo: Path, metadata: dict, order: list[str]) -> tuple[str,
     template_text = template.decode("utf-8")
     if expected_heading not in template_text:
         fail("release/CRATE-CHANGELOG.md does not match the workspace release heading")
-    stable_changelog_url = (
-        f"https://github.com/handshake-rs/hns-wallet-rs/blob/v{version}/CHANGELOG.md"
-    )
-    if stable_changelog_url not in template_text:
-        fail("release/CRATE-CHANGELOG.md does not link the immutable release tag")
+    if "`CHANGELOG.md`" not in template_text:
+        fail("release/CRATE-CHANGELOG.md must name the canonical changelog")
+    if re.search(r"\[[^]]*CHANGELOG\.md[^]]*\]\(", template_text):
+        fail("release/CRATE-CHANGELOG.md must not link a tag before it exists")
 
     positions = {package: index for index, package in enumerate(order)}
     expected_protocol_source = (
@@ -485,6 +488,14 @@ def main() -> None:
     if args.require_clean:
         if release_label == "unreleased":
             fail("execution requires a dated release heading, not 'unreleased'")
+        root_changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+        crate_changelog = (repo / "release/CRATE-CHANGELOG.md").read_text(
+            encoding="utf-8"
+        )
+        if "Unpublished initial release candidate" in root_changelog:
+            fail("execution requires release wording in CHANGELOG.md")
+        if "current unpublished release candidate" in crate_changelog:
+            fail("execution requires release wording in package changelogs")
         verify_clean_source(repo)
     print(f"release metadata valid for {len(order)} public crates at version {version}")
 

@@ -230,8 +230,10 @@ On 2026-08-03, the targeted allocation filter passed from a disposable NVMe
 checkout and NVMe target directory: `cargo test --locked -p
 hns-wallet-bitcoin-kyoto swap_key_store::tests -- --test-threads=1` reported 10
 passed, 0 failed, and 8 filtered out. No standalone build/check, full workspace
-gate, optimized RocksDB compilation, network test, or benchmark was run. This
-narrow evidence does not qualify the Bitcoin value runtime.
+gate, optimized RocksDB compilation, network test, or benchmark was run in that
+historical event. The allocation, encrypted BDK persistence, and ahead-tip
+crash regressions are now also covered by exact `2229be8` complete workspace CI.
+Neither source result qualifies the Bitcoin value runtime.
 
 | Scenario | Disk | Bandwidth | Usable balance | Full scan | Peak mobile memory |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -242,6 +244,7 @@ narrow evidence does not qualify the Bitcoin value runtime.
 | Genesis restore | not measured | not measured | not measured | not measured | not measured |
 
 Bitcoin send and settlement remain unavailable until the pinned persistence
-gap is resolved and the consolidated CI, invalid-PoW/filter/peer tests, regtest
-restart/reorg/broadcast/HTLC suite, mobile resource benchmarks, and independent
-review are recorded.
+gap is resolved and invalid-PoW/filter/peer tests, regtest restart/reorg/
+broadcast/HTLC product suites, mobile resource benchmarks, and independent
+review are recorded. Exact source CI has passed and is not a substitute for
+those network and product gates.

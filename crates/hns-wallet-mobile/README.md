@@ -22,9 +22,12 @@ directly with an injected `HnsBackend`. The backend is never selected from an
 insecure default.
 
 `synchronize` performs one fresh bounded reconciliation and returns a
-camel-case serializable `MobileHnsReadSnapshot` containing balance, receive
-target, transaction history, minimized known-name summaries, and successful-tip
-module status from one hidden chain/mempool binding. The explicit `balance`,
+serializable `MobileHnsReadSnapshot` containing balance, receive target,
+transaction history, minimized known-name summaries, and successful-tip module
+status from one hidden chain/mempool binding. Its outer snapshot fields and
+mobile name projections use camelCase; nested shared wallet types (`Amount`,
+`ReceiveTarget`, `TransactionSummary`, and `SyncStatus`) retain their established
+snake_case field names. The explicit `balance`,
 `receive_target`, `transaction_history`, `known_names`, and `module_status`
 methods each perform their own fresh synchronization. Lifecycle requests still
 cross private ABI-v2 framing; the combined trusted-native synchronization calls
@@ -37,10 +40,12 @@ separately authorized workflow. This crate does not add a mobile name-import
 path. It also does not ship a production device backend: the existing
 `HnsNodeRpcBackend` and `HnsNodeRpcConfig` are re-exported here for downstream
 composition, but remain an authenticated loopback node adapter rather than an
-Android or iOS wallet-index integration. Downstream applications must provide
-or integrate a bounded, deadline-enforced product backend, call synchronous
-reads off the UI thread, add their JNI/C/Swift projection, and qualify the exact
-installed product before exposing these reads.
+Android or iOS wallet-index integration. The downstream Android/iOS 0.5.9
+candidate source contains JNI/C projection, native recovery/read screens,
+Keystore/Keychain wrapping, and off-UI-thread call sites. Those wrappers are not
+shipped by this crate and do not supply a backend. A product must still provide
+or integrate a bounded, deadline-enforced backend and qualify the exact
+installed network/runtime before exposing synchronized results.
 
 Each read first obtains the durable chain epoch and initialized tip through the
 script-free `chain_snapshot` backend call, validates height-zero block evidence

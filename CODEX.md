@@ -19,4 +19,7 @@
   expiry, permission, rate, and replay checked.
 - Mainnet settlement remains disabled until the qualification matrix passes and
   a reviewed source change independently enables its immutable release gate.
-- Do not push from this repository.
+- Do not push without explicit authorization. When a direct-main push is
+  explicitly authorized, preserve the reviewed scope, exact evidence, and clean
+  source record rather than introducing a pull-request-only workflow. Push
+  authority never implies crates.io publication or release authority.
