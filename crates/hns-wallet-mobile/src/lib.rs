@@ -9,9 +9,10 @@ use hns_wallet_ffi::{
     decode_service_frame, encode_host_frame,
 };
 use hns_wallet_hns::{
-    HnsAccountRecord, HnsBootstrapPolicy, HnsExistingAccountSelector, HnsRuntimeConfig,
-    HnsWalletBootstrap, HnsWalletError, RecoveryPhrase,
+    HnsAccountRecord, HnsExistingAccountSelector, HnsRuntimeConfig, HnsWalletBootstrap,
+    HnsWalletError, RecoveryPhrase,
 };
+pub use hns_wallet_hns::{HnsBootstrapPolicy, HnsNetwork};
 use hns_wallet_host::{
     Clock, ClockError, HostError, HostOutput, SystemClock, SystemEntropy, WalletHost,
 };
@@ -400,7 +401,6 @@ pub enum MobileWalletError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hns_wallet_hns::HnsNetwork;
     use hns_wallet_store::EntityKind;
 
     fn private_tempdir() -> tempfile::TempDir {
