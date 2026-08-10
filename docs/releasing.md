@@ -48,8 +48,24 @@ release time rather than embedded as a claim in the source snapshot.
 The checked-in `0.1.0` heading and package-local changelogs describe an
 unpublished candidate. Their plain `CHANGELOG.md` reference deliberately does
 not point at a tag that does not yet exist. Before an authorized upload, replace
-the candidate statement with release-source wording, synchronize every package
-copy, and let the execute-mode validator reject a stale candidate declaration.
+the canonical `candidate` marker and its adjacent statement in both changelog
+authorities with the canonical `release` forms below, synchronize every package
+copy, and let the execute-mode validator reject any stale, missing, malformed,
+or mismatched declaration.
+
+Root `CHANGELOG.md` release form:
+
+```markdown
+<!-- hns-wallet-release-state: 0.1.0 release -->
+Initial release source for the independent Handshake wallet boundary:
+```
+
+`release/CRATE-CHANGELOG.md` release form:
+
+```markdown
+<!-- hns-wallet-release-state: 0.1.0 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+```
 
 Wallet source consumes the final immutable `hns-rs` release revision
 `b24b66c382de53330ec21dd3137e056a2bea3e2d`. Before any wallet upload, all 17
@@ -76,8 +92,8 @@ document and verify boundaries; they grant no runtime or deployment authority.
    while developing; do not add a generic `## Unreleased` section outside the
    selected shared version. Before an upload, date that heading, move every
    included change under it, and replace the root and package-template
-   unpublished-candidate statements with release-source wording. Synchronize
-   the package copies:
+   canonical candidate markers/statements with the documented release forms.
+   Synchronize the package copies:
 
    ```bash
    ./scripts/sync-release-files.sh
@@ -85,7 +101,8 @@ document and verify boundaries; they grant no runtime or deployment authority.
 
    The validator rejects an execution attempt whose version heading remains
    `unreleased`, whose root changelog retains a generic Unreleased section, or
-   whose package changelog still claims to be an unpublished candidate.
+   whose canonical root/template release-state marker is absent, malformed,
+   mismatched, still `candidate`, or separated from its exact wording.
 
 2. Run the cheap metadata, argument, and archive-inventory checks while
    preparing the release source. Archive-only mode uses `cargo package

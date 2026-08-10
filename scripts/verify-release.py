@@ -45,10 +45,91 @@ PROTOCOL_PACKAGES = {
     "hns-transaction",
     "hns-urkel-proof",
 }
+ROOT_RELEASE_STATE_WORDING = {
+    "candidate": (
+        "Unpublished initial release candidate for the independent Handshake wallet\n"
+        "boundary:"
+    ),
+    "release": "Initial release source for the independent Handshake wallet boundary:",
+}
+CRATE_RELEASE_STATE_WORDING = {
+    "candidate": (
+        "This heading describes the current unpublished release candidate, not an\n"
+        "existing crates.io package, Git tag, or GitHub release."
+    ),
+    "release": (
+        "This crate changelog describes the prepared `hns-wallet-rs` release source."
+    ),
+}
 
 
 def fail(message: str) -> None:
     raise SystemExit(f"error: {message}")
+
+
+def changelog_release_state(
+    document: str, path: str, version: str, wording: dict[str, str]
+) -> str:
+    heading = re.search(
+        rf"^## {re.escape(version)} - (?:unreleased|\d{{4}}-\d{{2}}-\d{{2}})$",
+        document,
+        re.MULTILINE,
+    )
+    if heading is None:
+        fail(f"{path} has no release section for {version}")
+    next_heading = re.search(r"^## ", document[heading.end() :], re.MULTILINE)
+    section_end = (
+        len(document)
+        if next_heading is None
+        else heading.end() + next_heading.start()
+    )
+    section = document[heading.end() : section_end]
+    marker_prefix = f"<!-- hns-wallet-release-state: {version} "
+    if section.count(marker_prefix) != 1:
+        fail(
+            f"{path} must contain exactly one canonical release-state marker "
+            f"for {version}"
+        )
+    marker = re.compile(
+        rf"^<!-- hns-wallet-release-state: {re.escape(version)} "
+        r"(candidate|release) -->$",
+        re.MULTILINE,
+    )
+    states = marker.findall(section)
+    if len(states) != 1:
+        fail(f"{path} has an invalid canonical release-state marker for {version}")
+    state = states[0]
+    expected_block = (
+        f"<!-- hns-wallet-release-state: {version} {state} -->\n{wording[state]}"
+    )
+    if section.count(expected_block) != 1:
+        fail(f"{path} does not use canonical wording for release state {state!r}")
+    other_state = "release" if state == "candidate" else "candidate"
+    if wording[other_state] in section:
+        fail(f"{path} contains contradictory {other_state} release-state wording")
+    return state
+
+
+def verify_changelog_release_state(
+    root_changelog: str, crate_changelog: str, version: str
+) -> str:
+    root_state = changelog_release_state(
+        root_changelog, "CHANGELOG.md", version, ROOT_RELEASE_STATE_WORDING
+    )
+    crate_state = changelog_release_state(
+        crate_changelog,
+        "release/CRATE-CHANGELOG.md",
+        version,
+        CRATE_RELEASE_STATE_WORDING,
+    )
+    if root_state != crate_state:
+        fail("root and package changelogs have different release-state markers")
+    return root_state
+
+
+def require_execution_release_state(release_state: str) -> None:
+    if release_state != "release":
+        fail("execution requires canonical release-state wording in all changelogs")
 
 
 def cargo_metadata(repo: Path, toolchain: str) -> dict:
@@ -297,7 +378,9 @@ def verify_release_artifacts(repo: Path) -> None:
         fail("Ethereum deployed bytecode length differs from runtimeLength")
 
 
-def verify_workspace(repo: Path, metadata: dict, order: list[str]) -> tuple[str, str]:
+def verify_workspace(
+    repo: Path, metadata: dict, order: list[str]
+) -> tuple[str, str, str]:
     root_manifest = tomllib.loads((repo / "Cargo.toml").read_text(encoding="utf-8"))
     workspace_package = root_manifest["workspace"]["package"]
     version = workspace_package["version"]
@@ -348,6 +431,7 @@ def verify_workspace(repo: Path, metadata: dict, order: list[str]) -> tuple[str,
 
     template = (repo / "release/CRATE-CHANGELOG.md").read_bytes()
     template_text = template.decode("utf-8")
+    release_state = verify_changelog_release_state(changelog, template_text, version)
     if expected_heading not in template_text:
         fail("release/CRATE-CHANGELOG.md does not match the workspace release heading")
     if "`CHANGELOG.md`" not in template_text:
@@ -443,7 +527,7 @@ def verify_workspace(repo: Path, metadata: dict, order: list[str]) -> tuple[str,
             f"observed={sorted(observed_protocol_dependencies)}"
         )
 
-    return version, release_label
+    return version, release_label, release_state
 
 
 def verify_clean_source(repo: Path) -> None:
@@ -473,7 +557,7 @@ def main() -> None:
 
     repo = Path(__file__).resolve().parent.parent
     order = release_order(repo)
-    version, release_label = verify_workspace(
+    version, release_label, release_state = verify_workspace(
         repo, cargo_metadata(repo, args.toolchain), order
     )
     verify_protocol_source(repo)
@@ -488,14 +572,7 @@ def main() -> None:
     if args.require_clean:
         if release_label == "unreleased":
             fail("execution requires a dated release heading, not 'unreleased'")
-        root_changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-        crate_changelog = (repo / "release/CRATE-CHANGELOG.md").read_text(
-            encoding="utf-8"
-        )
-        if "Unpublished initial release candidate" in root_changelog:
-            fail("execution requires release wording in CHANGELOG.md")
-        if "current unpublished release candidate" in crate_changelog:
-            fail("execution requires release wording in package changelogs")
+        require_execution_release_state(release_state)
         verify_clean_source(repo)
     print(f"release metadata valid for {len(order)} public crates at version {version}")
 

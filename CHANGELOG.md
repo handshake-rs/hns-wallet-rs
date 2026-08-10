@@ -5,6 +5,7 @@ file. The public crates use a shared version and follow Semantic Versioning.
 
 ## 0.1.0 - 2026-08-10
 
+<!-- hns-wallet-release-state: 0.1.0 candidate -->
 Unpublished initial release candidate for the independent Handshake wallet
 boundary:
 
