@@ -6,10 +6,10 @@ use std::collections::BTreeSet;
 use hns_covenants::{hash_name, validate_name};
 use hns_wallet_types::{
     AccountId, Amount, ApprovalKind, BaseUnits, BrowserRuntimeSessionId, FinalityModel,
-    HostAuthorityHandleId, HostSessionId, ModuleId, PermissionCapability, ProviderApprovalId,
-    ProviderAuthorityFingerprint, ProviderRequestId, ReceiveTarget, SyncStatus, TransactionSummary,
-    WalletAsset, WalletId, WalletServiceSessionId, WalletSessionId, WorkflowId,
-    PROVIDER_METHOD_WIRE_NAMES,
+    HostAuthorityHandleId, HostSessionId, ModuleId, PROVIDER_METHOD_WIRE_NAMES,
+    PermissionCapability, ProviderApprovalId, ProviderAuthorityFingerprint, ProviderRequestId,
+    ReceiveTarget, SyncStatus, TransactionSummary, WalletAsset, WalletId, WalletServiceSessionId,
+    WalletSessionId, WorkflowId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -487,8 +487,7 @@ pub struct HnsNameDisclosure {
 
 impl HnsNameDisclosure {
     pub fn validate(&self) -> Result<(), AbiError> {
-        if validate_name(self.name.as_bytes())
-            && hns_name_hash_matches(&self.name, &self.name_hash)
+        if validate_name(self.name.as_bytes()) && hns_name_hash_matches(&self.name, &self.name_hash)
         {
             Ok(())
         } else {
@@ -804,8 +803,13 @@ impl ApprovalSummary {
             ),
             Self::MarketIntent { action, .. } => matches!(
                 (method, *action),
-                ("swap_publishMarketIntent", MarketIntentApprovalAction::Publish)
-                    | ("swap_cancelMarketIntent", MarketIntentApprovalAction::Cancel)
+                (
+                    "swap_publishMarketIntent",
+                    MarketIntentApprovalAction::Publish
+                ) | (
+                    "swap_cancelMarketIntent",
+                    MarketIntentApprovalAction::Cancel
+                )
             ),
             Self::FillAcceptance { .. } => {
                 matches!(method, "swap_requestMatch" | "swap_acceptFill")
@@ -833,12 +837,10 @@ pub struct ApprovalPrompt {
 }
 
 impl ApprovalPrompt {
-    pub fn validate(
-        &self,
-        expected_kind: ApprovalKind,
-        now_unix_ms: u64,
-    ) -> Result<(), AbiError> {
-        self.binding.validate().map_err(|_| AbiError::InvalidApproval)?;
+    pub fn validate(&self, expected_kind: ApprovalKind, now_unix_ms: u64) -> Result<(), AbiError> {
+        self.binding
+            .validate()
+            .map_err(|_| AbiError::InvalidApproval)?;
         if self.expires_at_unix_ms <= now_unix_ms
             || self.expires_at_unix_ms > now_unix_ms.saturating_add(MAX_APPROVAL_LIFETIME_MS)
             || self.origin.is_empty()
@@ -1083,9 +1085,7 @@ fn encode_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, AbiError> {
     Ok(framed)
 }
 
-fn encode_zeroizing_frame<T: Serialize>(
-    value: &T,
-) -> Result<Zeroizing<Vec<u8>>, AbiError> {
+fn encode_zeroizing_frame<T: Serialize>(value: &T) -> Result<Zeroizing<Vec<u8>>, AbiError> {
     let payload = Zeroizing::new(serde_json::to_vec(value).map_err(|_| AbiError::Encoding)?);
     if payload.is_empty() || payload.len() > MAX_ABI_FRAME_BYTES {
         return Err(AbiError::FrameSize);
@@ -1145,8 +1145,7 @@ fn validate_service_request(request: &ServiceRequest) -> Result<(), AbiError> {
             Ok(())
         }
         ServiceRequest::ProviderCapabilities {
-            authority_revision,
-            ..
+            authority_revision, ..
         } => {
             if *authority_revision == 0 {
                 return Err(AbiError::InvalidAuthority);
@@ -1179,8 +1178,7 @@ fn validate_service_request(request: &ServiceRequest) -> Result<(), AbiError> {
             Ok(())
         }
         ServiceRequest::ApprovalDecision {
-            authority_revision,
-            ..
+            authority_revision, ..
         } => {
             if *authority_revision == 0 {
                 return Err(AbiError::InvalidApproval);
@@ -1215,10 +1213,7 @@ fn validate_wallet_request(request: &WalletRequest) -> Result<(), AbiError> {
             recovery_phrase,
         } => {
             validate_secret(passphrase.expose_secret(), MAX_PASSPHRASE_BYTES)?;
-            validate_secret(
-                recovery_phrase.expose_secret(),
-                MAX_RECOVERY_PHRASE_BYTES,
-            )
+            validate_secret(recovery_phrase.expose_secret(), MAX_RECOVERY_PHRASE_BYTES)
         }
         _ => Ok(()),
     }
@@ -1247,7 +1242,10 @@ fn validate_service_frame(frame: &ServiceFrame) -> Result<(), AbiError> {
             {
                 return Err(AbiError::InvalidEvent);
             }
-            event.binding.validate().map_err(|_| AbiError::InvalidEvent)?;
+            event
+                .binding
+                .validate()
+                .map_err(|_| AbiError::InvalidEvent)?;
             event.payload.validate()?;
             match &event.payload {
                 ProviderEventPayload::Connect {
@@ -1280,12 +1278,10 @@ fn validate_service_frame(frame: &ServiceFrame) -> Result<(), AbiError> {
 fn validate_service_response(response: &ServiceResponse) -> Result<(), AbiError> {
     match response {
         ServiceResponse::AuthorityRegistered {
-            authority_revision,
-            ..
+            authority_revision, ..
         }
         | ServiceResponse::AuthorityReplaced {
-            authority_revision,
-            ..
+            authority_revision, ..
         } if *authority_revision == 0 => Err(AbiError::InvalidEnvelope),
         ServiceResponse::ProviderResult { binding, value } => {
             binding.validate()?;
@@ -1395,9 +1391,7 @@ fn validate_warnings(warnings: &BTreeSet<ApprovalWarning>) -> Result<(), AbiErro
 }
 
 fn validate_hns_name_disclosures(names: &[HnsNameDisclosure]) -> Result<(), AbiError> {
-    if names.len() > MAX_HNS_NAME_DISCLOSURES
-        || names.windows(2).any(|pair| pair[0] >= pair[1])
-    {
+    if names.len() > MAX_HNS_NAME_DISCLOSURES || names.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(AbiError::InvalidApproval);
     }
     let mut canonical_names = BTreeSet::new();
@@ -1432,8 +1426,7 @@ fn hns_name_hash_matches(name: &str, encoded: &str) -> bool {
         };
         decoded[index] = (high << 4) | low;
     }
-    hash_name(name.as_bytes())
-        .is_ok_and(|expected| decoded == expected.into_bytes())
+    hash_name(name.as_bytes()).is_ok_and(|expected| decoded == expected.into_bytes())
 }
 
 fn validate_public_string(value: &str) -> Result<(), AbiError> {
@@ -1551,9 +1544,11 @@ mod tests {
         .expect("encode");
         let declared = u32::from_be_bytes(encoded[..4].try_into().expect("prefix")) as usize;
         assert_eq!(declared, encoded.len() - 4);
-        assert!(std::str::from_utf8(&encoded[4..])
-            .expect("json")
-            .contains("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"));
+        assert!(
+            std::str::from_utf8(&encoded[4..])
+                .expect("json")
+                .contains("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE")
+        );
         assert_eq!(
             decode_host_frame(&encoded).expect("decode"),
             decode_host_frame(&encoded).expect("decode twice")
@@ -1804,9 +1799,8 @@ mod tests {
             capabilities: BTreeSet::from([PermissionCapability::Names]),
             hns_names: vec![HnsNameDisclosure {
                 name: "alpha".to_owned(),
-                name_hash:
-                    "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f"
-                        .to_owned(),
+                name_hash: "f0277d92062bd9a41dd26cddbaf2c41d576cf7b0173cbe96c23d5f5a4f92cc8f"
+                    .to_owned(),
             }],
         };
         assert_eq!(
@@ -1860,7 +1854,9 @@ mod tests {
             },
         };
         assert_eq!(
-            validate_service_frame(&ServiceFrame::Event { event: event.clone() }),
+            validate_service_frame(&ServiceFrame::Event {
+                event: event.clone()
+            }),
             Err(AbiError::InvalidEvent)
         );
         event.binding.permission_generation = 7;

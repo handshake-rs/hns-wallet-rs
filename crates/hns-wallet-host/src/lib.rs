@@ -5,16 +5,16 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use hns_wallet_ffi::{
-    ApprovalDecision, ApprovalPrompt, DisconnectReason, HostAuthorityFacts, HostFrame, HostHello,
-    HostPlatform, ProviderBinding, ProviderCapabilitySnapshot, ProviderEventEnvelope,
-    ProviderEventPayload, ServiceCapability, ServiceErrorCode, ServiceFrame, ServiceHello,
-    ServiceLimits, ServiceRequest, ServiceResponse, SessionEnvelope, WalletRequest, WalletResponse,
-    APPROVAL_SCHEMA_VERSION, MAX_METHOD_BYTES, MAX_ORIGIN_BYTES, MAX_PROVIDER_METHODS,
-    MAX_PROVIDER_REQUEST_BYTES, MAX_PUBLIC_ITEMS, PROVIDER_SCHEMA_VERSION, WALLET_ABI_VERSION,
+    APPROVAL_SCHEMA_VERSION, ApprovalDecision, ApprovalPrompt, DisconnectReason,
+    HostAuthorityFacts, HostFrame, HostHello, HostPlatform, MAX_METHOD_BYTES, MAX_ORIGIN_BYTES,
+    MAX_PROVIDER_METHODS, MAX_PROVIDER_REQUEST_BYTES, MAX_PUBLIC_ITEMS, PROVIDER_SCHEMA_VERSION,
+    ProviderBinding, ProviderCapabilitySnapshot, ProviderEventEnvelope, ProviderEventPayload,
+    ServiceCapability, ServiceErrorCode, ServiceFrame, ServiceHello, ServiceLimits, ServiceRequest,
+    ServiceResponse, SessionEnvelope, WALLET_ABI_VERSION, WalletRequest, WalletResponse,
 };
 use hns_wallet_types::{
-    HostAuthorityHandleId, HostSessionId, ProviderApprovalId, ProviderRequestId,
-    WalletServiceSessionId, PROVIDER_METHOD_WIRE_NAMES,
+    HostAuthorityHandleId, HostSessionId, PROVIDER_METHOD_WIRE_NAMES, ProviderApprovalId,
+    ProviderRequestId, WalletServiceSessionId,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -208,13 +208,19 @@ pub enum HostError {
 enum AuthorityPhase {
     Detached,
     Registering,
-    Active { revision: u64 },
+    Active {
+        revision: u64,
+    },
     Replacing {
         revision: u64,
         replacement: HostAuthorityFacts,
     },
-    Revoking { revision: u64 },
-    Stale { revision: u64 },
+    Revoking {
+        revision: u64,
+    },
+    Stale {
+        revision: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -399,10 +405,7 @@ pub struct WalletHost<C, E> {
 }
 
 impl WalletHost<SystemClock, SystemEntropy> {
-    pub fn new_system(
-        platform: HostPlatform,
-        restart_generation: u64,
-    ) -> Result<Self, HostError> {
+    pub fn new_system(platform: HostPlatform, restart_generation: u64) -> Result<Self, HostError> {
         Self::new(platform, restart_generation, SystemClock, SystemEntropy)
     }
 }
@@ -524,20 +527,19 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
     }
 
     pub fn authority(&self, handle: HostAuthorityHandleId) -> Option<AuthoritySnapshot> {
-        self.authorities.get(&handle).map(|state| AuthoritySnapshot {
-            facts: state.facts.clone(),
-            lifecycle: lifecycle(&state.phase),
-            binding: state.binding,
-            capabilities: state.capabilities.clone(),
-        })
+        self.authorities
+            .get(&handle)
+            .map(|state| AuthoritySnapshot {
+                facts: state.facts.clone(),
+                lifecycle: lifecycle(&state.phase),
+                binding: state.binding,
+                capabilities: state.capabilities.clone(),
+            })
     }
 
     /// Forgets host facts that can no longer authorize work. A live,
     /// non-expired authority must use the correlated revoke operation instead.
-    pub fn discard_authority(
-        &mut self,
-        handle: HostAuthorityHandleId,
-    ) -> Result<(), HostError> {
+    pub fn discard_authority(&mut self, handle: HostAuthorityHandleId) -> Result<(), HostError> {
         let now = self.now()?;
         let discardable = {
             let state = self
@@ -753,10 +755,7 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
             let state = self.active_authority(handle, now)?;
             let revision = active_revision(state)?;
             let binding = state.binding.ok_or(HostError::StaleBinding)?;
-            let capabilities = state
-                .capabilities
-                .as_ref()
-                .ok_or(HostError::StaleBinding)?;
+            let capabilities = state.capabilities.as_ref().ok_or(HostError::StaleBinding)?;
             if binding.authority_handle != handle
                 || binding.authority_revision != revision
                 || capabilities.wallet_session_id != binding.wallet_session_id
@@ -844,8 +843,8 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
             .get_mut(&approval_id)
             .ok_or(HostError::ApprovalMismatch)?
             .phase = ApprovalPhase::Deciding {
-                request_id: queued.request_id,
-            };
+            request_id: queued.request_id,
+        };
         Ok(queued.frame)
     }
 
@@ -897,7 +896,9 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
             || !hello
                 .capabilities
                 .contains(&ServiceCapability::OpaqueAuthorityRegistry)
-            || (hello.capabilities.contains(&ServiceCapability::ValueMovement)
+            || (hello
+                .capabilities
+                .contains(&ServiceCapability::ValueMovement)
                 && !hello
                     .capabilities
                     .contains(&ServiceCapability::ProviderDispatch))
@@ -1476,7 +1477,9 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
 
         let key = EventCursorKey::from_binding(event.binding);
         let expected = match self.event_cursors.get(&key) {
-            Some(sequence) => sequence.checked_add(1).ok_or(HostError::SequenceExhausted)?,
+            Some(sequence) => sequence
+                .checked_add(1)
+                .ok_or(HostError::SequenceExhausted)?,
             None => 1,
         };
         if event.event_sequence != expected {
@@ -1539,11 +1542,7 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
                 .next_host_sequence
                 .checked_add(1)
                 .ok_or(HostError::SequenceExhausted)?;
-            (
-                session.service_session_id,
-                session.next_host_sequence,
-                next,
-            )
+            (session.service_session_id, session.next_host_sequence, next)
         };
         self.pending.insert(request_id, class);
         self.remember_request_id(request_id);
@@ -1617,10 +1616,7 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
         Ok(now)
     }
 
-    fn validate_response_authority_time(
-        &mut self,
-        class: &RequestClass,
-    ) -> Result<(), HostError> {
+    fn validate_response_authority_time(&mut self, class: &RequestClass) -> Result<(), HostError> {
         let Some(handle) = class.authority() else {
             return Ok(());
         };
@@ -1707,10 +1703,7 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
         Err(HostError::RandomIdentityUnavailable)
     }
 
-    fn random_provider_nonce(
-        &mut self,
-        handle: HostAuthorityHandleId,
-    ) -> Result<u64, HostError> {
+    fn random_provider_nonce(&mut self, handle: HostAuthorityHandleId) -> Result<u64, HostError> {
         for _ in 0..RANDOM_ATTEMPTS {
             let bytes = random_nonzero::<8, _>(&mut self.entropy)?;
             let nonce = u64::from_be_bytes(bytes);
@@ -2416,12 +2409,8 @@ mod tests {
         let (mut host, _) = new_host();
         negotiate(&mut host, required_capabilities());
         install_active_authority(&mut host, 2_000);
-        let result = host.apply_provider_binding(
-            handle(),
-            1,
-            "wallet_revokePermissions",
-            binding(),
-        );
+        let result =
+            host.apply_provider_binding(handle(), 1, "wallet_revokePermissions", binding());
         assert!(matches!(result, Err(HostError::StaleBinding)));
     }
 
@@ -2444,7 +2433,12 @@ mod tests {
         };
         host.accept_service_frame(ServiceFrame::Event { event })
             .expect("wallet locked event");
-        assert!(host.authority(handle()).expect("authority").binding.is_none());
+        assert!(
+            host.authority(handle())
+                .expect("authority")
+                .binding
+                .is_none()
+        );
     }
 
     #[test]
@@ -2452,20 +2446,11 @@ mod tests {
         let (mut host, _) = new_host();
         negotiate(&mut host, required_capabilities());
         install_active_authority(&mut host, 2_000);
-        host.install_approval(
-            handle(),
-            1,
-            "wallet_requestPermissions",
-            approval_prompt(),
-        )
-        .expect("first prompt");
+        host.install_approval(handle(), 1, "wallet_requestPermissions", approval_prompt())
+            .expect("first prompt");
         host.approvals.remove(&approval_id());
-        let result = host.install_approval(
-            handle(),
-            1,
-            "wallet_requestPermissions",
-            approval_prompt(),
-        );
+        let result =
+            host.install_approval(handle(), 1, "wallet_requestPermissions", approval_prompt());
         assert!(matches!(result, Err(HostError::ApprovalMismatch)));
     }
 }

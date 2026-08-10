@@ -5,7 +5,7 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hns_wallet_ffi::{declared_payload_len, LENGTH_PREFIX_BYTES};
+use hns_wallet_ffi::{LENGTH_PREFIX_BYTES, declared_payload_len};
 use hns_wallet_service::WalletService;
 use hns_wallet_store::{SharedWalletStore, WalletStore};
 use zeroize::Zeroizing;

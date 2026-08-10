@@ -54,8 +54,7 @@ pub const MAX_KYOTO_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_KYOTO_SYNC_TIMEOUT: Duration = Duration::from_secs(86_400);
 /// Wallet-private HKDF-SHA256 salt for Bitcoin atomic-swap keys. This is not a
 /// registered BIP-32 purpose or an interoperable descriptor path.
-pub const BITCOIN_SWAP_DERIVATION_DOMAIN: &[u8] =
-    b"hns-wallet-rs/bitcoin-atomic-swap-key/v1";
+pub const BITCOIN_SWAP_DERIVATION_DOMAIN: &[u8] = b"hns-wallet-rs/bitcoin-atomic-swap-key/v1";
 const BITCOIN_SWAP_DERIVATION_INFO_TAG: &[u8; 4] = b"HSWP";
 const BITCOIN_SWAP_ALLOCATION_DERIVATION_DOMAIN: &[u8] =
     b"hns-wallet-rs/bitcoin-atomic-swap-allocation-key/v1";
@@ -918,13 +917,9 @@ mod tests {
     fn swap_key_derivation_has_stable_public_vectors() {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let mnemonic = parse_recovery_phrase(phrase).expect("valid phrase");
-        let mainnet_reference = BitcoinSwapKeyReference::new(
-            Network::Bitcoin,
-            BitcoinSwapKeyRole::Receiver,
-            0,
-            0,
-        )
-        .expect("bounded reference");
+        let mainnet_reference =
+            BitcoinSwapKeyReference::new(Network::Bitcoin, BitcoinSwapKeyRole::Receiver, 0, 0)
+                .expect("bounded reference");
         let mainnet =
             derive_bitcoin_swap_key(&mnemonic, mainnet_reference).expect("derived swap key");
         assert_eq!(
@@ -937,13 +932,9 @@ mod tests {
         );
         assert!(format!("{mainnet:?}").contains("[REDACTED]"));
 
-        let regtest_reference = BitcoinSwapKeyReference::new(
-            Network::Regtest,
-            BitcoinSwapKeyRole::Receiver,
-            0,
-            0,
-        )
-        .expect("bounded reference");
+        let regtest_reference =
+            BitcoinSwapKeyReference::new(Network::Regtest, BitcoinSwapKeyRole::Receiver, 0, 0)
+                .expect("bounded reference");
         let regtest =
             derive_bitcoin_swap_key(&mnemonic, regtest_reference).expect("derived swap key");
         assert_eq!(regtest_reference.coin_type(), 1);
@@ -963,20 +954,12 @@ mod tests {
     fn swap_roles_are_bounded_and_do_not_reuse_bip84_keys() {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let mnemonic = parse_recovery_phrase(phrase).expect("valid phrase");
-        let receiver_reference = BitcoinSwapKeyReference::new(
-            Network::Bitcoin,
-            BitcoinSwapKeyRole::Receiver,
-            0,
-            0,
-        )
-        .expect("bounded reference");
-        let refund_reference = BitcoinSwapKeyReference::new(
-            Network::Bitcoin,
-            BitcoinSwapKeyRole::RefundOwner,
-            0,
-            0,
-        )
-        .expect("bounded reference");
+        let receiver_reference =
+            BitcoinSwapKeyReference::new(Network::Bitcoin, BitcoinSwapKeyRole::Receiver, 0, 0)
+                .expect("bounded reference");
+        let refund_reference =
+            BitcoinSwapKeyReference::new(Network::Bitcoin, BitcoinSwapKeyRole::RefundOwner, 0, 0)
+                .expect("bounded reference");
         let receiver =
             derive_bitcoin_swap_key(&mnemonic, receiver_reference).expect("receiver key");
         let refund = derive_bitcoin_swap_key(&mnemonic, refund_reference).expect("refund key");
@@ -1039,13 +1022,9 @@ mod tests {
     fn derived_swap_role_is_bound_to_the_htlc_position() {
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let mnemonic = parse_recovery_phrase(phrase).expect("valid phrase");
-        let receiver_reference = BitcoinSwapKeyReference::new(
-            Network::Regtest,
-            BitcoinSwapKeyRole::Receiver,
-            7,
-            42,
-        )
-        .expect("bounded reference");
+        let receiver_reference =
+            BitcoinSwapKeyReference::new(Network::Regtest, BitcoinSwapKeyRole::Receiver, 7, 42)
+                .expect("bounded reference");
         let receiver =
             derive_bitcoin_swap_key(&mnemonic, receiver_reference).expect("receiver key");
         assert_eq!(
@@ -1074,13 +1053,9 @@ mod tests {
                 .to_bytes()
         );
 
-        let refund_reference = BitcoinSwapKeyReference::new(
-            Network::Regtest,
-            BitcoinSwapKeyRole::RefundOwner,
-            7,
-            42,
-        )
-        .expect("bounded reference");
+        let refund_reference =
+            BitcoinSwapKeyReference::new(Network::Regtest, BitcoinSwapKeyRole::RefundOwner, 7, 42)
+                .expect("bounded reference");
         let refund = derive_bitcoin_swap_key(&mnemonic, refund_reference).expect("refund key");
         let refund_htlc = BitcoinHtlc::new_with_local_swap_key(
             Sha256::digest(preimage).into(),

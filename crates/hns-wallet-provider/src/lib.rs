@@ -52,8 +52,7 @@ impl Origin {
             Host::Ipv4(address) => address.is_loopback(),
             Host::Ipv6(address) => address.is_loopback(),
         };
-        let secure = parsed.scheme() == "https"
-            || (parsed.scheme() == "http" && loopback);
+        let secure = parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback);
         if !secure {
             return Err(ProviderError::InsecureContext);
         }
@@ -468,15 +467,9 @@ impl ProviderStateStore for WalletStore {
         next_generation: u64,
         now_unix: u64,
     ) -> Result<(), ProviderError> {
-        self.revoke_provider_permission(
-            scope,
-            expected_generation,
-            next_generation,
-            now_unix,
-        )?;
+        self.revoke_provider_permission(scope, expected_generation, next_generation, now_unix)?;
         Ok(())
     }
-
 }
 
 impl ProviderStateStore for SharedWalletStore {
@@ -515,12 +508,7 @@ impl ProviderStateStore for SharedWalletStore {
         now_unix: u64,
     ) -> Result<(), ProviderError> {
         self.with_store_mut(|store| {
-            store.revoke_provider_permission(
-                scope,
-                expected_generation,
-                next_generation,
-                now_unix,
-            )
+            store.revoke_provider_permission(scope, expected_generation, next_generation, now_unix)
         })?;
         Ok(())
     }
@@ -555,8 +543,7 @@ impl ProviderStateStore for MemoryProviderState {
         }
         self.permission_generations
             .insert(scope.to_owned(), record.generation);
-        self.permissions
-            .insert(scope.to_owned(), record.clone());
+        self.permissions.insert(scope.to_owned(), record.clone());
         Ok(())
     }
 
@@ -580,7 +567,6 @@ impl ProviderStateStore for MemoryProviderState {
             .insert(scope.to_owned(), next_generation);
         Ok(())
     }
-
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -632,13 +618,8 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         if self.authorities.len() >= MAX_REGISTERED_AUTHORITIES {
             return Err(ProviderError::AuthorityCapacity);
         }
-        self.authorities.insert(
-            handle,
-            RegisteredAuthority {
-                facts,
-                revision: 1,
-            },
-        );
+        self.authorities
+            .insert(handle, RegisteredAuthority { facts, revision: 1 });
         Ok(1)
     }
 
@@ -682,8 +663,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         self.pending
             .retain(|_, approval| approval.authority_handle != handle);
         self.rate.retain(|(candidate, _), _| *candidate != handle);
-        self.replay
-            .retain(|(candidate, _), _| *candidate != handle);
+        self.replay.retain(|(candidate, _), _| *candidate != handle);
         Ok(revision)
     }
 
@@ -703,8 +683,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         self.pending
             .retain(|_, approval| approval.authority_handle != handle);
         self.rate.retain(|(candidate, _), _| *candidate != handle);
-        self.replay
-            .retain(|(candidate, _), _| *candidate != handle);
+        self.replay.retain(|(candidate, _), _| *candidate != handle);
         Ok(())
     }
 
@@ -767,7 +746,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
                 &authority.facts,
                 now_unix,
             )?
-                .ok_or(ProviderError::Unauthorized)?;
+            .ok_or(ProviderError::Unauthorized)?;
             if permission.generation != permission_generation
                 || !permission.permits(required, now_unix)
             {
@@ -820,7 +799,9 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         now_unix_ms: u64,
     ) -> Result<ApprovedCall, ProviderError> {
         self.accept_time(now_unix_ms)?;
-        let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
+        let authority = self
+            .authority(handle, authority_revision, now_unix_ms)?
+            .clone();
         let approval = self
             .pending
             .get(&id)
@@ -864,7 +845,9 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         now_unix_ms: u64,
     ) -> Result<(), ProviderError> {
         self.accept_time(now_unix_ms)?;
-        let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
+        let authority = self
+            .authority(handle, authority_revision, now_unix_ms)?
+            .clone();
         let approval = self
             .pending
             .get(&id)
@@ -893,7 +876,9 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         now_unix_ms: u64,
     ) -> Result<PermissionSnapshot, ProviderError> {
         self.accept_time(now_unix_ms)?;
-        let authority = self.authority(handle, authority_revision, now_unix_ms)?.clone();
+        let authority = self
+            .authority(handle, authority_revision, now_unix_ms)?
+            .clone();
         let scope = permission_scope(&authority.facts);
         let generation = self.state.permission_generation(&scope)?.unwrap_or(0);
         let stored = self.state.permission(&scope)?;
@@ -903,11 +888,8 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         {
             return Err(ProviderError::Persistence);
         }
-        let permission = validate_permission_identity(
-            stored,
-            &authority.facts,
-            now_unix_ms / 1_000,
-        )?;
+        let permission =
+            validate_permission_identity(stored, &authority.facts, now_unix_ms / 1_000)?;
         Ok(PermissionSnapshot {
             generation,
             record: permission,
@@ -1076,12 +1058,8 @@ impl<S: ProviderStateStore> ProviderCore<S> {
         let next_generation = expected_generation
             .checked_add(1)
             .ok_or(ProviderError::StaleContext)?;
-        self.state.revoke_permission(
-            &scope,
-            expected_generation,
-            next_generation,
-            now_unix,
-        )?;
+        self.state
+            .revoke_permission(&scope, expected_generation, next_generation, now_unix)?;
         self.pending.retain(|_, approval| {
             approval.call.origin != authority.facts.origin
                 || approval.call.namespace != authority.facts.namespace
@@ -1129,8 +1107,7 @@ impl<S: ProviderStateStore> ProviderCore<S> {
             self.pending
                 .retain(|_, approval| approval.authority_handle != handle);
             self.rate.retain(|(candidate, _), _| *candidate != handle);
-            self.replay
-                .retain(|(candidate, _), _| *candidate != handle);
+            self.replay.retain(|(candidate, _), _| *candidate != handle);
         }
     }
 
@@ -1420,11 +1397,8 @@ mod tests {
     }
 
     fn provider() -> ProviderCore<MemoryProviderState> {
-        let mut provider = ProviderCore::new(
-            MemoryProviderState::default(),
-            wallet_session(),
-            false,
-        );
+        let mut provider =
+            ProviderCore::new(MemoryProviderState::default(), wallet_session(), false);
         provider
             .register_authority(handle(), registration(), NOW_MS)
             .expect("register authority");
@@ -1563,10 +1537,7 @@ mod tests {
             .grant_scoped_permissions(
                 handle(),
                 1,
-                BTreeSet::from([
-                    PermissionCapability::Accounts,
-                    PermissionCapability::Names,
-                ]),
+                BTreeSet::from([PermissionCapability::Accounts, PermissionCapability::Names]),
                 BTreeSet::from([account]),
                 BTreeSet::from([name]),
                 NOW_MS,
@@ -1586,10 +1557,7 @@ mod tests {
             provider.grant_scoped_permissions(
                 handle(),
                 1,
-                BTreeSet::from([
-                    PermissionCapability::Accounts,
-                    PermissionCapability::Names,
-                ]),
+                BTreeSet::from([PermissionCapability::Accounts, PermissionCapability::Names,]),
                 BTreeSet::from([account]),
                 oversized,
                 NOW_MS,
@@ -1849,9 +1817,7 @@ mod tests {
         state
             .save_permission(&scope, &record)
             .expect("trusted bootstrap");
-        state
-            .revoke_permission(&scope, 5, 6, 2)
-            .expect("revoke");
+        state.revoke_permission(&scope, 5, 6, 2).expect("revoke");
         let mut reset = record.clone();
         reset.generation = 6;
         assert!(matches!(

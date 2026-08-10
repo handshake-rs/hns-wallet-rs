@@ -1359,12 +1359,7 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             .with_store_mut(|store| Ok(prepare_hns_account_read(store, &selected, now_unix)))
             .map_err(map_shared_store_error)??;
         let tip = self.backend.get_chain_tip()?;
-        let scan = scan_hns_account_read(
-            &self.backend,
-            &self.store,
-            &preparation,
-            tip,
-        )?;
+        let scan = scan_hns_account_read(&self.backend, &self.store, &preparation, tip)?;
         let selected_after_scan = self.selector.selected_account()?;
         if selected_after_scan != preparation.fenced_account {
             return Err(HnsWalletError::StaleAccountRead);
@@ -3806,12 +3801,8 @@ fn prepare_hns_account_read(
     // runtime before deriving or querying any separated seller-key script.
     let mut fenced_account = stored.value;
     fenced_account.shakedex_scan_in_progress = true;
-    let account_revision = store.save_wallet_account(
-        &account_id,
-        stored.revision,
-        &fenced_account,
-        now_unix,
-    )?;
+    let account_revision =
+        store.save_wallet_account(&account_id, stored.revision, &fenced_account, now_unix)?;
     let fenced = store
         .wallet_account::<HnsAccountRecord>(&account_id)?
         .ok_or(HnsWalletError::StaleAccountRead)?;
@@ -3826,9 +3817,8 @@ fn prepare_hns_account_read(
     let mut scan_account = fenced_account.clone();
     normalize_restore_scan_account(&mut scan_account, allocated_next)?;
     let prefix = account_entity_prefix(&fenced_account.config);
-    let recovery_row = store.hns_recovery_state::<HnsRecoveryState>(&recovery_entity_id(
-        &fenced_account.config,
-    ))?;
+    let recovery_row = store
+        .hns_recovery_state::<HnsRecoveryState>(&recovery_entity_id(&fenced_account.config))?;
     let recovery = recovery_row
         .as_ref()
         .map_or_else(HnsRecoveryState::default, |stored| stored.value.clone());
@@ -3848,8 +3838,7 @@ fn prepare_hns_account_read(
     for stored in &coins {
         let expected = namespaced_outpoint_id(&fenced_account.config, stored.value.coin.outpoint);
         if stored.id.as_slice() != expected.as_slice()
-            || stored.value.derivation.account
-                != fenced_account.config.account_derivation_index
+            || stored.value.derivation.account != fenced_account.config.account_derivation_index
             || stored.value.to_canonical_coin().is_err()
         {
             return Err(HnsWalletError::InvalidEvidence);
@@ -4050,9 +4039,9 @@ fn reconcile_hns_read_transactions<B: HnsBackend>(
         .map(|address| address.program.clone())
         .collect();
     if programs.len() != addresses.len()
-        || addresses.iter().any(|address| {
-            validate_restore_program(address.derivation, &address.program).is_err()
-        })
+        || addresses
+            .iter()
+            .any(|address| validate_restore_program(address.derivation, &address.program).is_err())
     {
         return Err(HnsWalletError::InvalidEvidence);
     }
@@ -4096,12 +4085,8 @@ fn reconcile_hns_read_transactions<B: HnsBackend>(
         };
         let transaction = decode_transaction_for_id(&raw, entry.txid)?;
         raw_cache.insert(entry.txid, transaction.clone());
-        let competing_spender = hns_read_has_competing_spender(
-            backend,
-            entry.txid,
-            &transaction,
-            binding,
-        )?;
+        let competing_spender =
+            hns_read_has_competing_spender(backend, entry.txid, &transaction, binding)?;
         validate_inclusion(
             entry,
             evidence.status,
@@ -4126,9 +4111,9 @@ fn reconcile_hns_read_transactions<B: HnsBackend>(
             LocalTransactionStatus::Mempool
         } else if previous.get(&entry.txid).is_some_and(|old| {
             old.status == LocalTransactionStatus::Confirmed
-                && old.block_height.is_some_and(|height| {
-                    common_ancestor.is_none_or(|ancestor| height > ancestor)
-                })
+                && old
+                    .block_height
+                    .is_some_and(|height| common_ancestor.is_none_or(|ancestor| height > ancestor))
         }) {
             LocalTransactionStatus::Reorged
         } else {
@@ -4207,8 +4192,7 @@ fn revalidate_hns_read_names<B: HnsBackend>(
             Some(&wallet_name_addresses),
         )?
         .known_name;
-        if current.name_hash != stored.value.name_hash
-            || current.proof_height != binding.tip.height
+        if current.name_hash != stored.value.name_hash || current.proof_height != binding.tip.height
         {
             return Err(HnsWalletError::InvalidEvidence);
         }
@@ -4240,7 +4224,11 @@ fn verify_hns_read_snapshot_current<B: HnsBackend>(
             limit: 1,
         })?;
         if confirmed.binding != binding
-            || confirmed.history.len().saturating_add(confirmed.utxos.len()) > 1
+            || confirmed
+                .history
+                .len()
+                .saturating_add(confirmed.utxos.len())
+                > 1
         {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
@@ -4641,11 +4629,7 @@ where
     let mut expected_mempool = None;
     loop {
         let [coin_addresses, name_addresses, shakedex_addresses] = derive_branches(&account)?;
-        validate_disjoint_restore_programs(
-            &coin_addresses,
-            &name_addresses,
-            &shakedex_addresses,
-        )?;
+        validate_disjoint_restore_programs(&coin_addresses, &name_addresses, &shakedex_addresses)?;
 
         let (coin_scripts, coin_index_remap) = sorted_restore_scripts(&coin_addresses)?;
         let (binding, mempool, coin_history, coin_coins) = load_wallet_snapshot(
@@ -4673,8 +4657,7 @@ where
         )?;
         validate_same_restore_snapshot(binding, mempool, name_binding, name_mempool)?;
 
-        let (shakedex_scripts, shakedex_index_remap) =
-            sorted_restore_scripts(&shakedex_addresses)?;
+        let (shakedex_scripts, shakedex_index_remap) = sorted_restore_scripts(&shakedex_addresses)?;
         let (shakedex_binding, shakedex_mempool, shakedex_history, shakedex_coins) =
             load_wallet_snapshot(
                 backend,
@@ -4684,12 +4667,7 @@ where
                 Some(binding),
                 Some(mempool),
             )?;
-        validate_same_restore_snapshot(
-            binding,
-            mempool,
-            shakedex_binding,
-            shakedex_mempool,
-        )?;
+        validate_same_restore_snapshot(binding, mempool, shakedex_binding, shakedex_mempool)?;
         expected_binding = Some(binding);
         expected_mempool = Some(mempool);
 
@@ -4753,8 +4731,7 @@ where
         let required_external = required_scan_end(last_external, account.external_scan_end, gap);
         let required_internal = required_scan_end(last_internal, account.internal_scan_end, gap);
         let required_name = required_scan_end(last_name, account.name_scan_end, gap);
-        let required_shakedex =
-            required_scan_end(last_shakedex, account.shakedex_scan_end, gap);
+        let required_shakedex = required_scan_end(last_shakedex, account.shakedex_scan_end, gap);
         checked_scan_address_count(&[required_external, required_internal])?;
         checked_scan_address_count(&[required_name])?;
         checked_scan_address_count(&[required_shakedex])?;
@@ -7905,16 +7882,15 @@ mod tests {
         ) -> Result<MempoolWalletPage, HnsWalletError> {
             self.prove_store_mutex_is_released()?;
             let call = self.mempool_calls.fetch_add(1, Ordering::SeqCst);
-            let mempool = if self.fault == ProductionFollowupReadFault::RestartedMempool
-                && call >= 3
-            {
-                MempoolSnapshotBinding {
-                    instance_nonce: [34; 32],
-                    generation: 1,
-                }
-            } else {
-                Self::mempool()
-            };
+            let mempool =
+                if self.fault == ProductionFollowupReadFault::RestartedMempool && call >= 3 {
+                    MempoolSnapshotBinding {
+                        instance_nonce: [34; 32],
+                        generation: 1,
+                    }
+                } else {
+                    Self::mempool()
+                };
             Ok(MempoolWalletPage {
                 binding: Self::binding(),
                 mempool,
@@ -8972,8 +8948,14 @@ mod tests {
 
         let snapshot = runtime.synchronize().expect("one synchronized read");
         assert_eq!(snapshot.account_id, config.account_id);
-        assert_eq!(snapshot.binding.chain, ProductionFollowupReadBackend::binding());
-        assert_eq!(snapshot.binding.mempool, ProductionFollowupReadBackend::mempool());
+        assert_eq!(
+            snapshot.binding.chain,
+            ProductionFollowupReadBackend::binding()
+        );
+        assert_eq!(
+            snapshot.binding.mempool,
+            ProductionFollowupReadBackend::mempool()
+        );
         assert_eq!(snapshot.balance, Amount::new(WalletAsset::Hns, 0));
         assert!(snapshot.transactions.is_empty());
         assert!(snapshot.known_names.is_empty());
@@ -9066,11 +9048,8 @@ mod tests {
         assert!(locked_store.is_locked().expect("locked read store"));
 
         let (selector_store, selector_config) = production_followup_read_store();
-        let selector = HnsExistingAccountSelector::new(
-            selector_store,
-            selector_config.clone(),
-        )
-        .expect("selector authority");
+        let selector = HnsExistingAccountSelector::new(selector_store, selector_config.clone())
+            .expect("selector authority");
         let (different_store, _) = production_followup_read_store();
         assert!(matches!(
             HnsAccountReadRuntime::new(

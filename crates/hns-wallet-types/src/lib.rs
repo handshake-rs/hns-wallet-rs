@@ -110,12 +110,8 @@ fn encode_wire_id(bytes: &[u8]) -> String {
         let second = bytes[index + 1];
         let third = bytes[index + 2];
         encoded.push(BASE64URL_ALPHABET[(first >> 2) as usize] as char);
-        encoded.push(
-            BASE64URL_ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char,
-        );
-        encoded.push(
-            BASE64URL_ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char,
-        );
+        encoded.push(BASE64URL_ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        encoded.push(BASE64URL_ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
         encoded.push(BASE64URL_ALPHABET[(third & 0x3f) as usize] as char);
         index += 3;
     }
@@ -129,9 +125,8 @@ fn encode_wire_id(bytes: &[u8]) -> String {
             let first = bytes[index];
             let second = bytes[index + 1];
             encoded.push(BASE64URL_ALPHABET[(first >> 2) as usize] as char);
-            encoded.push(
-                BASE64URL_ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char,
-            );
+            encoded
+                .push(BASE64URL_ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
             encoded.push(BASE64URL_ALPHABET[((second & 0x0f) << 2) as usize] as char);
         }
         _ => {}
@@ -651,12 +646,9 @@ mod tests {
             serde_json::from_str::<ProviderRequestId>(&encoded).expect("deserialize"),
             id
         );
-        assert!(serde_json::from_str::<ProviderRequestId>("\"AQEBAQEBAQEBAQEBAQEBAg\"")
-            .is_ok());
-        assert!(serde_json::from_str::<ProviderRequestId>("\"AQEBAQEBAQEBAQEBAQEBAR\"")
-            .is_err());
-        assert!(serde_json::from_str::<ProviderRequestId>("\"AQEBAQEBAQEBAQEBAQEBAQ==\"")
-            .is_err());
+        assert!(serde_json::from_str::<ProviderRequestId>("\"AQEBAQEBAQEBAQEBAQEBAg\"").is_ok());
+        assert!(serde_json::from_str::<ProviderRequestId>("\"AQEBAQEBAQEBAQEBAQEBAR\"").is_err());
+        assert!(serde_json::from_str::<ProviderRequestId>("\"AQEBAQEBAQEBAQEBAQEBAQ==\"").is_err());
         assert!(ProviderRequestId::from_bytes([0_u8; 16]).is_err());
         assert!(!format!("{id:?}").contains("AQEBA"));
         assert_eq!(format!("{id}"), "<redacted>");

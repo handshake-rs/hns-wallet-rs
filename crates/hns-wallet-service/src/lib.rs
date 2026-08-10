@@ -14,8 +14,7 @@ use hns_wallet_ffi::{
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountReadSnapshot, HnsBackend, HnsClock,
-    HnsExistingAccountSelector, HnsWalletError, KnownName, NameOwnershipStatus,
-    NameResourceStatus,
+    HnsExistingAccountSelector, HnsWalletError, KnownName, NameOwnershipStatus, NameResourceStatus,
 };
 use hns_wallet_provider::{
     ApprovedCall, HostAuthorityRegistration, Origin, PROVIDER_API_VERSION, PendingApproval,
@@ -24,9 +23,9 @@ use hns_wallet_provider::{
 };
 use hns_wallet_store::{SharedWalletStore, StoreError};
 use hns_wallet_types::{
-    Amount, ApprovalId, ApprovalKind, HostAuthorityHandleId, HostSessionId,
-    LocalTransactionStatus, ModuleId, PermissionCapability, ProviderApprovalId, ProviderRequestId,
-    ReceiveTarget, TransactionSummary, WalletAsset, WalletServiceSessionId, WalletSessionId,
+    Amount, ApprovalId, ApprovalKind, HostAuthorityHandleId, HostSessionId, LocalTransactionStatus,
+    ModuleId, PermissionCapability, ProviderApprovalId, ProviderRequestId, ReceiveTarget,
+    TransactionSummary, WalletAsset, WalletServiceSessionId, WalletSessionId,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -112,19 +111,27 @@ impl ServiceRuntime for UnavailableRuntime {
     }
 
     fn prepare_approval(&mut self, _: &PendingApproval) -> Result<ApprovalSummary, ServiceFailure> {
-        Err(ServiceFailure::unsupported(ServiceCapability::ProviderDispatch))
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
     }
 
     fn execute_provider(&mut self, _: ApprovedCall) -> Result<Value, ServiceFailure> {
-        Err(ServiceFailure::unsupported(ServiceCapability::ProviderDispatch))
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
     }
 
     fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
-        Err(ServiceFailure::unsupported(ServiceCapability::WalletOperations))
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::WalletOperations,
+        ))
     }
 
     fn execute_wallet(&mut self, _: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
-        Err(ServiceFailure::unsupported(ServiceCapability::WalletOperations))
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::WalletOperations,
+        ))
     }
 }
 
@@ -163,10 +170,7 @@ impl ServiceRuntime for PersistentControlRuntime {
         method == ProviderMethod::WalletGetStatus
     }
 
-    fn prepare_approval(
-        &mut self,
-        _: &PendingApproval,
-    ) -> Result<ApprovalSummary, ServiceFailure> {
+    fn prepare_approval(&mut self, _: &PendingApproval) -> Result<ApprovalSummary, ServiceFailure> {
         Err(ServiceFailure::unsupported(
             ServiceCapability::ProviderDispatch,
         ))
@@ -422,10 +426,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsReadRuntime<B, C> {
         if self.store.is_locked().map_err(persistent_store_failure)? {
             return Err(wallet_locked());
         }
-        let selected = self
-            .runtime
-            .selected_account()
-            .map_err(hns_read_failure)?;
+        let selected = self.runtime.selected_account().map_err(hns_read_failure)?;
         let account = AccountSummary {
             account_id: selected.config.account_id,
             module: ModuleId::Handshake,
@@ -720,10 +721,11 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         payload: ProviderEventPayload,
         now_unix_ms: u64,
     ) -> Result<Vec<u8>, ServiceError> {
-        let permission = match self
-            .provider
-            .permission_snapshot(authority_handle, authority_revision, now_unix_ms)
-        {
+        let permission = match self.provider.permission_snapshot(
+            authority_handle,
+            authority_revision,
+            now_unix_ms,
+        ) {
             Ok(permission) => permission,
             Err(error) => {
                 self.event_sequences.clear();
@@ -821,8 +823,14 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         .map_err(ServiceError::from)
     }
 
-    fn accept_request_header<T>(&mut self, envelope: &SessionEnvelope<T>) -> Result<(), ServiceError> {
-        let session = self.session.as_mut().ok_or(ServiceError::HandshakeRequired)?;
+    fn accept_request_header<T>(
+        &mut self,
+        envelope: &SessionEnvelope<T>,
+    ) -> Result<(), ServiceError> {
+        let session = self
+            .session
+            .as_mut()
+            .ok_or(ServiceError::HandshakeRequired)?;
         if envelope.host_session_id != session.host_session_id
             || envelope.service_session_id != self.service_session_id
             || envelope.restart_generation != session.restart_generation
@@ -853,7 +861,10 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
     }
 
     fn next_service_sequence(&mut self) -> Result<(SessionState, u64), ServiceError> {
-        let session = self.session.as_mut().ok_or(ServiceError::HandshakeRequired)?;
+        let session = self
+            .session
+            .as_mut()
+            .ok_or(ServiceError::HandshakeRequired)?;
         let sequence = session.next_service_sequence;
         session.next_service_sequence = sequence
             .checked_add(1)
@@ -871,12 +882,14 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 authority_handle,
                 authority,
             } => {
-                let revision = self.provider.register_authority(
-                    authority_handle,
-                    provider_authority(authority)?,
-                    now_unix_ms,
-                )
-                .map_err(provider_failure)?;
+                let revision = self
+                    .provider
+                    .register_authority(
+                        authority_handle,
+                        provider_authority(authority)?,
+                        now_unix_ms,
+                    )
+                    .map_err(provider_failure)?;
                 Ok(ServiceResponse::AuthorityRegistered {
                     authority_handle,
                     authority_revision: revision,
@@ -887,13 +900,15 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 expected_authority_revision,
                 authority,
             } => {
-                let revision = self.provider.replace_authority(
-                    authority_handle,
-                    expected_authority_revision,
-                    provider_authority(authority)?,
-                    now_unix_ms,
-                )
-                .map_err(provider_failure)?;
+                let revision = self
+                    .provider
+                    .replace_authority(
+                        authority_handle,
+                        expected_authority_revision,
+                        provider_authority(authority)?,
+                        now_unix_ms,
+                    )
+                    .map_err(provider_failure)?;
                 self.pending
                     .retain(|_, pending| pending.binding.authority_handle != authority_handle);
                 self.event_sequences
@@ -919,11 +934,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             ServiceRequest::ProviderCapabilities {
                 authority_handle,
                 authority_revision,
-            } => self.provider_capabilities(
-                authority_handle,
-                authority_revision,
-                now_unix_ms,
-            ),
+            } => self.provider_capabilities(authority_handle, authority_revision, now_unix_ms),
             ServiceRequest::ProviderRequest {
                 authority_handle,
                 authority_revision,
@@ -951,8 +962,13 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 now_unix_ms,
             ),
             ServiceRequest::Wallet { request } => {
-                if !self.capabilities.contains(&ServiceCapability::WalletOperations) {
-                    return Err(ServiceFailure::unsupported(ServiceCapability::WalletOperations));
+                if !self
+                    .capabilities
+                    .contains(&ServiceCapability::WalletOperations)
+                {
+                    return Err(ServiceFailure::unsupported(
+                        ServiceCapability::WalletOperations,
+                    ));
                 }
                 let response = self.runtime.execute_wallet(request)?;
                 match &response {
@@ -986,11 +1002,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         authority_revision: u64,
         now_unix_ms: u64,
     ) -> Result<ServiceResponse, ServiceFailure> {
-        let binding = self.provider_binding(
-            authority_handle,
-            authority_revision,
-            now_unix_ms,
-        )?;
+        let binding = self.provider_binding(authority_handle, authority_revision, now_unix_ms)?;
         let capabilities = ProviderCapabilitySnapshot {
             provider_schema_version: PROVIDER_SCHEMA_VERSION,
             approval_schema_version: APPROVAL_SCHEMA_VERSION,
@@ -1156,20 +1168,19 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                         .map_err(provider_failure)?;
                     return Err(invalid_request("too many pending approvals"));
                 }
-                let (summary, hns_permission_scope) = match self
-                    .approval_summary(&approval, now_unix_ms)
-                {
-                    Ok(prepared) => prepared,
-                    Err(failure) => {
-                        let _ = self.provider.reject(
-                            authority_handle,
-                            authority_revision,
-                            approval.id,
-                            now_unix_ms,
-                        );
-                        return Err(failure);
-                    }
-                };
+                let (summary, hns_permission_scope) =
+                    match self.approval_summary(&approval, now_unix_ms) {
+                        Ok(prepared) => prepared,
+                        Err(failure) => {
+                            let _ = self.provider.reject(
+                                authority_handle,
+                                authority_revision,
+                                approval.id,
+                                now_unix_ms,
+                            );
+                            return Err(failure);
+                        }
+                    };
                 let wire_id = match wire_approval_id(approval.id) {
                     Ok(wire_id) => wire_id,
                     Err(failure) => {
@@ -1182,10 +1193,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                         return Err(failure);
                     }
                 };
-                let expires_at_unix_ms = match approval
-                    .expires_at_unix
-                    .checked_mul(1_000)
-                {
+                let expires_at_unix_ms = match approval.expires_at_unix.checked_mul(1_000) {
                     Some(expiry) => expiry,
                     None => {
                         let _ = self.provider.reject(
@@ -1256,24 +1264,21 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         {
             return Err(stale_approval());
         }
-        let binding = self.provider_binding(
-            authority_handle,
-            authority_revision,
-            now_unix_ms,
-        )?;
+        let binding = self.provider_binding(authority_handle, authority_revision, now_unix_ms)?;
         if pending.binding != binding {
             return Err(stale_approval());
         }
         let internal_id = ApprovalId::new(approval_id.into_bytes());
         match decision {
             hns_wallet_ffi::ApprovalDecision::Reject => {
-                self.provider.reject(
-                    authority_handle,
-                    authority_revision,
-                    internal_id,
-                    now_unix_ms,
-                )
-                .map_err(provider_failure)?;
+                self.provider
+                    .reject(
+                        authority_handle,
+                        authority_revision,
+                        internal_id,
+                        now_unix_ms,
+                    )
+                    .map_err(provider_failure)?;
                 self.pending.remove(&approval_id);
                 Ok(ServiceResponse::ApprovalRejected { approval_id })
             }
@@ -1293,13 +1298,15 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     self.pending.remove(&approval_id);
                     return Err(failure);
                 }
-                let call = self.provider.approve(
-                    authority_handle,
-                    authority_revision,
-                    internal_id,
-                    now_unix_ms,
-                )
-                .map_err(provider_failure)?;
+                let call = self
+                    .provider
+                    .approve(
+                        authority_handle,
+                        authority_revision,
+                        internal_id,
+                        now_unix_ms,
+                    )
+                    .map_err(provider_failure)?;
                 if call.method.approval() != Some(pending.kind) {
                     self.pending.remove(&approval_id);
                     return Err(stale_approval());
@@ -1328,11 +1335,8 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         let summary = match approval.call.method {
             ProviderMethod::WalletRequestPermissions => {
                 let capabilities = requested_capabilities(&approval.call)?;
-                hns_permission_scope = self.prepare_hns_permission_scope(
-                    approval,
-                    &capabilities,
-                    now_unix_ms,
-                )?;
+                hns_permission_scope =
+                    self.prepare_hns_permission_scope(approval, &capabilities, now_unix_ms)?;
                 let hns_names = hns_permission_scope
                     .as_ref()
                     .and_then(|scope| scope.names.as_ref())
@@ -1343,12 +1347,10 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     hns_names,
                 })
             }
-            ProviderMethod::HnsRequestAccounts => {
-                Ok(ApprovalSummary::Permissions {
-                    capabilities: requested_capabilities(&approval.call)?,
-                    hns_names: Vec::new(),
-                })
-            }
+            ProviderMethod::HnsRequestAccounts => Ok(ApprovalSummary::Permissions {
+                capabilities: requested_capabilities(&approval.call)?,
+                hns_names: Vec::new(),
+            }),
             ProviderMethod::WalletEnableModule | ProviderMethod::WalletDisableModule => {
                 let module = requested_module(&approval.call.params)?;
                 let action = if approval.call.method == ProviderMethod::WalletEnableModule {
@@ -1455,8 +1457,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         }
         if let Some(expected_names) = expected.names.as_ref() {
             let current_names = self.runtime.current_hns_names()?;
-            let current = hns_name_approval_scope(current_names)
-                .map_err(|_| stale_approval())?;
+            let current = hns_name_approval_scope(current_names).map_err(|_| stale_approval())?;
             if &current != expected_names {
                 return Err(stale_approval());
             }
@@ -1679,7 +1680,9 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             .ok_or_else(|| provider_failure(ProviderError::Unauthorized))?;
         let selected = self.runtime.selected_hns_account()?;
         validate_hns_account_summary(&selected)?;
-        if !record.capabilities.contains(&PermissionCapability::Accounts)
+        if !record
+            .capabilities
+            .contains(&PermissionCapability::Accounts)
             || !record.capabilities.contains(&required)
             || record.approved_accounts != BTreeSet::from([selected.account_id])
         {
@@ -2036,7 +2039,9 @@ fn bounded_provider_value(value: Value) -> Result<Value, ServiceFailure> {
         .len()
         > MAX_PROVIDER_RESULT_BYTES
     {
-        return Err(invalid_request("provider result exceeds the provider bound"));
+        return Err(invalid_request(
+            "provider result exceeds the provider bound",
+        ));
     }
     Ok(value)
 }
@@ -2107,8 +2112,7 @@ fn hns_name_approval_scope(
     let mut disclosures = Vec::with_capacity(known_names.len());
     for known_name in &known_names {
         let disclosure = hns_name_disclosure(known_name)?;
-        if !hashes.insert(known_name.name_hash)
-            || !canonical_names.insert(disclosure.name.clone())
+        if !hashes.insert(known_name.name_hash) || !canonical_names.insert(disclosure.name.clone())
         {
             return Err(hns_read_failure(HnsWalletError::InvalidEvidence));
         }
@@ -2215,7 +2219,9 @@ fn public_hns_receive_target(
         .validate()
         .map_err(|_| invalid_request("HNS receive target is invalid"))?;
     if !is_printable_ascii(&target.display) {
-        return Err(invalid_request("HNS receive target is not canonical public text"));
+        return Err(invalid_request(
+            "HNS receive target is not canonical public text",
+        ));
     }
     Ok(json!({
         "module": "handshake",
@@ -2350,9 +2356,7 @@ fn validate_hns_wallet_read_scope(
 
 fn validate_hns_account_summary(account: &AccountSummary) -> Result<(), ServiceFailure> {
     let valid_receive = account.receive_display.as_ref().is_none_or(|value| {
-        !value.is_empty()
-            && value.len() <= MAX_PUBLIC_STRING_BYTES
-            && is_printable_ascii(value)
+        !value.is_empty() && value.len() <= MAX_PUBLIC_STRING_BYTES && is_printable_ascii(value)
     });
     if account.module != ModuleId::Handshake
         || account.account_id.as_bytes().iter().all(|byte| *byte == 0)
@@ -2387,7 +2391,10 @@ fn validate_approval_summary(
         ..
     } = summary
     else {
-        if matches!(call.method, ProviderMethod::HnsSend | ProviderMethod::AssetSend) {
+        if matches!(
+            call.method,
+            ProviderMethod::HnsSend | ProviderMethod::AssetSend
+        ) {
             return Err(invalid_request("send approval summary is mismatched"));
         }
         return Ok(());
@@ -2805,17 +2812,17 @@ mod tests {
 
     fn production_followup_alpha_hash() -> [u8; 32] {
         [
-            0x27, 0x18, 0x78, 0xf8, 0xa9, 0x27, 0xb4, 0x56, 0x6a, 0xc9, 0x51, 0xfc, 0x81,
-            0x5b, 0x18, 0xdf, 0xad, 0x8d, 0x03, 0x02, 0xd6, 0x1d, 0x11, 0xd8, 0x0c, 0xbe,
-            0x15, 0xb7, 0xa3, 0xa0, 0x56, 0xaf,
+            0x27, 0x18, 0x78, 0xf8, 0xa9, 0x27, 0xb4, 0x56, 0x6a, 0xc9, 0x51, 0xfc, 0x81, 0x5b,
+            0x18, 0xdf, 0xad, 0x8d, 0x03, 0x02, 0xd6, 0x1d, 0x11, 0xd8, 0x0c, 0xbe, 0x15, 0xb7,
+            0xa3, 0xa0, 0x56, 0xaf,
         ]
     }
 
     fn production_followup_beta_hash() -> [u8; 32] {
         [
-            0xf0, 0x27, 0x7d, 0x92, 0x06, 0x2b, 0xd9, 0xa4, 0x1d, 0xd2, 0x6c, 0xdd, 0xba,
-            0xf2, 0xc4, 0x1d, 0x57, 0x6c, 0xf7, 0xb0, 0x17, 0x3c, 0xbe, 0x96, 0xc2, 0x3d,
-            0x5f, 0x5a, 0x4f, 0x92, 0xcc, 0x8f,
+            0xf0, 0x27, 0x7d, 0x92, 0x06, 0x2b, 0xd9, 0xa4, 0x1d, 0xd2, 0x6c, 0xdd, 0xba, 0xf2,
+            0xc4, 0x1d, 0x57, 0x6c, 0xf7, 0xb0, 0x17, 0x3c, 0xbe, 0x96, 0xc2, 0x3d, 0x5f, 0x5a,
+            0x4f, 0x92, 0xcc, 0x8f,
         ]
     }
 
@@ -2849,8 +2856,8 @@ mod tests {
         }
     }
 
-    fn production_followup_projection_service(
-    ) -> WalletService<MemoryProviderState, ProductionFollowupProjectionRuntime> {
+    fn production_followup_projection_service()
+    -> WalletService<MemoryProviderState, ProductionFollowupProjectionRuntime> {
         let account_id = AccountId::new([9; 16]);
         let runtime = ProductionFollowupProjectionRuntime {
             account: AccountSummary {
@@ -3192,9 +3199,8 @@ mod tests {
                 ]),
                 hns_names: vec![HnsNameDisclosure {
                     name: "alpha".to_owned(),
-                    name_hash:
-                        "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af"
-                            .to_owned(),
+                    name_hash: "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af"
+                        .to_owned(),
                 }],
             }
         );
@@ -3597,18 +3603,28 @@ mod tests {
 
     #[test]
     fn default_subprocess_never_claims_provider_value_or_browser_availability() {
-        let mut service = WalletService::new_ephemeral(
-            MemoryProviderState::default(),
-            UnavailableRuntime,
-        )
-        .expect("service");
+        let mut service =
+            WalletService::new_ephemeral(MemoryProviderState::default(), UnavailableRuntime)
+                .expect("service");
         let response = service.process_frame(&hello(), 1).expect("hello response");
         let ServiceFrame::Hello { hello } = decode_service_frame(&response).expect("decode") else {
             panic!("expected hello")
         };
-        assert!(!hello.capabilities.contains(&ServiceCapability::ProviderDispatch));
-        assert!(!hello.capabilities.contains(&ServiceCapability::ValueMovement));
-        assert!(!hello.capabilities.contains(&ServiceCapability::BrowserIntegration));
+        assert!(
+            !hello
+                .capabilities
+                .contains(&ServiceCapability::ProviderDispatch)
+        );
+        assert!(
+            !hello
+                .capabilities
+                .contains(&ServiceCapability::ValueMovement)
+        );
+        assert!(
+            !hello
+                .capabilities
+                .contains(&ServiceCapability::BrowserIntegration)
+        );
         service
             .provider
             .register_authority(handle(), registration(), NOW_MS)
@@ -3624,16 +3640,12 @@ mod tests {
 
     #[test]
     fn a_new_service_process_rotates_sessions_and_drops_ephemeral_state() {
-        let first = WalletService::new_ephemeral(
-            MemoryProviderState::default(),
-            UnavailableRuntime,
-        )
-        .expect("first");
-        let second = WalletService::new_ephemeral(
-            MemoryProviderState::default(),
-            UnavailableRuntime,
-        )
-        .expect("second");
+        let first =
+            WalletService::new_ephemeral(MemoryProviderState::default(), UnavailableRuntime)
+                .expect("first");
+        let second =
+            WalletService::new_ephemeral(MemoryProviderState::default(), UnavailableRuntime)
+                .expect("second");
         assert_ne!(first.service_session_id, second.service_session_id);
         assert!(second.pending.is_empty());
         assert!(second.event_sequences.is_empty());
@@ -3643,7 +3655,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn production_tranche_persistent_control_reopens_locked_and_preserves_only_permission_authority()
-    {
+     {
         use std::os::unix::fs::PermissionsExt as _;
 
         const PASSPHRASE: &str = "correct horse battery staple";
@@ -3667,8 +3679,16 @@ mod tests {
                 .capabilities
                 .contains(&ServiceCapability::PersistentPermissions)
         );
-        assert!(!first.capabilities.contains(&ServiceCapability::ValueMovement));
-        assert!(!first.capabilities.contains(&ServiceCapability::BrowserIntegration));
+        assert!(
+            !first
+                .capabilities
+                .contains(&ServiceCapability::ValueMovement)
+        );
+        assert!(
+            !first
+                .capabilities
+                .contains(&ServiceCapability::BrowserIntegration)
+        );
         first
             .provider
             .register_authority(handle(), registration(), NOW_MS)
@@ -3779,9 +3799,8 @@ mod tests {
         drop(first);
         drop(first_store);
 
-        let second_store = SharedWalletStore::new(
-            WalletStore::open(&database_path).expect("reopen locked store"),
-        );
+        let second_store =
+            SharedWalletStore::new(WalletStore::open(&database_path).expect("reopen locked store"));
         let mut second = WalletService::new_persistent_control(second_store.clone())
             .expect("second persistent service");
         assert!(second_store.is_locked().expect("restart lock state"));
@@ -3885,11 +3904,9 @@ mod tests {
             Err(ServiceError::PersistentStoreAuthorityMismatch)
         ));
 
-        let missing_selector = HnsExistingAccountSelector::new(
-            second_store.clone(),
-            production_hns_config(10, 1),
-        )
-        .expect("missing-account selector configuration");
+        let missing_selector =
+            HnsExistingAccountSelector::new(second_store.clone(), production_hns_config(10, 1))
+                .expect("missing-account selector configuration");
         let mut missing_account_service = WalletService::new_persistent_hns_accounts(
             second_store.clone(),
             PersistentHnsAccountConfig {
@@ -3914,7 +3931,11 @@ mod tests {
                 ..
             })
         ));
-        assert!(second_store.is_locked().expect("failed unlock relocks store"));
+        assert!(
+            second_store
+                .is_locked()
+                .expect("failed unlock relocks store")
+        );
 
         let mut service = WalletService::new_persistent_hns_accounts(
             first_store,
@@ -3982,7 +4003,11 @@ mod tests {
             HnsExistingAccountSelector::new(zero_store.clone(), zero_config),
             Err(HnsWalletError::InvalidRuntimeConfiguration)
         ));
-        assert!(zero_store.is_locked().expect("zero-account store remains locked"));
+        assert!(
+            zero_store
+                .is_locked()
+                .expect("zero-account store remains locked")
+        );
 
         let malformed_directory = tempfile::tempdir().expect("malformed private directory");
         std::fs::set_permissions(
@@ -4002,16 +4027,13 @@ mod tests {
         malformed_store
             .with_store_mut(|wallet| {
                 wallet
-                    .save_wallet_account(
-                        &production_hns_record_id(&expected),
-                        0,
-                        &malformed,
-                        10,
-                    )
+                    .save_wallet_account(&production_hns_record_id(&expected), 0, &malformed, 10)
                     .map(|_| ())
             })
             .expect("persist authenticated malformed row");
-        malformed_store.lock().expect("lock malformed account store");
+        malformed_store
+            .lock()
+            .expect("lock malformed account store");
         let selector = HnsExistingAccountSelector::new(malformed_store.clone(), expected)
             .expect("valid expected selector");
         let mut service = WalletService::new_persistent_hns_accounts(
@@ -4038,7 +4060,11 @@ mod tests {
                 ..
             })
         ));
-        assert!(malformed_store.is_locked().expect("malformed unlock relocks"));
+        assert!(
+            malformed_store
+                .is_locked()
+                .expect("malformed unlock relocks")
+        );
         assert!(matches!(
             service.dispatch(
                 ServiceRequest::Wallet {
@@ -4594,7 +4620,12 @@ mod tests {
         };
         assert_eq!(binding.permission_generation, 0);
         assert_eq!(
-            value.as_object().expect("object").keys().cloned().collect::<BTreeSet<_>>(),
+            value
+                .as_object()
+                .expect("object")
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from(["methods".to_owned(), "providerApiVersion".to_owned()])
         );
         assert_eq!(value["providerApiVersion"], json!(1));
@@ -4634,11 +4665,7 @@ mod tests {
                 NOW_MS,
             )
             .expect("permissions");
-        let ServiceResponse::ProviderResult {
-            binding,
-            value,
-        } = response
-        else {
+        let ServiceResponse::ProviderResult { binding, value } = response else {
             panic!("provider result")
         };
         assert_eq!(binding.permission_generation, 2);

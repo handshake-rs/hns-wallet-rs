@@ -3589,9 +3589,8 @@ mod tests {
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
             .expect("private wallet directory permissions");
         let database = directory.path().join("wallet.sqlite3");
-        let mut store =
-            WalletStore::create_with_kdf(&database, PASSPHRASE, KdfConfig::testing())
-                .expect("file-backed encrypted store");
+        let mut store = WalletStore::create_with_kdf(&database, PASSPHRASE, KdfConfig::testing())
+            .expect("file-backed encrypted store");
         let workflow_id = WorkflowId::new([0x41; 16]);
         let source_id = vec![0x42; 36];
         let funding_id = vec![0x43; 36];

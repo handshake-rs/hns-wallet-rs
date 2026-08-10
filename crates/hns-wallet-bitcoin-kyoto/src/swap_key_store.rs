@@ -15,9 +15,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use super::{
-    derive_bitcoin_swap_key_from_seed_for_allocation, BitcoinSwapKeyReference,
-    BitcoinSwapKeyRole, BitcoinSwapPublicKey, BitcoinWalletError, DerivedBitcoinSwapKey,
-    BITCOIN_SWAP_KEY_SCHEME_VERSION, MAX_BITCOIN_SWAP_ACCOUNT_INDEX, MAX_BITCOIN_SWAP_KEY_INDEX,
+    BITCOIN_SWAP_KEY_SCHEME_VERSION, BitcoinSwapKeyReference, BitcoinSwapKeyRole,
+    BitcoinSwapPublicKey, BitcoinWalletError, DerivedBitcoinSwapKey,
+    MAX_BITCOIN_SWAP_ACCOUNT_INDEX, MAX_BITCOIN_SWAP_KEY_INDEX,
+    derive_bitcoin_swap_key_from_seed_for_allocation,
 };
 
 const ALLOCATION_STORAGE_VERSION: u16 = 1;
@@ -51,7 +52,11 @@ impl BitcoinSwapKeyAllocationRequest {
     fn validate(self) -> Result<(), BitcoinSwapKeyAllocationError> {
         if self.wallet_id.as_bytes().iter().all(|byte| *byte == 0)
             || self.session_id.as_bytes().iter().all(|byte| *byte == 0)
-            || self.terms_commitment.as_bytes().iter().all(|byte| *byte == 0)
+            || self
+                .terms_commitment
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
             || self.account_index > MAX_BITCOIN_SWAP_ACCOUNT_INDEX
         {
             return Err(BitcoinSwapKeyAllocationError::InvalidRequest);
@@ -110,7 +115,11 @@ impl BitcoinSwapKeyAllocation {
             || self.wallet_id.as_bytes().iter().all(|byte| *byte == 0)
             || self.session_id.as_bytes().iter().all(|byte| *byte == 0)
             || self.recovery_seed_commitment.iter().all(|byte| *byte == 0)
-            || self.terms_commitment.as_bytes().iter().all(|byte| *byte == 0)
+            || self
+                .terms_commitment
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
             || self.public_key.reference() != self.reference
         {
             return Err(BitcoinSwapKeyAllocationError::CorruptAllocation);
@@ -292,13 +301,8 @@ pub fn allocate_bitcoin_swap_key(
 
     for attempt in 0..MAX_ALLOCATION_ATTEMPTS {
         let high_water = load_high_water(store, request)?;
-        let (saves, allocation) =
-            prepare_allocation_saves(store, request, now_unix, high_water)?;
-        match store.apply_entity_batch(
-            EntityKind::BitcoinSwapKeyAllocation,
-            &saves,
-            &[],
-        ) {
+        let (saves, allocation) = prepare_allocation_saves(store, request, now_unix, high_water)?;
+        match store.apply_entity_batch(EntityKind::BitcoinSwapKeyAllocation, &saves, &[]) {
             Ok(()) => {
                 let verified = derive_allocated_bitcoin_swap_key_from_store(store, request)?;
                 if verified.public_key() != allocation.public_key() {
@@ -646,16 +650,14 @@ fn prepare_allocation_saves(
         saves.push(EntityBatchSave {
             id: namespace_anchor_record_id(request),
             expected_revision: 0,
-            value: BitcoinSwapKeyAllocationRecord::NamespaceAnchor(
-                BitcoinSwapKeyNamespaceAnchor {
-                    storage_version: ALLOCATION_STORAGE_VERSION,
-                    wallet_id: request.wallet_id,
-                    network: request.network,
-                    account_index: request.account_index,
-                    role: request.role,
-                    recovery_seed_commitment: seed_commitment,
-                },
-            ),
+            value: BitcoinSwapKeyAllocationRecord::NamespaceAnchor(BitcoinSwapKeyNamespaceAnchor {
+                storage_version: ALLOCATION_STORAGE_VERSION,
+                wallet_id: request.wallet_id,
+                network: request.network,
+                account_index: request.account_index,
+                role: request.role,
+                recovery_seed_commitment: seed_commitment,
+            }),
             updated_at_unix: now_unix,
         });
     }
@@ -826,12 +828,7 @@ mod tests {
         .expect("mnemonic");
         let seed = mnemonic.to_seed_normalized("");
         store
-            .put_secret(
-                wallet_id.as_bytes(),
-                SecretKind::RecoverySeed,
-                &seed,
-                1,
-            )
+            .put_secret(wallet_id.as_bytes(), SecretKind::RecoverySeed, &seed, 1)
             .expect("seed");
     }
 
@@ -855,24 +852,21 @@ mod tests {
     fn exact_session_retry_is_idempotent_and_clock_bound() {
         let mut store = in_memory_store();
         let original_request = request(2, BitcoinSwapKeyRole::Receiver, 3);
-        let first =
-            allocate_bitcoin_swap_key(&mut store, original_request, 10).expect("first");
-        let retry =
-            allocate_bitcoin_swap_key(&mut store, original_request, 11).expect("retry");
+        let first = allocate_bitcoin_swap_key(&mut store, original_request, 10).expect("first");
+        let retry = allocate_bitcoin_swap_key(&mut store, original_request, 11).expect("retry");
         assert_eq!(first, retry);
         assert_eq!(first.reference().key_index(), 0);
 
         let high_water = load_high_water(&store, original_request)
             .expect("high water")
             .expect("present");
-        assert_eq!(high_water.revision, 1, "idempotence must not advance the counter");
+        assert_eq!(
+            high_water.revision, 1,
+            "idempotence must not advance the counter"
+        );
 
-        allocate_bitcoin_swap_key(
-            &mut store,
-            request(4, BitcoinSwapKeyRole::Receiver, 5),
-            20,
-        )
-        .expect("later allocation");
+        allocate_bitcoin_swap_key(&mut store, request(4, BitcoinSwapKeyRole::Receiver, 5), 20)
+            .expect("later allocation");
         assert!(matches!(
             allocate_bitcoin_swap_key(&mut store, original_request, 19),
             Err(BitcoinSwapKeyAllocationError::ClockRollback)
@@ -980,22 +974,13 @@ mod tests {
     fn stale_counter_batch_is_atomic() {
         let mut store = in_memory_store();
         let stale_request = request(2, BitcoinSwapKeyRole::Receiver, 3);
-        let (stale_saves, _) = prepare_allocation_saves(
-            &store,
-            stale_request,
-            10,
-            None,
-        )
-        .expect("stale batch");
+        let (stale_saves, _) =
+            prepare_allocation_saves(&store, stale_request, 10, None).expect("stale batch");
         let winner_request = request(4, BitcoinSwapKeyRole::Receiver, 5);
         allocate_bitcoin_swap_key(&mut store, winner_request, 10).expect("winner");
 
         assert!(matches!(
-            store.apply_entity_batch(
-                EntityKind::BitcoinSwapKeyAllocation,
-                &stale_saves,
-                &[]
-            ),
+            store.apply_entity_batch(EntityKind::BitcoinSwapKeyAllocation, &stale_saves, &[]),
             Err(StoreError::StaleRevision { .. })
         ));
         assert!(
@@ -1161,8 +1146,8 @@ mod tests {
         .expect("load")
         .expect("allocation");
         assert_eq!(loaded, expected);
-        let derived = derive_allocated_bitcoin_swap_key_from_store(&reopened, request)
-            .expect("rederive");
+        let derived =
+            derive_allocated_bitcoin_swap_key_from_store(&reopened, request).expect("rederive");
         assert_eq!(derived.public_key(), expected.public_key());
     }
 }

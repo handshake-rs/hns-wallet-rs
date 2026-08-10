@@ -38,8 +38,7 @@ pub const ETHEREUM_MAINNET_RUNTIME_RELEASE_QUALIFIED: bool = false;
 pub const fn capabilities() -> ChainCapabilities {
     ChainCapabilities {
         receive: true,
-        send: ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED
-            && ETHEREUM_VALUE_RUNTIME_RELEASE_QUALIFIED,
+        send: ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED && ETHEREUM_VALUE_RUNTIME_RELEASE_QUALIFIED,
         history: ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED,
         atomic_settlement: ETHEREUM_SYNC_RUNTIME_RELEASE_QUALIFIED
             && ETHEREUM_VALUE_RUNTIME_RELEASE_QUALIFIED
@@ -152,8 +151,8 @@ pub fn ethereum_value_runtime_permit() -> Result<EthereumValueRuntimePermit, Eth
     Ok(EthereumValueRuntimePermit(()))
 }
 
-pub fn ethereum_settlement_runtime_permit(
-) -> Result<EthereumSettlementRuntimePermit, EthereumError> {
+pub fn ethereum_settlement_runtime_permit() -> Result<EthereumSettlementRuntimePermit, EthereumError>
+{
     if !ETHEREUM_SETTLEMENT_RUNTIME_RELEASE_QUALIFIED {
         return Err(EthereumError::SettlementOperationsDisabled);
     }
@@ -775,8 +774,8 @@ impl PreparedEip1559Transaction {
         if secret.address != self.operation.required_signer() {
             return Err(EthereumError::SignerAddressMismatch);
         }
-        let signing = SigningKey::from_slice(&secret.material.0)
-            .map_err(|_| EthereumError::Signing)?;
+        let signing =
+            SigningKey::from_slice(&secret.material.0).map_err(|_| EthereumError::Signing)?;
         if address_from_verifying_key(&VerifyingKey::from(&signing)) != secret.address {
             return Err(EthereumError::SignerAddressMismatch);
         }
@@ -893,8 +892,7 @@ impl FeeBoundEip1559Transaction {
         if permitted_class != self.transaction.operation.class() {
             return Err(EthereumError::RuntimePermitMismatch);
         }
-        self.transaction
-            .sign(secret, self.approved_maximum_fee_wei)
+        self.transaction.sign(secret, self.approved_maximum_fee_wei)
     }
 }
 
@@ -931,9 +929,7 @@ impl EthereumOperation {
             Self::NativeTransfer { .. } => Zeroizing::new(Vec::new()),
             Self::HtlcLock(terms) => {
                 let mut data = Zeroizing::new(Vec::with_capacity(4 + (5 * 32)));
-                data.extend_from_slice(&selector(
-                    b"lock(bytes32,bytes32,address,address,uint64)",
-                ));
+                data.extend_from_slice(&selector(b"lock(bytes32,bytes32,address,address,uint64)"));
                 data.extend_from_slice(&terms.swap_id);
                 data.extend_from_slice(&terms.hashlock);
                 data.extend_from_slice(&abi_address(terms.receiver));
@@ -1262,10 +1258,7 @@ mod tests {
         let mismatched_permit = transaction()
             .bind_fee_limit(exact_maximum)
             .expect("exact fee cap is bound");
-        assert_eq!(
-            mismatched_permit.approved_maximum_fee_wei(),
-            exact_maximum
-        );
+        assert_eq!(mismatched_permit.approved_maximum_fee_wei(), exact_maximum);
         assert!(matches!(
             mismatched_permit.sign(
                 EthereumSigningPermit::Settlement(&settlement_permit),
@@ -1294,8 +1287,7 @@ mod tests {
             derive_account_from_phrase(phrase(), EthereumKeyRole::Wallet, 0, 1)
                 .expect("other wallet");
         let (swap, swap_secret) =
-            derive_account_from_phrase(phrase(), EthereumKeyRole::AtomicSwap, 0, 0)
-                .expect("swap");
+            derive_account_from_phrase(phrase(), EthereumKeyRole::AtomicSwap, 0, 0).expect("swap");
 
         let native = PreparedEip1559Transaction::native_transfer(
             &value_permit,
@@ -1363,8 +1355,7 @@ mod tests {
     fn private_settlement_permit_keeps_typed_primitives_testable() {
         let permit = settlement_permit();
         let (swap, secret) =
-            derive_account_from_phrase(phrase(), EthereumKeyRole::AtomicSwap, 0, 0)
-                .expect("swap");
+            derive_account_from_phrase(phrase(), EthereumKeyRole::AtomicSwap, 0, 0).expect("swap");
         let deployment = deployment(&[0x60, 0x00]);
 
         let mut refund_terms = terms();
@@ -1387,10 +1378,7 @@ mod tests {
         let mut redeem_terms = terms();
         redeem_terms.receiver = swap.address;
         let preimage = EthereumHtlcPreimage::new([9; 32]);
-        assert_eq!(
-            format!("{preimage:?}"),
-            "EthereumHtlcPreimage([REDACTED])"
-        );
+        assert_eq!(format!("{preimage:?}"), "EthereumHtlcPreimage([REDACTED])");
         let redeem = PreparedEip1559Transaction::htlc_redeem(
             &permit,
             &deployment,
