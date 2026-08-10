@@ -145,7 +145,12 @@ pub enum ApprovalDecision {
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "operation",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum ServiceRequest {
     RegisterAuthority {
         authority_handle: HostAuthorityHandleId,
@@ -233,7 +238,12 @@ impl<'de> Deserialize<'de> for SecretString {
 }
 
 #[derive(Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "operation",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum WalletRequest {
     Status,
     CreateWallet {
@@ -272,7 +282,12 @@ pub enum WalletRequest {
 // while serde already bounds and validates the frame at the transport edge.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "frameType", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "frameType",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum HostFrame {
     Hello {
         hello: HostHello,
@@ -285,7 +300,12 @@ pub enum HostFrame {
 // Keep the payload inline to preserve the public frame representation.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "frameType", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "frameType",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum ServiceFrame {
     Hello {
         hello: ServiceHello,
@@ -356,7 +376,12 @@ impl ProviderCapabilitySnapshot {
 // do not inherit an allocation solely to equalize enum variant sizes.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "result",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum ServiceResponse {
     AuthorityRegistered {
         authority_handle: HostAuthorityHandleId,
@@ -392,7 +417,12 @@ pub enum ServiceResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "result", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "result",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum WalletResponse {
     Status {
         status: WalletRuntimeStatus,
@@ -505,7 +535,12 @@ impl HnsNameDisclosure {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum ApprovalSummary {
     Permissions {
         capabilities: BTreeSet<PermissionCapability>,
@@ -886,7 +921,12 @@ pub enum DisconnectReason {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "event",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum ProviderEventPayload {
     Connect {
         permission_generation: u64,
@@ -1500,6 +1540,7 @@ pub enum AbiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::de::DeserializeOwned;
 
     fn host_session() -> HostSessionId {
         HostSessionId::from_bytes([1_u8; 32]).expect("host session")
@@ -1523,6 +1564,21 @@ mod tests {
 
     fn approval_id() -> ProviderApprovalId {
         ProviderApprovalId::from_bytes([6_u8; 16]).expect("approval id")
+    }
+
+    fn wallet_id() -> WalletId {
+        WalletId::new([8_u8; 16])
+    }
+
+    fn assert_json_round_trip<T>(value: &T, expected: Value)
+    where
+        T: DeserializeOwned + std::fmt::Debug + PartialEq + Serialize,
+    {
+        let encoded = serde_json::to_value(value).expect("serialize schema-shaped value");
+        assert_eq!(encoded, expected);
+        let bytes = serde_json::to_vec(&encoded).expect("encode schema-shaped JSON");
+        let decoded: T = serde_json::from_slice(&bytes).expect("deserialize schema-shaped value");
+        assert_eq!(&decoded, value);
     }
 
     fn request(body: ServiceRequest) -> HostFrame {
@@ -1581,12 +1637,110 @@ mod tests {
             method: "wallet_getStatus".to_owned(),
             params: Value::Null,
         });
-        let json = String::from_utf8(encode_host_frame(&frame).expect("frame")[4..].to_vec())
-            .expect("json");
-        assert!(json.contains("authorityHandle"));
-        assert!(!json.contains("authenticated"));
-        assert!(!json.contains("walletSession"));
-        assert!(!json.contains("permissionGeneration"));
+        let encoded = encode_host_frame(&frame).expect("frame");
+        let json: Value = serde_json::from_slice(&encoded[LENGTH_PREFIX_BYTES..]).expect("json");
+        assert_eq!(
+            json["envelope"]["body"],
+            serde_json::json!({
+                "operation": "providerRequest",
+                "authorityHandle": serde_json::to_value(handle()).expect("handle"),
+                "authorityRevision": 1,
+                "requestNonce": 9,
+                "method": "wallet_getStatus",
+                "params": null,
+            })
+        );
+        assert_eq!(decode_host_frame(&encoded), Ok(frame));
+    }
+
+    #[test]
+    fn every_tagged_enum_uses_schema_shaped_camel_case_fields() {
+        assert_json_round_trip(
+            &ServiceFrame::Response {
+                envelope: SessionEnvelope {
+                    protocol_version: WALLET_ABI_VERSION,
+                    host_session_id: host_session(),
+                    service_session_id: service_session(),
+                    restart_generation: 7,
+                    channel_sequence: 1,
+                    request_id: request_id(),
+                    body: ServiceResponse::AuthorityRegistered {
+                        authority_handle: handle(),
+                        authority_revision: 2,
+                    },
+                },
+            },
+            serde_json::json!({
+                "frameType": "response",
+                "envelope": {
+                    "protocolVersion": WALLET_ABI_VERSION,
+                    "hostSessionId": serde_json::to_value(host_session()).expect("host session"),
+                    "serviceSessionId": serde_json::to_value(service_session()).expect("service session"),
+                    "restartGeneration": 7,
+                    "channelSequence": 1,
+                    "requestId": serde_json::to_value(request_id()).expect("request id"),
+                    "body": {
+                        "result": "authorityRegistered",
+                        "authorityHandle": serde_json::to_value(handle()).expect("handle"),
+                        "authorityRevision": 2,
+                    },
+                },
+            }),
+        );
+        assert_json_round_trip(
+            &WalletRequest::RestoreWallet {
+                passphrase: SecretString::new("correct horse battery staple".to_owned()),
+                recovery_phrase: SecretString::new(
+                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                        .to_owned(),
+                ),
+            },
+            serde_json::json!({
+                "operation": "restoreWallet",
+                "passphrase": "correct horse battery staple",
+                "recoveryPhrase": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            }),
+        );
+        assert_json_round_trip(
+            &ServiceResponse::AuthorityRegistered {
+                authority_handle: handle(),
+                authority_revision: 2,
+            },
+            serde_json::json!({
+                "result": "authorityRegistered",
+                "authorityHandle": serde_json::to_value(handle()).expect("handle"),
+                "authorityRevision": 2,
+            }),
+        );
+        assert_json_round_trip(
+            &WalletResponse::WalletCreated {
+                wallet_id: wallet_id(),
+            },
+            serde_json::json!({
+                "result": "walletCreated",
+                "walletId": serde_json::to_value(wallet_id()).expect("wallet id"),
+            }),
+        );
+        assert_json_round_trip(
+            &ApprovalSummary::TypedSignature {
+                message_type: "hns-name-auth".to_owned(),
+                message_digest: "00".repeat(32),
+            },
+            serde_json::json!({
+                "kind": "typedSignature",
+                "messageType": "hns-name-auth",
+                "messageDigest": "00".repeat(32),
+            }),
+        );
+        assert_json_round_trip(
+            &ProviderEventPayload::MarketIntentChanged {
+                market_intent_ids: vec!["intent-1".to_owned()],
+            },
+            serde_json::json!({
+                "event": "marketIntentChanged",
+                "marketIntentIds": ["intent-1"],
+            }),
+        );
     }
 
     #[test]
