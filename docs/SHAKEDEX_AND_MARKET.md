@@ -9,7 +9,7 @@ post-lock buyer fulfillment, seller recovery, and the seller-script FINALIZE
 that follows either signed TRANSFER parent, but every authorization and
 submission entrypoint remains release-gated. The wallet dependency boundary
 consumes the canonical V2 `hns-swap` and
-`hns-marketplace-protocol` source from the same immutable revision `4b989aa`.
+`hns-marketplace-protocol` source from the same immutable revision `29e4b47`.
 It does not reproduce listing hashes, signatures, Shakedex scripts, presigns,
 cancellations, or Denuo envelopes.
 

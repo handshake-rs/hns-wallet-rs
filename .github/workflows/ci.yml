@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 9 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualification:
+    name: Wallet qualification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install native and source-policy dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ripgrep
+
+      - name: Install declared Rust toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal --component rustfmt,clippy
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - name: Run the complete locked qualification gate
+        run: ./scripts/check.sh
+
+  rustsec:
+    name: RustSec
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Install declared Rust toolchain
+        run: rustup toolchain install 1.89.0 --profile minimal
+
+      - name: Install pinned RustSec scanner
+        run: cargo +1.89.0 install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit locked wallet dependencies
+        run: cargo +1.89.0 audit

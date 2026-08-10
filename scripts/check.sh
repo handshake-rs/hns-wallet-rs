@@ -12,7 +12,7 @@ fi
 hns_revision="29e4b473bd2cfee460b56d5092b7bc28da5ec5dc"
 hns_repository="https://github.com/handshake-rs/hns-rs.git"
 hns_lock_source="git+${hns_repository}?rev=${hns_revision}#${hns_revision}"
-for package in hns-covenants hns-encoding hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
+for package in hns-covenants hns-encoding hns-marketplace-protocol hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
   if ! awk -v package="$package" -v source="$hns_lock_source" '
     BEGIN { RS = ""; found = 0 }
     index($0, "name = \"" package "\"") {
@@ -26,7 +26,7 @@ for package in hns-covenants hns-encoding hns-primitives hns-script hns-swap hns
   fi
 done
 
-for package in hns-covenants hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
+for package in hns-covenants hns-marketplace-protocol hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
   declaration="$package = { version = \"=0.2.0\", git = \"$hns_repository\", rev = \"$hns_revision\" }"
   if ! rg --fixed-strings --line-regexp --quiet "$declaration" Cargo.toml; then
     echo "$package must use the reviewed immutable hns-rs source" >&2
