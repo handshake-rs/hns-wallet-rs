@@ -31,7 +31,8 @@ boundary:
 - persistence-first Shakedex and chain-neutral market state machines whose live
   product and value gates remain disabled, including a bounded encrypted/CAS
   offline Denuo V2 offer/cancellation outbox with exact-envelope restart
-  validation and monotonic retry/acknowledgement state;
+  validation, persist-before-return single-flight handoff journaling, explicit
+  crash-as-retry recovery, and monotonic bounded failure state;
 - Kyoto-only Bitcoin state and a native-ETH policy/contract verification
   boundary whose settlement permits remain unavailable; and
 - deterministic, non-mainnet fixtures for downstream qualification.

@@ -20,10 +20,12 @@ pub use canonical::{
     verify_listing_cancellation,
 };
 pub use outbox::{
-    DenuoOutboxEnqueue, DenuoOutboxEntry, DenuoOutboxMessageKind, DenuoOutboxState,
-    DenuoPublicationOutbox, MAX_DENUO_OUTBOX_ENTRIES, MAX_DENUO_OUTBOX_ENVELOPE_BYTES,
-    MAX_DENUO_OUTBOX_RETRY_ATTEMPTS, MAX_DENUO_OUTBOX_SERIALIZED_BYTES,
-    StoredDenuoPublicationOutbox, load_denuo_publication_outbox, save_denuo_publication_outbox,
+    DenuoHandoffFailureResult, DenuoHandoffPreparation, DenuoOutboxEnqueue, DenuoOutboxMessageKind,
+    DenuoOutboxState, DenuoPreparedHandoff, DenuoPublicationOutbox, MAX_DENUO_OUTBOX_ENTRIES,
+    MAX_DENUO_OUTBOX_ENVELOPE_BYTES, MAX_DENUO_OUTBOX_RETRY_ATTEMPTS,
+    MAX_DENUO_OUTBOX_SERIALIZED_BYTES, StoredDenuoPublicationOutbox, load_denuo_publication_outbox,
+    load_prepared_denuo_handoff, prepare_next_denuo_handoff, record_denuo_handoff_failure,
+    recover_denuo_handoff_as_retry, save_denuo_publication_outbox,
 };
 pub use plans::{
     BuyerLockPlan, BuyerLockPlanState, MAX_SHAKEDEX_TRANSACTION_PLANS, SellerLockPlan,
@@ -599,8 +601,8 @@ pub enum ShakedexError {
     DenuoOutboxCapacity,
     #[error("persisted Denuo publication outbox is corrupt or noncanonical")]
     CorruptDenuoOutbox,
-    #[error("Denuo publication outbox entry was not found")]
-    DenuoOutboxNotFound,
+    #[error("Denuo publication outbox handoff attempt does not match durable state")]
+    DenuoOutboxHandoffMismatch,
     #[error("Denuo publication outbox transition is not monotonic")]
     InvalidDenuoOutboxTransition,
     #[error("Denuo publication outbox retry limit was reached")]

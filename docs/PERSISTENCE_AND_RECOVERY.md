@@ -117,25 +117,34 @@ the encrypted `DenuoBoardObject` namespace and its own store CAS revision. It
 retains at most 1,024 exact canonical V2 offer/cancellation envelopes (16 KiB
 each, 512 KiB serialized aggregate), their nonzero request IDs, canonical
 listing/cancellation content hashes, local domain-separated envelope digests,
-and bounded monotonic retry/acknowledgement metadata. Restart validation
+and bounded monotonic preparation/failure metadata. Restart validation
 re-decodes and exactly re-encodes every envelope and rejects duplicate request
 or message identity, digest mismatch, timestamp/state regression, and
 oversized state. Exact enqueue is idempotent; the same message with another
-request ID conflicts. Acknowledged records are terminal and remain subject to
-the same capacity bound. The 64th recorded failure becomes an explicit
-terminal exhausted record, is excluded from due work, and cannot later be
-retried or acknowledged. Terminal retry counts and last-attempt timestamps
-must remain coherent. No compaction, network transport, peer state, or
-publication authority exists in this boundary.
+request ID conflicts. Schema v2 permits at most one aggregate-wide
+`HandoffPrepared` row. Its domain-separated attempt ID binds the envelope ID,
+request ID, next attempt ordinal, and preparation time. The CAS update is
+durable before the non-cloneable, non-serializable exact-byte artifact is
+returned. A restart reloads that same outcome-unknown attempt and requires an
+explicit recovery-as-failure transition; it never auto-resends or assumes
+acceptance. The 64th recorded failure becomes an explicit terminal exhausted
+record and is excluded from later preparation. Terminal retry counts and
+last-attempt timestamps must remain coherent. No compaction, network transport,
+peer state, remote acknowledgement, or publication authority exists here.
 
 Through the Shakedex outbox API, an entry's first persisted state must be
 pending. Later saves verify the current encrypted record before allowing
-additive pending entries or one exact retry/acknowledgement advance; they reject
-removal, immutable-byte changes, skipped retry history, terminal rollback, and
-record-time regression. Creation, last-attempt, acknowledgement, and exhaustion
-timestamps cannot exceed the containing record's update time; a future
-scheduled retry may. A caller with raw mutable `WalletStore` access remains a
-trusted in-process composition authority: record AEAD detects external storage
+additive pending entries, one exact due-state-to-prepared transition, or the
+correlated prepared-to-retry/exhausted failure transition. They reject removal,
+immutable-byte changes, skipped retry history, multiple prepared entries,
+terminal rollback, and record-time regression. Creation, preparation,
+last-attempt, legacy acknowledgement, and exhaustion timestamps cannot exceed
+the containing record's update time; a future scheduled retry may. Schema-v1
+rows are validated and normalized in memory; the next mutating CAS save writes
+schema v2. Existing schema-v1 `Acknowledged` rows remain immutable terminal
+compatibility state, while schema v2 exposes no acknowledgement constructor or
+transition. A caller with raw mutable `WalletStore` access remains a trusted
+in-process composition authority: record AEAD detects external storage
 tampering, but cannot defend against an authorized writer constructing and
 encrypting another record. This tranche does not redesign that store boundary.
 
@@ -144,9 +153,11 @@ cancellation admission requires a `VerifiedListingCancellation` already bound
 to its exact authenticated listing. After that typed boundary, restart relies
 on the authenticated encrypted store plus exact envelope/signature/content-
 identity and state validation. Stored bytes alone are never accepted as fresh
-listing-bound cancellation authority. Likewise, due outbox entries do not
-prove that an offer remains current: a future transport must reacquire fresh
-listing/lock/network/time authority before sending exact stored bytes.
+listing-bound cancellation authority. Likewise, a prepared local handoff does
+not prove that an offer remains current or that a peer accepted it: a future
+authenticated transport adapter must reacquire fresh listing/lock/network/time
+authority before sending the exact stored bytes and supply its own correlated
+acceptance evidence.
 
 Dormant Shakedex structural plans use the encrypted seller or buyer workflow
 journal and its exact expected revision. Fulfillment plans retain the canonical

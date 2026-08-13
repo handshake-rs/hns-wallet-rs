@@ -193,27 +193,29 @@ encrypting another record. No broader store-boundary redesign is part of this
 tranche.
 
 The outbox retains at most 1,024 entries, limits each exact envelope to 16 KiB,
-and rejects an aggregate serialized form above 512 KiB. Retry attempts are
-bounded at 64 and must advance timestamps; acknowledgement is terminal and
-cannot regress to a retry state. Recording the 64th failed attempt returns and
-persists an explicit terminal exhausted state which is never reported due;
-neither acknowledgement nor another retry can rewrite it. Acknowledged and
-exhausted entries remain within the same hard bounds and are not silently
-pruned. Loading re-decodes and exactly
+and rejects an aggregate serialized form above 512 KiB. Schema v2 selects due
+entries deterministically by due time, creation time, then envelope ID, and
+permits at most one aggregate-wide `HandoffPrepared` row. The attempt ID binds
+the exact envelope ID, original request ID, next failure ordinal, and
+preparation timestamp. Its CAS state is durable before the exact-byte prepared
+artifact is returned. That artifact has private fields and is neither cloneable
+nor serializable. Loading re-decodes and exactly
 re-encodes every envelope, recomputes both identities, and checks sorted unique
 envelope IDs, request IDs, and message identities. The first durable version
 of every entry must be pending; subsequent CAS saves cannot remove entries,
-rewrite exact bytes, skip retry states, roll back acknowledgement, or regress
-the encrypted record timestamp. Entry creation, attempt, acknowledgement, and
-exhaustion times cannot lie after that record timestamp; retry count and last-
-attempt presence remain coherent in terminal states. This boundary performs no
-network I/O, peer discovery, publication, transport acknowledgement, or gate
-change; a future qualified supervisor must preserve the exact stored bytes and
-supply its own authenticated delivery evidence. Because typed offer admission
-authenticates canonical structure and signature but does not prove current
-coin, network, or time authority, that supervisor must also reacquire the
-fresh current listing/lock/network/time evidence before sending. `due_entries`
-is scheduling metadata only and is never publication authority.
+rewrite exact bytes, skip the prepare-before-failure phase, create multiple
+prepared rows, roll back terminal state, or regress the encrypted record
+timestamp. Restart reloads the identical outcome-unknown preparation but never
+auto-resends it; an explicit correlated recovery call records one failure and
+schedules the identical envelope and request ID. Failure 64 becomes terminal
+`Exhausted`. Schema-v1 rows are validated in place and migrate on their next
+mutating save. A schema-v1 `Acknowledged` row remains immutable terminal legacy
+state; schema v2 has no API that can create acknowledgement or claim remote
+acceptance. This boundary performs no network I/O, peer discovery, publication,
+transport acknowledgement, or gate change. A future authenticated transport
+adapter must preserve the exact stored bytes, supply correlated acceptance
+evidence, and reacquire fresh current listing/lock/network/time authority before
+sending.
 
 Three compile-time gates are immutable and `false`:
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
