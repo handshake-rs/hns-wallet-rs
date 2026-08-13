@@ -3,6 +3,7 @@
 
 mod board;
 mod canonical;
+mod outbox;
 mod plans;
 mod transactions;
 mod value_workflow;
@@ -17,6 +18,12 @@ pub use canonical::{
     decode_denuo_inventory, decode_denuo_offer, decode_denuo_request, encode_denuo_cancellation,
     encode_denuo_inventory, encode_denuo_offer, encode_denuo_request, verify_fixed_price_listing,
     verify_listing_cancellation,
+};
+pub use outbox::{
+    DenuoOutboxEnqueue, DenuoOutboxEntry, DenuoOutboxMessageKind, DenuoOutboxState,
+    DenuoPublicationOutbox, MAX_DENUO_OUTBOX_ENTRIES, MAX_DENUO_OUTBOX_ENVELOPE_BYTES,
+    MAX_DENUO_OUTBOX_RETRY_ATTEMPTS, MAX_DENUO_OUTBOX_SERIALIZED_BYTES,
+    StoredDenuoPublicationOutbox, load_denuo_publication_outbox, save_denuo_publication_outbox,
 };
 pub use plans::{
     BuyerLockPlan, BuyerLockPlanState, MAX_SHAKEDEX_TRANSACTION_PLANS, SellerLockPlan,
@@ -584,6 +591,20 @@ pub enum ShakedexError {
     NameMarketBoardCapacity,
     #[error("persisted Denuo name-market board is corrupt or noncanonical")]
     CorruptNameMarketBoard,
+    #[error("invalid, noncanonical, or unsupported Denuo publication outbox envelope")]
+    InvalidDenuoOutboxEnvelope,
+    #[error("Denuo publication outbox identity or request correlation conflicts")]
+    DenuoOutboxConflict,
+    #[error("Denuo publication outbox reached its explicit capacity")]
+    DenuoOutboxCapacity,
+    #[error("persisted Denuo publication outbox is corrupt or noncanonical")]
+    CorruptDenuoOutbox,
+    #[error("Denuo publication outbox entry was not found")]
+    DenuoOutboxNotFound,
+    #[error("Denuo publication outbox transition is not monotonic")]
+    InvalidDenuoOutboxTransition,
+    #[error("Denuo publication outbox retry limit was reached")]
+    DenuoOutboxRetryLimit,
     #[error("verified evidence does not permit this transition")]
     InvalidTransition,
     #[error("name or transaction evidence is invalid")]

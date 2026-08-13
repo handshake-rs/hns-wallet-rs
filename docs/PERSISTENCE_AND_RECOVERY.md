@@ -112,6 +112,42 @@ admission policy remain required for a live relay. The cache does not persist
 an action capability; current locking-coin/network/time authority must be
 reacquired before a listing can drive value behavior.
 
+The offline name-market publication outbox uses a second fixed record ID in
+the encrypted `DenuoBoardObject` namespace and its own store CAS revision. It
+retains at most 1,024 exact canonical V2 offer/cancellation envelopes (16 KiB
+each, 512 KiB serialized aggregate), their nonzero request IDs, canonical
+listing/cancellation content hashes, local domain-separated envelope digests,
+and bounded monotonic retry/acknowledgement metadata. Restart validation
+re-decodes and exactly re-encodes every envelope and rejects duplicate request
+or message identity, digest mismatch, timestamp/state regression, and
+oversized state. Exact enqueue is idempotent; the same message with another
+request ID conflicts. Acknowledged records are terminal and remain subject to
+the same capacity bound. The 64th recorded failure becomes an explicit
+terminal exhausted record, is excluded from due work, and cannot later be
+retried or acknowledged. Terminal retry counts and last-attempt timestamps
+must remain coherent. No compaction, network transport, peer state, or
+publication authority exists in this boundary.
+
+Through the Shakedex outbox API, an entry's first persisted state must be
+pending. Later saves verify the current encrypted record before allowing
+additive pending entries or one exact retry/acknowledgement advance; they reject
+removal, immutable-byte changes, skipped retry history, terminal rollback, and
+record-time regression. Creation, last-attempt, acknowledgement, and exhaustion
+timestamps cannot exceed the containing record's update time; a future
+scheduled retry may. A caller with raw mutable `WalletStore` access remains a
+trusted in-process composition authority: record AEAD detects external storage
+tampering, but cannot defend against an authorized writer constructing and
+encrypting another record. This tranche does not redesign that store boundary.
+
+Initial offer admission requires an `AuthenticatedFixedPriceListing`; initial
+cancellation admission requires a `VerifiedListingCancellation` already bound
+to its exact authenticated listing. After that typed boundary, restart relies
+on the authenticated encrypted store plus exact envelope/signature/content-
+identity and state validation. Stored bytes alone are never accepted as fresh
+listing-bound cancellation authority. Likewise, due outbox entries do not
+prove that an offer remains current: a future transport must reacquire fresh
+listing/lock/network/time authority before sending exact stored bytes.
+
 Dormant Shakedex structural plans use the encrypted seller or buyer workflow
 journal and its exact expected revision. Fulfillment plans retain the canonical
 seller-controlled prefix and ordered buyer suffix; recovery plans bind the

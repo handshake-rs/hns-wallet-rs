@@ -29,7 +29,9 @@ boundary:
   loopback backend is re-exported for native composition, but no production
   device transport or product read gate is supplied here;
 - persistence-first Shakedex and chain-neutral market state machines whose live
-  product and value gates remain disabled;
+  product and value gates remain disabled, including a bounded encrypted/CAS
+  offline Denuo V2 offer/cancellation outbox with exact-envelope restart
+  validation and monotonic retry/acknowledgement state;
 - Kyoto-only Bitcoin state and a native-ETH policy/contract verification
   boundary whose settlement permits remain unavailable; and
 - deterministic, non-mainnet fixtures for downstream qualification.

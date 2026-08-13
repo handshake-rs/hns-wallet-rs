@@ -171,6 +171,50 @@ Persisted board objects are re-decoded on load, but they remain cache data:
 every purchase or value action must reacquire fresh locking-coin and chain
 evidence.
 
+A separate encrypted `DenuoBoardObject` record holds a dormant, offline-only
+publication outbox. It accepts only exact canonical V2 `Offer` and `Cancel`
+envelopes with nonzero request IDs. Each row binds the canonical listing or
+cancellation content hash and a wallet-local, domain-separated SHA-256
+`envelope_id` over the exact envelope bytes. The latter is local persistence
+identity, not a Denuo protocol content identifier. Exact enqueue retries are
+idempotent; request-ID churn, duplicate message identity under different
+envelope bytes, registry substitution, malformed bytes, and non-publication
+message families fail closed.
+
+Through the Shakedex outbox API, first admission is typed rather than
+caller-asserted: an offer requires its `AuthenticatedFixedPriceListing`, while
+a cancellation requires the listing-bound `VerifiedListingCancellation`.
+Restart validation rechecks canonical signatures, exact encoding, identities,
+and lifecycle invariants; it does not recreate the listing-bound admission
+authority from arbitrary stored bytes. Raw mutable `WalletStore` access is a
+trusted in-process composition boundary: AEAD detects external storage
+tampering, but does not defend against an authorized writer constructing and
+encrypting another record. No broader store-boundary redesign is part of this
+tranche.
+
+The outbox retains at most 1,024 entries, limits each exact envelope to 16 KiB,
+and rejects an aggregate serialized form above 512 KiB. Retry attempts are
+bounded at 64 and must advance timestamps; acknowledgement is terminal and
+cannot regress to a retry state. Recording the 64th failed attempt returns and
+persists an explicit terminal exhausted state which is never reported due;
+neither acknowledgement nor another retry can rewrite it. Acknowledged and
+exhausted entries remain within the same hard bounds and are not silently
+pruned. Loading re-decodes and exactly
+re-encodes every envelope, recomputes both identities, and checks sorted unique
+envelope IDs, request IDs, and message identities. The first durable version
+of every entry must be pending; subsequent CAS saves cannot remove entries,
+rewrite exact bytes, skip retry states, roll back acknowledgement, or regress
+the encrypted record timestamp. Entry creation, attempt, acknowledgement, and
+exhaustion times cannot lie after that record timestamp; retry count and last-
+attempt presence remain coherent in terminal states. This boundary performs no
+network I/O, peer discovery, publication, transport acknowledgement, or gate
+change; a future qualified supervisor must preserve the exact stored bytes and
+supply its own authenticated delivery evidence. Because typed offer admission
+authenticates canonical structure and signature but does not prove current
+coin, network, or time authority, that supervisor must also reacquire the
+fresh current listing/lock/network/time evidence before sending. `due_entries`
+is scheduling metadata only and is never publication authority.
+
 Three compile-time gates are immutable and `false`:
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
 `SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`, and
