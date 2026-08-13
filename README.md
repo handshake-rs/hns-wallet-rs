@@ -56,7 +56,11 @@ real HNS backend and encrypted wallet state. It authenticates the selected
 account around each bounded reconciliation, retains one exact chain/mempool
 binding internally, performs no node I/O while a `SharedWalletStore` closure is
 active, and commits only across exact account/entity revision fences. The
-approval-schema-v3 Names prompt carried by private ABI v2 contains the exact
+service crate also provides one concrete native-launcher constructor which
+wires that same composition to the authenticated loopback RPC backend, the
+production wall clock, and the literal shared store authority. It adds no CLI
+configuration, artifact trust, browser-engine authority, or availability gate.
+The approval-schema-v3 Names prompt carried by private ABI v2 contains the exact
 sorted canonical name/lowercase-hash set it may grant. The service freezes that
 bounded set before prompting, re-synchronizes at approval, rejects any account
 or set change, and persists only the unchanged displayed hashes. This

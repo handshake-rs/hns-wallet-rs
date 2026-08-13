@@ -14,7 +14,9 @@ use hns_wallet_ffi::{
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountReadSnapshot, HnsBackend, HnsClock,
-    HnsExistingAccountSelector, HnsWalletError, KnownName, NameOwnershipStatus, NameResourceStatus,
+    HnsExistingAccountSelector, HnsNodeRpcBackend, HnsNodeRpcConfig, HnsRuntimeConfig,
+    HnsWalletError, KnownName, NameOwnershipStatus, NameResourceStatus,
+    SystemClock as HnsSystemClock,
 };
 use hns_wallet_provider::{
     ApprovedCall, HostAuthorityRegistration, Origin, PROVIDER_API_VERSION, PendingApproval,
@@ -389,6 +391,26 @@ pub struct PersistentHnsReadConfig<B, C> {
     pub runtime: HnsAccountReadRuntime<B, C>,
     pub account_label: String,
 }
+
+/// Trusted native-launcher inputs for the concrete authenticated-loopback HNS
+/// read service. The expected account is configuration, not a caller-selected
+/// website identity: unlock re-authenticates the exact persisted account before
+/// any provider request can use it.
+///
+/// The node authorization value remains redacted and zeroizing inside
+/// [`HnsNodeRpcConfig`]. This type deliberately contains no signing, import,
+/// marketplace, value, or browser-engine authority switch.
+pub struct PersistentNativeHnsReadConfig {
+    pub account: HnsRuntimeConfig,
+    pub node_rpc: HnsNodeRpcConfig,
+    pub account_label: String,
+}
+
+/// Concrete read-only runtime used by a separately trusted native browser
+/// launcher. Browser-engine authority and artifact admission remain outside
+/// this crate and are never inferred from constructing this type.
+pub type PersistentNativeHnsReadRuntime =
+    PersistentHnsReadRuntime<HnsNodeRpcBackend, HnsSystemClock>;
 
 /// Product-composable HNS account runtime that performs one live, bounded
 /// reconciliation for every balance/history/receive/name result. It exposes
@@ -1966,6 +1988,46 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsR
     }
 }
 
+impl WalletService<SharedWalletStore, PersistentNativeHnsReadRuntime> {
+    /// Compose the concrete native HNS read service around an authenticated
+    /// loopback node and the identical locked store authority retained by
+    /// provider permissions. This is the intended service-side boundary for a
+    /// separately admitted browser-native launcher; it does not itself grant
+    /// browser authority or advertise browser integration.
+    ///
+    /// The resulting provider surface is limited to status, the exact account
+    /// join, balance, history, receive address, and approval-scoped known-name
+    /// reads plus the existing permission/lock controls. Runtime configuration
+    /// with either value switch enabled is rejected by the exact-account
+    /// selector before service construction.
+    pub fn new_persistent_native_hns_reads(
+        store: SharedWalletStore,
+        config: PersistentNativeHnsReadConfig,
+    ) -> Result<Self, ServiceError> {
+        if !store.is_locked()? {
+            return Err(ServiceError::PersistentStoreMustStartLocked);
+        }
+        let PersistentNativeHnsReadConfig {
+            account,
+            node_rpc,
+            account_label,
+        } = config;
+        let selector = HnsExistingAccountSelector::new(store.clone(), account)
+            .map_err(|_| ServiceError::InvalidPersistentHnsAccount)?;
+        let backend = HnsNodeRpcBackend::new(node_rpc)
+            .map_err(|_| ServiceError::InvalidPersistentHnsAccount)?;
+        let runtime = HnsAccountReadRuntime::new(backend, HnsSystemClock, store.clone(), selector)
+            .map_err(|_| ServiceError::PersistentStoreAuthorityMismatch)?;
+        Self::new_persistent_hns_reads(
+            store,
+            PersistentHnsReadConfig {
+                runtime,
+                account_label,
+            },
+        )
+    }
+}
+
 fn provider_authority(
     authority: HostAuthorityFacts,
 ) -> Result<HostAuthorityRegistration, ServiceFailure> {
@@ -3024,6 +3086,22 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn native_hns_read_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::var_os("HNS_WALLET_STORE_TEST_TMPDIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let directory = tempfile::Builder::new()
+            .prefix("hns-wallet-native-read-")
+            .tempdir_in(root)
+            .expect("private native HNS read directory");
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("private native HNS read directory mode");
+        directory
+    }
+
+    #[cfg(target_os = "linux")]
     fn production_hns_account(config: HnsRuntimeConfig) -> HnsAccountRecord {
         HnsAccountRecord {
             config,
@@ -3889,6 +3967,221 @@ mod tests {
             .expect("restart permission snapshot");
         assert_eq!(permission.generation, 2);
         assert!(permission.record.is_none());
+    }
+
+    #[test]
+    fn native_hns_read_inputs_require_authenticated_loopback_rpc() {
+        assert!(
+            HnsNodeRpcConfig::new(
+                "192.0.2.1:14038".parse().expect("non-loopback socket"),
+                "Bearer node-authority",
+            )
+            .is_err()
+        );
+        assert!(
+            HnsNodeRpcConfig::new("127.0.0.1:14038".parse().expect("loopback socket"), "",)
+                .is_err()
+        );
+        assert!(
+            HnsNodeRpcConfig::new(
+                "[::1]:14038".parse().expect("IPv6 loopback socket"),
+                "Bearer node-authority",
+            )
+            .is_ok()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_hns_read_constructor_wires_exact_store_and_read_only_surface() {
+        let directory = native_hns_read_tempdir();
+        let account = production_hns_config(9, 0);
+        let store = production_hns_store(
+            &directory.path().join("wallet.sqlite3"),
+            std::slice::from_ref(&account),
+        );
+        let node_rpc = HnsNodeRpcConfig::new(
+            "127.0.0.1:14038".parse().expect("loopback socket"),
+            "Bearer test-only-node-authority",
+        )
+        .expect("authenticated loopback configuration");
+        let mut service = WalletService::new_persistent_native_hns_reads(
+            store.clone(),
+            PersistentNativeHnsReadConfig {
+                account: account.clone(),
+                node_rpc,
+                account_label: "Handshake".to_owned(),
+            },
+        )
+        .expect("native HNS read service");
+
+        assert!(service.runtime.store.is_same_authority(&store));
+        assert!(service.runtime.runtime.shares_store_authority(&store));
+        assert!(store.is_locked().expect("locked startup"));
+        assert!(
+            service
+                .capabilities
+                .contains(&ServiceCapability::PersistentPermissions)
+        );
+        assert!(
+            service
+                .capabilities
+                .contains(&ServiceCapability::ProviderDispatch)
+        );
+        assert!(
+            !service
+                .capabilities
+                .contains(&ServiceCapability::ValueMovement)
+        );
+        assert!(
+            !service
+                .capabilities
+                .contains(&ServiceCapability::BrowserIntegration)
+        );
+
+        service
+            .provider
+            .register_authority(handle(), registration(), NOW_MS)
+            .expect("native browser authority");
+        let ServiceResponse::Wallet {
+            response: WalletResponse::Unlocked,
+        } = service
+            .dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Unlock {
+                        passphrase: hns_wallet_ffi::SecretString::new(
+                            "correct horse battery staple".to_owned(),
+                        ),
+                    },
+                },
+                NOW_MS + 1,
+            )
+            .expect("unlock native HNS read service")
+        else {
+            panic!("unlock response")
+        };
+
+        let ServiceResponse::Wallet {
+            response: WalletResponse::Status { status },
+        } = service
+            .dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Status,
+                },
+                NOW_MS + 2,
+            )
+            .expect("native status read")
+        else {
+            panic!("status response")
+        };
+        assert!(!status.locked);
+        assert_eq!(status.active_wallet, Some(account.wallet_id));
+        assert_eq!(
+            status.enabled_modules,
+            BTreeSet::from([ModuleId::Handshake])
+        );
+        assert!(!status.mainnet_settlement_enabled);
+
+        let ServiceResponse::Wallet {
+            response: WalletResponse::Accounts { accounts },
+        } = service
+            .dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::ListAccounts,
+                },
+                NOW_MS + 3,
+            )
+            .expect("native account read")
+        else {
+            panic!("account response")
+        };
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id, account.account_id);
+
+        let ServiceResponse::ProviderCapabilities { capabilities, .. } = service
+            .provider_capabilities(handle(), 1, NOW_MS + 4)
+            .expect("native read capabilities")
+        else {
+            panic!("provider capabilities response")
+        };
+        assert_eq!(
+            capabilities.methods,
+            BTreeSet::from([
+                "hns_accounts".to_owned(),
+                "hns_getBalance".to_owned(),
+                "hns_getName".to_owned(),
+                "hns_getNames".to_owned(),
+                "hns_getReceiveAddress".to_owned(),
+                "hns_getTransactions".to_owned(),
+                "hns_requestAccounts".to_owned(),
+                "wallet_getCapabilities".to_owned(),
+                "wallet_getPermissions".to_owned(),
+                "wallet_getStatus".to_owned(),
+                "wallet_lock".to_owned(),
+                "wallet_requestPermissions".to_owned(),
+                "wallet_revokePermissions".to_owned(),
+            ])
+        );
+
+        for (index, method) in [
+            ProviderMethod::HnsSend,
+            ProviderMethod::HnsImportKnownName,
+            ProviderMethod::HnsTransferName,
+            ProviderMethod::HnsFinalizeName,
+            ProviderMethod::HnsSignTypedMessage,
+            ProviderMethod::NameMarketCreateFixedPriceOffer,
+            ProviderMethod::NameMarketFinalizePurchase,
+            ProviderMethod::AssetSend,
+            ProviderMethod::WalletEnableModule,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(matches!(
+                service.provider_request(
+                    handle(),
+                    1,
+                    u64::try_from(index).expect("bounded request index") + 1,
+                    method.wire_name().to_owned(),
+                    Value::Null,
+                    NOW_MS + 5 + u64::try_from(index).expect("bounded request index"),
+                ),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::UnsupportedCapability,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_hns_read_constructor_rejects_value_enabled_account_config() {
+        let directory = native_hns_read_tempdir();
+        let persisted = production_hns_config(9, 0);
+        let store = production_hns_store(
+            &directory.path().join("wallet.sqlite3"),
+            std::slice::from_ref(&persisted),
+        );
+        let mut value_account = persisted;
+        value_account.value_operations_enabled = true;
+        let node_rpc = HnsNodeRpcConfig::new(
+            "127.0.0.1:14038".parse().expect("loopback socket"),
+            "Bearer test-only-node-authority",
+        )
+        .expect("authenticated loopback configuration");
+
+        assert!(matches!(
+            WalletService::new_persistent_native_hns_reads(
+                store,
+                PersistentNativeHnsReadConfig {
+                    account: value_account,
+                    node_rpc,
+                    account_label: "Handshake".to_owned(),
+                },
+            ),
+            Err(ServiceError::InvalidPersistentHnsAccount)
+        ));
     }
 
     #[cfg(target_os = "linux")]

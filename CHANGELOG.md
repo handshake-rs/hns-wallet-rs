@@ -15,6 +15,9 @@ boundary:
 - a Handshake-first account, name-state, node-RPC, and recovery boundary;
 - origin-bound provider permissions, private ABI-v2 framing, trusted host state,
   and an in-process service composition;
+- a concrete fail-closed native HNS read-service constructor which binds an
+  exact non-value account, authenticated loopback node RPC, and the literal
+  shared store authority without enabling browser integration or value;
 - atomic single-account mobile create, restore, open, unlock, lock, and status
   control without a WebView or value surface;
 - an injectable `MobileHnsReadController` which transfers or opens one exact

@@ -178,6 +178,15 @@ account, and returns nothing if the binding, store corpus, lock state, or
 selection changes. Node calls occur only after every shared-store closure has
 returned.
 
+`WalletService::new_persistent_native_hns_reads` is the concrete service-side
+composition for a separately trusted native browser launcher. It constructs
+the selector, synchronized runtime, authenticated loopback RPC backend, and
+production clock from the literal same locked `SharedWalletStore`. Invalid or
+value-enabled account configuration and non-loopback or empty RPC authority are
+rejected before a service is returned. This constructor does not change the
+checked-in executable, admit an artifact, register an engine authority, or
+advertise `browserIntegration` or `valueMovement`.
+
 Read capabilities are additive only after a persisted exact Accounts grant.
 `wallet_requestPermissions` cannot replace or select that account. Approving
 Names first performs one live synchronization and places the exact sorted
