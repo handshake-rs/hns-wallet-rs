@@ -108,6 +108,18 @@ watermark preservation, cross-network exact-retry rejection, and exact no-write
 retry after signed expiry. This is not exact-commit CI or live
 transport/product/value qualification and changes no release gate.
 
+The closed single-offer board-read tranche adds focused source regressions for
+canonical V2 singular `GetOffer`/`Offer` correlation, mandatory nonzero request
+IDs, wrong registry and every other request/response family, malformed and
+trailing input, typed missing/cancelled absence without node queries, exact
+read-only repeat, restart reacquisition, spent/expired/wrong-network/stale
+chain and mempool evidence, and deterministic board replacement during the
+current-lock query. A selected-account mutation during runtime clock
+observation is also fenced after the clock returns. The opaque plan retains no
+response bytes and exposes no listing, lock, transport, provider, or value
+capability. This remains local source evidence until exact-commit CI/CodeQL and
+changes no release gate.
+
 CodeQL passed at exact `2229be8`; `ba9f013` remains the historical baseline.
 This repository records no independent security audit, database or resource
 benchmark, multi-process network test, installed-device run, or installed-

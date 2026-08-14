@@ -67,6 +67,14 @@ independently disabled.
   authority. This is still offline source composition: it supplies no live
   relay supervision, HRM/HNSA-currentness adapter, approval, signing,
   broadcast, quote, or product availability authority.
+- The single-offer board-read plan accepts only canonical V2 `GetOffer` with a
+  nonzero correlation ID and internally verifies the paired singular type-7
+  `Offer`; missing and cancelled rows require no node query. It retains no
+  response bytes and exposes no listing or current-lock handle. Its private
+  point-in-time evidence is returned only after runtime clock observation and
+  final chain, mempool, and exact selected-account fences. It is not a lease:
+  any future live emitter must reacquire and fence current authority
+  immediately before encoding or transport.
 - Bitcoin production synchronization has one backend: Kyoto direct P2P with
   BIP157/158. There is no trusted indexer fallback.
 - Handshake node evidence crosses one authenticated loopback HTTP/1.1 boundary.

@@ -1593,6 +1593,10 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
         )
         .map_err(|_| HnsWalletError::InvalidEvidence)?;
 
+        // The clock is runtime-owned but may still observe shared state. Sample
+        // it before the final chain, mempool, and selected-account fences so no
+        // clock-time mutation can survive into the returned authority.
+        let observed_at_unix = self.clock.now_unix()?;
         if self.backend.get_chain_snapshot()? != binding {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
@@ -1612,7 +1616,6 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             }
             Ok(())
         })?;
-        let observed_at_unix = self.clock.now_unix()?;
 
         Ok(VerifiedCurrentShakedexLock {
             binding,

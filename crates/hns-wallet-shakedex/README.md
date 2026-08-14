@@ -33,6 +33,18 @@ not authority: `current_offer` rechecks the live lock and fences the unchanged
 board row after the node queries. This layer performs no relay I/O and does not
 use an HRM/HNSA receipt as chain authority.
 
+One exact canonical V2 `GetOffer` can now be evaluated into a closed response
+plan. The request and singular `Offer` response require the same nonzero
+correlation ID; zero remains valid only for protocol families such as an
+unsolicited cancellation tombstone. Missing or cancelled rows produce typed
+absence without a node query. A current plan privately retains the freshly
+reacquired lock and unchanged board revision, but exposes only request ID,
+listing hash, and revision. Runtime clock observation precedes the final
+chain, mempool, and exact selected-account fences. Internally authenticated
+response bytes are discarded, and the plan is point-in-time evidence rather
+than a transport lease or permission to encode, send, sign, provide, or move
+value.
+
 Shakedex creation, discovery, signing, broadcast, and dependent value gates
 remain unavailable to products until the documented qualification is complete.
 See the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)

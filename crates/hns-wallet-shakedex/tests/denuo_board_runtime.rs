@@ -1,14 +1,14 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use blake2::Blake2bVar;
 use blake2::digest::{Update, VariableOutput};
 use hns_covenants::{FinalizeCovenant, NameState, hash_name};
-use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketMessage};
+use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketHello, NameMarketMessage};
 use hns_primitives::{
     BlockHash, Dollarydoos, Height, Outpoint as CanonicalOutpoint,
     TransactionHash as CanonicalTransactionHash,
@@ -28,9 +28,11 @@ use hns_wallet_hns::{
     SpendingTransactionEvidence, TransactionEvidence,
 };
 use hns_wallet_shakedex::{
-    DenuoBoardCancellationAdmission, DenuoBoardOfferAdmission, DenuoBoardRuntime,
-    SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED, SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED,
-    SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, ShakedexError, load_name_market_board,
+    DenuoBoardCancellationAdmission, DenuoBoardOfferAdmission, DenuoBoardOfferResponsePlan,
+    DenuoBoardRuntime, DenuoNameMarketRequest, SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED,
+    SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED, SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, ShakedexError,
+    encode_denuo_request, load_name_market_board, prepare_denuo_board_offer_response,
+    save_name_market_board, verify_fixed_price_listing,
 };
 use hns_wallet_store::{SharedWalletStore, WalletStore};
 use hns_wallet_types::{AccountId, BaseUnits, ObjectHash, TransactionHash};
@@ -299,22 +301,35 @@ impl MarketFixture {
     }
 }
 
+type QueryHook = Box<dyn FnOnce() + Send>;
+
 #[derive(Clone)]
 struct BackendControl {
     spent: Arc<AtomicBool>,
+    restart_chain_on_fence: Arc<AtomicBool>,
+    chain_snapshot_count: Arc<AtomicU64>,
     restart_mempool_on_fence: Arc<AtomicBool>,
     reject_queries: Arc<AtomicBool>,
     query_count: Arc<AtomicU64>,
+    query_hook: Arc<Mutex<Option<QueryHook>>>,
 }
 
 impl BackendControl {
     fn new() -> Self {
         Self {
             spent: Arc::new(AtomicBool::new(false)),
+            restart_chain_on_fence: Arc::new(AtomicBool::new(false)),
+            chain_snapshot_count: Arc::new(AtomicU64::new(0)),
             restart_mempool_on_fence: Arc::new(AtomicBool::new(false)),
             reject_queries: Arc::new(AtomicBool::new(false)),
             query_count: Arc::new(AtomicU64::new(0)),
+            query_hook: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn install_query_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        let mut installed = self.query_hook.lock().expect("query hook mutex");
+        assert!(installed.replace(Box::new(hook)).is_none());
     }
 }
 
@@ -333,6 +348,15 @@ impl TestBackend {
         if self.control.reject_queries.load(Ordering::SeqCst) {
             return Err(Self::unexpected(method));
         }
+        let hook = self
+            .control
+            .query_hook
+            .lock()
+            .map_err(|_| HnsWalletError::RuntimePoisoned)?
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
         Ok(())
     }
 }
@@ -340,6 +364,15 @@ impl TestBackend {
 impl HnsBackend for TestBackend {
     fn get_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError> {
         self.record_query("get_chain_snapshot")?;
+        let snapshot_index = self
+            .control
+            .chain_snapshot_count
+            .fetch_add(1, Ordering::SeqCst);
+        if self.control.restart_chain_on_fence.load(Ordering::SeqCst) && snapshot_index % 2 == 1 {
+            let mut restarted = self.market.binding;
+            restarted.tip.block_hash[0] ^= 1;
+            return Ok(restarted);
+        }
         Ok(self.market.binding)
     }
 
@@ -820,6 +853,442 @@ fn board_conflicts_spends_stale_mempool_and_unrelated_stores_fail_closed() {
         .expect("updated offer");
     assert_eq!(current_update.board_revision(), 2);
     assert_eq!(current_update.listing().listing_hash(), update_hash);
+}
+
+#[test]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "a release-gate flip requires explicit review of this closed read boundary"
+)]
+fn single_offer_response_plan_reacquires_after_restart_and_hides_cancelled_rows_without_queries() {
+    let directory = TestDirectory::new();
+    let database = directory.0.join("wallet.sqlite3");
+    let market = Arc::new(MarketFixture::new());
+    let listing = market.listing(30, 12_345_678);
+    let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
+    let offer = NameMarketMessage::Offer(listing.clone())
+        .encode_envelope(DenuoRegistryVersion::V2, 140)
+        .expect("offer envelope");
+    let request = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        139,
+        &DenuoNameMarketRequest::Offer(listing_hash),
+    )
+    .expect("GetOffer request");
+    let (_, cancellation, cancellation_hash) = market.cancellation(&listing, 31, 141);
+    let control = BackendControl::new();
+    let (store, config) = create_store(&database);
+    let hns = runtime(
+        store.clone(),
+        config.clone(),
+        market.clone(),
+        control.clone(),
+    );
+    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    assert!(matches!(
+        board.admit_offer(&offer, listing_hash),
+        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+    ));
+    let queries_after_admission = control.query_count.load(Ordering::SeqCst);
+    let plan =
+        prepare_denuo_board_offer_response(&request, &board).expect("closed current response plan");
+    let queries_after_plan = control.query_count.load(Ordering::SeqCst);
+    assert!(queries_after_plan > queries_after_admission);
+    assert_eq!(plan.request_id(), 139);
+    assert_eq!(plan.listing_hash(), listing_hash);
+    assert_eq!(plan.board_revision(), Some(1));
+    let DenuoBoardOfferResponsePlan::Current(prepared) = &plan else {
+        panic!("expected current response plan");
+    };
+    assert_eq!(prepared.request_id(), 139);
+    assert_eq!(prepared.listing_hash(), listing_hash);
+    assert_eq!(prepared.board_revision(), 1);
+    assert_eq!(
+        store
+            .try_with_store(load_name_market_board)
+            .expect("read-only plan")
+            .revision,
+        1
+    );
+    let repeated =
+        prepare_denuo_board_offer_response(&request, &board).expect("exact repeated response plan");
+    assert!(matches!(repeated, DenuoBoardOfferResponsePlan::Current(_)));
+    assert!(control.query_count.load(Ordering::SeqCst) > queries_after_plan);
+    assert_eq!(
+        store
+            .try_with_store(load_name_market_board)
+            .expect("repeated read-only plan")
+            .revision,
+        1
+    );
+    drop(repeated);
+    drop(plan);
+    drop(board);
+    drop(hns);
+    drop(store);
+
+    let mut reopened = WalletStore::open(&database).expect("reopen wallet store");
+    reopened.unlock(PASSPHRASE).expect("unlock restarted store");
+    let restarted_store = SharedWalletStore::new(reopened);
+    let restarted_control = BackendControl::new();
+    let restarted_hns = runtime(
+        restarted_store.clone(),
+        config,
+        market,
+        restarted_control.clone(),
+    );
+    let restarted = DenuoBoardRuntime::new(&restarted_hns, restarted_store.clone())
+        .expect("restarted shared authority");
+    assert_eq!(restarted_control.query_count.load(Ordering::SeqCst), 0);
+    let restarted_plan = prepare_denuo_board_offer_response(&request, &restarted)
+        .expect("fresh restart response plan");
+    assert!(matches!(
+        restarted_plan,
+        DenuoBoardOfferResponsePlan::Current(_)
+    ));
+    let queries_after_restart_plan = restarted_control.query_count.load(Ordering::SeqCst);
+    assert!(queries_after_restart_plan > 0);
+
+    let missing_hash = ObjectHash::new([0x77; 32]);
+    let missing_request = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        142,
+        &DenuoNameMarketRequest::Offer(missing_hash),
+    )
+    .expect("missing GetOffer request");
+    let missing = prepare_denuo_board_offer_response(&missing_request, &restarted)
+        .expect("missing response plan");
+    assert!(matches!(
+        missing,
+        DenuoBoardOfferResponsePlan::Absent {
+            request_id: 142,
+            listing_hash: hash,
+        } if hash == missing_hash
+    ));
+    assert_eq!(
+        restarted_control.query_count.load(Ordering::SeqCst),
+        queries_after_restart_plan
+    );
+
+    restarted
+        .admit_cancellation(&cancellation, listing_hash, cancellation_hash)
+        .expect("cancel target");
+    let queries_after_cancellation = restarted_control.query_count.load(Ordering::SeqCst);
+    let cancelled =
+        prepare_denuo_board_offer_response(&request, &restarted).expect("cancelled response plan");
+    assert!(matches!(
+        cancelled,
+        DenuoBoardOfferResponsePlan::Absent {
+            request_id: 139,
+            listing_hash: hash,
+        } if hash == listing_hash
+    ));
+    assert_eq!(
+        restarted_control.query_count.load(Ordering::SeqCst),
+        queries_after_cancellation
+    );
+
+    assert!(!HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
+    assert!(!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
+    assert!(!SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
+    assert!(!SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+    assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
+}
+
+#[test]
+fn single_offer_response_plan_rejects_every_other_request_family_before_node_queries() {
+    let market = Arc::new(MarketFixture::new());
+    let listing = market.listing(40, 12_345_678);
+    let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
+    let hello = NameMarketMessage::Hello(NameMarketHello {
+        hns_magic: market.network.magic,
+        hns_genesis: market.network.genesis,
+        maximum_payload: 1_024,
+        feature_flags: 0,
+    })
+    .encode_envelope(DenuoRegistryVersion::V2, 0)
+    .expect("zero-ID hello family");
+    let (_, cancellation, _) = market.cancellation(&listing, 41, 0);
+    let control = BackendControl::new();
+    control.reject_queries.store(true, Ordering::SeqCst);
+    let (store, config) = create_store(":memory:");
+    let hns = runtime(store.clone(), config, market, control.clone());
+    let board = DenuoBoardRuntime::new(&hns, store).expect("shared store authority");
+    let inventory = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        150,
+        &DenuoNameMarketRequest::Inventory,
+    )
+    .expect("inventory request");
+    let offers = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        151,
+        &DenuoNameMarketRequest::Offers(vec![listing_hash]),
+    )
+    .expect("multi-offer request family");
+    let v1 = encode_denuo_request(
+        DenuoRegistryVersion::V1,
+        152,
+        &DenuoNameMarketRequest::Offer(listing_hash),
+    )
+    .expect("V1 GetOffer request");
+    let mut zero_id = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        155,
+        &DenuoNameMarketRequest::Offer(listing_hash),
+    )
+    .expect("canonical nonzero GetOffer request");
+    const REQUEST_ID_OFFSET: usize = 4 + (5 * core::mem::size_of::<u16>());
+    zero_id[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + core::mem::size_of::<u64>()]
+        .copy_from_slice(&0_u64.to_le_bytes());
+    let mut trailing = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        156,
+        &DenuoNameMarketRequest::Offer(listing_hash),
+    )
+    .expect("canonical GetOffer before trailing byte");
+    trailing.push(0);
+    let batch_response = NameMarketMessage::Offers(vec![listing.clone()])
+        .encode_envelope(DenuoRegistryVersion::V2, 157)
+        .expect("batch response family");
+    let offer_response = NameMarketMessage::Offer(listing)
+        .encode_envelope(DenuoRegistryVersion::V2, 153)
+        .expect("offer response family");
+    let inventory_response = NameMarketMessage::OfferInventory(vec![listing_hash.into_bytes()])
+        .encode_envelope(DenuoRegistryVersion::V2, 154)
+        .expect("inventory response family");
+
+    for rejected in [
+        hello.as_slice(),
+        inventory.as_slice(),
+        offers.as_slice(),
+        batch_response.as_slice(),
+        offer_response.as_slice(),
+        inventory_response.as_slice(),
+        cancellation.as_slice(),
+        zero_id.as_slice(),
+        trailing.as_slice(),
+        &[0x01, 0x02, 0x03],
+    ] {
+        assert!(matches!(
+            prepare_denuo_board_offer_response(rejected, &board),
+            Err(ShakedexError::InvalidDenuoEnvelope)
+        ));
+    }
+    assert!(matches!(
+        prepare_denuo_board_offer_response(&v1, &board),
+        Err(ShakedexError::DenuoRegistryMismatch)
+    ));
+    assert_eq!(control.query_count.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn single_offer_response_plan_fails_on_spend_stale_mempool_board_replacement_and_expiry() {
+    let market = Arc::new(MarketFixture::new());
+    let listing = market.listing(50, 12_345_678);
+    let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
+    let offer = NameMarketMessage::Offer(listing)
+        .encode_envelope(DenuoRegistryVersion::V2, 160)
+        .expect("offer envelope");
+    let request = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        161,
+        &DenuoNameMarketRequest::Offer(listing_hash),
+    )
+    .expect("GetOffer request");
+    let control = BackendControl::new();
+    let (store, config) = create_store(":memory:");
+    let hns = runtime(
+        store.clone(),
+        config.clone(),
+        market.clone(),
+        control.clone(),
+    );
+    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    assert!(matches!(
+        board.admit_offer(&offer, listing_hash),
+        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+    ));
+
+    control.restart_chain_on_fence.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        prepare_denuo_board_offer_response(&request, &board),
+        Err(ShakedexError::InvalidEvidence)
+    ));
+    control
+        .restart_chain_on_fence
+        .store(false, Ordering::SeqCst);
+
+    control.spent.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        prepare_denuo_board_offer_response(&request, &board),
+        Err(ShakedexError::InvalidEvidence)
+    ));
+    control.spent.store(false, Ordering::SeqCst);
+    control
+        .restart_mempool_on_fence
+        .store(true, Ordering::SeqCst);
+    assert!(matches!(
+        prepare_denuo_board_offer_response(&request, &board),
+        Err(ShakedexError::InvalidEvidence)
+    ));
+    control
+        .restart_mempool_on_fence
+        .store(false, Ordering::SeqCst);
+
+    let replacement = market.listing(51, 12_345_679);
+    let replacement_hash = ObjectHash::new(replacement.listing_hash().expect("replacement hash"));
+    let verified_replacement = verify_fixed_price_listing(
+        &replacement.encode().expect("replacement bytes"),
+        replacement_hash,
+        market.network,
+        NOW_UNIX,
+        &market.locking_coin,
+    )
+    .expect("verified replacement");
+    let (expected_revision, replacement_board) = store
+        .try_with_store(|wallet| {
+            let mut stored = load_name_market_board(wallet)?;
+            stored.board.apply_offer(&verified_replacement)?;
+            Ok::<_, ShakedexError>((stored.revision, stored.board))
+        })
+        .expect("stage replacement board");
+    let hook_store = store.clone();
+    control.install_query_hook(move || {
+        hook_store
+            .try_with_store_mut(|wallet| {
+                save_name_market_board(wallet, expected_revision, &replacement_board, NOW_UNIX)
+                    .map(|_| ())
+            })
+            .expect("replace board during current-lock reacquisition");
+    });
+    assert!(matches!(
+        prepare_denuo_board_offer_response(&request, &board),
+        Err(ShakedexError::StaleRevision)
+    ));
+    assert_eq!(
+        store
+            .try_with_store(load_name_market_board)
+            .expect("replacement committed")
+            .revision,
+        2
+    );
+    drop(board);
+    drop(hns);
+
+    let late_control = BackendControl::new();
+    let late_hns = late_runtime(store.clone(), config.clone(), market.clone(), late_control);
+    let late_board =
+        DenuoBoardRuntime::new(&late_hns, store.clone()).expect("late shared authority");
+    let replacement_request = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        162,
+        &DenuoNameMarketRequest::Offer(replacement_hash),
+    )
+    .expect("expired replacement request");
+    assert!(matches!(
+        prepare_denuo_board_offer_response(&replacement_request, &late_board),
+        Err(ShakedexError::InvalidListing)
+    ));
+    drop(late_board);
+    drop(late_hns);
+
+    let mut other_network_config = config;
+    other_network_config.network = HnsNetwork::Testnet;
+    store
+        .try_with_store_mut(|wallet| {
+            let mut accounts = wallet.wallet_accounts::<HnsAccountRecord>(2)?;
+            let stored = accounts.pop().expect("selected account row");
+            assert!(accounts.is_empty());
+            let mut changed = stored.value;
+            changed.config.network = other_network_config.network;
+            wallet
+                .save_wallet_account(&stored.id, stored.revision, &changed, NOW_UNIX)
+                .map(|_| ())
+        })
+        .expect("move selected account to another network");
+    let other_network_control = BackendControl::new();
+    let other_network_hns = runtime(
+        store.clone(),
+        other_network_config,
+        market,
+        other_network_control.clone(),
+    );
+    let other_network_board =
+        DenuoBoardRuntime::new(&other_network_hns, store).expect("other-network shared authority");
+    assert!(matches!(
+        prepare_denuo_board_offer_response(&replacement_request, &other_network_board),
+        Err(ShakedexError::InvalidEvidence)
+    ));
+    assert!(other_network_control.query_count.load(Ordering::SeqCst) > 0);
+}
+
+#[test]
+fn single_offer_response_plan_fences_account_mutation_during_clock_observation() {
+    let market = Arc::new(MarketFixture::new());
+    let listing = market.listing(60, 12_345_678);
+    let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
+    let offer = NameMarketMessage::Offer(listing)
+        .encode_envelope(DenuoRegistryVersion::V2, 170)
+        .expect("offer envelope");
+    let request = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        171,
+        &DenuoNameMarketRequest::Offer(listing_hash),
+    )
+    .expect("GetOffer request");
+    let control = BackendControl::new();
+    let (store, config) = create_store(":memory:");
+    let admitting_hns = runtime(
+        store.clone(),
+        config.clone(),
+        market.clone(),
+        control.clone(),
+    );
+    let admitting_board =
+        DenuoBoardRuntime::new(&admitting_hns, store.clone()).expect("shared store authority");
+    assert!(matches!(
+        admitting_board.admit_offer(&offer, listing_hash),
+        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+    ));
+    drop(admitting_board);
+    drop(admitting_hns);
+
+    let mut account_id = [0_u8; 32];
+    account_id[..16].copy_from_slice(config.wallet_id.as_bytes());
+    account_id[16..].copy_from_slice(config.account_id.as_bytes());
+    let selector = HnsExistingAccountSelector::new(store.clone(), config)
+        .expect("exact non-value account selector");
+    let clock = AccountMutatingClock {
+        store: store.clone(),
+        account_id,
+        called: AtomicBool::new(false),
+    };
+    let mutating_hns = HnsAccountReadRuntime::new(
+        TestBackend {
+            market,
+            control: control.clone(),
+        },
+        clock,
+        store.clone(),
+        selector,
+    )
+    .expect("account-mutating read runtime");
+    let mutating_board =
+        DenuoBoardRuntime::new(&mutating_hns, store.clone()).expect("shared store authority");
+
+    assert!(matches!(
+        prepare_denuo_board_offer_response(&request, &mutating_board),
+        Err(ShakedexError::HnsIntegration)
+    ));
+    assert!(control.query_count.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        store
+            .try_with_store(load_name_market_board)
+            .expect("unchanged board after account race")
+            .revision,
+        1
+    );
 }
 
 #[test]

@@ -3,6 +3,7 @@
 
 mod acceptance;
 mod board;
+mod board_read;
 mod board_runtime;
 mod canonical;
 mod outbox;
@@ -18,6 +19,10 @@ pub use acceptance::{
 pub use board::{
     BoardOfferStatus, NameMarketBoard, PersistedBoardOffer, StoredNameMarketBoard,
     load_name_market_board, save_name_market_board,
+};
+pub use board_read::{
+    DenuoBoardOfferResponsePlan, PreparedDenuoBoardOfferResponse,
+    prepare_denuo_board_offer_response,
 };
 pub use board_runtime::{
     CurrentDenuoBoardOffer, DenuoBoardCancellationAdmission, DenuoBoardOfferAdmission,

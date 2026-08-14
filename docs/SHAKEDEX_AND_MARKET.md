@@ -212,6 +212,23 @@ an endpoint-signed relay receipt substitutes for current HNS locking-coin
 authority. Every canonical Denuo and Shakedex value product gate remains
 `false`.
 
+The board also accepts exactly one canonical V2 `GetOffer` envelope through a
+closed read boundary. Denuo requires a nonzero correlation ID for both this
+type-6 request and its singular type-7 `Offer` response; this differs from the
+zero-ID cancellation/tombstone case. Inventory, batch, response-family, V1,
+zero-ID, malformed, and noncanonical inputs are rejected before current-lock
+lookup. Missing or cancelled rows return typed absence without querying a
+node. Otherwise the runtime reacquires and fences `current_offer`, encodes the
+singular response internally, authenticates its exact request ID, listing hash,
+and canonical listing bytes, then discards both encoded and decoded response
+objects. Runtime clock observation occurs before the final chain, mempool, and
+exact selected-account revision/value fences, so a clock-time account mutation
+cannot survive into the plan. The non-cloneable, non-serializable plan exposes
+only correlation ID, hash, and board revision. It carries no response bytes or
+transport/value capability, and a future emitter must reacquire authority
+again immediately at use time because neither the plan nor
+`CurrentDenuoBoardOffer` is a lease.
+
 A separate encrypted `DenuoBoardObject` record holds a dormant, offline-only
 publication outbox. It accepts only exact canonical V2 `Offer` and `Cancel`
 envelopes with nonzero request IDs. Each row binds the canonical listing or
