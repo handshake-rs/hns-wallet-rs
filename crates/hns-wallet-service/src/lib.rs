@@ -3002,8 +3002,8 @@ mod tests {
     use hns_wallet_provider::MemoryProviderState;
     use hns_wallet_store::WalletStore;
     use hns_wallet_types::{
-        AccountId, BaseUnits, BrowserRuntimeSessionId, ProviderAuthorityFingerprint,
-        SignedBaseUnits, TransactionHash, WalletId,
+        AccountId, BaseUnits, BrowserRuntimeSessionId, HnsNameReceiveTarget,
+        ProviderAuthorityFingerprint, SignedBaseUnits, TransactionHash, WalletId,
     };
 
     const NOW_MS: u64 = 100_000;
@@ -3309,6 +3309,12 @@ mod tests {
                     account: account_id,
                     display: "rs1qproductionfollowup".to_owned(),
                     derivation_index: 7,
+                },
+                name_receive_target: HnsNameReceiveTarget {
+                    module: ModuleId::Handshake,
+                    account: account_id,
+                    display: "rs1qproductionfollowupname".to_owned(),
+                    derivation_index: 11,
                 },
                 known_names: vec![production_followup_known_name()],
             },
@@ -3801,6 +3807,9 @@ mod tests {
                 },
             })
         );
+        let encoded = serde_json::to_string(&value).expect("encode public receive target");
+        assert!(!encoded.contains("productionfollowupname"));
+        assert!(!encoded.contains("nameReceiveTarget"));
 
         let ServiceResponse::ProviderResult { value, .. } = service
             .provider_request(

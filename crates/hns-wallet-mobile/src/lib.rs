@@ -30,7 +30,8 @@ use hns_wallet_service::{
 };
 use hns_wallet_store::{SharedWalletStore, StoreError, WalletStore};
 use hns_wallet_types::{
-    Amount, ModuleId, ReceiveTarget, SyncPhase, SyncStatus, TransactionSummary, WalletAsset,
+    AccountId, Amount, HnsNameReceiveTarget, ModuleId, ReceiveTarget, SyncPhase, SyncStatus,
+    TransactionSummary, WalletAsset,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -170,6 +171,7 @@ pub enum MobileHnsNameOwnershipStatus {
 pub struct MobileHnsReadSnapshot {
     pub balance: Amount,
     pub receive_target: ReceiveTarget,
+    pub name_receive_target: HnsNameReceiveTarget,
     pub transaction_history: Vec<TransactionSummary>,
     pub known_names: Vec<MobileHnsNameSummary>,
     pub module_status: SyncStatus,
@@ -616,6 +618,13 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
         Ok(self.synchronize()?.receive_target)
     }
 
+    /// Return the dedicated `HnsName`, change-zero receive target from one new
+    /// bounded synchronization. This target is never an ordinary HNS payment
+    /// receive address.
+    pub fn name_receive_target(&mut self) -> Result<HnsNameReceiveTarget, MobileWalletError> {
+        Ok(self.synchronize()?.name_receive_target)
+    }
+
     /// Return transaction history from one new bounded synchronization.
     pub fn transaction_history(&mut self) -> Result<Vec<TransactionSummary>, MobileWalletError> {
         Ok(self.synchronize()?.transaction_history)
@@ -644,8 +653,6 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
             .map_err(mobile_service_failure)?;
         if snapshot.account_id != self.account_config.account_id
             || snapshot.balance.asset != WalletAsset::Hns
-            || snapshot.receive_target.module != ModuleId::Handshake
-            || snapshot.receive_target.account != snapshot.account_id
             || snapshot
                 .transactions
                 .iter()
@@ -653,10 +660,11 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
         {
             return Err(MobileWalletError::Hns(HnsWalletError::InvalidEvidence));
         }
-        snapshot
-            .receive_target
-            .validate()
-            .map_err(|_| MobileWalletError::Hns(HnsWalletError::InvalidEvidence))?;
+        validate_mobile_hns_receive_targets(
+            snapshot.account_id,
+            &snapshot.receive_target,
+            &snapshot.name_receive_target,
+        )?;
         let mut known_names = snapshot
             .known_names
             .iter()
@@ -678,6 +686,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
         Ok(MobileHnsReadSnapshot {
             balance: snapshot.balance,
             receive_target: snapshot.receive_target,
+            name_receive_target: snapshot.name_receive_target,
             transaction_history: snapshot.transactions,
             known_names,
             module_status: SyncStatus {
@@ -689,6 +698,31 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
             },
         })
     }
+}
+
+fn validate_mobile_hns_receive_targets(
+    expected_account: AccountId,
+    receive_target: &ReceiveTarget,
+    name_receive_target: &HnsNameReceiveTarget,
+) -> Result<(), MobileWalletError> {
+    if receive_target.module != ModuleId::Handshake
+        || receive_target.account != expected_account
+        || name_receive_target.module != ModuleId::Handshake
+        || name_receive_target.account != expected_account
+        || receive_target.validate().is_err()
+        || name_receive_target.validate().is_err()
+        || !receive_target
+            .display
+            .bytes()
+            .all(|byte| (0x20..=0x7e).contains(&byte))
+        || !name_receive_target
+            .display
+            .bytes()
+            .all(|byte| (0x20..=0x7e).contains(&byte))
+    {
+        return Err(MobileWalletError::Hns(HnsWalletError::InvalidEvidence));
+    }
+    Ok(())
 }
 
 fn mobile_hns_name_summary(name: &KnownName) -> Result<MobileHnsNameSummary, MobileWalletError> {
@@ -1176,6 +1210,8 @@ mod tests {
         assert!(!status.mainnet_settlement_enabled);
 
         reads.unlock(&key).expect("unlock read controller");
+        assert!(!reads.account_config().value_operations_enabled);
+        assert!(!reads.account_config().settlement_enabled);
         let accounts = reads.accounts().expect("read account");
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].account_id, expected_account);
@@ -1188,6 +1224,13 @@ mod tests {
         assert_eq!(snapshot.receive_target.module, ModuleId::Handshake);
         assert_eq!(snapshot.receive_target.account, expected_account);
         assert!(snapshot.receive_target.display.starts_with("rs1"));
+        assert_eq!(snapshot.name_receive_target.module, ModuleId::Handshake);
+        assert_eq!(snapshot.name_receive_target.account, expected_account);
+        assert!(snapshot.name_receive_target.display.starts_with("rs1"));
+        assert_ne!(
+            snapshot.name_receive_target.display,
+            snapshot.receive_target.display
+        );
         assert!(snapshot.transaction_history.is_empty());
         assert!(snapshot.known_names.is_empty());
         assert_eq!(
@@ -1214,15 +1257,32 @@ mod tests {
                 "balance",
                 "knownNames",
                 "moduleStatus",
+                "nameReceiveTarget",
                 "receiveTarget",
                 "transactionHistory",
             ])
         );
+        let name_target_fields = encoded["nameReceiveTarget"]
+            .as_object()
+            .expect("name receive target object")
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
         assert_eq!(
-            serde_json::from_value::<MobileHnsReadSnapshot>(encoded)
+            name_target_fields,
+            BTreeSet::from(["account", "derivation_index", "display", "module"])
+        );
+        assert_eq!(
+            serde_json::from_value::<MobileHnsReadSnapshot>(encoded.clone())
                 .expect("deserialize mobile HNS snapshot"),
             snapshot
         );
+        let mut legacy_shape = encoded;
+        legacy_shape
+            .as_object_mut()
+            .expect("legacy snapshot object")
+            .remove("nameReceiveTarget");
+        assert!(serde_json::from_value::<MobileHnsReadSnapshot>(legacy_shape).is_err());
 
         let before = probe.snapshot_calls.load(Ordering::SeqCst);
         assert_eq!(
@@ -1237,6 +1297,11 @@ mod tests {
                 .account,
             expected_account
         );
+        let fresh_name_target = reads
+            .name_receive_target()
+            .expect("fresh name receive target");
+        assert_eq!(fresh_name_target, snapshot.name_receive_target);
+        assert_ne!(fresh_name_target.display, snapshot.receive_target.display);
         assert!(
             reads
                 .transaction_history()
@@ -1248,7 +1313,7 @@ mod tests {
             reads.module_status().expect("fresh module status").phase,
             SyncPhase::Ready
         );
-        assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), before + 5);
+        assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), before + 6);
         assert_eq!(probe.tip_calls.load(Ordering::SeqCst), 0);
         assert!(probe.confirmed_calls.load(Ordering::SeqCst) > 0);
         assert!(probe.mempool_calls.load(Ordering::SeqCst) > 0);
@@ -1271,7 +1336,7 @@ mod tests {
             reopened
                 .synchronize()
                 .expect("reopened synchronized snapshot")
-                .receive_target
+                .name_receive_target
                 .account,
             expected_account
         );
@@ -1387,6 +1452,62 @@ mod tests {
         let mut oversized_height = known_name;
         oversized_height.proof_height = MAX_JAVASCRIPT_SAFE_INTEGER + 1;
         assert!(mobile_hns_name_summary(&oversized_height).is_err());
+    }
+
+    #[test]
+    fn trusted_mobile_name_receive_target_revalidates_account_module_and_display() {
+        let account = AccountId::new([0x31; 16]);
+        let receive = ReceiveTarget {
+            module: ModuleId::Handshake,
+            account,
+            display: "rs1qcoin".to_owned(),
+            derivation_index: 2,
+        };
+        let name = HnsNameReceiveTarget {
+            module: ModuleId::Handshake,
+            account,
+            display: "rs1qname".to_owned(),
+            derivation_index: 5,
+        };
+        validate_mobile_hns_receive_targets(account, &receive, &name)
+            .expect("valid trusted native targets");
+
+        for invalid in [
+            HnsNameReceiveTarget {
+                module: ModuleId::Bitcoin,
+                ..name.clone()
+            },
+            HnsNameReceiveTarget {
+                account: AccountId::new([0x32; 16]),
+                ..name.clone()
+            },
+            HnsNameReceiveTarget {
+                display: String::new(),
+                ..name.clone()
+            },
+            HnsNameReceiveTarget {
+                display: "rs1qname\n".to_owned(),
+                ..name.clone()
+            },
+            HnsNameReceiveTarget {
+                display: "rs1qn\u{e9}me".to_owned(),
+                ..name.clone()
+            },
+        ] {
+            assert!(validate_mobile_hns_receive_targets(account, &receive, &invalid).is_err());
+        }
+        for invalid_receive in [
+            ReceiveTarget {
+                module: ModuleId::Bitcoin,
+                ..receive.clone()
+            },
+            ReceiveTarget {
+                account: AccountId::new([0x32; 16]),
+                ..receive
+            },
+        ] {
+            assert!(validate_mobile_hns_receive_targets(account, &invalid_receive, &name).is_err());
+        }
     }
 
     #[test]

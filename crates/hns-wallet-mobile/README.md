@@ -23,17 +23,21 @@ insecure default.
 
 `synchronize` performs one fresh bounded reconciliation and returns a
 serializable `MobileHnsReadSnapshot` containing balance, receive target,
-transaction history, minimized known-name summaries, and successful-tip module
-status from one hidden chain/mempool binding. Its outer snapshot fields and
-mobile name projections use camelCase; nested shared wallet types (`Amount`,
-`ReceiveTarget`, `TransactionSummary`, and `SyncStatus`) retain their established
-snake_case field names. The explicit `balance`,
-`receive_target`, `transaction_history`, `known_names`, and `module_status`
-methods each perform their own fresh synchronization. Lifecycle requests still
-cross private ABI-v2 framing; the combined trusted-native synchronization calls
-the composed service directly and never exposes its binding or raw name proof,
-state, resource, owner, or derivation evidence. A failed read locks the wallet
-before another request can proceed.
+dedicated name receive target, transaction history, minimized known-name
+summaries, and successful-tip module status from one hidden chain/mempool
+binding. Its outer snapshot fields and mobile name projections use camelCase;
+nested shared wallet types (`Amount`, `ReceiveTarget`,
+`HnsNameReceiveTarget`, `TransactionSummary`, and `SyncStatus`) retain their
+established snake_case field names. The explicit `balance`, `receive_target`,
+`name_receive_target`, `transaction_history`, `known_names`, and
+`module_status` methods each perform their own fresh synchronization. The name
+target is revalidated as a bounded Handshake target for the selected account;
+its `HnsName`, change-zero, exact-index invariant was already enforced inside
+the synchronized HNS runtime. Lifecycle requests still cross private ABI-v2
+framing; the combined trusted-native synchronization calls the composed service
+directly and never exposes its binding or raw name proof, state, resource,
+owner, or derivation evidence. A failed read locks the wallet before another
+request can proceed.
 
 Known-name output can only revalidate and minimize names already persisted by a
 separately authorized workflow. This crate does not add a mobile name-import

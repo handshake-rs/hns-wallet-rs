@@ -33,7 +33,13 @@ exactly one non-value HNS account, opens only a complete seed/account bootstrap,
 and exposes status, unlock, lock, and account identity through a private ABI-v2
 session. A separate backend-injected native read controller reuses that exact
 shared-store authority and returns one bounded serializable balance/receive/
-history/known-name/module-status snapshot.
+history/known-name/module-status snapshot. That trusted-native snapshot now
+contains both the ordinary HNS coin `ReceiveTarget` and a structurally distinct
+`HnsNameReceiveTarget`, derived only from `HnsName`, change zero, at the exact
+post-scan `next_name_index`. The mobile facade exposes the latter through a
+freshly synchronized `name_receive_target()` call and the serialized
+`nameReceiveTarget` field. It does not add that target to website/provider JSON
+or change any provider, signing, value, settlement, or marketplace capability.
 It obtains the durable epoch and exact tip through a script-free chain snapshot,
 binds height-zero evidence to the selected account network, and only then
 derives and queries wallet ScriptIds. The mobile crate re-exports the concrete
@@ -89,6 +95,12 @@ no account-selection or backend inputs, so it remains the control-only runtime.
 The native controllers are library-only compositions. Downstream mobile
 candidate wrappers do not supply a production wallet-index backend or make the
 browser/provider integration and value paths available here.
+The separately maintained `hns-dane-browser-mobile` consumer currently pins an
+older wallet source and therefore does not yet consume this producer shape. It
+must coordinate an HNS Wallet Read v2 (HNWR-v2) dependency, binding,
+serialization, and trusted-UI adoption before presenting `nameReceiveTarget`;
+the producer source may land first, but that does not make the pinned consumer
+compatible or available.
 
 Current safety status: the production-hardening source boundary is implemented,
 but executable HNS, Bitcoin, and Ethereum value operations and all mainnet
@@ -156,26 +168,31 @@ gate stays false.
 
 ## Crates
 
-- `hns-wallet-types`: wallet-local identifiers and UI-safe summaries.
+- `hns-wallet-types`: wallet-local identifiers and UI-safe summaries, including
+  structurally distinct ordinary-coin and Handshake name receive targets.
 - `hns-wallet-store`: SQLite migrations, authenticated encryption, and one
   cloneable process-local lock/key authority.
 - `hns-wallet-chain-api`: modular chain and settlement capability traits.
-- `hns-wallet-hns`: Handshake account/name workflows and node backend.
+- `hns-wallet-hns`: Handshake account/name workflows, exact synchronized coin
+  and name receive-target derivation, and node backend.
 - `hns-wallet-provider`: hostile-page request, permission, and approval core.
 - `hns-wallet-shakedex`: release-gated persisted seller/buyer/recovery and
   post-TRANSFER script-FINALIZE schemas.
 - `hns-wallet-market`: price-bound reservations, atomic-swap recovery, and a
   release-unavailable encrypted canonical price-round gossip cache.
 - `hns-wallet-mobile`: platform-neutral, single-account Android/iOS lifecycle
-  controller plus an injected, synchronized, minimized HNS read composition;
-  no concrete device backend or value/provider surface.
+  controller plus an injected, synchronized, minimized HNS read composition
+  with distinct coin and name receive projections; no concrete device backend
+  or value/provider surface, and downstream HNWR-v2 adoption remains required.
 - `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet, encrypted session-bound swap-key allocation primitive, and Bitcoin HTLC adapter.
 - `hns-wallet-ethereum`: offline native-ETH account derivation plus
   release-gated Helios/HTLC policy.
 - `hns-wallet-ffi`: ABI v2 framing, canonical service IDs, approval prompts, and events.
 - `hns-wallet-service`: private session/authority registry plus locked,
   existing-database control, exact-account, and synchronized non-value HNS read
-  library compositions.
+  library compositions. Its trusted-native snapshot carries the dedicated name
+  target, while website-provider projection remains limited to the ordinary
+  coin receive target.
 - `hns-wallet-host`: caller-side negotiation, correlation, authority, approval,
   binding, and event-replay state for trusted browser/mobile adapters.
 - `hns-wallet-testkit`: deterministic, non-mainnet fixtures.

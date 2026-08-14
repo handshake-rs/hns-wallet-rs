@@ -33,6 +33,14 @@ scan/index metadata without changing its configuration, and write or clear the
 durable discovery fence used by the ordinary read scanner. These are bounded
 authenticated read-cache rows scoped to the exact existing account.
 
+Every synchronized account snapshot carries two structurally distinct receive
+projections. `ReceiveTarget` remains the ordinary `HnsCoin` change-zero target;
+`HnsNameReceiveTarget` is selected only from `HnsName`, change zero, at the
+post-scan account's exact `next_name_index`. Missing, wrong-role, wrong-account,
+wrong-branch, wrong-index, or ambiguous name-target evidence fails the whole
+read. This read projection does not allocate a key or change any value,
+settlement, provider, or browser capability.
+
 Its value and settlement configurations remain fail-closed until the embedding
 product completes the documented adapter and runtime qualification. See the
 [workspace repository](https://github.com/handshake-rs/hns-wallet-rs) for the

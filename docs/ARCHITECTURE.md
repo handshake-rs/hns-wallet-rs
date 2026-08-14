@@ -110,10 +110,13 @@ request, and commits only if account selection, revisions, ciphertext-backed
 rows, chain tip/epoch, and mempool instance/generation still match. Provider
 service calls retain the resulting binding internally and project only the
 account's balance, transaction summaries, receive target, and approved
-known-name summaries. The trusted-native mobile composition obtains the same
-snapshot directly from its composed service only long enough to build a
-minimized serializable result; its public snapshot omits the binding and all raw
-name proof/state/resource/owner/derivation evidence.
+known-name summaries. The synchronized snapshot also contains a structurally
+distinct name receive target, selected from `HnsName` change zero at the exact
+post-scan `next_name_index`; provider projection deliberately does not expose
+it. The trusted-native mobile composition obtains the same snapshot directly
+from its composed service only long enough to build a minimized serializable
+result containing both distinct targets; its public snapshot omits the binding
+and all raw name proof/state/resource/owner/derivation evidence.
 
 Historical persisted accounts with a value or settlement bit set have one
 explicit recovery-only opening path. Structural validation is separated from

@@ -466,6 +466,39 @@ impl ReceiveTarget {
     }
 }
 
+/// Dedicated Handshake name-owner receive target.
+///
+/// This is intentionally a different type from [`ReceiveTarget`]: a name
+/// owner must be derived from the `HnsName` branch and must never be reused as
+/// an ordinary HNS coin receive target. The HNS runtime is responsible for
+/// enforcing that role, account, change-zero, and synchronized-index binding
+/// before constructing this projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HnsNameReceiveTarget {
+    pub module: ModuleId,
+    pub account: AccountId,
+    pub display: String,
+    pub derivation_index: u32,
+}
+
+impl HnsNameReceiveTarget {
+    pub fn validate(&self) -> Result<(), TypeError> {
+        if self.module != ModuleId::Handshake {
+            return Err(TypeError::InvalidModule {
+                field: "HNS name receive target",
+                expected: "handshake",
+            });
+        }
+        if self.display.is_empty() || self.display.len() > 512 {
+            return Err(TypeError::InvalidLength {
+                field: "HNS name receive target",
+                maximum: 512,
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DerivationReference {
     pub role: KeyRole,
@@ -595,6 +628,11 @@ pub struct PersistedWorkflowReference {
 pub enum TypeError {
     #[error("{field} is empty or exceeds {maximum} bytes")]
     InvalidLength { field: &'static str, maximum: usize },
+    #[error("{field} must use the {expected} module")]
+    InvalidModule {
+        field: &'static str,
+        expected: &'static str,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -635,6 +673,58 @@ mod tests {
             Amount::new(WalletAsset::Hns, 1).checked_add(Amount::new(WalletAsset::Btc, 1)),
             Err(AmountError::AssetMismatch)
         );
+    }
+
+    #[test]
+    fn hns_name_receive_target_is_a_bounded_distinct_dto() {
+        let target = HnsNameReceiveTarget {
+            module: ModuleId::Handshake,
+            account: AccountId::new([7; 16]),
+            display: "rs1qnameowner".to_owned(),
+            derivation_index: 9,
+        };
+        target.validate().expect("bounded name receive target");
+        let encoded = serde_json::to_vec(&target).expect("encode name receive target");
+        assert_eq!(
+            serde_json::from_slice::<HnsNameReceiveTarget>(&encoded)
+                .expect("decode name receive target"),
+            target
+        );
+        assert!(
+            HnsNameReceiveTarget {
+                display: String::new(),
+                ..target.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            HnsNameReceiveTarget {
+                display: "x".repeat(513),
+                ..target.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        HnsNameReceiveTarget {
+            display: "x".repeat(512),
+            ..target
+        }
+        .validate()
+        .expect("maximum-length name receive target");
+        assert!(matches!(
+            HnsNameReceiveTarget {
+                module: ModuleId::Bitcoin,
+                account: AccountId::new([7; 16]),
+                display: "bc1qnotahnsnameowner".to_owned(),
+                derivation_index: 9,
+            }
+            .validate(),
+            Err(TypeError::InvalidModule {
+                field: "HNS name receive target",
+                expected: "handshake",
+            })
+        ));
     }
 
     #[test]

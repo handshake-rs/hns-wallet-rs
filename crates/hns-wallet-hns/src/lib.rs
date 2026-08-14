@@ -76,9 +76,10 @@ use hns_wallet_store::{
 };
 use hns_wallet_types::{
     AccountId, Amount, ApprovalId, BaseUnits, ChainCapabilities, DerivationReference, FeeModel,
-    FinalityModel, HashAlgorithm, KeyRole, LocalTransactionStatus, LocktimeModel, ModuleId,
-    ObjectHash, ReceiveTarget, SessionId, SignedBaseUnits, SyncPhase, SyncStatus, TransactionHash,
-    TransactionSummary, WalletAsset, WalletId, WorkflowId, WorkflowKind,
+    FinalityModel, HashAlgorithm, HnsNameReceiveTarget, KeyRole, LocalTransactionStatus,
+    LocktimeModel, ModuleId, ObjectHash, ReceiveTarget, SessionId, SignedBaseUnits, SyncPhase,
+    SyncStatus, TransactionHash, TransactionSummary, WalletAsset, WalletId, WorkflowId,
+    WorkflowKind,
 };
 use k256::ecdsa::signature::hazmat::PrehashSigner;
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
@@ -1555,6 +1556,10 @@ pub struct HnsAccountReadSnapshot {
     pub balance: Amount,
     pub transactions: Vec<TransactionSummary>,
     pub receive_target: ReceiveTarget,
+    /// Dedicated change-zero `HnsName` destination at the synchronized
+    /// account's exact `next_name_index`. This is not an ordinary HNS payment
+    /// address and does not enable a name or value mutation.
+    pub name_receive_target: HnsNameReceiveTarget,
     pub known_names: Vec<KnownName>,
 }
 
@@ -1689,6 +1694,7 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             }
         })?;
         let receive_target = hns_read_receive_target(&scan.account, &scan.addresses)?;
+        let name_receive_target = hns_read_name_receive_target(&scan.account, &scan.addresses)?;
         let checkpoints = hns_read_checkpoints(
             &self.backend,
             scan.binding,
@@ -1740,6 +1746,7 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
                 .map(|transaction| transaction.summary)
                 .collect(),
             receive_target,
+            name_receive_target,
             known_names: names,
         })
     }
@@ -4366,6 +4373,33 @@ fn hns_read_receive_target(
         })
         .ok_or(HnsWalletError::InvalidEvidence)?;
     let target = ReceiveTarget {
+        module: ModuleId::Handshake,
+        account: account.config.account_id,
+        display: address.address.clone(),
+        derivation_index: address.derivation.index,
+    };
+    target
+        .validate()
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    Ok(target)
+}
+
+fn hns_read_name_receive_target(
+    account: &HnsAccountRecord,
+    addresses: &[DerivedHnsAddress],
+) -> Result<HnsNameReceiveTarget, HnsWalletError> {
+    let mut matching = addresses.iter().filter(|address| {
+        address.account_id == account.config.account_id
+            && address.derivation.role == KeyRole::HnsName
+            && address.derivation.account == account.config.account_derivation_index
+            && address.derivation.change == 0
+            && address.derivation.index == account.next_name_index
+    });
+    let address = matching.next().ok_or(HnsWalletError::InvalidEvidence)?;
+    if matching.next().is_some() {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let target = HnsNameReceiveTarget {
         module: ModuleId::Handshake,
         account: account.config.account_id,
         display: address.address.clone(),
@@ -8238,6 +8272,7 @@ mod tests {
         account_id: [u8; 32],
         network: HnsNetwork,
         fault: ProductionFollowupReadFault,
+        name_history_program: Option<Vec<u8>>,
         snapshot_calls: AtomicUsize,
         tip_calls: AtomicUsize,
         confirmed_calls: AtomicUsize,
@@ -8255,11 +8290,17 @@ mod tests {
                 account_id: account_entity_id(config),
                 network: config.network,
                 fault,
+                name_history_program: None,
                 snapshot_calls: AtomicUsize::new(0),
                 tip_calls: AtomicUsize::new(0),
                 confirmed_calls: AtomicUsize::new(0),
                 mempool_calls: AtomicUsize::new(0),
             }
+        }
+
+        fn with_name_history_program(mut self, program: Vec<u8>) -> Self {
+            self.name_history_program = Some(program);
+            self
         }
 
         fn binding() -> SnapshotBinding {
@@ -8388,10 +8429,30 @@ mod tests {
             if self.fault == ProductionFollowupReadFault::StaleChain && call > 0 {
                 binding.chain_epoch += 1;
             }
+            let history = self
+                .name_history_program
+                .as_ref()
+                .and_then(|program| {
+                    request
+                        .scripts
+                        .iter()
+                        .position(|script| script.hash.as_slice() == program.as_slice())
+                })
+                .map(|script_index| HistoryEntry {
+                    txid: TransactionHash::new([0x71; 32]),
+                    height: Some(binding.tip.height),
+                    block_hash: Some(binding.tip.block_hash),
+                    transaction_position: Some(0),
+                    spent: false,
+                    first_seen_unix: Some(binding.tip.median_time_past),
+                    script_index: u32::try_from(script_index).expect("bounded script index"),
+                })
+                .into_iter()
+                .collect();
             Ok(ConfirmedWalletPage {
                 binding,
                 next_cursor: None,
-                history: Vec::new(),
+                history,
                 utxos: Vec::new(),
             })
         }
@@ -9129,6 +9190,125 @@ mod tests {
     }
 
     #[test]
+    fn name_receive_target_is_role_separated_and_uses_the_exact_current_index() {
+        let mut account =
+            HnsAccountRecord::initial_non_value(test_runtime_config()).expect("non-value account");
+        account.next_receive_index = 3;
+        account.next_name_index = 7;
+        let address = |role, index, display: &str| DerivedHnsAddress {
+            account_id: account.config.account_id,
+            derivation: DerivationReference {
+                role,
+                account: account.config.account_derivation_index,
+                change: 0,
+                index,
+            },
+            address: display.to_owned(),
+            program: vec![u8::try_from(index).expect("test index"); 20],
+            used: false,
+        };
+        let coin_receive = address(KeyRole::HnsCoin, 3, "coin-receive");
+        let coin_at_name_index = address(KeyRole::HnsCoin, 7, "coin-at-name-index");
+        let name_seven = address(KeyRole::HnsName, 7, "name-seven");
+        let name_eight = address(KeyRole::HnsName, 8, "name-eight");
+        let addresses = vec![
+            coin_receive,
+            coin_at_name_index,
+            name_seven.clone(),
+            name_eight.clone(),
+        ];
+
+        let ordinary = hns_read_receive_target(&account, &addresses).expect("ordinary target");
+        let name = hns_read_name_receive_target(&account, &addresses).expect("name target");
+        assert_eq!(ordinary.display, "coin-receive");
+        assert_eq!(ordinary.derivation_index, 3);
+        assert_eq!(name.display, "name-seven");
+        assert_eq!(name.derivation_index, 7);
+        assert_eq!(name.account, account.config.account_id);
+        assert_eq!(name.module, ModuleId::Handshake);
+
+        account.next_name_index = 8;
+        let advanced =
+            hns_read_name_receive_target(&account, &addresses).expect("advanced name target");
+        assert_eq!(advanced.display, "name-eight");
+        assert_eq!(advanced.derivation_index, 8);
+
+        account.next_name_index = 6;
+        assert!(matches!(
+            hns_read_name_receive_target(&account, &addresses),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+    }
+
+    #[test]
+    fn name_receive_target_fails_closed_on_wrong_derivation_or_ambiguous_evidence() {
+        let mut account =
+            HnsAccountRecord::initial_non_value(test_runtime_config()).expect("non-value account");
+        account.next_name_index = 9;
+        let valid = DerivedHnsAddress {
+            account_id: account.config.account_id,
+            derivation: DerivationReference {
+                role: KeyRole::HnsName,
+                account: account.config.account_derivation_index,
+                change: 0,
+                index: account.next_name_index,
+            },
+            address: "name-nine".to_owned(),
+            program: vec![9; 20],
+            used: false,
+        };
+
+        let malformed = vec![
+            DerivedHnsAddress {
+                derivation: DerivationReference {
+                    role: KeyRole::HnsCoin,
+                    ..valid.derivation
+                },
+                ..valid.clone()
+            },
+            DerivedHnsAddress {
+                account_id: AccountId::new([99; 16]),
+                ..valid.clone()
+            },
+            DerivedHnsAddress {
+                derivation: DerivationReference {
+                    account: valid.derivation.account + 1,
+                    ..valid.derivation
+                },
+                ..valid.clone()
+            },
+            DerivedHnsAddress {
+                derivation: DerivationReference {
+                    change: 1,
+                    ..valid.derivation
+                },
+                ..valid.clone()
+            },
+            DerivedHnsAddress {
+                derivation: DerivationReference {
+                    index: valid.derivation.index - 1,
+                    ..valid.derivation
+                },
+                ..valid.clone()
+            },
+            DerivedHnsAddress {
+                address: String::new(),
+                ..valid.clone()
+            },
+        ];
+        for address in malformed {
+            assert!(matches!(
+                hns_read_name_receive_target(&account, &[address]),
+                Err(HnsWalletError::InvalidEvidence)
+            ));
+        }
+        assert!(matches!(
+            hns_read_name_receive_target(&account, &[valid.clone(), valid]),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+    }
+
+    #[test]
     fn name_and_shakedex_outputs_are_tracked_but_never_ordinary_spend_candidates() {
         for (role, byte) in [(KeyRole::HnsName, 31), (KeyRole::HnsShakedex, 32)] {
             let address = test_derived_address(role, byte);
@@ -9513,6 +9693,16 @@ mod tests {
         assert_eq!(snapshot.receive_target.account, config.account_id);
         assert_eq!(snapshot.receive_target.derivation_index, 0);
         assert!(snapshot.receive_target.display.starts_with("rs1"));
+        assert_eq!(snapshot.name_receive_target.module, ModuleId::Handshake);
+        assert_eq!(snapshot.name_receive_target.account, config.account_id);
+        assert_eq!(snapshot.name_receive_target.derivation_index, 0);
+        assert!(snapshot.name_receive_target.display.starts_with("rs1"));
+        assert_ne!(
+            snapshot.name_receive_target.display,
+            snapshot.receive_target.display
+        );
+        assert!(!config.value_operations_enabled);
+        assert!(!config.settlement_enabled);
         assert_eq!(runtime.backend.snapshot_calls.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.backend.tip_calls.load(Ordering::SeqCst), 0);
         assert!(runtime.backend.confirmed_calls.load(Ordering::SeqCst) > 0);
@@ -9533,6 +9723,62 @@ mod tests {
                 Ok(())
             })
             .expect("authenticated read commit");
+    }
+
+    #[test]
+    fn name_history_advances_the_returned_target_to_the_post_scan_index() {
+        let (store, config) = production_followup_read_store();
+        let account = store
+            .with_store(|wallet| {
+                wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .map(|stored| stored.value)
+                    .ok_or(StoreError::CorruptMetadata)
+            })
+            .expect("persisted scan account");
+        let used_name = store
+            .try_with_store(|wallet| {
+                derive_restore_addresses(wallet, &account, KeyRole::HnsName)
+                    .map(|addresses| addresses.into_iter().next().expect("initial name branch"))
+            })
+            .expect("derive used name target");
+        assert_eq!(used_name.derivation.index, 0);
+
+        let backend = ProductionFollowupReadBackend::new(
+            store.clone(),
+            &config,
+            ProductionFollowupReadFault::Healthy,
+        )
+        .with_name_history_program(used_name.program.clone());
+        let binding = ProductionFollowupReadBackend::binding();
+        let scan =
+            scan_restore_snapshot(&backend, account, binding.tip, Some(binding), |candidate| {
+                store.try_with_store(|wallet| {
+                    Ok([
+                        derive_restore_addresses(wallet, candidate, KeyRole::HnsCoin)?,
+                        derive_restore_addresses(wallet, candidate, KeyRole::HnsName)?,
+                        derive_restore_addresses(wallet, candidate, KeyRole::HnsShakedex)?,
+                    ])
+                })
+            })
+            .expect("scan name history and extend the trailing gap");
+
+        assert_eq!(scan.account.last_used_name, Some(0));
+        assert_eq!(scan.account.next_name_index, 1);
+        assert!(scan.account.name_scan_end >= 1);
+        let target = hns_read_name_receive_target(&scan.account, &scan.addresses)
+            .expect("post-scan name receive target");
+        let post_scan_address = scan
+            .addresses
+            .iter()
+            .find(|address| {
+                address.derivation.role == KeyRole::HnsName
+                    && address.derivation.index == scan.account.next_name_index
+            })
+            .expect("derived post-scan name address");
+        assert_eq!(target.derivation_index, 1);
+        assert_eq!(target.display, post_scan_address.address);
+        assert_ne!(target.display, used_name.address);
     }
 
     #[test]
