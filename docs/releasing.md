@@ -72,14 +72,15 @@ This crate changelog describes the prepared `hns-wallet-rs` release source.
 ```
 
 Wallet source consumes the final immutable `hns-rs` release revision
-`b24b66c382de53330ec21dd3137e056a2bea3e2d`. Before any wallet upload, all 17
-shared `hns-rs` `0.2.0` packages must be visible on crates.io, and every
-downloaded archive must identify that exact revision in
-`.cargo_vcs_info.json`. Dry-run preflight patches protocol dependencies to that
-Git revision and wallet dependencies to local workspace paths. Those patches
-are verification aids only; they are never used during an actual upload.
-If the protocol artifacts identify any other source commit, stop rather than
-qualifying or executing this wallet release.
+`b24b66c382de53330ec21dd3137e056a2bea3e2d`. On 2026-08-14, all 17 required
+`hns-rs` `0.2.0` archives were published to crates.io and verified to identify
+that exact revision in `.cargo_vcs_info.json`. Execution still downloads and
+revalidates every prerequisite immediately before any wallet upload; if one is
+missing, dirty, or identifies any other source commit, it stops. Dry-run
+preflight preserves the exact Git-source policy by patching protocol
+dependencies to that revision and wallet dependencies to local workspace
+paths. Those patches are verification aids only; they are never used during an
+actual upload.
 
 The `hns-wallet-ffi` package archive must contain byte-identical copies of
 `abi/contracts-v2.schema.json` and `abi/golden-vectors-v2.json`. The
@@ -155,10 +156,11 @@ document and verify boundaries; they grant no runtime or deployment authority.
 
    Partial selection is deliberately unavailable in execution mode.
 
-6. Confirm the `hns-rs` release completed, then stop and obtain explicit human
-   authorization for the irreversible wallet upload. Authentication,
-   publication, and tagging are never CI steps and are not implied by a
-   successful dry-run. Authenticate without placing a token in the repository:
+6. Reconfirm the published `hns-rs` prerequisites, then stop and obtain
+   explicit human authorization for the irreversible wallet upload.
+   Authentication, publication, and tagging are never CI steps and are not
+   implied by a successful dry-run. Authenticate without placing a token in
+   the repository:
 
    ```bash
    cargo login
@@ -173,35 +175,41 @@ document and verify boundaries; they grant no runtime or deployment authority.
 
 Execution mode first downloads all 17 required protocol archives and rejects
 any package whose `.cargo_vcs_info.json` does not identify the exact pinned
-`hns-rs` revision. It then creates and runs the custom inventory verifier over
-each wallet source package before any possible upload. Within one invocation,
-that archive is reused for post-upload or resume checksum verification instead
-of being packaged twice. Execute-mode archive validation rejects a
-`.cargo_vcs_info.json` record with `"dirty": true`, even if the worktree became
-dirty after the initial clean-source check.
+`hns-rs` revision. For a new wallet version, it creates and runs the custom
+inventory verifier over the normalized source package before any possible
+upload. Execute-mode archive validation rejects a `.cargo_vcs_info.json`
+record with `"dirty": true`, even if the worktree became dirty after the
+initial clean-source check.
 
 Execution is restartable, but it never skips a wallet package merely because an
-API record exists. For an already-published package/version, it downloads the
-crates.io archive and requires byte-for-byte SHA-256 identity plus the current
-release commit in both archives' `.cargo_vcs_info.json`. A mismatch aborts the
-release.
+API record exists. For an already-published package/version, it reconstructs
+the source archive through Cargo's registry-backed publish dry-run so normalized
+`Cargo.lock` registry source and checksum fields reproduce the uploaded archive.
+It then downloads the crates.io archive and requires byte-for-byte SHA-256
+identity plus the current release commit in both archives'
+`.cargo_vcs_info.json`. A mismatch aborts the release.
 
-New uploads use a 605-second propagation and cooldown interval before the next
-allowlisted crate by default. The command waits only after a successful new
-upload and only when another crate remains; verified resume skips and the final
-new upload do not sleep. Override the interval only when crates.io communicates
-a different non-negative limit:
+Before an upload, the script checks whether the crate name already exists and
+selects crates.io's independent action bucket. A new name uses a 605-second
+new-name propagation/cooldown interval; a new version of an existing name uses
+a 65-second existing-crate update interval. Those defaults add five seconds to
+the current [crates.io default refill periods](https://github.com/rust-lang/crates.io/blob/main/src/rate_limiter.rs).
+The command waits only after a successful upload and only when another crate
+remains; verified resume skips and the final upload do not sleep. Override
+either interval only when crates.io communicates a different non-negative
+limit:
 
 ```bash
-PUBLISH_INTERVAL_SECONDS=605 \
+PUBLISH_NEW_INTERVAL_SECONDS=605 \
+PUBLISH_UPDATE_INTERVAL_SECONDS=65 \
   ./scripts/publish.sh --execute --confirm-publish 0.1.0
 ```
 
-After each cooldown, the script downloads the new archive and requires the
-same exact checksum and source-commit identity before attempting the next
-dependent package. If propagation is incomplete, it exits safely; rerun after
-the registry API exposes the package so the existing upload can be verified and
-the sequence resumed.
+After each applicable cooldown, the script downloads the new archive and
+requires the same exact checksum and source-commit identity before attempting
+the next dependent package. If propagation is incomplete, it exits safely;
+rerun after the registry API exposes the package so the registry-backed resume
+archive can be verified and the sequence resumed without republishing.
 
 After publication, push an annotated `vX.Y.Z` tag and confirm every package
 page and docs.rs build. Publication cannot be rolled back: yanking can

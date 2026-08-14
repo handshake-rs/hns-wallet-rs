@@ -60,11 +60,17 @@ boundary:
 The package set also carries a dependency-ordered publication allowlist,
 crates.io metadata and archive validation, package-local release notes, exact
 ABI schema/vector and Ethereum contract-artifact inventory checks, and an
-explicitly confirmed, resumable publication procedure. A source archive or
-successful test is not authorization to enable provider, value, settlement,
-or marketplace product gates.
+explicitly confirmed, resumable publication procedure. The release runner
+classifies new crate names and updates to existing crates into fail-closed
+605-second and 65-second crates.io cadence buckets, respectively, and rebuilds
+an already-published version through Cargo's registry-backed publish dry-run
+before exact resume checksum verification. A source archive or successful test
+is not authorization to enable provider, value, settlement, or marketplace
+product gates.
 
-Version `0.1.0` is the initial shared release line. Before any wallet upload,
-all required `hns-rs` `0.2.0` archives must exist on crates.io and identify the
-exact reviewed protocol release commit. Registry and tag state are verified by
-the release procedure instead of being encoded as a time-sensitive claim here.
+Version `0.1.0` is the initial shared release line. On 2026-08-14, all 17
+required `hns-rs` `0.2.0` archives were published to crates.io and verified to
+identify the exact reviewed protocol release commit
+`b24b66c382de53330ec21dd3137e056a2bea3e2d`. The wallet crates remain release
+candidates; the release procedure revalidates registry provenance at execution
+time and does not enable any provider, value, settlement, or marketplace gate.

@@ -183,18 +183,40 @@ def verify_release_document(repo: Path, order: list[str], version: str) -> None:
         fail("docs/releasing.md does not use the current version in execute examples")
 
     publish_script = (repo / "scripts/publish.sh").read_text(encoding="utf-8")
-    interval_match = re.search(
-        r"^publish_interval_seconds=\$\{PUBLISH_INTERVAL_SECONDS-(\d+)\}$",
-        publish_script,
-        re.MULTILINE,
+    interval_defaults = (
+        (
+            "publish_new_interval_seconds",
+            "PUBLISH_NEW_INTERVAL_SECONDS",
+            "new-name",
+        ),
+        (
+            "publish_update_interval_seconds",
+            "PUBLISH_UPDATE_INTERVAL_SECONDS",
+            "existing-crate update",
+        ),
     )
-    if interval_match is None:
-        fail("scripts/publish.sh has no validated publication interval default")
-    default_interval = interval_match.group(1)
-    if f"{default_interval}-second" not in document:
-        fail("docs/releasing.md omits the publication interval default")
-    if f"PUBLISH_INTERVAL_SECONDS={default_interval}" not in document:
-        fail("docs/releasing.md cooldown example differs from the script default")
+    for shell_name, environment_name, description in interval_defaults:
+        interval_match = re.search(
+            rf"^{shell_name}=\$\{{{environment_name}-(\d+)\}}$",
+            publish_script,
+            re.MULTILINE,
+        )
+        if interval_match is None:
+            fail(
+                f"scripts/publish.sh has no validated {description} "
+                "publication interval default"
+            )
+        default_interval = interval_match.group(1)
+        if re.search(
+            rf"{re.escape(default_interval)}-second\s+{re.escape(description)}",
+            document,
+        ) is None:
+            fail(f"docs/releasing.md omits the {description} interval default")
+        if f"{environment_name}={default_interval}" not in document:
+            fail(
+                f"docs/releasing.md {description} cooldown example differs "
+                "from the script default"
+            )
 
     required_release_text = (
         "./scripts/publish.sh --archive-only",
@@ -204,6 +226,11 @@ def verify_release_document(repo: Path, order: list[str], version: str) -> None:
     for required in required_release_text:
         if required not in document:
             fail(f"docs/releasing.md omits {required!r}")
+    if re.search(
+        r"all 17 required\s+`hns-rs` `0\.2\.0` archives were published",
+        document,
+    ) is None:
+        fail("docs/releasing.md omits the published protocol prerequisite record")
 
     self_expiring_claims = (
         "packages are unpublished",
@@ -252,12 +279,20 @@ def verify_publish_script_safety(repo: Path) -> None:
     required_fragments = (
         "--archive-only)",
         "create_source_package()",
+        "create_registry_source_package()",
+        "published_crate_status()",
         "verify_protocol_packages_published()",
         "require_clean_archive_vcs=yes",
         '*\\"dirty\\":true*',
         'protocol_vcs_info="$release_tmp/$package-$protocol_version.cargo_vcs_info.json"',
         '> "$protocol_vcs_info"',
         'json.load(open(sys.argv[1], encoding="utf-8"))["git"]["sha1"]',
+        'crate_status=$(published_crate_status "$package" "$version")',
+        "publish_interval_seconds=$publish_update_interval_seconds",
+        "publish_kind=existing-crate-update",
+        "publish_interval_seconds=$publish_new_interval_seconds",
+        "publish_kind=new-crate-name",
+        'error: crates.io returned HTTP $crate_status while classifying $package',
     )
     for fragment in required_fragments:
         if fragment not in script:
@@ -269,16 +304,72 @@ def verify_publish_script_safety(repo: Path) -> None:
         fail("execute-mode protocol VCS reads must materialize tar output")
 
     try:
+        registry_builder = script.split("create_registry_source_package() {", 1)[
+            1
+        ].split("\n}", 1)[0]
+        crate_status_function = script.split("published_crate_status() {", 1)[1].split(
+            "\n}", 1
+        )[0]
+    except IndexError as error:
+        fail(f"scripts/publish.sh registry helper is incomplete: {error}")
+    for fragment in (
+        'cargo +"$rust_toolchain" publish',
+        "--locked",
+        "--dry-run",
+        '-p "$package"',
+        'verify_source_package "$package"',
+    ):
+        if fragment not in registry_builder:
+            fail(
+                "registry-backed resume package construction omits "
+                f"{fragment!r}"
+            )
+    if "--allow-dirty" in registry_builder:
+        fail("registry-backed resume package construction must reject dirty source")
+    if '"https://crates.io/api/v1/crates/$package"' not in crate_status_function:
+        fail("crate-name classification must query the exact crates.io name endpoint")
+
+    try:
         execute = script.split("    --execute)", 1)[1]
         protocol_position = execute.index("verify_protocol_packages_published")
-        package_position = execute.index('create_source_package "$package" no')
+        version_status_position = execute.index(
+            'status=$(published_package_status "$package" "$version")'
+        )
+        resume_package_position = execute.index(
+            'create_registry_source_package "$package"'
+        )
+        resume_position = execute.index(
+            'verify_published_package "$package" "$version"'
+        )
+        classification_position = execute.index(
+            'crate_status=$(published_crate_status "$package" "$version")'
+        )
+        new_package_position = execute.index('create_source_package "$package" no')
         upload_position = execute.index(
             'cargo +"$rust_toolchain" publish --locked -p "$package"'
         )
     except (IndexError, ValueError) as error:
         fail(f"scripts/publish.sh execute path is incomplete: {error}")
-    if not protocol_position < package_position < upload_position:
-        fail("protocol and wallet archives must be verified before execute upload")
+    if not (
+        protocol_position
+        < version_status_position
+        < resume_package_position
+        < resume_position
+        < classification_position
+        < new_package_position
+        < upload_position
+    ):
+        fail(
+            "protocol and path-specific wallet archive checks must precede "
+            "resume verification and execute upload"
+        )
+    classification = execute[classification_position:new_package_position]
+    if re.search(
+        r'\n\s+\*\)\n\s+echo "error: crates\.io returned HTTP '
+        r'\$crate_status while classifying \$package" >&2\n\s+exit 1',
+        classification,
+    ) is None:
+        fail("crate-name classification must reject every unexpected HTTP status")
     if "--allow-dirty" in execute:
         fail("scripts/publish.sh execute path must never allow dirty packaging")
 
