@@ -17,9 +17,9 @@ use hns_wallet_ffi::{
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountReadSnapshot, HnsBackend, HnsClock,
-    HnsExistingAccountSelector, HnsNodeRpcBackend, HnsNodeRpcConfig, HnsRuntimeConfig,
-    HnsWalletError, KnownName, NameOwnershipStatus, NameResourceStatus,
-    SystemClock as HnsSystemClock,
+    HnsExistingAccountSelector, HnsNodeRpcBackend, HnsNodeRpcConfig,
+    HnsPersistedRecoveryReadOnlyRuntime, HnsRuntimeConfig, HnsWalletError, KnownName,
+    NameOwnershipStatus, NameResourceStatus, SystemClock as HnsSystemClock,
 };
 use hns_wallet_provider::{
     ApprovedCall, HostAuthorityRegistration, Origin, PROVIDER_API_VERSION, PendingApproval,
@@ -37,7 +37,7 @@ use thiserror::Error;
 
 pub use native_read_bootstrap::{
     NativeHnsReadBootstrapError, NativeHnsReadBootstrapPassphrase, NativeHnsReadProfileFence,
-    ProfileBackedNativeHnsReadRuntime,
+    ProfileBackedNativeHnsReadRuntime, RecoveryProfileBackedNativeHnsReadRuntime,
 };
 pub use native_read_profile::{
     LoadedNativeHnsReadProfile, NATIVE_HNS_READ_PROFILE_ID, NATIVE_HNS_READ_PROFILE_SCHEMA_VERSION,
@@ -64,10 +64,11 @@ type HnsReadPermissionExtension = (
 pub trait ServiceRuntime {
     fn capabilities(&self) -> BTreeSet<ServiceCapability>;
 
-    /// Admit one decoded service request before any provider or wallet state
-    /// can change. Ordinary runtimes preserve the complete private service
-    /// vocabulary; closed compositions can narrow it without modifying the
-    /// shared ABI schema.
+    /// Admit one decoded service request before request-specific provider or
+    /// wallet dispatch. Framed session sequence/replay bookkeeping may already
+    /// have advanced before this hook. Ordinary runtimes preserve the complete
+    /// private service vocabulary; closed compositions can narrow it without
+    /// modifying the shared ABI schema.
     fn admit_service_request(&self, _: &ServiceRequest) -> Result<(), ServiceFailure> {
         Ok(())
     }
@@ -434,6 +435,9 @@ pub struct PersistentNativeHnsReadConfig {
 pub type PersistentNativeHnsReadRuntime =
     PersistentHnsReadRuntime<HnsNodeRpcBackend, HnsSystemClock>;
 
+type PersistentNativeRecoveryReadOnlyRuntime =
+    PersistentRecoveryReadOnlyHnsRuntime<HnsNodeRpcBackend, HnsSystemClock>;
+
 /// Product-composable HNS account runtime that performs one live, bounded
 /// reconciliation for every balance/history/receive/name result. It exposes
 /// no value, signing, import, module, marketplace, or settlement path.
@@ -648,6 +652,212 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsReadRuntime<B, 
             | WalletRequest::RestoreWallet { .. }
             | WalletRequest::ModuleStatus { .. }
             | WalletRequest::WorkflowStatus { .. } => Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            )),
+        }
+    }
+}
+
+/// Closed recovery base retained inside this crate. Unlike
+/// [`PersistentHnsReadRuntime`], this type cannot be composed into the
+/// provider-capable ordinary service and admits only the six non-signing
+/// wallet reads used by the profile-backed recovery wrapper.
+struct PersistentRecoveryReadOnlyHnsRuntime<B, C> {
+    store: SharedWalletStore,
+    runtime: HnsPersistedRecoveryReadOnlyRuntime<B, C>,
+    account_label: String,
+}
+
+impl<B: HnsBackend, C: HnsClock> PersistentRecoveryReadOnlyHnsRuntime<B, C> {
+    fn new(
+        store: SharedWalletStore,
+        runtime: HnsPersistedRecoveryReadOnlyRuntime<B, C>,
+        account_label: String,
+    ) -> Self {
+        Self {
+            store,
+            runtime,
+            account_label,
+        }
+    }
+
+    #[cfg(test)]
+    fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
+        self.store.is_same_authority(store) && self.runtime.shares_store_authority(store)
+    }
+
+    fn status(&self) -> Result<WalletRuntimeStatus, ServiceFailure> {
+        let locked = self.store.is_locked().map_err(persistent_store_failure)?;
+        let active_wallet = if locked {
+            None
+        } else {
+            Some(
+                self.runtime
+                    .selected_account()
+                    .map_err(hns_read_failure)?
+                    .config
+                    .wallet_id,
+            )
+        };
+        Ok(WalletRuntimeStatus {
+            locked,
+            active_wallet,
+            enabled_modules: BTreeSet::from([ModuleId::Handshake]),
+            mainnet_settlement_enabled: false,
+        })
+    }
+
+    fn exact_account(&self) -> Result<AccountSummary, ServiceFailure> {
+        if self.store.is_locked().map_err(persistent_store_failure)? {
+            return Err(wallet_locked());
+        }
+        let selected = self.runtime.selected_account().map_err(hns_read_failure)?;
+        let account = AccountSummary {
+            account_id: selected.config.account_id,
+            module: ModuleId::Handshake,
+            label: self.account_label.clone(),
+            receive_display: None,
+        };
+        validate_hns_account_summary(&account)?;
+        Ok(account)
+    }
+
+    fn synchronize(&self) -> Result<HnsAccountReadSnapshot, ServiceFailure> {
+        let selected = self.exact_account()?;
+        let snapshot = self.runtime.synchronize().map_err(hns_read_failure)?;
+        if snapshot.account_id != selected.account_id {
+            return Err(hns_read_failure(HnsWalletError::StaleAccountRead));
+        }
+        Ok(snapshot)
+    }
+
+    fn unlock(&self, passphrase: &str) -> Result<(), ServiceFailure> {
+        self.store
+            .unlock(passphrase)
+            .map_err(persistent_store_failure)?;
+        if let Err(error) = self.exact_account() {
+            self.store.lock().map_err(persistent_store_failure)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn admits_wallet_request(request: &WalletRequest) -> bool {
+        matches!(
+            request,
+            WalletRequest::Status
+                | WalletRequest::ListAccounts
+                | WalletRequest::Balance {
+                    module: ModuleId::Handshake,
+                    ..
+                }
+                | WalletRequest::ReceiveTarget {
+                    module: ModuleId::Handshake,
+                    ..
+                }
+                | WalletRequest::TransactionHistory {
+                    module: ModuleId::Handshake,
+                    ..
+                }
+                | WalletRequest::ModuleStatus {
+                    module: ModuleId::Handshake,
+                }
+        )
+    }
+}
+
+impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentRecoveryReadOnlyHnsRuntime<B, C> {
+    fn capabilities(&self) -> BTreeSet<ServiceCapability> {
+        BTreeSet::from([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::HnsReadOperationsV1,
+        ])
+    }
+
+    fn admit_service_request(&self, request: &ServiceRequest) -> Result<(), ServiceFailure> {
+        match request {
+            ServiceRequest::Wallet { request } if Self::admits_wallet_request(request) => Ok(()),
+            ServiceRequest::Wallet { .. } => Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            )),
+            _ => Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            )),
+        }
+    }
+
+    fn supports_provider_method(&self, _: ProviderMethod) -> bool {
+        false
+    }
+
+    fn prepare_approval(&mut self, _: &PendingApproval) -> Result<ApprovalSummary, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
+
+    fn execute_provider(&mut self, _: ApprovedCall) -> Result<Value, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
+
+    fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
+        self.store.lock().map_err(persistent_store_failure)
+    }
+
+    fn execute_wallet(&mut self, request: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
+        if !Self::admits_wallet_request(&request) {
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ));
+        }
+        match request {
+            WalletRequest::Status => Ok(WalletResponse::Status {
+                status: self.status()?,
+            }),
+            WalletRequest::ListAccounts => Ok(WalletResponse::Accounts {
+                accounts: vec![self.exact_account()?],
+            }),
+            WalletRequest::Balance { module, account } => {
+                let snapshot = self.synchronize()?;
+                validate_hns_wallet_read_scope(module, account, snapshot.account_id)?;
+                Ok(WalletResponse::Balance {
+                    amount: snapshot.balance,
+                })
+            }
+            WalletRequest::ReceiveTarget { module, account } => {
+                let snapshot = self.synchronize()?;
+                validate_hns_wallet_read_scope(module, account, snapshot.account_id)?;
+                Ok(WalletResponse::ReceiveTarget {
+                    target: snapshot.receive_target,
+                })
+            }
+            WalletRequest::TransactionHistory { module, account } => {
+                let snapshot = self.synchronize()?;
+                validate_hns_wallet_read_scope(module, account, snapshot.account_id)?;
+                if snapshot.transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS {
+                    return Err(hns_read_result_bound());
+                }
+                Ok(WalletResponse::TransactionHistory {
+                    transactions: snapshot.transactions,
+                })
+            }
+            WalletRequest::ModuleStatus {
+                module: ModuleId::Handshake,
+            } => {
+                let snapshot = self.synchronize()?;
+                Ok(WalletResponse::ModuleStatus {
+                    status: hns_wallet_types::SyncStatus {
+                        phase: hns_wallet_types::SyncPhase::Ready,
+                        validated_height: snapshot.binding.chain.tip.height,
+                        scanned_height: snapshot.binding.chain.tip.height,
+                        target_height: Some(snapshot.binding.chain.tip.height),
+                        last_error: None,
+                    },
+                })
+            }
+            _ => Err(ServiceFailure::unsupported(
                 ServiceCapability::WalletOperations,
             )),
         }
@@ -2055,6 +2265,48 @@ impl WalletService<SharedWalletStore, PersistentNativeHnsReadRuntime> {
     }
 }
 
+impl WalletService<SharedWalletStore, PersistentNativeRecoveryReadOnlyRuntime> {
+    /// Construct the crate-private base used only by the explicit
+    /// profile-backed recovery wrapper. The distinct runtime never advertises
+    /// or executes provider dispatch.
+    pub(crate) fn new_persisted_recovery_read_only_native_hns_reads(
+        store: SharedWalletStore,
+        config: PersistentNativeHnsReadConfig,
+    ) -> Result<Self, ServiceError> {
+        if !store.is_locked()? {
+            return Err(ServiceError::PersistentStoreMustStartLocked);
+        }
+        let PersistentNativeHnsReadConfig {
+            account,
+            node_rpc,
+            account_label,
+        } = config;
+        if account_label.is_empty()
+            || account_label.len() > MAX_PUBLIC_STRING_BYTES
+            || !is_printable_ascii(&account_label)
+        {
+            return Err(ServiceError::InvalidPersistentHnsAccount);
+        }
+        let backend = HnsNodeRpcBackend::new(node_rpc)
+            .map_err(|_| ServiceError::InvalidPersistentHnsAccount)?;
+        let runtime = HnsPersistedRecoveryReadOnlyRuntime::new(
+            backend,
+            HnsSystemClock,
+            store.clone(),
+            account,
+        )
+        .map_err(|_| ServiceError::InvalidPersistentHnsAccount)?;
+        if !runtime.shares_store_authority(&store) {
+            return Err(ServiceError::PersistentStoreAuthorityMismatch);
+        }
+        Self::new(
+            store.clone(),
+            PersistentRecoveryReadOnlyHnsRuntime::new(store, runtime, account_label),
+            false,
+        )
+    }
+}
+
 fn provider_authority(
     authority: HostAuthorityFacts,
 ) -> Result<HostAuthorityRegistration, ServiceFailure> {
@@ -3254,6 +3506,35 @@ mod tests {
             label.to_owned(),
         )
         .expect("valid native HNS read profile")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn persist_existing_flagged_native_hns_read_profile(
+        store: &SharedWalletStore,
+        config: &HnsRuntimeConfig,
+        updated_at_unix: u64,
+    ) {
+        assert!(config.value_operations_enabled || config.settlement_enabled);
+        let record = json!({
+            "state": "active",
+            "schemaVersion": NATIVE_HNS_READ_PROFILE_SCHEMA_VERSION,
+            "account": config,
+            "nodeEndpoint": "127.0.0.1:24191",
+            "nodeAuthorization": "Bearer historical-recovery-profile",
+            "accountLabel": "Handshake Recovery",
+        });
+        store
+            .with_store_mut(|wallet| {
+                wallet
+                    .save_native_hns_read_profile(
+                        NATIVE_HNS_READ_PROFILE_ID,
+                        0,
+                        &record,
+                        updated_at_unix,
+                    )
+                    .map(|_| ())
+            })
+            .expect("persist simulated existing flagged native HNS profile");
     }
 
     #[cfg(target_os = "linux")]
@@ -4948,6 +5229,338 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn flagged_profiles_open_only_as_exact_six_read_recovery_services() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let directory = native_hns_read_tempdir();
+
+        for (index, network, value_operations_enabled, settlement_enabled) in [
+            (0, HnsNetwork::Mainnet, true, false),
+            (1, HnsNetwork::Mainnet, false, true),
+            (2, HnsNetwork::Testnet, true, false),
+            (3, HnsNetwork::Testnet, false, true),
+            (4, HnsNetwork::Testnet, true, true),
+        ] {
+            let mut account = production_hns_config(9, 0);
+            account.network = network;
+            account.value_operations_enabled = value_operations_enabled;
+            account.settlement_enabled = settlement_enabled;
+            let store = native_hns_profile_store(
+                &directory.path().join(format!("recovery-{index}.sqlite3")),
+                &account,
+            );
+            persist_existing_flagged_native_hns_read_profile(&store, &account, 100);
+
+            assert!(matches!(
+                load_native_hns_read_profile(&store),
+                Err(NativeHnsReadProfileError::InvalidConfiguration)
+            ));
+            store.lock().expect("lock flagged profile before bootstrap");
+            assert!(matches!(
+                WalletService::new_profile_backed_native_hns_reads(
+                    store.clone(),
+                    native_hns_bootstrap_passphrase(PASSPHRASE),
+                    NativeHnsReadProfileFence::new(1, 100),
+                ),
+                Err(NativeHnsReadBootstrapError::Profile(
+                    NativeHnsReadProfileError::InvalidConfiguration
+                ))
+            ));
+            assert!(store.is_locked().expect("ordinary failure relocks"));
+
+            let mut service: WalletService<
+                SharedWalletStore,
+                RecoveryProfileBackedNativeHnsReadRuntime,
+            > = WalletService::new_recovery_read_only_profile_backed_native_hns_reads(
+                store.clone(),
+                native_hns_bootstrap_passphrase(PASSPHRASE),
+                NativeHnsReadProfileFence::new(1, 100),
+            )
+            .expect("exact flagged recovery service");
+            assert!(!store.is_locked().expect("recovery service is active"));
+            assert!(service.runtime.shares_store_authority(&store));
+            assert_eq!(
+                service.runtime.capabilities(),
+                BTreeSet::from([
+                    ServiceCapability::WalletOperations,
+                    ServiceCapability::HnsReadOperationsV1,
+                ])
+            );
+            assert_eq!(
+                service.capabilities,
+                BTreeSet::from([
+                    ServiceCapability::CanonicalFraming,
+                    ServiceCapability::RestartIsolation,
+                    ServiceCapability::OpaqueAuthorityRegistry,
+                    ServiceCapability::StructuredApprovals,
+                    ServiceCapability::TypedEvents,
+                    ServiceCapability::WalletOperations,
+                    ServiceCapability::HnsReadOperationsV1,
+                ])
+            );
+            for capability in [
+                ServiceCapability::ProviderDispatch,
+                ServiceCapability::PersistentPermissions,
+                ServiceCapability::ValueMovement,
+                ServiceCapability::BrowserIntegration,
+            ] {
+                assert!(!service.capabilities.contains(&capability));
+            }
+            for method in ProviderMethod::ALL {
+                assert!(!service.runtime.supports_provider_method(method));
+            }
+            assert!(matches!(
+                service.runtime.selected_hns_account(),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::UnsupportedCapability,
+                    unsupported_capability: Some(ServiceCapability::ProviderDispatch),
+                    ..
+                })
+            ));
+            assert!(matches!(
+                service.runtime.current_hns_names(),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::UnsupportedCapability,
+                    unsupported_capability: Some(ServiceCapability::ProviderDispatch),
+                    ..
+                })
+            ));
+
+            let allowed = [
+                WalletRequest::Status,
+                WalletRequest::ListAccounts,
+                WalletRequest::Balance {
+                    module: ModuleId::Handshake,
+                    account: account.account_id,
+                },
+                WalletRequest::ReceiveTarget {
+                    module: ModuleId::Handshake,
+                    account: account.account_id,
+                },
+                WalletRequest::TransactionHistory {
+                    module: ModuleId::Handshake,
+                    account: account.account_id,
+                },
+                WalletRequest::ModuleStatus {
+                    module: ModuleId::Handshake,
+                },
+            ];
+            assert_eq!(allowed.len(), 6);
+            assert!(
+                allowed
+                    .iter()
+                    .all(RecoveryProfileBackedNativeHnsReadRuntime::admits_wallet_request)
+            );
+
+            let ServiceResponse::Wallet {
+                response: WalletResponse::Status { status },
+            } = service
+                .dispatch(
+                    ServiceRequest::Wallet {
+                        request: WalletRequest::Status,
+                    },
+                    NOW_MS,
+                )
+                .expect("recovery status")
+            else {
+                panic!("status response")
+            };
+            assert!(!status.locked);
+            assert_eq!(status.active_wallet, Some(account.wallet_id));
+            assert!(!status.mainnet_settlement_enabled);
+            let ServiceResponse::Wallet {
+                response: WalletResponse::Accounts { accounts },
+            } = service
+                .dispatch(
+                    ServiceRequest::Wallet {
+                        request: WalletRequest::ListAccounts,
+                    },
+                    NOW_MS + 1,
+                )
+                .expect("recovery exact account")
+            else {
+                panic!("accounts response")
+            };
+            assert_eq!(accounts.len(), 1);
+            assert_eq!(accounts[0].account_id, account.account_id);
+
+            assert!(matches!(
+                service.dispatch(
+                    ServiceRequest::Wallet {
+                        request: WalletRequest::Lock,
+                    },
+                    NOW_MS + 2,
+                ),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::UnsupportedCapability,
+                    unsupported_capability: Some(ServiceCapability::WalletOperations),
+                    ..
+                })
+            ));
+            assert!(matches!(
+                service.dispatch(
+                    ServiceRequest::ProviderCapabilities {
+                        authority_handle: handle(),
+                        authority_revision: 1,
+                    },
+                    NOW_MS + 3,
+                ),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::UnsupportedCapability,
+                    unsupported_capability: Some(ServiceCapability::ProviderDispatch),
+                    ..
+                })
+            ));
+            assert!(!store.is_locked().expect("rejections do not invoke lock"));
+
+            drop(service);
+            assert!(store.is_locked().expect("recovery drop relocks"));
+            let restarted: WalletService<
+                SharedWalletStore,
+                RecoveryProfileBackedNativeHnsReadRuntime,
+            > = WalletService::new_recovery_read_only_profile_backed_native_hns_reads(
+                store.clone(),
+                native_hns_bootstrap_passphrase(PASSPHRASE),
+                NativeHnsReadProfileFence::new(1, 100),
+            )
+            .expect("restart exact flagged recovery service");
+            drop(restarted);
+            assert!(store.is_locked().expect("restarted recovery drop relocks"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn flagged_profile_recovery_rejects_absent_nonflagged_mismatch_and_stale_fences() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let directory = native_hns_read_tempdir();
+        let mut flagged = production_hns_config(9, 0);
+        flagged.network = HnsNetwork::Testnet;
+        flagged.value_operations_enabled = true;
+
+        let absent = native_hns_profile_store(&directory.path().join("absent.sqlite3"), &flagged);
+        absent.lock().expect("lock absent recovery profile");
+        assert!(matches!(
+            WalletService::new_recovery_read_only_profile_backed_native_hns_reads(
+                absent.clone(),
+                native_hns_bootstrap_passphrase(PASSPHRASE),
+                NativeHnsReadProfileFence::new(1, 100),
+            ),
+            Err(NativeHnsReadBootstrapError::ProfileAbsent)
+        ));
+        assert!(absent.is_locked().expect("absent recovery relocks"));
+
+        let nonflagged = production_hns_config(9, 0);
+        let nonflagged_store =
+            native_hns_profile_store(&directory.path().join("nonflagged.sqlite3"), &nonflagged);
+        let nonflagged_profile = native_hns_profile(
+            nonflagged,
+            "127.0.0.1:24191",
+            "Bearer nonflagged-recovery-fixture",
+            "Handshake",
+        );
+        provision_native_hns_read_profile(&nonflagged_store, 0, &nonflagged_profile, 100)
+            .expect("provision nonflagged profile");
+        nonflagged_store
+            .lock()
+            .expect("lock nonflagged recovery profile");
+        assert!(matches!(
+            WalletService::new_recovery_read_only_profile_backed_native_hns_reads(
+                nonflagged_store.clone(),
+                native_hns_bootstrap_passphrase(PASSPHRASE),
+                NativeHnsReadProfileFence::new(1, 100),
+            ),
+            Err(NativeHnsReadBootstrapError::Profile(
+                NativeHnsReadProfileError::InvalidConfiguration
+            ))
+        ));
+        assert!(
+            nonflagged_store
+                .is_locked()
+                .expect("nonflagged recovery relocks")
+        );
+
+        let stale = native_hns_profile_store(&directory.path().join("stale.sqlite3"), &flagged);
+        persist_existing_flagged_native_hns_read_profile(&stale, &flagged, 100);
+        stale.lock().expect("lock stale recovery profile");
+        assert!(matches!(
+            WalletService::new_recovery_read_only_profile_backed_native_hns_reads(
+                stale.clone(),
+                native_hns_bootstrap_passphrase(PASSPHRASE),
+                NativeHnsReadProfileFence::new(1, 99),
+            ),
+            Err(NativeHnsReadBootstrapError::ProfileFenceMismatch {
+                expected_revision: 1,
+                expected_updated_at_unix: 99,
+                actual_revision: 1,
+                actual_updated_at_unix: 100,
+            })
+        ));
+        assert!(stale.is_locked().expect("stale recovery relocks"));
+
+        let mismatch =
+            native_hns_profile_store(&directory.path().join("account-mismatch.sqlite3"), &flagged);
+        let mut other_flags = flagged.clone();
+        other_flags.value_operations_enabled = false;
+        other_flags.settlement_enabled = true;
+        persist_existing_flagged_native_hns_read_profile(&mismatch, &other_flags, 100);
+        mismatch.lock().expect("lock mismatch recovery profile");
+        assert!(matches!(
+            WalletService::new_recovery_read_only_profile_backed_native_hns_reads(
+                mismatch.clone(),
+                native_hns_bootstrap_passphrase(PASSPHRASE),
+                NativeHnsReadProfileFence::new(1, 100),
+            ),
+            Err(NativeHnsReadBootstrapError::Profile(
+                NativeHnsReadProfileError::AccountMismatch
+            ))
+        ));
+        assert!(mismatch.is_locked().expect("mismatch recovery relocks"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn flagged_profile_recovery_locks_on_live_revocation() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let directory = native_hns_read_tempdir();
+        let mut flagged = production_hns_config(9, 0);
+        flagged.network = HnsNetwork::Testnet;
+        flagged.settlement_enabled = true;
+        let store = native_hns_profile_store(&directory.path().join("revoked.sqlite3"), &flagged);
+        persist_existing_flagged_native_hns_read_profile(&store, &flagged, 100);
+        store
+            .lock()
+            .expect("lock recovery profile before bootstrap");
+        let mut service: WalletService<
+            SharedWalletStore,
+            RecoveryProfileBackedNativeHnsReadRuntime,
+        > = WalletService::new_recovery_read_only_profile_backed_native_hns_reads(
+            store.clone(),
+            native_hns_bootstrap_passphrase(PASSPHRASE),
+            NativeHnsReadProfileFence::new(1, 100),
+        )
+        .expect("active recovery profile");
+
+        assert_eq!(
+            revoke_native_hns_read_profile(&store, 1, 101).expect("revoke active recovery profile"),
+            2
+        );
+        assert!(matches!(
+            service.dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Status,
+                },
+                NOW_MS,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::PersistenceFailure,
+                ..
+            })
+        ));
+        assert!(store.is_locked().expect("revoked recovery service locks"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn profile_backed_native_hns_reads_lock_on_live_profile_rotation_or_revocation() {
         const PASSPHRASE: &str = "correct horse battery staple";
         let directory = native_hns_read_tempdir();
@@ -5183,32 +5796,40 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn native_hns_read_constructor_rejects_value_enabled_account_config() {
+    fn native_hns_read_constructor_rejects_exact_persisted_flagged_account_config() {
         let directory = native_hns_read_tempdir();
-        let persisted = production_hns_config(9, 0);
-        let store = production_hns_store(
-            &directory.path().join("wallet.sqlite3"),
-            std::slice::from_ref(&persisted),
-        );
-        let mut value_account = persisted;
-        value_account.value_operations_enabled = true;
-        let node_rpc = HnsNodeRpcConfig::new(
-            "127.0.0.1:14038".parse().expect("loopback socket"),
-            "Bearer test-only-node-authority",
-        )
-        .expect("authenticated loopback configuration");
+        for (index, network, value_operations_enabled, settlement_enabled) in [
+            (0, HnsNetwork::Mainnet, true, false),
+            (1, HnsNetwork::Mainnet, false, true),
+            (2, HnsNetwork::Testnet, true, false),
+            (3, HnsNetwork::Testnet, false, true),
+        ] {
+            let mut persisted = production_hns_config(9, 0);
+            persisted.network = network;
+            persisted.value_operations_enabled = value_operations_enabled;
+            persisted.settlement_enabled = settlement_enabled;
+            let store = production_hns_store(
+                &directory.path().join(format!("wallet-{index}.sqlite3")),
+                std::slice::from_ref(&persisted),
+            );
+            let node_rpc = HnsNodeRpcConfig::new(
+                "127.0.0.1:14038".parse().expect("loopback socket"),
+                "Bearer test-only-node-authority",
+            )
+            .expect("authenticated loopback configuration");
 
-        assert!(matches!(
-            WalletService::new_persistent_native_hns_reads(
-                store,
-                PersistentNativeHnsReadConfig {
-                    account: value_account,
-                    node_rpc,
-                    account_label: "Handshake".to_owned(),
-                },
-            ),
-            Err(ServiceError::InvalidPersistentHnsAccount)
-        ));
+            assert!(matches!(
+                WalletService::new_persistent_native_hns_reads(
+                    store,
+                    PersistentNativeHnsReadConfig {
+                        account: persisted,
+                        node_rpc,
+                        account_label: "Handshake".to_owned(),
+                    },
+                ),
+                Err(ServiceError::InvalidPersistentHnsAccount)
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]

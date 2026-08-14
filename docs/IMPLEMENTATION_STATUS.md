@@ -23,6 +23,17 @@ independently.
 | Testkit | deterministic non-mainnet, hostile-input, reorg, and qualification fixtures | full multi-process network harnesses |
 | Browser products | authority and adapter work lives in separate repositories | installed-extension/native-host and signed-device qualification |
 
+An explicit historical-flag recovery path is implemented in source. It opens
+only an exact already-persisted HNS account/profile with at least one value or
+settlement bit, treats those bits as identity rather than capability, and
+returns a distinct exact-six service runtime with no provider dispatch,
+persistent permissions, value, browser, current-lock/Denuo, signing, workflow,
+import/export, or lifecycle surface. Missing/non-flagged/mismatched/revoked or
+stale state fails and relocks; ordinary and full constructors remain gated.
+Focused source tests cover mainnet/testnet and both flags, restart and live
+fences, exact capabilities, and non-mutating protected high-water reads. This
+is recovery access to existing data, not production value availability.
+
 ## HNS value release gate
 
 `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` is `false`. Runtime configuration rejects

@@ -168,15 +168,35 @@ zeroizing/redacted/non-cloneable/non-serializable passphrase, and exact active
 profile revision/update time. It unlocks only to authenticate and consume the
 encrypted singleton, relocks before ordinary native-read construction,
 performs a private internal unlock, and authenticates the same fence again
-before returning. Its runtime-level request admission executes before the
-shared service dispatcher, so every authority, provider, approval, ABI
-unlock/lock, create/restore, workflow, and non-HNS module request is rejected;
+before returning. Its runtime-level request admission executes at the start of
+request-specific dispatch, after framed session sequence/replay bookkeeping,
+so every authority, provider, approval, ABI unlock/lock, create/restore,
+workflow, and non-HNS module request is rejected;
 only the six marker reads remain. The active profile fence is loaded before and
 after each admitted read. A mismatch, tombstone, absence, malformed profile, or
 store failure suppresses the read result and clears the key. Drop also
 best-effort clears the same shared key. This is process-local containment, not
 a cross-process database lease or secret-delivery mechanism; installed
 products still need both and must terminate the process on lease invalidation.
+
+The recovery-only profile constructor is a distinct closed runtime, not a mode
+on the provider-capable native-read service. It accepts only exact existing
+flagged account/profile identity under the same revision and live read fences;
+there is no typed flagged-profile provisioning surface, and privileged generic
+low-level store mutation is out-of-band state construction rather than recovery
+authority. Its exact service capability
+set omits `providerDispatch`, `persistentPermissions`, `valueMovement`, and
+`browserIntegration`, every provider method is unsupported, and only the six
+non-signing `hnsReadOperationsV1` wallet reads are admitted. Structural config
+validation in this path is explicitly inert: it never authorizes current
+Shakedex-lock/Denuo access, allocation, signing, import/export, workflows,
+lifecycle, broadcast, settlement, or value. Ordinary/full constructors still
+perform authority and release-gate validation. A synchronized recovery read is
+not physically read-only: under the same revision fences it may create or
+replace derived-address, coin, transaction, name, and recovery-cache rows,
+update WalletAccount scan/index metadata without changing its configuration,
+and write or clear the discovery fence, but it cannot create account/profile/
+allocation/signer/workflow/value authority or rewrite configuration.
 
 The injected backend is synchronous and broader than this read subset, but the
 read controller exposes none of its broadcast, fee, signing, action, or value

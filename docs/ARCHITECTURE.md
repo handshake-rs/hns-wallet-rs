@@ -115,6 +115,22 @@ snapshot directly from its composed service only long enough to build a
 minimized serializable result; its public snapshot omits the binding and all raw
 name proof/state/resource/owner/derivation evidence.
 
+Historical persisted accounts with a value or settlement bit set have one
+explicit recovery-only opening path. Structural validation is separated from
+ordinary authority validation, but the bits remain authenticated identity and
+never become capability. The public core wrapper exposes only exact account
+selection and the synchronized projection. At the service boundary a distinct
+profile-backed recovery runtime admits the same six wallet reads and advertises
+no provider dispatch, persistent permissions, value, browser, Shakedex-lock,
+Denuo, signing, workflow, import/export, or lifecycle authority. It cannot
+provision missing state; exact account/profile/revision fences and the ordinary
+chain/mempool checks still apply. Ordinary and full constructors continue to
+use the unchanged production gates. Like the ordinary synchronized scanner, a
+recovery read may update WalletAccount scan/index metadata without changing its
+configuration, create or replace derived-address/cache rows, and write or clear
+its discovery fence, but never create the selected account/profile/configuration
+or any allocation, signer, workflow, or value authority.
+
 Names consent is a two-snapshot service flow, not post-approval enumeration.
 Prompt preparation synchronizes once, projects a sorted maximum-64 canonical
 name/hash list, and retains that exact account/list/hash set in ephemeral

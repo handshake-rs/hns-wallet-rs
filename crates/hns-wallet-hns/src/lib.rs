@@ -1219,7 +1219,14 @@ impl HnsRuntimeConfig {
         Ok(config)
     }
 
-    pub fn validate(&self) -> Result<(), HnsWalletError> {
+    /// Validate inert account identity and bounded scan policy only.
+    ///
+    /// This deliberately does not validate value-release authority. It exists
+    /// so an explicitly recovery-only reader can preserve and authenticate
+    /// historical persisted flags without interpreting them as capability.
+    /// Calling it does not authorize opening the full runtime, signing,
+    /// broadcasting, settlement, provider use, or any value mutation.
+    pub fn validate_structure(&self) -> Result<(), HnsWalletError> {
         if self.account_id.as_bytes().iter().all(|byte| *byte == 0) {
             return Err(HnsWalletError::InvalidRuntimeConfiguration);
         }
@@ -1232,6 +1239,13 @@ impl HnsRuntimeConfig {
         if self.minimum_confirmations == 0 || self.dust_threshold.is_zero() {
             return Err(HnsWalletError::InvalidRuntimeConfiguration);
         }
+        Ok(())
+    }
+
+    /// Validate both inert configuration and currently available runtime
+    /// authority. Every ordinary and full runtime constructor uses this path.
+    pub fn validate(&self) -> Result<(), HnsWalletError> {
+        self.validate_structure()?;
         if self.network == HnsNetwork::Mainnet
             && (self.value_operations_enabled || self.settlement_enabled)
         {
@@ -1403,6 +1417,34 @@ impl fmt::Debug for HnsWalletBootstrap {
     }
 }
 
+/// Internal validation purpose carried through exact selection and every
+/// synchronized-read persistence fence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HnsAccountReadMode {
+    OrdinaryNonValue,
+    PersistedRecoveryReadOnly,
+}
+
+impl HnsAccountReadMode {
+    fn validate_config(self, config: &HnsRuntimeConfig) -> Result<(), HnsWalletError> {
+        match self {
+            Self::OrdinaryNonValue => {
+                config.validate()?;
+                if config.value_operations_enabled || config.settlement_enabled {
+                    return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+                }
+            }
+            Self::PersistedRecoveryReadOnly => {
+                config.validate_structure()?;
+                if !config.value_operations_enabled && !config.settlement_enabled {
+                    return Err(HnsWalletError::InvalidRuntimeConfiguration);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Read-only selector for one exact pre-existing HNS account held by the same
 /// Arc-backed store/key authority as its caller.
 ///
@@ -1413,6 +1455,7 @@ impl fmt::Debug for HnsWalletBootstrap {
 pub struct HnsExistingAccountSelector {
     store: SharedWalletStore,
     expected: HnsRuntimeConfig,
+    mode: HnsAccountReadMode,
 }
 
 impl HnsExistingAccountSelector {
@@ -1420,11 +1463,20 @@ impl HnsExistingAccountSelector {
         store: SharedWalletStore,
         expected: HnsRuntimeConfig,
     ) -> Result<Self, HnsWalletError> {
-        expected.validate()?;
-        if expected.value_operations_enabled || expected.settlement_enabled {
-            return Err(HnsWalletError::RuntimeIntegrationUnavailable);
-        }
-        Ok(Self { store, expected })
+        Self::new_with_mode(store, expected, HnsAccountReadMode::OrdinaryNonValue)
+    }
+
+    fn new_with_mode(
+        store: SharedWalletStore,
+        expected: HnsRuntimeConfig,
+        mode: HnsAccountReadMode,
+    ) -> Result<Self, HnsWalletError> {
+        mode.validate_config(&expected)?;
+        Ok(Self {
+            store,
+            expected,
+            mode,
+        })
     }
 
     pub fn expected_record_id(&self) -> [u8; 32] {
@@ -1433,6 +1485,10 @@ impl HnsExistingAccountSelector {
 
     pub fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
         self.store.is_same_authority(store)
+    }
+
+    const fn mode(&self) -> HnsAccountReadMode {
+        self.mode
     }
 
     /// Re-read and authenticate the selected account on every call. This makes
@@ -1528,6 +1584,18 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
         store: SharedWalletStore,
         selector: HnsExistingAccountSelector,
     ) -> Result<Self, HnsWalletError> {
+        if selector.mode() != HnsAccountReadMode::OrdinaryNonValue {
+            return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+        }
+        Self::new_with_selector(backend, clock, store, selector)
+    }
+
+    fn new_with_selector(
+        backend: B,
+        clock: C,
+        store: SharedWalletStore,
+        selector: HnsExistingAccountSelector,
+    ) -> Result<Self, HnsWalletError> {
         if !selector.shares_store_authority(&store) {
             return Err(HnsWalletError::StoreAuthorityMismatch);
         }
@@ -1559,7 +1627,14 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
         let selected = self.selector.selected_account()?;
         let preparation = self
             .store
-            .with_store_mut(|store| Ok(prepare_hns_account_read(store, &selected, now_unix)))
+            .with_store_mut(|store| {
+                Ok(prepare_hns_account_read(
+                    store,
+                    &selected,
+                    self.selector.mode(),
+                    now_unix,
+                ))
+            })
             .map_err(map_shared_store_error)??;
         let binding = self.backend.get_chain_snapshot()?;
         verify_hns_read_chain_identity(
@@ -1667,6 +1742,66 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             receive_target,
             known_names: names,
         })
+    }
+}
+
+/// Explicit recovery-only reader for one exact already-persisted HNS account
+/// whose historical configuration contains a value or settlement flag.
+///
+/// The flags remain authenticated identity facts. They are never converted to
+/// a permit or capability, and missing or non-exact persisted state fails on
+/// selection. This wrapper exposes only exact selection and synchronized read
+/// projection; its inner runtime is private, so current Shakedex-lock, Denuo,
+/// signing, import/export, workflow, broadcast, and value APIs are unreachable.
+/// Synchronization may update WalletAccount scan/index metadata (never its
+/// configuration), create or replace derived-address, coin, transaction, name,
+/// and recovery-cache rows, and write or clear the durable discovery fence. It
+/// cannot create an account, profile, allocation, signer, workflow, or value
+/// authority or alter the selected account configuration. Every such cache row
+/// is bounded, authenticated, and scoped to that exact existing account.
+///
+/// ```compile_fail
+/// # use hns_wallet_hns::{HnsBackend, HnsClock, HnsPersistedRecoveryReadOnlyRuntime};
+/// # fn no_market_authority<B: HnsBackend, C: HnsClock>(
+/// #     runtime: &HnsPersistedRecoveryReadOnlyRuntime<B, C>,
+/// # ) {
+/// let _ = runtime.verify_current_shakedex_lock(b"name", [2_u8; 33]);
+/// # }
+/// ```
+pub struct HnsPersistedRecoveryReadOnlyRuntime<B, C = SystemClock> {
+    inner: HnsAccountReadRuntime<B, C>,
+}
+
+impl<B: HnsBackend, C: HnsClock> HnsPersistedRecoveryReadOnlyRuntime<B, C> {
+    /// Select an exact existing flagged account for recovery reads. Construction
+    /// validates structure only and never writes; later selection requires the
+    /// complete persisted configuration to match byte-for-byte.
+    pub fn new(
+        backend: B,
+        clock: C,
+        store: SharedWalletStore,
+        expected: HnsRuntimeConfig,
+    ) -> Result<Self, HnsWalletError> {
+        let selector = HnsExistingAccountSelector::new_with_mode(
+            store.clone(),
+            expected,
+            HnsAccountReadMode::PersistedRecoveryReadOnly,
+        )?;
+        Ok(Self {
+            inner: HnsAccountReadRuntime::new_with_selector(backend, clock, store, selector)?,
+        })
+    }
+
+    pub fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
+        self.inner.shares_store_authority(store)
+    }
+
+    pub fn selected_account(&self) -> Result<HnsAccountRecord, HnsWalletError> {
+        self.inner.selected_account()
+    }
+
+    pub fn synchronize(&self) -> Result<HnsAccountReadSnapshot, HnsWalletError> {
+        self.inner.synchronize()
     }
 }
 
@@ -3983,15 +4118,13 @@ fn map_shared_store_error(error: StoreError) -> HnsWalletError {
 fn prepare_hns_account_read(
     store: &mut WalletStore,
     selected: &HnsAccountRecord,
+    mode: HnsAccountReadMode,
     now_unix: u64,
 ) -> Result<HnsReadPreparation, HnsWalletError> {
     if store.is_locked() {
         return Err(HnsWalletError::StoreLocked);
     }
-    selected.config.validate()?;
-    if selected.config.value_operations_enabled || selected.config.settlement_enabled {
-        return Err(HnsWalletError::RuntimeIntegrationUnavailable);
-    }
+    mode.validate_config(&selected.config)?;
     let account_id = account_entity_id(&selected.config);
     let stored = store
         .wallet_account::<HnsAccountRecord>(&account_id)?
@@ -4015,8 +4148,18 @@ fn prepare_hns_account_read(
     {
         return Err(HnsWalletError::StaleAccountRead);
     }
-    let allocated_next = shakedex_key::allocation_next_index(store, &fenced_account.config)
-        .map_err(map_shakedex_restore_error)?;
+    let allocated_next = match mode {
+        HnsAccountReadMode::OrdinaryNonValue => {
+            shakedex_key::allocation_next_index(store, &fenced_account.config)
+        }
+        HnsAccountReadMode::PersistedRecoveryReadOnly => {
+            shakedex_key::allocation_next_index_for_persisted_recovery_read(
+                store,
+                &fenced_account.config,
+            )
+        }
+    }
+    .map_err(map_shakedex_restore_error)?;
     let mut scan_account = fenced_account.clone();
     normalize_restore_scan_account(&mut scan_account, allocated_next)?;
     let prefix = account_entity_prefix(&fenced_account.config);
@@ -8345,6 +8488,11 @@ mod tests {
         config.birthday_height = 0;
         config.restore_lookahead = 1;
         config.minimum_confirmations = 1;
+        let store = production_followup_read_store_for_config(config.clone());
+        (store, config)
+    }
+
+    fn production_followup_read_store_for_config(config: HnsRuntimeConfig) -> SharedWalletStore {
         let mut store = WalletStore::create(":memory:", PRODUCTION_FOLLOWUP_PASSPHRASE)
             .expect("create synchronized-read store");
         store
@@ -8375,7 +8523,7 @@ mod tests {
         store
             .save_wallet_account(&account_entity_id(&config), 0, &account, 1)
             .expect("persist synchronized-read account");
-        (SharedWalletStore::new(store), config)
+        SharedWalletStore::new(store)
     }
 
     fn production_followup_read_runtime(
@@ -8392,6 +8540,21 @@ mod tests {
             selector,
         )
         .expect("synchronized account read runtime")
+    }
+
+    fn production_followup_recovery_read_runtime(
+        store: SharedWalletStore,
+        config: HnsRuntimeConfig,
+        fault: ProductionFollowupReadFault,
+    ) -> HnsPersistedRecoveryReadOnlyRuntime<ProductionFollowupReadBackend, ProductionFollowupClock>
+    {
+        HnsPersistedRecoveryReadOnlyRuntime::new(
+            ProductionFollowupReadBackend::new(store.clone(), &config, fault),
+            ProductionFollowupClock,
+            store,
+            config,
+        )
+        .expect("persisted recovery-only read runtime")
     }
 
     fn canonical_name_view(
@@ -9474,6 +9637,167 @@ mod tests {
             ),
             Err(HnsWalletError::StoreAuthorityMismatch)
         ));
+    }
+
+    #[test]
+    fn persisted_flagged_accounts_open_only_through_the_recovery_read_wrapper() {
+        for (network, value_operations_enabled, settlement_enabled) in [
+            (HnsNetwork::Mainnet, true, false),
+            (HnsNetwork::Mainnet, false, true),
+            (HnsNetwork::Testnet, true, false),
+            (HnsNetwork::Testnet, false, true),
+            (HnsNetwork::Testnet, true, true),
+        ] {
+            let mut config = test_runtime_config();
+            config.network = network;
+            config.birthday_height = 0;
+            config.restore_lookahead = 1;
+            config.minimum_confirmations = 1;
+            config.value_operations_enabled = value_operations_enabled;
+            config.settlement_enabled = settlement_enabled;
+            let store = production_followup_read_store_for_config(config.clone());
+
+            config
+                .validate_structure()
+                .expect("flagged account structure remains valid");
+            if network == HnsNetwork::Mainnet {
+                assert!(matches!(
+                    config.validate(),
+                    Err(HnsWalletError::MainnetDisabled)
+                ));
+            } else {
+                assert!(matches!(
+                    config.validate(),
+                    Err(HnsWalletError::RuntimeIntegrationUnavailable)
+                ));
+            }
+            assert!(matches!(
+                HnsExistingAccountSelector::new(store.clone(), config.clone()),
+                Err(HnsWalletError::MainnetDisabled)
+                    | Err(HnsWalletError::RuntimeIntegrationUnavailable)
+            ));
+
+            let full_store = WalletStore::create(":memory:", PRODUCTION_FOLLOWUP_PASSPHRASE)
+                .expect("create ordinary full-runtime store");
+            assert!(matches!(
+                HnsWalletRuntime::open(
+                    ProductionFollowupReadBackend::new(
+                        store.clone(),
+                        &config,
+                        ProductionFollowupReadFault::Healthy,
+                    ),
+                    full_store,
+                    config.clone(),
+                    ProductionFollowupClock,
+                ),
+                Err(HnsWalletError::MainnetDisabled)
+                    | Err(HnsWalletError::RuntimeIntegrationUnavailable)
+            ));
+
+            let runtime = production_followup_recovery_read_runtime(
+                store.clone(),
+                config.clone(),
+                ProductionFollowupReadFault::Healthy,
+            );
+            assert_eq!(
+                runtime
+                    .selected_account()
+                    .expect("exact flagged account")
+                    .config,
+                config
+            );
+            let snapshot = runtime.synchronize().expect("recovery-only read");
+            assert_eq!(snapshot.account_id, config.account_id);
+            drop(runtime);
+
+            let restarted = production_followup_recovery_read_runtime(
+                store.clone(),
+                config.clone(),
+                ProductionFollowupReadFault::Healthy,
+            );
+            restarted
+                .synchronize()
+                .expect("restarted recovery-only read");
+            assert_eq!(
+                restarted
+                    .selected_account()
+                    .expect("restarted exact account")
+                    .config,
+                config
+            );
+
+            let (different_store, _) = production_followup_read_store();
+            assert!(!restarted.shares_store_authority(&different_store));
+            assert!(restarted.shares_store_authority(&store));
+        }
+    }
+
+    #[test]
+    fn persisted_flagged_recovery_reads_reject_missing_mismatch_and_live_fence_changes() {
+        let recovery_config = || {
+            let mut config = test_runtime_config();
+            config.network = HnsNetwork::Testnet;
+            config.birthday_height = 0;
+            config.restore_lookahead = 1;
+            config.minimum_confirmations = 1;
+            config.value_operations_enabled = true;
+            config
+        };
+
+        let missing_config = recovery_config();
+        let missing_store = SharedWalletStore::new(
+            WalletStore::create(":memory:", PRODUCTION_FOLLOWUP_PASSPHRASE)
+                .expect("create missing-account store"),
+        );
+        let missing = production_followup_recovery_read_runtime(
+            missing_store,
+            missing_config,
+            ProductionFollowupReadFault::Healthy,
+        );
+        assert!(matches!(
+            missing.selected_account(),
+            Err(HnsWalletError::AccountConfigurationMismatch)
+        ));
+
+        let config = recovery_config();
+        let mismatch_store = production_followup_read_store_for_config(config.clone());
+        let mut mismatched = config.clone();
+        mismatched.value_operations_enabled = false;
+        mismatched.settlement_enabled = true;
+        let mismatch = production_followup_recovery_read_runtime(
+            mismatch_store,
+            mismatched,
+            ProductionFollowupReadFault::Healthy,
+        );
+        assert!(matches!(
+            mismatch.selected_account(),
+            Err(HnsWalletError::AccountConfigurationMismatch)
+        ));
+
+        for fault in [
+            ProductionFollowupReadFault::StaleChain,
+            ProductionFollowupReadFault::RestartedMempool,
+            ProductionFollowupReadFault::ChangedAccount,
+            ProductionFollowupReadFault::LockedStore,
+        ] {
+            let config = recovery_config();
+            let store = production_followup_read_store_for_config(config.clone());
+            let runtime = production_followup_recovery_read_runtime(store, config, fault);
+            let result = runtime.synchronize();
+            match fault {
+                ProductionFollowupReadFault::StaleChain
+                | ProductionFollowupReadFault::RestartedMempool => {
+                    assert!(matches!(result, Err(HnsWalletError::StaleNodeSnapshot)));
+                }
+                ProductionFollowupReadFault::ChangedAccount => {
+                    assert!(matches!(result, Err(HnsWalletError::StaleAccountRead)));
+                }
+                ProductionFollowupReadFault::LockedStore => {
+                    assert!(matches!(result, Err(HnsWalletError::StoreLocked)));
+                }
+                _ => unreachable!("the recovery fence matrix contains only fault cases"),
+            }
+        }
     }
 
     #[test]

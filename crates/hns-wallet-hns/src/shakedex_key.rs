@@ -175,6 +175,13 @@ struct AllocationContext {
 impl AllocationContext {
     fn from_config(config: &HnsRuntimeConfig) -> Result<Self, HnsShakedexKeyAllocationError> {
         config.validate()?;
+        Self::from_structurally_valid_config(config)
+    }
+
+    fn from_structurally_valid_config(
+        config: &HnsRuntimeConfig,
+    ) -> Result<Self, HnsShakedexKeyAllocationError> {
+        config.validate_structure()?;
         if config.wallet_id.as_bytes().iter().all(|byte| *byte == 0)
             || config.account_id.as_bytes().iter().all(|byte| *byte == 0)
         {
@@ -740,6 +747,25 @@ pub(super) fn allocation_next_index(
     config: &HnsRuntimeConfig,
 ) -> Result<u32, HnsShakedexKeyAllocationError> {
     let context = AllocationContext::from_config(config)?;
+    allocation_next_index_for_context(store, context)
+}
+
+/// Read an existing protected high-water for the closed persisted-recovery
+/// scanner without interpreting historical value flags as allocation
+/// authority. This path cannot create, advance, load a signer for, or otherwise
+/// mutate an allocation.
+pub(super) fn allocation_next_index_for_persisted_recovery_read(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+) -> Result<u32, HnsShakedexKeyAllocationError> {
+    let context = AllocationContext::from_structurally_valid_config(config)?;
+    allocation_next_index_for_context(store, context)
+}
+
+fn allocation_next_index_for_context(
+    store: &WalletStore,
+    context: AllocationContext,
+) -> Result<u32, HnsShakedexKeyAllocationError> {
     let Some(stored) = load_high_water(store, context)? else {
         return Ok(0);
     };
@@ -1637,6 +1663,141 @@ mod tests {
         assert!(matches!(
             signer.validate_proof_context(&proof),
             Err(HnsShakedexKeyAllocationError::SigningContextMismatch)
+        ));
+    }
+
+    #[test]
+    fn persisted_recovery_high_water_read_is_non_mutating_and_requires_exact_pair() {
+        let directory = TestDirectory::new();
+        let config = config();
+        let account = account();
+        let context = AllocationContext::from_config(&config).expect("ordinary context");
+        let mut store = WalletStore::create(directory.path().join("source.sqlite3"), PASSPHRASE)
+            .expect("create allocation source store");
+        seed_store(&mut store, &account);
+        allocate_hns_shakedex_key(&mut store, &config, &request(3, b"alpha", 4), 10)
+            .expect("create real protected high water");
+
+        let anchor_id = namespace_anchor_record_id(context);
+        let high_water_id = high_water_record_id(context);
+        let anchor_before = store
+            .load_entity::<HnsShakedexKeyAllocationRecord>(
+                EntityKind::HnsShakedexKeyAllocation,
+                &anchor_id,
+            )
+            .expect("load namespace anchor")
+            .expect("namespace anchor present");
+        let high_water_before = store
+            .load_entity::<HnsShakedexKeyAllocationRecord>(
+                EntityKind::HnsShakedexKeyAllocation,
+                &high_water_id,
+            )
+            .expect("load protected high water")
+            .expect("protected high water present");
+        let anchor_bytes = serde_json::to_vec(&anchor_before.value).expect("encode anchor");
+        let high_water_bytes =
+            serde_json::to_vec(&high_water_before.value).expect("encode high water");
+
+        let mut flagged = config.clone();
+        flagged.value_operations_enabled = true;
+        assert!(matches!(
+            allocation_next_index(&store, &flagged),
+            Err(HnsShakedexKeyAllocationError::Wallet(
+                HnsWalletError::RuntimeIntegrationUnavailable
+            ))
+        ));
+        assert_eq!(
+            allocation_next_index_for_persisted_recovery_read(&store, &flagged)
+                .expect("authenticate existing high water for recovery scan"),
+            1
+        );
+
+        let anchor_after = store
+            .load_entity::<HnsShakedexKeyAllocationRecord>(
+                EntityKind::HnsShakedexKeyAllocation,
+                &anchor_id,
+            )
+            .expect("reload namespace anchor")
+            .expect("namespace anchor remains");
+        let high_water_after = store
+            .load_entity::<HnsShakedexKeyAllocationRecord>(
+                EntityKind::HnsShakedexKeyAllocation,
+                &high_water_id,
+            )
+            .expect("reload protected high water")
+            .expect("protected high water remains");
+        assert_eq!(anchor_after, anchor_before);
+        assert_eq!(high_water_after, high_water_before);
+        assert_eq!(
+            serde_json::to_vec(&anchor_after.value).expect("re-encode anchor"),
+            anchor_bytes
+        );
+        assert_eq!(
+            serde_json::to_vec(&high_water_after.value).expect("re-encode high water"),
+            high_water_bytes
+        );
+
+        let mut missing =
+            WalletStore::create(directory.path().join("missing-anchor.sqlite3"), PASSPHRASE)
+                .expect("create missing-pair store");
+        seed_store(&mut missing, &account);
+        missing
+            .save_entity(
+                EntityKind::HnsShakedexKeyAllocation,
+                &high_water_id,
+                0,
+                &high_water_before.value,
+                high_water_before.updated_at_unix,
+            )
+            .expect("persist high water without anchor");
+        assert!(matches!(
+            allocation_next_index_for_persisted_recovery_read(&missing, &flagged),
+            Err(HnsShakedexKeyAllocationError::CorruptAllocation)
+        ));
+        assert_eq!(
+            missing
+                .load_entity::<HnsShakedexKeyAllocationRecord>(
+                    EntityKind::HnsShakedexKeyAllocation,
+                    &high_water_id,
+                )
+                .expect("reload missing-pair high water")
+                .expect("missing-pair high water remains")
+                .value,
+            high_water_before.value
+        );
+
+        let mut corrupt =
+            WalletStore::create(directory.path().join("corrupt-pair.sqlite3"), PASSPHRASE)
+                .expect("create corrupt-pair store");
+        seed_store(&mut corrupt, &account);
+        let corrupt_anchor = match anchor_before.value.clone() {
+            HnsShakedexKeyAllocationRecord::NamespaceAnchor(mut anchor) => {
+                anchor.recovery_seed_commitment = [0x55; 32];
+                HnsShakedexKeyAllocationRecord::NamespaceAnchor(anchor)
+            }
+            _ => panic!("expected namespace anchor record"),
+        };
+        corrupt
+            .save_entity(
+                EntityKind::HnsShakedexKeyAllocation,
+                &anchor_id,
+                0,
+                &corrupt_anchor,
+                anchor_before.updated_at_unix,
+            )
+            .expect("persist corrupt anchor");
+        corrupt
+            .save_entity(
+                EntityKind::HnsShakedexKeyAllocation,
+                &high_water_id,
+                0,
+                &high_water_before.value,
+                high_water_before.updated_at_unix,
+            )
+            .expect("persist paired high water");
+        assert!(matches!(
+            allocation_next_index_for_persisted_recovery_read(&corrupt, &flagged),
+            Err(HnsShakedexKeyAllocationError::CorruptAllocation)
         ));
     }
 }

@@ -355,6 +355,23 @@ and clears the fence with the final account CAS. A crash or stale node leaves
 the fence set; a later process re-authenticates the partial corpus and performs
 a fresh complete scan before clearing it.
 
+The explicit `HnsPersistedRecoveryReadOnlyRuntime` reuses this same scanner and
+all of its account/entity/chain/mempool fences for an exact already-persisted
+flagged account. It cannot insert a missing account or rewrite configuration.
+Its structural Shakedex high-water lookup only authenticates an existing
+anchor/high-water pair and recovery-seed commitment. Complete pair absence is
+the valid next-index-zero case; a one-sided or malformed pair fails closed. The
+lookup may decrypt the zeroizing recovery seed to authenticate its commitment,
+and the scanner derives public keys from protected secret material, but this
+path cannot return or load a seller signer, sign, or create/advance allocation
+state. The scanner may update WalletAccount scan/index metadata without
+changing its configuration, create or replace bounded authenticated
+derived-address, coin, transaction, name, and recovery-cache rows scoped to the
+exact existing account, and write or clear the durable discovery fence. It
+cannot create an account/profile/allocation/signer/workflow or value authority
+or rewrite configuration; the historical value/settlement bits remain
+unchanged and confer no authority.
+
 Name-role scan advancement is monotonic and bounded across restart and reorg.
 Outputs to discovered name keys remain visible to history/reconciliation but
 are excluded from ordinary balance, input selection, reservations, and
@@ -462,7 +479,7 @@ Authorization subset excludes JSON quote/backslash escape bytes so decoding
 does not require a non-zeroizing parser scratch copy. Creation and
 rotation use entity revision CAS and reject timestamp rollback; provisioning
 and load additionally require the authenticated sole HNS account and complete
-singleton recovery-seed bootstrap. Load distinguishes an absent namespace, an
+singleton recovery-seed bootstrap. Ordinary load distinguishes an absent namespace, an
 active profile, and a revoked tombstone; it rejects extra/wrong-ID rows,
 ambiguous account state, partial bootstrap, non-loopback endpoints, or either
 value switch. Revocation uses the same exact revision and replaces the active
@@ -473,6 +490,16 @@ while its payload is authenticated and encrypted with the
 database/kind/ID/revision/time binding used by other typed
 entities. Loading requires an unlocked store and authenticates the account
 again, but supplies no chain freshness and performs no node call.
+
+A separate recovery loader accepts only an already-persisted active profile
+whose exact authenticated account has at least one historical value/settlement
+bit. It preserves schema v1 and exposes no typed profile provisioning or
+rotation path for a flagged record; generic low-level store mutation remains a
+privileged out-of-band operation. The profile-backed recovery constructor
+requires the same exact
+revision/update-time fence before construction, after private unlock, and
+before and after each of the six admitted reads. Missing, non-flagged,
+mismatched, stale, revoked, or malformed state relocks and fails.
 
 Account/seed authentication and profile CAS share one process-local
 `SharedWalletStore` critical section. They are not one cross-process SQLite

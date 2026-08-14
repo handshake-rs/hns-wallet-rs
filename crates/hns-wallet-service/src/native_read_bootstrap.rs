@@ -14,8 +14,16 @@ use zeroize::Zeroizing;
 
 use crate::{
     LoadedNativeHnsReadProfile, NativeHnsReadProfileError, PersistentNativeHnsReadRuntime,
-    ServiceError, ServiceRuntime, WalletService, load_native_hns_read_profile,
+    PersistentNativeRecoveryReadOnlyRuntime, ServiceError, ServiceRuntime, WalletService,
+    load_native_hns_read_profile,
+    native_read_profile::load_persisted_recovery_read_only_native_hns_profile,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeHnsReadBootstrapMode {
+    OrdinaryNonValue,
+    PersistedRecoveryReadOnly,
+}
 
 /// One consumable wallet passphrase supplied by a trusted process-local
 /// bootstrap composition. The allocation is zeroized on every return path and
@@ -103,30 +111,15 @@ impl ProfileBackedNativeHnsReadRuntime {
     }
 
     pub(crate) fn admits_wallet_request(request: &WalletRequest) -> bool {
-        matches!(
-            request,
-            WalletRequest::Status
-                | WalletRequest::ListAccounts
-                | WalletRequest::Balance {
-                    module: ModuleId::Handshake,
-                    ..
-                }
-                | WalletRequest::ReceiveTarget {
-                    module: ModuleId::Handshake,
-                    ..
-                }
-                | WalletRequest::TransactionHistory {
-                    module: ModuleId::Handshake,
-                    ..
-                }
-                | WalletRequest::ModuleStatus {
-                    module: ModuleId::Handshake,
-                }
-        )
+        admits_wallet_request(request)
     }
 
     fn revalidate_profile_fence(&self) -> Result<(), ServiceFailure> {
-        match require_active_profile(&self.inner.store, self.profile_fence) {
+        match require_active_profile(
+            &self.inner.store,
+            self.profile_fence,
+            NativeHnsReadBootstrapMode::OrdinaryNonValue,
+        ) {
             Ok(loaded) => {
                 drop(loaded);
                 Ok(())
@@ -137,6 +130,125 @@ impl ProfileBackedNativeHnsReadRuntime {
             }
         }
     }
+}
+
+/// Closed recovery-only post-bootstrap runtime for an exact already-persisted
+/// flagged account/profile. Its flags are identity facts only: this type
+/// advertises no provider or value capability and admits only the six frozen
+/// `hnsReadOperationsV1` wallet reads.
+pub struct RecoveryProfileBackedNativeHnsReadRuntime {
+    inner: PersistentNativeRecoveryReadOnlyRuntime,
+    profile_fence: NativeHnsReadProfileFence,
+}
+
+impl RecoveryProfileBackedNativeHnsReadRuntime {
+    #[cfg(test)]
+    pub(crate) fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
+        self.inner.shares_store_authority(store)
+    }
+
+    pub(crate) fn admits_wallet_request(request: &WalletRequest) -> bool {
+        admits_wallet_request(request)
+    }
+
+    fn revalidate_profile_fence(&self) -> Result<(), ServiceFailure> {
+        match require_active_profile(
+            &self.inner.store,
+            self.profile_fence,
+            NativeHnsReadBootstrapMode::PersistedRecoveryReadOnly,
+        ) {
+            Ok(loaded) => {
+                drop(loaded);
+                Ok(())
+            }
+            Err(_) => {
+                let _ = self.inner.store.lock();
+                Err(profile_fence_changed())
+            }
+        }
+    }
+}
+
+impl Drop for RecoveryProfileBackedNativeHnsReadRuntime {
+    fn drop(&mut self) {
+        let _ = self.inner.store.lock();
+    }
+}
+
+impl ServiceRuntime for RecoveryProfileBackedNativeHnsReadRuntime {
+    fn capabilities(&self) -> BTreeSet<ServiceCapability> {
+        BTreeSet::from([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::HnsReadOperationsV1,
+        ])
+    }
+
+    fn admit_service_request(&self, request: &ServiceRequest) -> Result<(), ServiceFailure> {
+        match request {
+            ServiceRequest::Wallet { request } if Self::admits_wallet_request(request) => Ok(()),
+            ServiceRequest::Wallet { .. } => Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            )),
+            _ => Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            )),
+        }
+    }
+
+    fn supports_provider_method(&self, _: ProviderMethod) -> bool {
+        false
+    }
+
+    fn prepare_approval(&mut self, _: &PendingApproval) -> Result<ApprovalSummary, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
+
+    fn execute_provider(&mut self, _: ApprovedCall) -> Result<Value, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::ProviderDispatch,
+        ))
+    }
+
+    fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
+        self.inner.lock_wallet()
+    }
+
+    fn execute_wallet(&mut self, request: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
+        if !Self::admits_wallet_request(&request) {
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ));
+        }
+        self.revalidate_profile_fence()?;
+        let response = self.inner.execute_wallet(request);
+        self.revalidate_profile_fence()?;
+        response
+    }
+}
+
+fn admits_wallet_request(request: &WalletRequest) -> bool {
+    matches!(
+        request,
+        WalletRequest::Status
+            | WalletRequest::ListAccounts
+            | WalletRequest::Balance {
+                module: ModuleId::Handshake,
+                ..
+            }
+            | WalletRequest::ReceiveTarget {
+                module: ModuleId::Handshake,
+                ..
+            }
+            | WalletRequest::TransactionHistory {
+                module: ModuleId::Handshake,
+                ..
+            }
+            | WalletRequest::ModuleStatus {
+                module: ModuleId::Handshake,
+            }
+    )
 }
 
 impl Drop for ProfileBackedNativeHnsReadRuntime {
@@ -281,14 +393,13 @@ impl WalletService<SharedWalletStore, ProfileBackedNativeHnsReadRuntime> {
         }
 
         store.unlock(passphrase.expose_secret())?;
-        let loaded = require_active_profile(&store, fence)?;
+        let loaded =
+            require_active_profile(&store, fence, NativeHnsReadBootstrapMode::OrdinaryNonValue)?;
         let config = loaded.profile.into_service_config()?;
         store.lock()?;
 
-        let base = WalletService::<SharedWalletStore, PersistentNativeHnsReadRuntime>::new_persistent_native_hns_reads(
-            store.clone(),
-            config,
-        )?;
+        let base = WalletService::<SharedWalletStore, PersistentNativeHnsReadRuntime>::
+            new_persistent_native_hns_reads(store.clone(), config)?;
         let mut service = Self::from_base(base, fence);
         service
             .runtime
@@ -297,7 +408,8 @@ impl WalletService<SharedWalletStore, ProfileBackedNativeHnsReadRuntime> {
             .map_err(|_| NativeHnsReadBootstrapError::InternalUnlock)?;
         service.rotate_wallet_session(false)?;
 
-        let reloaded = require_active_profile(&store, fence)?;
+        let reloaded =
+            require_active_profile(&store, fence, NativeHnsReadBootstrapMode::OrdinaryNonValue)?;
         drop(reloaded);
         Ok(service)
     }
@@ -339,6 +451,109 @@ impl WalletService<SharedWalletStore, ProfileBackedNativeHnsReadRuntime> {
     }
 }
 
+impl WalletService<SharedWalletStore, RecoveryProfileBackedNativeHnsReadRuntime> {
+    /// Explicitly reopen an already-persisted flagged account/profile through
+    /// the closed six-read recovery surface.
+    ///
+    /// This does not provision a profile or account, and it rejects an absent,
+    /// non-flagged, structurally invalid, mismatched, stale, or revoked record.
+    /// The selected value/settlement bits remain exact identity only. Provider
+    /// dispatch, current-lock/Denuo authority, signing, import/export,
+    /// workflows, value movement, and lifecycle requests remain unreachable.
+    pub fn new_recovery_read_only_profile_backed_native_hns_reads(
+        store: SharedWalletStore,
+        passphrase: NativeHnsReadBootstrapPassphrase,
+        fence: NativeHnsReadProfileFence,
+    ) -> Result<Self, NativeHnsReadBootstrapError> {
+        let relock_store = store.clone();
+        let result = Self::bootstrap(store, &passphrase, fence);
+        if result.is_err() {
+            relock_store.lock()?;
+        }
+        result
+    }
+
+    fn bootstrap(
+        store: SharedWalletStore,
+        passphrase: &NativeHnsReadBootstrapPassphrase,
+        fence: NativeHnsReadProfileFence,
+    ) -> Result<Self, NativeHnsReadBootstrapError> {
+        if fence.revision == 0 {
+            return Err(NativeHnsReadBootstrapError::InvalidProfileFence);
+        }
+        if !store.is_locked()? {
+            return Err(ServiceError::PersistentStoreMustStartLocked.into());
+        }
+
+        store.unlock(passphrase.expose_secret())?;
+        let loaded = require_active_profile(
+            &store,
+            fence,
+            NativeHnsReadBootstrapMode::PersistedRecoveryReadOnly,
+        )?;
+        let config = loaded
+            .profile
+            .into_persisted_recovery_read_only_service_config()?;
+        store.lock()?;
+
+        let base = WalletService::<
+            SharedWalletStore,
+            PersistentNativeRecoveryReadOnlyRuntime,
+        >::new_persisted_recovery_read_only_native_hns_reads(store.clone(), config)?;
+        let mut service = Self::from_base(base, fence);
+        service
+            .runtime
+            .inner
+            .unlock(passphrase.expose_secret())
+            .map_err(|_| NativeHnsReadBootstrapError::InternalUnlock)?;
+        service.rotate_wallet_session(false)?;
+
+        let reloaded = require_active_profile(
+            &store,
+            fence,
+            NativeHnsReadBootstrapMode::PersistedRecoveryReadOnly,
+        )?;
+        drop(reloaded);
+        Ok(service)
+    }
+
+    fn from_base(
+        base: WalletService<SharedWalletStore, PersistentNativeRecoveryReadOnlyRuntime>,
+        profile_fence: NativeHnsReadProfileFence,
+    ) -> Self {
+        let WalletService {
+            provider,
+            runtime,
+            service_session_id,
+            wallet_session_id,
+            mut capabilities,
+            session,
+            seen_request_ids,
+            request_order,
+            pending,
+            event_sequences,
+        } = base;
+        capabilities.remove(&ServiceCapability::ProviderDispatch);
+        capabilities.remove(&ServiceCapability::ValueMovement);
+        capabilities.remove(&ServiceCapability::BrowserIntegration);
+        Self {
+            provider,
+            runtime: RecoveryProfileBackedNativeHnsReadRuntime {
+                inner: runtime,
+                profile_fence,
+            },
+            service_session_id,
+            wallet_session_id,
+            capabilities,
+            session,
+            seen_request_ids,
+            request_order,
+            pending,
+            event_sequences,
+        }
+    }
+}
+
 fn profile_fence_changed() -> ServiceFailure {
     ServiceFailure {
         code: ServiceErrorCode::PersistenceFailure,
@@ -350,8 +565,14 @@ fn profile_fence_changed() -> ServiceFailure {
 fn require_active_profile(
     store: &SharedWalletStore,
     expected: NativeHnsReadProfileFence,
+    mode: NativeHnsReadBootstrapMode,
 ) -> Result<crate::StoredNativeHnsReadProfile, NativeHnsReadBootstrapError> {
-    let loaded = match load_native_hns_read_profile(store)? {
+    let loaded = match match mode {
+        NativeHnsReadBootstrapMode::OrdinaryNonValue => load_native_hns_read_profile(store),
+        NativeHnsReadBootstrapMode::PersistedRecoveryReadOnly => {
+            load_persisted_recovery_read_only_native_hns_profile(store)
+        }
+    }? {
         LoadedNativeHnsReadProfile::Absent => {
             return Err(NativeHnsReadBootstrapError::ProfileAbsent);
         }

@@ -16,6 +16,36 @@ pub const NATIVE_HNS_READ_PROFILE_SCHEMA_VERSION: u16 = 1;
 /// The only record identifier admitted in the native HNS read-profile namespace.
 pub const NATIVE_HNS_READ_PROFILE_ID: &[u8] = b"native-hns-read-profile-v1";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeHnsReadProfileValidation {
+    OrdinaryNonValue,
+    PersistedRecoveryReadOnly,
+}
+
+impl NativeHnsReadProfileValidation {
+    fn validate_account(self, account: &HnsRuntimeConfig) -> Result<(), NativeHnsReadProfileError> {
+        match self {
+            Self::OrdinaryNonValue => {
+                account
+                    .validate()
+                    .map_err(|_| NativeHnsReadProfileError::InvalidConfiguration)?;
+                if account.value_operations_enabled || account.settlement_enabled {
+                    return Err(NativeHnsReadProfileError::InvalidConfiguration);
+                }
+            }
+            Self::PersistedRecoveryReadOnly => {
+                account
+                    .validate_structure()
+                    .map_err(|_| NativeHnsReadProfileError::InvalidConfiguration)?;
+                if !account.value_operations_enabled && !account.settlement_enabled {
+                    return Err(NativeHnsReadProfileError::InvalidConfiguration);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Wallet-owned configuration for a future trusted native HNS read service.
 ///
 /// The profile is deliberately non-cloneable and non-serializable through its
@@ -83,7 +113,22 @@ impl NativeHnsReadProfile {
     pub fn into_service_config(
         self,
     ) -> Result<PersistentNativeHnsReadConfig, NativeHnsReadProfileError> {
-        self.validate()?;
+        self.into_service_config_with_validation(NativeHnsReadProfileValidation::OrdinaryNonValue)
+    }
+
+    pub(crate) fn into_persisted_recovery_read_only_service_config(
+        self,
+    ) -> Result<PersistentNativeHnsReadConfig, NativeHnsReadProfileError> {
+        self.into_service_config_with_validation(
+            NativeHnsReadProfileValidation::PersistedRecoveryReadOnly,
+        )
+    }
+
+    fn into_service_config_with_validation(
+        self,
+        validation: NativeHnsReadProfileValidation,
+    ) -> Result<PersistentNativeHnsReadConfig, NativeHnsReadProfileError> {
+        self.validate_with(validation)?;
         let node_rpc = HnsNodeRpcConfig::new(
             self.node_endpoint,
             self.node_authorization.expose_secret().to_owned(),
@@ -97,12 +142,20 @@ impl NativeHnsReadProfile {
     }
 
     fn validate(&self) -> Result<(), NativeHnsReadProfileError> {
+        self.validate_with(NativeHnsReadProfileValidation::OrdinaryNonValue)
+    }
+
+    fn validate_with(
+        &self,
+        validation: NativeHnsReadProfileValidation,
+    ) -> Result<(), NativeHnsReadProfileError> {
         validate_profile_parts(
             self.schema_version,
             &self.account,
             self.node_endpoint,
             self.node_authorization.expose_secret(),
             &self.account_label,
+            validation,
         )
     }
 }
@@ -189,7 +242,7 @@ pub fn provision_native_hns_read_profile(
     store.try_with_store_mut(|wallet| {
         authenticate_exact_account(wallet, profile.account())?;
         let existing = wallet.native_hns_read_profiles::<PersistedNativeHnsReadProfile>(2)?;
-        validate_singleton(&existing)?;
+        validate_singleton(&existing, NativeHnsReadProfileValidation::OrdinaryNonValue)?;
         validate_update_fence(existing.first(), expected_revision, updated_at_unix)?;
         wallet
             .save_native_hns_read_profile(
@@ -208,9 +261,28 @@ pub fn provision_native_hns_read_profile(
 pub fn load_native_hns_read_profile(
     store: &SharedWalletStore,
 ) -> Result<LoadedNativeHnsReadProfile, NativeHnsReadProfileError> {
+    load_native_hns_read_profile_with_validation(
+        store,
+        NativeHnsReadProfileValidation::OrdinaryNonValue,
+    )
+}
+
+pub(crate) fn load_persisted_recovery_read_only_native_hns_profile(
+    store: &SharedWalletStore,
+) -> Result<LoadedNativeHnsReadProfile, NativeHnsReadProfileError> {
+    load_native_hns_read_profile_with_validation(
+        store,
+        NativeHnsReadProfileValidation::PersistedRecoveryReadOnly,
+    )
+}
+
+fn load_native_hns_read_profile_with_validation(
+    store: &SharedWalletStore,
+    validation: NativeHnsReadProfileValidation,
+) -> Result<LoadedNativeHnsReadProfile, NativeHnsReadProfileError> {
     store.try_with_store_mut(|wallet| {
         let mut records = wallet.native_hns_read_profiles::<PersistedNativeHnsReadProfile>(2)?;
-        validate_singleton(&records)?;
+        validate_singleton(&records, validation)?;
         let Some(record) = records.pop() else {
             return Ok(LoadedNativeHnsReadProfile::Absent);
         };
@@ -231,7 +303,7 @@ pub fn load_native_hns_read_profile(
                     node_authorization,
                     account_label,
                 };
-                profile.validate()?;
+                profile.validate_with(validation)?;
                 authenticate_exact_account(wallet, profile.account())?;
                 Ok(LoadedNativeHnsReadProfile::Active(
                     StoredNativeHnsReadProfile {
@@ -407,7 +479,10 @@ impl PersistedHnsRuntimeConfig {
 }
 
 impl PersistedNativeHnsReadProfile {
-    fn validate(&self) -> Result<(), NativeHnsReadProfileError> {
+    fn validate_with(
+        &self,
+        validation: NativeHnsReadProfileValidation,
+    ) -> Result<(), NativeHnsReadProfileError> {
         match self {
             Self::Active {
                 schema_version,
@@ -423,6 +498,7 @@ impl PersistedNativeHnsReadProfile {
                     *node_endpoint,
                     node_authorization.expose_secret(),
                     account_label,
+                    validation,
                 )
             }
             Self::Revoked { schema_version } => validate_schema(*schema_version),
@@ -432,10 +508,11 @@ impl PersistedNativeHnsReadProfile {
 
 fn validate_singleton(
     records: &[StoredEntity<PersistedNativeHnsReadProfile>],
+    validation: NativeHnsReadProfileValidation,
 ) -> Result<(), NativeHnsReadProfileError> {
     validate_singleton_identity(records)?;
     if let Some(record) = records.first() {
-        record.value.validate()?;
+        record.value.validate_with(validation)?;
     }
     Ok(())
 }
@@ -478,21 +555,18 @@ fn validate_profile_parts(
     node_endpoint: SocketAddr,
     node_authorization: &str,
     account_label: &str,
+    validation: NativeHnsReadProfileValidation,
 ) -> Result<(), NativeHnsReadProfileError> {
     validate_schema(schema_version)?;
-    account
-        .validate()
-        .map_err(|_| NativeHnsReadProfileError::InvalidConfiguration)?;
-    if account.value_operations_enabled
-        || account.settlement_enabled
-        // Escaped JSON strings can pass through a serde_json parser scratch
-        // buffer before `SecretString` owns the decoded allocation. Restrict
-        // the persisted profile to visible ASCII Authorization values whose
-        // JSON representation is byte-for-byte escape-free.
-        || node_authorization
-            .as_bytes()
-            .iter()
-            .any(|byte| matches!(*byte, b'"' | b'\\'))
+    validation.validate_account(account)?;
+    // Escaped JSON strings can pass through a serde_json parser scratch buffer
+    // before `SecretString` owns the decoded allocation. Restrict the persisted
+    // profile to visible ASCII Authorization values whose JSON representation
+    // is byte-for-byte escape-free.
+    if node_authorization
+        .as_bytes()
+        .iter()
+        .any(|byte| matches!(*byte, b'"' | b'\\'))
         || account_label.is_empty()
         || account_label.len() > MAX_PUBLIC_STRING_BYTES
         || !is_printable_ascii(account_label)

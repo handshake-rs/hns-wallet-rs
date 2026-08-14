@@ -72,6 +72,15 @@ parser scratch allocations. This does not qualify a live node credential,
 exclusive cross-process lease, one-shot secret transport, or read operation,
 and changes no provider, browser, value, or publication gate.
 
+The historical-flag recovery tranche adds focused local source regressions for
+mainnet/testnet value and settlement identity, ordinary/full-constructor
+rejection, exact account/profile/revision matching, restart, chain/mempool and
+live-revocation fences, an exact capability set without provider dispatch or
+persistent permissions, and a real protected Shakedex anchor/high-water pair
+whose authenticated recovery read leaves bytes and revisions unchanged while
+missing/corrupt pairs fail closed. This evidence does not qualify installed
+transport, provider exposure, signing, settlement, value, or any release gate.
+
 The later operation-level read tranche adds local source regressions for the
 closed `hnsReadOperationsV1` wire marker, its required `walletOperations`
 dependency, the dedicated six-request host admission path, and strict

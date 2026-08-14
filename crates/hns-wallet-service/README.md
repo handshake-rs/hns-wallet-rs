@@ -58,6 +58,27 @@ delivery outside argv/environment/native messages, process termination on
 lease loss, artifact admission, and installed-product qualification remain
 downstream responsibilities.
 
+An explicit
+`WalletService::new_recovery_read_only_profile_backed_native_hns_reads`
+constructor can reopen only an exact already-persisted schema-v1 profile and
+account whose historical configuration contains at least one value/settlement
+flag. There is no typed native-read-profile provisioning API for such a
+profile, and the recovery constructor never provisions. Direct generic
+low-level store mutation is privileged out-of-band state construction, not
+recovery authority. The constructor returns a distinct
+`RecoveryProfileBackedNativeHnsReadRuntime`, not the
+provider-capable ordinary base. Its flags remain identity only, its service
+advertises neither provider dispatch nor persistent permissions nor value, and
+its complete request boundary admits the same exact six non-signing reads.
+Absent, non-flagged, mismatched, stale, revoked, or structurally invalid state
+fails and relocks. Ordinary profile load/bootstrap and the full native-read
+constructor continue to reject these flags under the unchanged production
+gates. Admitted synchronization may update WalletAccount scan/index metadata
+without changing its configuration, create or replace the ordinary scanner's
+derived-address/cache rows, and write or clear its discovery fence. It cannot
+create the account/profile/configuration or any allocation, signer, workflow,
+or value authority.
+
 The library-only persistent HNS read composition also offers one explicitly
 trusted-native synchronization entry point for `hns-wallet-mobile`. It returns
 the already-bounded core snapshot so the mobile crate can immediately build its

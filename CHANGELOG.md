@@ -18,6 +18,12 @@ boundary:
 - a concrete fail-closed native HNS read-service constructor which binds an
   exact non-value account, authenticated loopback node RPC, and the literal
   shared store authority without enabling browser integration or value;
+- an explicit recovery-only core and profile-backed service opening path for an
+  exact already-persisted HNS account/profile with historical value or
+  settlement flags. The flags remain identity only; ordinary/full constructors
+  still reject them, while the distinct recovery service exposes exactly six
+  non-signing reads with no provider, persistent-permission, current-lock,
+  Denuo, signing, workflow, lifecycle, or value capability;
 - atomic single-account mobile create, restore, open, unlock, lock, and status
   control without a WebView or value surface;
 - an injectable `MobileHnsReadController` which transfers or opens one exact
