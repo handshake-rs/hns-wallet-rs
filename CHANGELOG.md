@@ -61,7 +61,12 @@ boundary:
   offer for later use. The same runtime admits signed cancellation tombstones
   through an exact persisted-listing/account-network/trusted-time fence without
   requiring a still-live lock; this negative path performs no node call, keeps
-  exact restart/expiry retries revision-stable, and changes no release gate;
+  exact restart/expiry retries revision-stable, and changes no release gate.
+  Closed canonical V2 board reads cover singular offers, inventory, and a
+  maximum-64 `GetOffers` subset. The batch path preflights its aggregate
+  response, verifies every active row under one coherent HNS current-lock
+  batch, fences the full requested board projection, discards temporary wire
+  bytes, and exposes no transport, publication, signing, or value capability;
 - deletion-protected encrypted HNSA/HNSR publisher high-water state with exact
   route-and-endpoint scope, physically independent endpoint-delegation and
   named-route dimensions, persist-before-use nonzero reservations, safe crash
@@ -101,3 +106,11 @@ CI `31812028843`, including Wallet qualification and RustSec, and CodeQL
 `31812028405` for Actions, JavaScript/TypeScript, Rust, and Python on
 2026-08-14. This is source qualification only and does not satisfy publication,
 installed-product, network, value, or release-gate requirements.
+
+Exact current source `3f52586c8befd85d21df5bb89a7ceb0097a0f2bb` passed complete
+locked CI `31837067925`, including Wallet qualification and RustSec, and
+CodeQL `31837067848` for Actions, JavaScript/TypeScript, Rust, and Python on
+2026-08-14. This descendant includes the coherent current-lock batch and
+closed `GetOffers` response-plan tranches. The result remains source
+qualification only and does not authorize publication, transport, provider,
+signing, settlement, value, or any release-gate change.

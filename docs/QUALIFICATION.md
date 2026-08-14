@@ -155,8 +155,9 @@ and rejects an otherwise valid receipt whose configured magic is one without
 mutating the prepared row. Zero is therefore neither a sentinel nor a
 wildcard; policy fingerprints, receipt signatures, and handoff comparison
 continue to bind its exact four-byte little-endian encoding. No release gate
-changes. The correction passes the full local workspace gate; exact-commit
-CI/CodeQL remains required after commit.
+changes. Exact descendant `2061a27e0358c7f00fcc70497ef97f9b89d569da`
+passed complete locked CI `31818578772` and four-language CodeQL
+`31818578297`; the correction remains source evidence only.
 
 The closed batch-offer board-read tranche adds focused local source
 regressions for canonical V2 `GetOffers`, the wallet/type-5 limit of 64 before
@@ -168,12 +169,14 @@ It also covers shared seller-script deduplication, duplicate underlying names
 failing before backend/clock access, unchanged-board read behavior, exact full
 requested-row and revision races, listing expiry, and unchanged false gates.
 The opaque public projection contains only request ID, board revision, and
-requested/returned counts. This is local source evidence rather than
-exact-commit CI/CodeQL and supplies no transport, provider, publication,
+requested/returned counts. Exact source
+`3f52586c8befd85d21df5bb89a7ceb0097a0f2bb` passed complete locked CI
+`31837067925`, including Wallet qualification and RustSec, and four-language
+CodeQL `31837067848`. This supplies no transport, provider, publication,
 signing, or value qualification.
 
-`9649098`, `bc5901f`, `2229be8`, and `ba9f013` remain exact historical green
-CI/CodeQL baselines.
+`3f52586`, `b8c430d`, `2061a27`, `9649098`, `bc5901f`, `2229be8`, and
+`ba9f013` remain exact historical green CI/CodeQL baselines.
 This repository records no independent security audit, database or resource
 benchmark, multi-process network test, installed-device run, or installed-
 browser wallet run for the package boundary. Downstream candidate source does
