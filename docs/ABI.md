@@ -157,6 +157,11 @@ installed-device qualification. Filesystem paths, process commands, raw signing,
 recovery output, private keys, database keys, preimages, and arbitrary contract
 calls are absent from the protocol.
 
+The encrypted native-HNS-read profile is a wallet library provisioning record,
+not an ABI request, response, capability, or browser message. The checked-in
+subprocess does not load it. Provisioning it therefore does not make any read
+operation or provider available and does not alter the v2 frame vocabulary.
+
 ## Machine-readable contracts
 
 `../abi/contracts-v2.schema.json` is one JSON Schema Draft 2020-12 bundle with

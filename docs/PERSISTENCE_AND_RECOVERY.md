@@ -454,6 +454,43 @@ runtime-selected singleton to equal the persisted permission singleton. The
 checked-in subprocess selects neither HNS composition, and steps 9 through 13
 plus all value supervision remain uncomposed there.
 
+The encrypted `NativeHnsReadProfile` namespace is a library-only provisioning
+input for a future trusted native-read composition. Its fixed schema-v1 record
+atomically stores the exact HNS runtime configuration, literal loopback node
+socket, zeroizing Authorization secret, and display label. The persisted
+Authorization subset excludes JSON quote/backslash escape bytes so decoding
+does not require a non-zeroizing parser scratch copy. Creation and
+rotation use entity revision CAS and reject timestamp rollback; provisioning
+and load additionally require the authenticated sole HNS account and complete
+singleton recovery-seed bootstrap. Load distinguishes an absent namespace, an
+active profile, and a revoked tombstone; it rejects extra/wrong-ID rows,
+ambiguous account state, partial bootstrap, non-loopback endpoints, or either
+value switch. Revocation uses the same exact revision and replaces the active
+record with a secret-free tombstone. Re-provisioning must continue that
+revision/update-time high-water, preventing an in-place revoke/re-provision
+ABA. The record's existence, revision, and update time remain SQLite metadata,
+while its payload is authenticated and encrypted with the
+database/kind/ID/revision/time binding used by other typed
+entities. Loading requires an unlocked store and authenticates the account
+again, but supplies no chain freshness and performs no node call.
+
+Account/seed authentication and profile CAS share one process-local
+`SharedWalletStore` critical section. They are not one cross-process SQLite
+transaction, so an admitted launcher must establish exclusive database
+ownership. A tombstone also does not securely erase older encrypted pages,
+WAL entries, or backups; operational revocation must rotate the node-side
+Authorization credential.
+
+This profile does not change the required startup sequence above. A future
+launcher must exclusively own the database, briefly unlock to authenticate and
+consume the profile, lock before constructing the existing native-read
+service, and require a fresh private-ABI unlock before reads. It must also bind
+the admitted live session to the loaded profile revision and kill or
+revalidate that session on rotation/revocation. The tombstone does not by
+itself terminate a process. The current executable does none of those things,
+and the profile is not authority for a browser,
+provider, signing, value, settlement, or marketplace operation.
+
 The HNS source implements the concrete synchronous authenticated node adapter,
 bounded coin/name/Shakedex-role chain/mempool snapshot reconciliation, and
 prepared-transaction recovery. The learned durable chain epoch,

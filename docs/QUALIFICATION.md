@@ -54,6 +54,17 @@ qualifies a wallet commit nor changes a wallet product gate.
 | Mobile controller | exact `2229be8` CI passed the lifecycle, synchronized-read, same-authority, fresh-read, script-free snapshot, zero-script-query wrong-network, and failure-lock/retry regressions | atomic seed/account bootstrap and source reopen coverage; installed platform restart remains downstream | downstream Android/iOS 0.5.9 candidate source contains JNI/C projection, Keystore/Keychain wrapping, native recovery/read screens, and off-UI-thread calls; no archive-capable production device wallet-index backend, installed-device synchronization, resource benchmark, or production network qualification; the loopback adapter is not device transport | candidate read UI can fail closed around the library projection, but product backend availability remains false; provider/value/HNSA/HNSR/settlement/market unavailable |
 | Browser products | separate repositories | platform integration pending | no installed/signed E2E | unavailable |
 
+The later inert native-HNS-read profile tranche adds local source regressions
+for encrypted-at-rest provisioning, closed nested schema, locked and partial
+bootstrap denial, exact-account matching, concurrent CAS, timestamp rollback,
+restart persistence, deletion-protected revocation tombstones,
+revoke/re-provision ABA prevention, unknown-schema revocation, and public
+non-Serde/non-Clone secret containment. This is not installed-browser or
+desktop-broker evidence. Persisted credentials additionally reject JSON escape
+bytes to avoid non-zeroizing parser scratch allocations. This does not qualify
+a live node credential or read operation, and changes no provider, browser,
+value, or publication gate.
+
 CodeQL passed at exact `2229be8`; `ba9f013` remains the historical baseline.
 This repository records no independent security audit, database or resource
 benchmark, multi-process network test, installed-device run, or installed-

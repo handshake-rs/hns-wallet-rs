@@ -52,6 +52,7 @@ const CHECKPOINT_PENDING_KEY: &str = "plaintext_checkpoint_pending";
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum EntityKind {
     WalletAccount,
+    NativeHnsReadProfile,
     DerivedAddress,
     HnsUtxo,
     HnsTransaction,
@@ -86,6 +87,7 @@ impl EntityKind {
     pub const fn label(self) -> &'static str {
         match self {
             Self::WalletAccount => "wallet_account",
+            Self::NativeHnsReadProfile => "native_hns_read_profile",
             Self::DerivedAddress => "derived_address",
             Self::HnsUtxo => "hns_utxo",
             Self::HnsTransaction => "hns_transaction",
@@ -120,7 +122,8 @@ impl EntityKind {
     const fn deletion_protected(self) -> bool {
         matches!(
             self,
-            Self::HnsShakedexKeyAllocation
+            Self::NativeHnsReadProfile
+                | Self::HnsShakedexKeyAllocation
                 | Self::BitcoinWalletState
                 | Self::BitcoinSwapKeyAllocation
         )
@@ -1164,6 +1167,13 @@ impl WalletStore {
             wallet_accounts,
             delete_wallet_account,
             WalletAccount
+        ),
+        (
+            save_native_hns_read_profile,
+            native_hns_read_profile,
+            native_hns_read_profiles,
+            delete_native_hns_read_profile,
+            NativeHnsReadProfile
         ),
         (
             save_derived_address,

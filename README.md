@@ -60,6 +60,22 @@ service crate also provides one concrete native-launcher constructor which
 wires that same composition to the authenticated loopback RPC backend, the
 production wall clock, and the literal shared store authority. It adds no CLI
 configuration, artifact trust, browser-engine authority, or availability gate.
+An inert provisioning API can now persist one wallet-owned native-read profile
+as an encrypted CAS record. It binds the exact sole non-value HNS account and
+literal loopback endpoint to a zeroizing/redacted node Authorization value and
+a bounded label. Persisted Authorization rejects JSON escape bytes so parsing
+cannot create an unowned plaintext scratch copy. Provisioning and every load
+require unlock, re-authenticate that sole account, and require its complete
+singleton recovery-seed bootstrap.
+Revocation replaces the secret-bearing record with a persistent tombstone, so
+later re-provisioning continues the revision/update-time high-water. The
+checked-in executable does not consume the profile, and rotation/revocation
+does not claim to stop an
+already-running process; trusted unlock transport, profile-revision admission,
+exclusive database ownership, operation-level read qualification, and signed
+browser artifact admission remain required before browser use. Tombstoning is
+not secure erasure from SQLite WALs or backups; node-side credential rotation
+remains required.
 The approval-schema-v3 Names prompt carried by private ABI v2 contains the exact
 sorted canonical name/lowercase-hash set it may grant. The service freezes that
 bounded set before prompting, re-synchronizes at approval, rejects any account

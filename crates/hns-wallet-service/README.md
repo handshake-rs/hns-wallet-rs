@@ -20,6 +20,26 @@ unchanged: launcher configuration, artifact admission, browser-engine
 authority, transport, approval UI, and installed-product qualification remain
 downstream responsibilities.
 
+The library also provides an inert wallet-owned `NativeHnsReadProfile`
+provisioning boundary. One schema-v1 encrypted compare-and-swap entity stores
+an exact non-value HNS account configuration, a literal loopback node socket,
+a zeroizing/redacted escape-free Authorization value, and a bounded display
+label. Provision,
+rotation, and load additionally require the authenticated sole HNS account and
+its complete singleton recovery-seed bootstrap; load is available only after
+wallet unlock and re-authenticates the account every time. This is startup
+configuration, not browser, provider, chain, or live-session authority. No
+checked-in executable consumes it. Revocation persists a secret-free tombstone
+so a later re-provision cannot reset the authenticated revision/update-time
+high-water. Account/seed authentication and profile CAS share one
+process-local store critical section; a separate process still requires
+exclusive database ownership. Tombstoning is not secure erasure from SQLite
+WALs or backups, so revocation also requires rotating the node credential. A
+future trusted launcher must lock the store again before service construction,
+deliver unlock outside argv and the environment, revalidate the profile
+revision around admission, and terminate an active service when rotating or
+revoking it.
+
 The library-only persistent HNS read composition also offers one explicitly
 trusted-native synchronization entry point for `hns-wallet-mobile`. It returns
 the already-bounded core snapshot so the mobile crate can immediately build its

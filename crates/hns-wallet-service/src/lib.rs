@@ -1,6 +1,8 @@
 #![doc = "Private wallet service composition without browser-engine policy."]
 #![forbid(unsafe_code)]
 
+mod native_read_profile;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use hns_wallet_ffi::{
@@ -31,6 +33,13 @@ use hns_wallet_types::{
 };
 use serde_json::{Value, json};
 use thiserror::Error;
+
+pub use native_read_profile::{
+    LoadedNativeHnsReadProfile, NATIVE_HNS_READ_PROFILE_ID, NATIVE_HNS_READ_PROFILE_SCHEMA_VERSION,
+    NativeHnsReadProfile, NativeHnsReadProfileError, NativeHnsReadProfileMetadata,
+    NativeHnsReadProfileState, StoredNativeHnsReadProfile, load_native_hns_read_profile,
+    provision_native_hns_read_profile, revoke_native_hns_read_profile,
+};
 
 pub const MAX_SEEN_REQUEST_IDS: usize = 4_096;
 pub const MAX_SERVICE_PENDING_APPROVALS: usize = 128;
@@ -406,7 +415,7 @@ pub struct PersistentNativeHnsReadConfig {
     pub account_label: String,
 }
 
-/// Concrete read-only runtime used by a separately trusted native browser
+/// Concrete non-value read runtime used by a separately trusted native browser
 /// launcher. Browser-engine authority and artifact admission remain outside
 /// this crate and are never inferred from constructing this type.
 pub type PersistentNativeHnsReadRuntime =
@@ -3155,6 +3164,42 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn native_hns_profile_store(
+        database_path: &std::path::Path,
+        config: &HnsRuntimeConfig,
+    ) -> SharedWalletStore {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let mut store = WalletStore::create(database_path, PASSPHRASE)
+            .expect("create native HNS profile store");
+        store
+            .initialize_recovery_seed_and_wallet_account(
+                config.wallet_id.as_bytes(),
+                &[0x51_u8; 64],
+                &production_hns_record_id(config),
+                &production_hns_account(config.clone()),
+                1,
+            )
+            .expect("initialize complete native HNS profile bootstrap");
+        SharedWalletStore::new(store)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_hns_profile(
+        config: HnsRuntimeConfig,
+        endpoint: &str,
+        authorization: &str,
+        label: &str,
+    ) -> NativeHnsReadProfile {
+        NativeHnsReadProfile::new(
+            config,
+            endpoint.parse().expect("profile loopback endpoint"),
+            hns_wallet_ffi::SecretString::new(authorization.to_owned()),
+            label.to_owned(),
+        )
+        .expect("valid native HNS read profile")
+    }
+
+    #[cfg(target_os = "linux")]
     fn production_hns_service(
         store: SharedWalletStore,
         config: HnsRuntimeConfig,
@@ -3993,7 +4038,443 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn native_hns_read_constructor_wires_exact_store_and_read_only_surface() {
+    fn native_hns_read_profile_rejects_ambient_or_value_authority() {
+        let account = production_hns_config(9, 0);
+        for endpoint in ["192.0.2.1:14038", "127.0.0.1:0"] {
+            assert!(matches!(
+                NativeHnsReadProfile::new(
+                    account.clone(),
+                    endpoint.parse().expect("socket address"),
+                    hns_wallet_ffi::SecretString::new("Bearer node-authority".to_owned()),
+                    "Handshake".to_owned(),
+                ),
+                Err(NativeHnsReadProfileError::InvalidConfiguration)
+            ));
+        }
+        for authorization in [
+            String::new(),
+            "Bearer\nnode-authority".to_owned(),
+            "Bearer quoted-\"authority\"".to_owned(),
+            "Bearer escaped\\authority".to_owned(),
+            "x".repeat(4_097),
+        ] {
+            assert!(matches!(
+                NativeHnsReadProfile::new(
+                    account.clone(),
+                    "127.0.0.1:14038".parse().expect("loopback socket"),
+                    hns_wallet_ffi::SecretString::new(authorization),
+                    "Handshake".to_owned(),
+                ),
+                Err(NativeHnsReadProfileError::InvalidConfiguration)
+            ));
+        }
+        assert!(matches!(
+            NativeHnsReadProfile::new(
+                account.clone(),
+                "127.0.0.1:14038".parse().expect("loopback socket"),
+                hns_wallet_ffi::SecretString::new("Bearer node-authority".to_owned()),
+                "Handshake\nWallet".to_owned(),
+            ),
+            Err(NativeHnsReadProfileError::InvalidConfiguration)
+        ));
+
+        let mut value_account = account;
+        value_account.value_operations_enabled = true;
+        assert!(matches!(
+            NativeHnsReadProfile::new(
+                value_account,
+                "127.0.0.1:14038".parse().expect("loopback socket"),
+                hns_wallet_ffi::SecretString::new("Bearer node-authority".to_owned()),
+                "Handshake".to_owned(),
+            ),
+            Err(NativeHnsReadProfileError::InvalidConfiguration)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_hns_read_profile_is_encrypted_rotatable_and_restart_durable() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        const FIRST_AUTHORIZATION: &str = "Bearer native-profile-secret-one-63e9";
+        const SECOND_AUTHORIZATION: &str = "Bearer native-profile-secret-two-a1d4";
+        const ACCOUNT_LABEL: &str = "Native Profile HNS 63e9";
+        let directory = native_hns_read_tempdir();
+        let database_path = directory.path().join("wallet.sqlite3");
+        let account = production_hns_config(9, 0);
+        let store = native_hns_profile_store(&database_path, &account);
+
+        assert!(matches!(
+            load_native_hns_read_profile(&store).expect("empty unlocked profile namespace"),
+            LoadedNativeHnsReadProfile::Absent
+        ));
+        store.lock().expect("lock before denial checks");
+        assert!(matches!(
+            load_native_hns_read_profile(&store),
+            Err(NativeHnsReadProfileError::Store(StoreError::Locked))
+        ));
+        assert!(matches!(
+            store.unlock("wrong passphrase"),
+            Err(StoreError::InvalidPassphrase)
+        ));
+        assert!(store.is_locked().expect("failed first unlock stays locked"));
+        store.unlock(PASSPHRASE).expect("unlock profile store");
+
+        let first = native_hns_profile(
+            account.clone(),
+            "127.0.0.1:24191",
+            FIRST_AUTHORIZATION,
+            ACCOUNT_LABEL,
+        );
+        let debug = format!("{first:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(FIRST_AUTHORIZATION));
+        assert_eq!(
+            provision_native_hns_read_profile(&store, 0, &first, 100).expect("provision profile"),
+            1
+        );
+
+        for entry in std::fs::read_dir(directory.path()).expect("profile store files") {
+            let path = entry.expect("profile store entry").path();
+            if !path.is_file() {
+                continue;
+            }
+            let contents = std::fs::read(&path).expect("profile store bytes");
+            for needle in [
+                FIRST_AUTHORIZATION.as_bytes(),
+                b"127.0.0.1:24191".as_slice(),
+                ACCOUNT_LABEL.as_bytes(),
+            ] {
+                assert!(
+                    !contents
+                        .windows(needle.len())
+                        .any(|window| window == needle),
+                    "{} exposed encrypted profile cleartext",
+                    path.display()
+                );
+            }
+        }
+
+        let LoadedNativeHnsReadProfile::Active(loaded) =
+            load_native_hns_read_profile(&store).expect("load profile")
+        else {
+            panic!("stored active profile")
+        };
+        assert_eq!(loaded.revision, 1);
+        assert_eq!(loaded.updated_at_unix, 100);
+        assert_eq!(loaded.profile.account(), &account);
+        assert_eq!(loaded.profile.schema_version(), 1);
+        let config = loaded
+            .profile
+            .into_service_config()
+            .expect("consume profile into service config");
+        assert_eq!(config.account, account);
+        assert_eq!(config.node_rpc.endpoint().to_string(), "127.0.0.1:24191");
+        assert_eq!(config.account_label, ACCOUNT_LABEL);
+        assert!(!format!("{:?}", config.node_rpc).contains(FIRST_AUTHORIZATION));
+
+        let second = native_hns_profile(
+            account.clone(),
+            "[::1]:24192",
+            SECOND_AUTHORIZATION,
+            "Rotated Native Profile",
+        );
+        assert!(matches!(
+            provision_native_hns_read_profile(&store, 1, &second, 99),
+            Err(NativeHnsReadProfileError::TimestampRollback)
+        ));
+        assert_eq!(
+            provision_native_hns_read_profile(&store, 1, &second, 101).expect("CAS rotate profile"),
+            2
+        );
+        assert!(matches!(
+            provision_native_hns_read_profile(&store, 1, &first, 102),
+            Err(NativeHnsReadProfileError::Store(
+                StoreError::StaleRevision {
+                    expected: 1,
+                    actual: 2
+                }
+            ))
+        ));
+
+        store.lock().expect("lock before restart");
+        drop(store);
+        let restarted = SharedWalletStore::new(
+            WalletStore::open(&database_path).expect("reopen native HNS profile store"),
+        );
+        restarted
+            .unlock(PASSPHRASE)
+            .expect("unlock restarted store");
+        let LoadedNativeHnsReadProfile::Active(loaded) =
+            load_native_hns_read_profile(&restarted).expect("load restarted profile")
+        else {
+            panic!("latest active profile revision")
+        };
+        assert_eq!(loaded.revision, 2);
+        assert_eq!(loaded.profile.node_endpoint().to_string(), "[::1]:24192");
+        assert_eq!(loaded.profile.account_label(), "Rotated Native Profile");
+        assert!(matches!(
+            revoke_native_hns_read_profile(&restarted, 2, 100),
+            Err(NativeHnsReadProfileError::TimestampRollback)
+        ));
+        assert_eq!(
+            revoke_native_hns_read_profile(&restarted, 2, 102).expect("CAS revoke profile"),
+            3
+        );
+        let LoadedNativeHnsReadProfile::Revoked(revoked) =
+            load_native_hns_read_profile(&restarted).expect("load revoked profile")
+        else {
+            panic!("revoked profile tombstone")
+        };
+        assert_eq!(
+            revoked,
+            NativeHnsReadProfileMetadata {
+                revision: 3,
+                state: NativeHnsReadProfileState::Revoked,
+                updated_at_unix: 102,
+            }
+        );
+        assert!(matches!(
+            restarted.with_store_mut(
+                |wallet| wallet.delete_native_hns_read_profile(NATIVE_HNS_READ_PROFILE_ID, 3,)
+            ),
+            Err(StoreError::ProtectedEntity)
+        ));
+        assert!(matches!(
+            revoke_native_hns_read_profile(&restarted, 2, 103),
+            Err(NativeHnsReadProfileError::Store(
+                StoreError::StaleRevision {
+                    expected: 2,
+                    actual: 3
+                }
+            ))
+        ));
+        assert!(matches!(
+            provision_native_hns_read_profile(&restarted, 0, &first, 103),
+            Err(NativeHnsReadProfileError::Store(
+                StoreError::StaleRevision {
+                    expected: 0,
+                    actual: 3
+                }
+            ))
+        ));
+        assert!(matches!(
+            provision_native_hns_read_profile(&restarted, 3, &first, 101),
+            Err(NativeHnsReadProfileError::TimestampRollback)
+        ));
+        assert_eq!(
+            provision_native_hns_read_profile(&restarted, 3, &first, 103)
+                .expect("re-provision from tombstone"),
+            4
+        );
+        let LoadedNativeHnsReadProfile::Active(reprovisioned) =
+            load_native_hns_read_profile(&restarted).expect("load re-provisioned profile")
+        else {
+            panic!("re-provisioned active profile")
+        };
+        assert_eq!(reprovisioned.revision, 4);
+        assert_eq!(reprovisioned.updated_at_unix, 103);
+        assert_eq!(
+            revoke_native_hns_read_profile(&restarted, 4, 104)
+                .expect("revoke re-provisioned profile"),
+            5
+        );
+        assert_eq!(
+            revoke_native_hns_read_profile(&restarted, 5, 105)
+                .expect("advance an already-revoked tombstone"),
+            6
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_hns_read_profile_cas_has_one_concurrent_winner() {
+        let directory = native_hns_read_tempdir();
+        let account = production_hns_config(9, 0);
+        let store = native_hns_profile_store(&directory.path().join("wallet.sqlite3"), &account);
+        let initial = native_hns_profile(
+            account.clone(),
+            "127.0.0.1:24191",
+            "Bearer initial-profile",
+            "Handshake",
+        );
+        assert_eq!(
+            provision_native_hns_read_profile(&store, 0, &initial, 1).expect("initial profile"),
+            1
+        );
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for (port, timestamp) in [(24192_u16, 2_u64), (24193, 3)] {
+            let worker_store = store.clone();
+            let worker_barrier = barrier.clone();
+            let worker_account = account.clone();
+            workers.push(std::thread::spawn(move || {
+                let profile = native_hns_profile(
+                    worker_account,
+                    &format!("127.0.0.1:{port}"),
+                    &format!("Bearer concurrent-{port}"),
+                    "Handshake",
+                );
+                worker_barrier.wait();
+                provision_native_hns_read_profile(&worker_store, 1, &profile, timestamp)
+            }));
+        }
+        barrier.wait();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("profile worker"))
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok(2)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Err(NativeHnsReadProfileError::Store(
+                            StoreError::StaleRevision {
+                                expected: 1,
+                                actual: 2
+                            }
+                        ))
+                    )
+                })
+                .count(),
+            1
+        );
+        let LoadedNativeHnsReadProfile::Active(winner) =
+            load_native_hns_read_profile(&store).expect("load winning profile")
+        else {
+            panic!("winning active profile")
+        };
+        assert_eq!(winner.revision, 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_hns_read_profile_rejects_ambiguous_or_partial_wallet_state() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let directory = native_hns_read_tempdir();
+        let account = production_hns_config(9, 0);
+        let partial = production_hns_store(
+            &directory.path().join("partial.sqlite3"),
+            std::slice::from_ref(&account),
+        );
+        partial.unlock(PASSPHRASE).expect("unlock partial store");
+        let profile = native_hns_profile(
+            account.clone(),
+            "127.0.0.1:24191",
+            "Bearer partial-profile",
+            "Handshake",
+        );
+        assert!(matches!(
+            provision_native_hns_read_profile(&partial, 0, &profile, 1),
+            Err(NativeHnsReadProfileError::AccountMismatch)
+        ));
+
+        let complete =
+            native_hns_profile_store(&directory.path().join("ambiguous.sqlite3"), &account);
+        let second = production_hns_config(10, 1);
+        complete
+            .with_store_mut(|wallet| {
+                wallet
+                    .save_wallet_account(
+                        &production_hns_record_id(&second),
+                        0,
+                        &production_hns_account(second),
+                        2,
+                    )
+                    .map(|_| ())
+            })
+            .expect("persist ambiguous second account");
+        assert!(matches!(
+            provision_native_hns_read_profile(&complete, 0, &profile, 2),
+            Err(NativeHnsReadProfileError::AccountMismatch)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_hns_read_profile_rejects_unknown_schema_and_wrong_record_id() {
+        let directory = native_hns_read_tempdir();
+        let account = production_hns_config(9, 0);
+        let store = native_hns_profile_store(&directory.path().join("wallet.sqlite3"), &account);
+        let valid_record = json!({
+            "state": "active",
+            "schemaVersion": 1,
+            "account": account,
+            "nodeEndpoint": "127.0.0.1:24191",
+            "nodeAuthorization": "Bearer schema-profile",
+            "accountLabel": "Handshake",
+        });
+        let mut unknown_account_field = valid_record.clone();
+        unknown_account_field["account"]["future_authority"] = json!(true);
+        store
+            .with_store_mut(|wallet| {
+                wallet
+                    .save_native_hns_read_profile(b"wrong-profile-id", 0, &valid_record, 1)
+                    .map(|_| ())
+            })
+            .expect("persist wrong profile ID");
+        assert!(matches!(
+            load_native_hns_read_profile(&store),
+            Err(NativeHnsReadProfileError::SingletonConflict)
+        ));
+
+        let unknown_store = native_hns_profile_store(
+            &directory.path().join("unknown-schema.sqlite3"),
+            &production_hns_config(9, 0),
+        );
+        let mut unknown = valid_record;
+        unknown["schemaVersion"] = json!(2);
+        unknown_store
+            .with_store_mut(|wallet| {
+                wallet
+                    .save_native_hns_read_profile(NATIVE_HNS_READ_PROFILE_ID, 0, &unknown, 2)
+                    .map(|_| ())
+            })
+            .expect("persist unknown profile schema");
+        assert!(matches!(
+            load_native_hns_read_profile(&unknown_store),
+            Err(NativeHnsReadProfileError::UnsupportedSchema)
+        ));
+        assert_eq!(
+            revoke_native_hns_read_profile(&unknown_store, 1, 3)
+                .expect("revoke unknown profile schema without decoding its secret"),
+            2
+        );
+
+        let nested_unknown_store = native_hns_profile_store(
+            &directory.path().join("unknown-account-field.sqlite3"),
+            &production_hns_config(9, 0),
+        );
+        nested_unknown_store
+            .with_store_mut(|wallet| {
+                wallet
+                    .save_native_hns_read_profile(
+                        NATIVE_HNS_READ_PROFILE_ID,
+                        0,
+                        &unknown_account_field,
+                        2,
+                    )
+                    .map(|_| ())
+            })
+            .expect("persist unknown nested account field");
+        assert!(matches!(
+            load_native_hns_read_profile(&nested_unknown_store),
+            Err(NativeHnsReadProfileError::Store(StoreError::Json(_)))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_hns_read_constructor_wires_exact_store_and_non_value_surface() {
         let directory = native_hns_read_tempdir();
         let account = production_hns_config(9, 0);
         let store = production_hns_store(
