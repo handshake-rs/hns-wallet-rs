@@ -78,6 +78,15 @@ control executable do not. This is contract/source evidence, not a native
 launcher, installed extension, signed artifact, live node, or availability
 qualification. Closed-enum ABI-v2 consumers must adopt the marker in lockstep.
 
+Exact local source commit `77d891cf320f83ecb580e378d1987b3048c5c9ad`
+adds schema-v3 Denuo relay-acceptance persistence. Its 24 Shakedex library
+tests passed again from an isolated clean checkout with the concurrent wallet
+publisher files absent; focused warning-denied Clippy and rustdoc also passed.
+That evidence covers canonical endpoint signatures, exact receipt replay and
+conflict, schema-v1/v2 migration denial, and restart self-validation only. It
+is not hosted CI, CodeQL, normalized packaging, live relay/HRM/HNSA authority,
+board currentness, installed-product, or value-gate qualification.
+
 CodeQL passed at exact `2229be8`; `ba9f013` remains the historical baseline.
 This repository records no independent security audit, database or resource
 benchmark, multi-process network test, installed-device run, or installed-

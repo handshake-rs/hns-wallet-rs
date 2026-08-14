@@ -193,7 +193,7 @@ encrypting another record. No broader store-boundary redesign is part of this
 tranche.
 
 The outbox retains at most 1,024 entries, limits each exact envelope to 16 KiB,
-and rejects an aggregate serialized form above 512 KiB. Schema v2 selects due
+and rejects an aggregate serialized form above 512 KiB. Schema v3 selects due
 entries deterministically by due time, creation time, then envelope ID, and
 permits at most one aggregate-wide `HandoffPrepared` row. The attempt ID binds
 the exact envelope ID, original request ID, next failure ordinal, and
@@ -210,12 +210,28 @@ auto-resends it; an explicit correlated recovery call records one failure and
 schedules the identical envelope and request ID. Failure 64 becomes terminal
 `Exhausted`. Schema-v1 rows are validated in place and migrate on their next
 mutating save. A schema-v1 `Acknowledged` row remains immutable terminal legacy
-state; schema v2 has no API that can create acknowledgement or claim remote
-acceptance. This boundary performs no network I/O, peer discovery, publication,
-transport acknowledgement, or gate change. A future authenticated transport
-adapter must preserve the exact stored bytes, supply correlated acceptance
-evidence, and reacquire fresh current listing/lock/network/time authority before
-sending.
+state. Schema-v2 rows may retain a prepared handoff, but they cannot inject
+either that legacy acknowledgement or schema-v3 `RelayAccepted` state.
+
+Schema v3 can move one exact prepared handoff to terminal `RelayAccepted` only
+with a bounded, canonically encoded, strict-DER low-S secp256k1 receipt signed
+by the configured HNSA endpoint key. The receipt binds the network, exact HRM
+root tuple, HNSA service/delegation/endpoint identifiers, caller-owned nonzero
+Denuo application-profile ID, endpoint validity, maximum receipt lifetime,
+attempt, request, content identity, and exact-envelope digest. The complete
+policy and receipt bytes are encrypted with the row and re-parsed, exactly
+re-encoded, fingerprinted, lifetime-checked, and signature-verified after every
+restart. An exact retry returns the existing terminal snapshot without a
+revision change; a different valid receipt conflicts with the first terminal
+receipt.
+
+This is wallet-defined relay transport evidence only. It does not establish a
+current HRM/HNSA authority, board inclusion or currentness, live chain or quote
+authority, propagation, or permission to move value. The boundary still
+performs no network I/O, peer discovery, publication, or gate change. A future
+transport adapter must construct the policy from retained current HRM/HNSA
+authority, preserve the exact stored bytes, and reacquire fresh current
+listing/lock/network/time authority before any dependent use.
 
 Three compile-time gates are immutable and `false`:
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,

@@ -43,7 +43,14 @@ independently disabled.
   a pruned round hash/ID leaves duplicate detection. Full retained-row restart
   validation still supplies neither a live chain anchor nor quote/value
   authority, and it does not detect rollback of the complete authenticated
-  database snapshot.
+  database snapshot. The schema-v3 publication outbox can separately retain a
+  canonical endpoint-signed receipt for one exact prepared envelope. Its full
+  wallet-supplied HRM/HNSA policy, endpoint window, maximum lifetime, exact
+  handoff identity, and signature are revalidated after restart, but the
+  receipt proves only that configured endpoint accepted those bytes. It does
+  not prove that the HRM/HNSA lineage is current, that a board included or
+  retained the listing, that the lock remains unspent, or that any price or
+  value action is authorized.
 - Bitcoin production synchronization has one backend: Kyoto direct P2P with
   BIP157/158. There is no trusted indexer fallback.
 - Handshake node evidence crosses one authenticated loopback HTTP/1.1 boundary.
