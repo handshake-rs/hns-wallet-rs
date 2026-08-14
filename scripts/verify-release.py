@@ -15,10 +15,12 @@ from pathlib import Path
 
 REPOSITORY = "https://github.com/handshake-rs/hns-wallet-rs"
 PROTOCOL_REPOSITORY = "https://github.com/handshake-rs/hns-rs.git"
-PROTOCOL_REVISION = "b24b66c382de53330ec21dd3137e056a2bea3e2d"
-PROTOCOL_VERSION = "=0.2.0"
+PROTOCOL_REVISION = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+PROTOCOL_VERSION = "=0.3.0"
 PROTOCOL_PUBLIC_PACKAGES = (
     "hns-encoding",
+    "hns-rollback-journal",
+    "hns-hrm",
     "hns-primitives",
     "hns-covenants",
     "hns-dns-relay-protocol",
@@ -407,7 +409,7 @@ def verify_protocol_source(repo: Path) -> None:
 
     release_document = (repo / "docs/releasing.md").read_text(encoding="utf-8")
     if PROTOCOL_REVISION not in release_document:
-        fail("docs/releasing.md omits the qualified protocol revision")
+        fail("docs/releasing.md omits the pinned protocol revision")
     if f"`hns-rs` `{PROTOCOL_VERSION.removeprefix('=')}`" not in release_document:
         fail("docs/releasing.md omits the required protocol package version")
 

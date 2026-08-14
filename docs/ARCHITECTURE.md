@@ -19,10 +19,14 @@ hostile website
 Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
 proofs, signed fixed-price listings/cancellations, Denuo name-market envelopes,
 and zero-ID price-round gossip remain in `hns-rs`. This workspace consumes the
-required protocol crates from reviewed immutable revision `b24b66c`; its exact
-source and lock coherence are checked before the workspace gate. The wallet
-owns protocol verification, encrypted replay/tombstone board state, and an
-exact-policy-bound price-round cache with predecessor-checkpoint bootstrap,
+required protocol crates as exact `hns-rs` `0.3.0` from reviewed immutable Git
+revision `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`; its exact source and lock
+coherence are checked before the workspace gate. That source is not yet
+published, so irreversible wallet publication must also fail closed until all
+19 current upstream archives are published and provenance-verified at that
+revision. The wallet owns protocol verification, encrypted replay/tombstone
+board state, and an exact-policy-bound price-round cache with predecessor-
+checkpoint bootstrap,
 trusted local `accepted_at_unix`, canonical reporter-aligned durable sequence
 high-watermarks, and a fully validated maximum-128-round suffix. Node indexes
 and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
@@ -52,9 +56,10 @@ release-gate authority.
 | `hns-wallet-testkit` | deterministic non-mainnet fixtures | production configuration |
 
 Every maintained repository keeps its own lockfile, tests, and release. There
-are no sibling-checkout dependencies. A newly added `hns-rs` protocol crate
-must be released or referenced by an immutable commit before a wallet release
-can consume it.
+are no sibling-checkout dependencies. Wallet source may review an `hns-rs`
+protocol crate through one immutable commit, but an irreversible wallet release
+also requires every package in that exact upstream version to be published and
+provenance-verified first.
 
 The machine-readable contract bundle under `abi/` describes strict private
 ABI-v2 JSON payloads, the private capability snapshot, public approval/event
@@ -144,12 +149,13 @@ refreshed quote with `RequiresRebroadcast` before submission, and allows at most
 one full reconciliation and one retry for stale or unavailable quote evidence.
 Confirmed wallet coins retain exact inclusion height and canonical covenant
 bytes through encrypted persistence. Final transactions are checked against
-the ordered reconstructed consensus coins: immutable `hns-script` 0.2 computes
-sigops, policy virtual size, minimum fee, and standard weight/sigop bounds,
-while exact input/output sums independently reproduce actual fee. Legacy or
-mismatched evidence fails closed. This source has not passed consolidated
-wallet qualification, so `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains
-false; no local copy of the node formula is used.
+the ordered reconstructed consensus coins: immutable `hns-script` `0.3.0`
+computes sigops, policy virtual size, minimum fee, and standard weight/sigop
+bounds, while exact input/output sums independently reproduce actual fee.
+Legacy or mismatched evidence fails closed. This source has not passed
+consolidated wallet qualification, so
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains false; no local copy of the
+node formula is used.
 
 Name evidence deliberately preserves the interval-committed Urkel proof/state/
 owner view separately from the node's current state/owner view. The proof root

@@ -8,10 +8,12 @@ compatibility. A separate encrypted aggregate child workflow now coordinates
 post-lock buyer fulfillment, seller recovery, and the seller-script FINALIZE
 that follows either signed TRANSFER parent, but every authorization and
 submission entrypoint remains release-gated. The wallet dependency boundary
-consumes the canonical V2 `hns-swap` and
-`hns-marketplace-protocol` source from the same immutable revision `b24b66c`.
-It does not reproduce listing hashes, signatures, Shakedex scripts, presigns,
-cancellations, or Denuo envelopes.
+consumes canonical V2 `hns-swap` and `hns-marketplace-protocol` as exact
+`hns-rs` `0.3.0` Git source from immutable revision
+`88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`. That source pin is not registry
+publication evidence and changes no release gate. The wallet does not reproduce
+listing hashes, signatures, Shakedex scripts, presigns, cancellations, or Denuo
+envelopes.
 
 The canonical protocol-verification boundary decodes a bounded fixed-price
 listing, requires its exact content hash, and calls

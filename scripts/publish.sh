@@ -17,9 +17,9 @@ require_clean_archive_vcs=no
 package_operation="publish-dry-run"
 release_manifest=release/public-crates.txt
 protocol_repository=https://github.com/handshake-rs/hns-rs.git
-protocol_revision=b24b66c382de53330ec21dd3137e056a2bea3e2d
-protocol_version=0.2.0
-protocol_crates='hns-encoding hns-primitives hns-covenants hns-dns-relay-protocol hns-header-consensus hns-service-authority hns-odoh-protocol hns-p2p-experimental hns-urkel-proof hns-transaction hns-chat-protocol hns-hnsr-protocol hns-script hns-mining hns-swap hns-marketplace-protocol hns-p2p-wire'
+protocol_revision=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e
+protocol_version=0.3.0
+protocol_crates='hns-encoding hns-rollback-journal hns-hrm hns-primitives hns-covenants hns-dns-relay-protocol hns-header-consensus hns-service-authority hns-odoh-protocol hns-p2p-experimental hns-urkel-proof hns-transaction hns-chat-protocol hns-hnsr-protocol hns-script hns-mining hns-swap hns-marketplace-protocol hns-p2p-wire'
 
 cleanup_release_tmp() {
     if [ -n "$release_tmp" ] && [ -d "$release_tmp" ]
@@ -575,7 +575,7 @@ verify_protocol_packages_published() {
             exit 1
         fi
     done
-    echo "verified all 17 hns-rs $protocol_version archives at source $protocol_revision"
+    echo "verified all 19 hns-rs $protocol_version archives at source $protocol_revision"
 }
 
 verify_new_upload() {

@@ -68,9 +68,15 @@ before exact resume checksum verification. A source archive or successful test
 is not authorization to enable provider, value, settlement, or marketplace
 product gates.
 
-Version `0.1.0` is the initial shared release line. On 2026-08-14, all 17
-required `hns-rs` `0.2.0` archives were published to crates.io and verified to
-identify the exact reviewed protocol release commit
-`b24b66c382de53330ec21dd3137e056a2bea3e2d`. The wallet crates remain release
-candidates; the release procedure revalidates registry provenance at execution
-time and does not enable any provider, value, settlement, or marketplace gate.
+Version `0.1.0` is the initial shared release line. Historical release evidence
+remains recorded: on 2026-08-14, all 17 required `hns-rs` `0.2.0` archives were
+published to crates.io and verified to identify the exact protocol release
+commit `b24b66c382de53330ec21dd3137e056a2bea3e2d`.
+
+The current dependency tranche instead pins every protocol dependency to exact
+unpublished `hns-rs` `0.3.0` Git revision
+`88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`. The wallet crates remain release
+candidates, and irreversible wallet publication must fail closed until all 19
+current upstream archives are published and each registry archive proves that
+exact revision. The dependency update does not enable any provider, value,
+settlement, or marketplace gate.

@@ -71,16 +71,21 @@ Initial release source for the independent Handshake wallet boundary:
 This crate changelog describes the prepared `hns-wallet-rs` release source.
 ```
 
-Wallet source consumes the final immutable `hns-rs` release revision
+The previous dependency baseline used immutable `hns-rs` revision
 `b24b66c382de53330ec21dd3137e056a2bea3e2d`. On 2026-08-14, all 17 required
 `hns-rs` `0.2.0` archives were published to crates.io and verified to identify
-that exact revision in `.cargo_vcs_info.json`. Execution still downloads and
-revalidates every prerequisite immediately before any wallet upload; if one is
-missing, dirty, or identifies any other source commit, it stops. Dry-run
-preflight preserves the exact Git-source policy by patching protocol
-dependencies to that revision and wallet dependencies to local workspace
-paths. Those patches are verification aids only; they are never used during an
-actual upload.
+that exact revision in `.cargo_vcs_info.json`. That evidence is historical and
+does not satisfy the current release prerequisite.
+
+Wallet source now consumes exact immutable `hns-rs` `0.3.0` Git revision
+`88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`. Its 19 current upstream archives
+are not yet published and provenance-verified. Execution must download and
+revalidate every prerequisite immediately before any wallet upload; if one is
+missing, dirty, or identifies any other source commit, it stops before the
+irreversible sequence. Dry-run preflight preserves the exact Git-source policy
+by patching protocol dependencies to that revision and wallet dependencies to
+local workspace paths. Those patches are verification aids only; they are never
+used during an actual upload.
 
 The `hns-wallet-ffi` package archive must contain byte-identical copies of
 `abi/contracts-v2.schema.json` and `abi/golden-vectors-v2.json`. The
@@ -156,7 +161,8 @@ document and verify boundaries; they grant no runtime or deployment authority.
 
    Partial selection is deliberately unavailable in execution mode.
 
-6. Reconfirm the published `hns-rs` prerequisites, then stop and obtain
+6. Reconfirm that all current `hns-rs` prerequisites are published and
+   provenance-verified, then stop and obtain
    explicit human authorization for the irreversible wallet upload.
    Authentication, publication, and tagging are never CI steps and are not
    implied by a successful dry-run. Authenticate without placing a token in
@@ -173,7 +179,7 @@ document and verify boundaries; they grant no runtime or deployment authority.
    ./scripts/publish.sh --execute --confirm-publish 0.1.0
    ```
 
-Execution mode first downloads all 17 required protocol archives and rejects
+Execution mode first downloads all 19 required protocol archives and rejects
 any package whose `.cargo_vcs_info.json` does not identify the exact pinned
 `hns-rs` revision. For a new wallet version, it creates and runs the custom
 inventory verifier over the normalized source package before any possible

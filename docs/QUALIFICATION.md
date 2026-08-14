@@ -1,6 +1,6 @@
 # Qualification matrix
 
-Snapshot: 2026-08-10. This file records source-scoped evidence and the durable
+Snapshot: 2026-08-14. This file records source-scoped evidence and the durable
 qualification procedure, not transient workflow or registry state. Unit
 coverage, source packaging, or publication never authorizes mainnet value.
 Evidence is attached to exact commits and is not inherited automatically by
@@ -30,21 +30,24 @@ only as historical evidence. The rows below describe exact implementation source
 exact workflow records before upload. No source workflow result supplies
 product, network, value, or release-gate authority.
 
-The final protocol source
+The historical `hns-rs` `0.2.0` protocol source
 `b24b66c382de53330ec21dd3137e056a2bea3e2d` independently passed its complete
 [`hns-rs` CI run](https://github.com/handshake-rs/hns-rs/actions/runs/31398600728),
 four-language
 [`hns-rs` CodeQL run](https://github.com/handshake-rs/hns-rs/actions/runs/31398598588),
 and
 [`hns-rs` 17-package release preflight](https://github.com/handshake-rs/hns-rs/actions/runs/31399004538)
-on 2026-08-10. That is upstream protocol-source evidence only; it neither
-qualifies a wallet commit nor changes a wallet product gate.
+on 2026-08-10. That is historical upstream protocol-source evidence only; it
+neither qualifies the current `0.3.0` wallet dependency tranche nor changes a
+wallet product gate. The current candidate pins exact `hns-rs` `0.3.0` Git
+revision `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`; no exact-commit wallet CI,
+CodeQL, or normalized release preflight is recorded for that later tranche.
 
 | Area | Exact source evidence | Persistence/restart and reorg | Product/network evidence | Release status |
 | --- | --- | --- | --- | --- |
 | Types and chain traits | complete locked workspace CI passed at `2229be8` | n/a | no product dependency | exact source recorded; API review remains |
 | Encrypted store/schema v3 | exact `2229be8` CI passed, including atomic bootstrap, rollback, migrations, encrypted CRUD/CAS, and Unix filesystem regressions | source reopen/restart tests; no installed Android/iOS secure-store runtime evidence in this package boundary | downstream mobile candidate source contains Keystore/Keychain wrapping, but device filesystem/runtime qualification remains external | platform qualification pending |
-| HNS wallet and names | exact `2229be8` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, name workflows, and fail-closed value gates | source restart/reorg paths; no multi-process regtest | wallet RPC source pairs with node `2b267ffe`; selected qualified node main `2712d1d` contains that API; protocol pinned to final immutable `hns-rs` `b24b66c` | HNS funding, value, and fee gates remain `false` |
+| HNS wallet and names | historical exact `2229be8` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, name workflows, and fail-closed value gates; the current dependency tranche is not yet qualified | source restart/reorg paths; no multi-process regtest | wallet RPC source pairs with node `2b267ffe`; selected qualified node main `2712d1d` contains that API; current protocol source pins exact `hns-rs` `0.3.0` revision `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e` | HNS funding, value, and fee gates remain `false` |
 | Provider core | exact `2229be8` CI passed, including account binding, scoped reads, exact Names consent, and unavailable-method ordering | grants persist; pending approval/UI authority remains process-local | no installed-browser wallet consent or backend E2E | browser and value exposure unavailable |
 | Fixed-price Shakedex | exact `2229be8` CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Denuo, provider, trusted UI, or product coin selection | every Shakedex and dependent HNS value gate remains `false` |
 | Market sessions | exact `2229be8` workspace CI passed | CAS journal source; recovery evidence incomplete | no pair E2E, rendezvous, or relay transport | unavailable |
@@ -133,10 +136,15 @@ gate-change authorization.
 
 ## Publication prerequisites
 
-Before any wallet upload, all 17 `hns-rs` `0.2.0` archives must be visible on
-crates.io and each archive must identify exact source commit
-`b24b66c382de53330ec21dd3137e056a2bea3e2d` in `.cargo_vcs_info.json`. The
-wallet execute path verifies this provenance, constructs and inspects each
-normalized wallet archive before upload, and requires a clean source record.
-Any differing protocol provenance aborts execution.
-Actual publication remains a separate, explicitly authorized human action.
+As a historical record, all 17 required hns-rs 0.2.0 archives were published to
+crates.io and provenance-verified on 2026-08-14 at exact source commit
+`b24b66c382de53330ec21dd3137e056a2bea3e2d`. That superseded record does not
+satisfy the current release prerequisite.
+
+Before any wallet upload, all 19 current `hns-rs` `0.3.0` archives must be
+visible on crates.io and each archive must identify exact source commit
+`88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e` in `.cargo_vcs_info.json`. Those
+archives are currently unpublished. The wallet execute path must verify every
+archive before it constructs or uploads a wallet archive; any missing archive
+or differing protocol provenance aborts execution. Actual publication remains
+a separate, explicitly authorized human action. No runtime gate changes.
