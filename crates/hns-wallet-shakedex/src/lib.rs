@@ -19,14 +19,19 @@ pub use board::{
     BoardOfferStatus, NameMarketBoard, PersistedBoardOffer, StoredNameMarketBoard,
     load_name_market_board, save_name_market_board,
 };
-pub use board_runtime::{CurrentDenuoBoardOffer, DenuoBoardOfferAdmission, DenuoBoardRuntime};
+pub use board_runtime::{
+    CurrentDenuoBoardOffer, DenuoBoardCancellationAdmission, DenuoBoardOfferAdmission,
+    DenuoBoardRuntime,
+};
 pub use canonical::{
-    AuthenticatedFixedPriceListing, DenuoNameMarketRequest, VerifiedFixedPriceListing,
-    VerifiedListingCancellation, authenticate_fixed_price_listing,
+    AuthenticatedFixedPriceListing, AuthenticatedListingCancellation, DenuoNameMarketRequest,
+    VerifiedFixedPriceListing, VerifiedListingCancellation, authenticate_fixed_price_listing,
+    authenticate_listing_cancellation, decode_denuo_authenticated_cancellation,
     decode_denuo_authenticated_offer, decode_denuo_cancellation, decode_denuo_inventory,
     decode_denuo_offer, decode_denuo_request, encode_denuo_cancellation, encode_denuo_inventory,
     encode_denuo_offer, encode_denuo_request, verify_authenticated_fixed_price_listing,
-    verify_fixed_price_listing, verify_listing_cancellation,
+    verify_authenticated_listing_cancellation, verify_fixed_price_listing,
+    verify_listing_cancellation,
 };
 pub use outbox::{
     DenuoHandoffAcceptanceResult, DenuoHandoffFailureResult, DenuoHandoffPreparation,

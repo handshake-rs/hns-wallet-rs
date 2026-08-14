@@ -23,10 +23,15 @@ decoder with one exact non-value HNS account-read runtime and the literal same
 only after runtime-owned time/network and a fresh exact current, unspent
 Shakedex lock validate the listing. Exact retries return `Existing` without a
 revision bump; sequence equivocation and stale chain, mempool, account, or
-store authority fail closed. Loading cached bytes is still not authority:
-`current_offer` rechecks the live lock and fences the unchanged board row after
-the node queries. This layer performs no relay I/O and does not use an HRM/HNSA
-receipt as chain authority.
+store authority fail closed. Signed cancellations use a narrower negative
+boundary: exact target/content authentication plus the selected account's
+network, trusted clock, full account-selection fence, and board CAS, with no
+node or live-lock query. This permits a tombstone after lock loss while
+conferring no listing or value authority; exact persisted retries remain
+revision-stable after restart and signed expiry. Loading cached bytes is still
+not authority: `current_offer` rechecks the live lock and fences the unchanged
+board row after the node queries. This layer performs no relay I/O and does not
+use an HRM/HNSA receipt as chain authority.
 
 Shakedex creation, discovery, signing, broadcast, and dependent value gates
 remain unavailable to products until the documented qualification is complete.

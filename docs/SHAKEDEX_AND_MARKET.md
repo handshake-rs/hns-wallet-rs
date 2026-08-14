@@ -188,6 +188,19 @@ returning the ephemeral lock; only then may the board reducer commit through
 CAS. Exact retries return `Existing` at the unchanged revision, higher
 sequences replace the same identity, and equivocation/rollback fails closed.
 
+Cancellation admission uses an intentionally narrower authority. A first
+phase authenticates the canonical V2 cancellation signature plus externally
+expected target and content hashes without treating it as time- or
+listing-bound. The HNS runtime then observes only the exact selected account,
+its network, and trusted wall time; it performs no backend query. One bounded
+store mutation rechecks the full account selection and exact account revision,
+reauthenticates the persisted target listing, verifies the cancellation's
+active window and seller/network binding, advances the tombstone watermark,
+and saves by board CAS. A spent or missing lock does not block this negative
+replay-prevention action. Exact persisted retries remain no-write `Existing`
+results after restart or signed expiry; changed cancellations must still be
+currently valid and strictly advance the watermark.
+
 `current_offer` deliberately repeats the current-lock query after restart or
 before later use, verifies the persisted canonical listing against that exact
 coin/network/time, and finally fences the unchanged board revision and row.

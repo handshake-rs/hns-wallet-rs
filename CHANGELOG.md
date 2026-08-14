@@ -52,7 +52,10 @@ boundary:
   read runtime, obtains runtime-owned time/network plus exact current and
   unspent Shakedex-lock evidence before each CAS admission, keeps exact retries
   revision-stable, and reacquires that live authority before returning a cached
-  offer for later use;
+  offer for later use. The same runtime admits signed cancellation tombstones
+  through an exact persisted-listing/account-network/trusted-time fence without
+  requiring a still-live lock; this negative path performs no node call, keeps
+  exact restart/expiry retries revision-stable, and changes no release gate;
 - deletion-protected encrypted HNSA/HNSR publisher high-water state with exact
   route-and-endpoint scope, physically independent endpoint-delegation and
   named-route dimensions, persist-before-use nonzero reservations, safe crash

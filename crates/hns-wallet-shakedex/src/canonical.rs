@@ -81,6 +81,54 @@ impl AuthenticatedFixedPriceListing {
     }
 }
 
+/// A canonical cancellation whose seller signature, exact target hash, and
+/// exact content identity are authenticated. It is only a safe lookup phase:
+/// the target listing, selected network, and signed time window still require
+/// independent verification before this object can mutate a board.
+pub struct AuthenticatedListingCancellation {
+    cancellation: ListingCancellation,
+    encoded: Vec<u8>,
+    cancellation_hash: ObjectHash,
+}
+
+impl AuthenticatedListingCancellation {
+    pub fn encoded(&self) -> &[u8] {
+        &self.encoded
+    }
+
+    pub const fn cancellation_hash(&self) -> ObjectHash {
+        self.cancellation_hash
+    }
+
+    pub const fn listing_hash(&self) -> ObjectHash {
+        ObjectHash::new(self.cancellation.listing_hash)
+    }
+
+    pub const fn network(&self) -> NetworkBinding {
+        self.cancellation.network
+    }
+
+    pub const fn seller_public_key(&self) -> &[u8; 33] {
+        &self.cancellation.seller_public_key
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.cancellation.sequence
+    }
+
+    pub const fn created_at_unix(&self) -> u64 {
+        self.cancellation.created_at
+    }
+
+    pub const fn expires_at_unix(&self) -> u64 {
+        self.cancellation.expires_at
+    }
+
+    pub(crate) const fn canonical(&self) -> &ListingCancellation {
+        &self.cancellation
+    }
+}
+
 /// A signed listing additionally verified against one exact Shakedex locking
 /// coin, network, and wall-clock boundary. This type does not prove that the
 /// supplied coin is current or unspent; a value runtime must obtain it from
@@ -285,28 +333,90 @@ pub fn verify_listing_cancellation(
     verified_cancellation_from_canonical(cancellation, listing, expected_network, now_unix)
 }
 
+/// Authenticate canonical cancellation bytes against both externally expected
+/// content identities without treating the result as listing/time authority.
+pub fn authenticate_listing_cancellation(
+    encoded: &[u8],
+    expected_listing_hash: ObjectHash,
+    expected_cancellation_hash: ObjectHash,
+) -> Result<AuthenticatedListingCancellation, ShakedexError> {
+    if encoded.is_empty() || encoded.len() > MAX_LISTING_CANCELLATION_SIZE {
+        return Err(ShakedexError::InvalidCancellation);
+    }
+    let cancellation =
+        ListingCancellation::decode(encoded).map_err(|_| ShakedexError::InvalidCancellation)?;
+    authenticated_cancellation_from_canonical(
+        cancellation,
+        expected_listing_hash,
+        expected_cancellation_hash,
+    )
+}
+
+/// Bind an authenticated cancellation to one exact authenticated listing,
+/// selected network, and trusted wall-clock observation.
+pub fn verify_authenticated_listing_cancellation(
+    authenticated: AuthenticatedListingCancellation,
+    listing: &AuthenticatedFixedPriceListing,
+    expected_network: NetworkBinding,
+    now_unix: u64,
+) -> Result<VerifiedListingCancellation, ShakedexError> {
+    authenticated
+        .canonical()
+        .verify_for_listing(listing.canonical(), expected_network, now_unix)
+        .map_err(|_| ShakedexError::InvalidCancellation)?;
+    Ok(VerifiedListingCancellation {
+        cancellation: authenticated.cancellation,
+        encoded: authenticated.encoded,
+        cancellation_hash: authenticated.cancellation_hash,
+    })
+}
+
+fn authenticated_cancellation_from_canonical(
+    cancellation: ListingCancellation,
+    expected_listing_hash: ObjectHash,
+    expected_cancellation_hash: ObjectHash,
+) -> Result<AuthenticatedListingCancellation, ShakedexError> {
+    let listing_hash = ObjectHash::new(cancellation.listing_hash);
+    let cancellation_hash = ObjectHash::new(
+        cancellation
+            .cancellation_hash()
+            .map_err(|_| ShakedexError::InvalidCancellation)?,
+    );
+    if listing_hash != expected_listing_hash || cancellation_hash != expected_cancellation_hash {
+        return Err(ShakedexError::InvalidCancellation);
+    }
+    let encoded = cancellation
+        .encode()
+        .map_err(|_| ShakedexError::InvalidCancellation)?;
+    Ok(AuthenticatedListingCancellation {
+        cancellation,
+        encoded,
+        cancellation_hash,
+    })
+}
+
 fn verified_cancellation_from_canonical(
     cancellation: ListingCancellation,
     listing: &AuthenticatedFixedPriceListing,
     expected_network: NetworkBinding,
     now_unix: u64,
 ) -> Result<VerifiedListingCancellation, ShakedexError> {
-    cancellation
-        .verify_for_listing(listing.canonical(), expected_network, now_unix)
-        .map_err(|_| ShakedexError::InvalidCancellation)?;
     let cancellation_hash = ObjectHash::new(
         cancellation
             .cancellation_hash()
             .map_err(|_| ShakedexError::InvalidCancellation)?,
     );
-    let encoded = cancellation
-        .encode()
-        .map_err(|_| ShakedexError::InvalidCancellation)?;
-    Ok(VerifiedListingCancellation {
+    let authenticated = authenticated_cancellation_from_canonical(
         cancellation,
-        encoded,
+        ObjectHash::new(
+            listing
+                .canonical()
+                .listing_hash()
+                .map_err(|_| ShakedexError::InvalidListing)?,
+        ),
         cancellation_hash,
-    })
+    )?;
+    verify_authenticated_listing_cancellation(authenticated, listing, expected_network, now_unix)
 }
 
 pub fn encode_denuo_offer(
@@ -386,8 +496,47 @@ pub fn decode_denuo_cancellation(
     let NameMarketMessage::Cancel(cancellation) = message else {
         return Err(ShakedexError::InvalidDenuoEnvelope);
     };
-    let cancellation =
-        verified_cancellation_from_canonical(cancellation, listing, expected_network, now_unix)?;
+    let cancellation_hash = ObjectHash::new(
+        cancellation
+            .cancellation_hash()
+            .map_err(|_| ShakedexError::InvalidCancellation)?,
+    );
+    let authenticated = authenticated_cancellation_from_canonical(
+        cancellation,
+        listing.listing_hash(),
+        cancellation_hash,
+    )?;
+    let cancellation = verify_authenticated_listing_cancellation(
+        authenticated,
+        listing,
+        expected_network,
+        now_unix,
+    )?;
+    Ok((request_id, cancellation))
+}
+
+/// Decode one canonical Denuo cancellation and authenticate its signature,
+/// exact listing target, and exact cancellation content hash. The returned
+/// object is intentionally not listing-, network-, or time-verified.
+pub fn decode_denuo_authenticated_cancellation(
+    encoded: &[u8],
+    expected_registry: DenuoRegistryVersion,
+    expected_listing_hash: ObjectHash,
+    expected_cancellation_hash: ObjectHash,
+) -> Result<(u64, AuthenticatedListingCancellation), ShakedexError> {
+    let (registry, request_id, message) = NameMarketMessage::decode_envelope(encoded)
+        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+    if registry != expected_registry {
+        return Err(ShakedexError::DenuoRegistryMismatch);
+    }
+    let NameMarketMessage::Cancel(cancellation) = message else {
+        return Err(ShakedexError::InvalidDenuoEnvelope);
+    };
+    let cancellation = authenticated_cancellation_from_canonical(
+        cancellation,
+        expected_listing_hash,
+        expected_cancellation_hash,
+    )?;
     Ok((request_id, cancellation))
 }
 
@@ -561,7 +710,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock")
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
+        let parent = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let directory = parent.join(format!(
             "hns-wallet-shakedex-board-{}-{unique}",
             std::process::id()
         ));
@@ -717,6 +869,49 @@ mod tests {
         let cancellation_envelope =
             encode_denuo_cancellation(DenuoRegistryVersion::V2, 80, &verified_cancellation)
                 .expect("cancellation envelope");
+        let cancellation_hash = verified_cancellation.cancellation_hash();
+        let (authenticated_request_id, authenticated_cancellation) =
+            decode_denuo_authenticated_cancellation(
+                &cancellation_envelope,
+                DenuoRegistryVersion::V2,
+                listing_hash,
+                cancellation_hash,
+            )
+            .expect("authenticated cancellation lookup phase");
+        assert_eq!(authenticated_request_id, 80);
+        assert_eq!(authenticated_cancellation.listing_hash(), listing_hash);
+        assert_eq!(
+            authenticated_cancellation.cancellation_hash(),
+            cancellation_hash
+        );
+        assert_eq!(authenticated_cancellation.network(), network);
+        assert_eq!(authenticated_cancellation.sequence(), 43);
+        assert!(matches!(
+            decode_denuo_authenticated_cancellation(
+                &cancellation_envelope,
+                DenuoRegistryVersion::V2,
+                ObjectHash::new([0x91; 32]),
+                cancellation_hash,
+            ),
+            Err(ShakedexError::InvalidCancellation)
+        ));
+        assert!(matches!(
+            decode_denuo_authenticated_cancellation(
+                &cancellation_envelope,
+                DenuoRegistryVersion::V2,
+                listing_hash,
+                ObjectHash::new([0x92; 32]),
+            ),
+            Err(ShakedexError::InvalidCancellation)
+        ));
+        let phase_verified = verify_authenticated_listing_cancellation(
+            authenticated_cancellation,
+            discovered.authenticated(),
+            network,
+            ACTIVE_TIME + 2,
+        )
+        .expect("listing/time-bound cancellation phase");
+        assert_eq!(phase_verified.cancellation_hash(), cancellation_hash);
         let mut restarted = encrypted_board_restart(&board);
         restarted.validate().expect("canonical restored board");
         let persisted_offer = restarted.offer(listing_hash).expect("persisted offer");

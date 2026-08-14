@@ -59,9 +59,14 @@ independently disabled.
   NameState/action context, exact locking coin, and confirmed/mempool
   unspentness before a board CAS. Exact retries do not write. Cached active
   bytes are re-authenticated against a newly acquired lock and an unchanged
-  board row before later use. This is still offline source composition: it
-  supplies no live relay supervision, HRM/HNSA-currentness adapter, approval,
-  signing, broadcast, quote, or product availability authority.
+  board row before later use. Cancellation admission instead authenticates the
+  exact signed target/content and fences selected-account network, trusted wall
+  time, the full account selection, and board CAS without consulting a node or
+  requiring the target lock to remain live. That negative tombstone only
+  prevents replay/resurrection; it is not publication, chain, or value
+  authority. This is still offline source composition: it supplies no live
+  relay supervision, HRM/HNSA-currentness adapter, approval, signing,
+  broadcast, quote, or product availability authority.
 - Bitcoin production synchronization has one backend: Kyoto direct P2P with
   BIP157/158. There is no trusted indexer fallback.
 - Handshake node evidence crosses one authenticated loopback HTTP/1.1 boundary.

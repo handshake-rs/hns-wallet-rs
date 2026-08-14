@@ -7,8 +7,9 @@ use hns_wallet_types::ObjectHash;
 
 use crate::{
     AuthenticatedFixedPriceListing, BoardOfferStatus, ShakedexError, VerifiedFixedPriceListing,
+    authenticate_fixed_price_listing, decode_denuo_authenticated_cancellation,
     decode_denuo_authenticated_offer, load_name_market_board, save_name_market_board,
-    verify_authenticated_fixed_price_listing,
+    verify_authenticated_fixed_price_listing, verify_authenticated_listing_cancellation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +57,55 @@ impl DenuoBoardOfferAdmission {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DenuoBoardCancellationAdmission {
+    Applied {
+        request_id: u64,
+        listing_hash: ObjectHash,
+        cancellation_hash: ObjectHash,
+        revision: u64,
+    },
+    Existing {
+        request_id: u64,
+        listing_hash: ObjectHash,
+        cancellation_hash: ObjectHash,
+        revision: u64,
+    },
+}
+
+impl DenuoBoardCancellationAdmission {
+    pub const fn request_id(self) -> u64 {
+        match self {
+            Self::Applied { request_id, .. } | Self::Existing { request_id, .. } => request_id,
+        }
+    }
+
+    pub const fn listing_hash(self) -> ObjectHash {
+        match self {
+            Self::Applied { listing_hash, .. } | Self::Existing { listing_hash, .. } => {
+                listing_hash
+            }
+        }
+    }
+
+    pub const fn cancellation_hash(self) -> ObjectHash {
+        match self {
+            Self::Applied {
+                cancellation_hash, ..
+            }
+            | Self::Existing {
+                cancellation_hash, ..
+            } => cancellation_hash,
+        }
+    }
+
+    pub const fn revision(self) -> u64 {
+        match self {
+            Self::Applied { revision, .. } | Self::Existing { revision, .. } => revision,
+        }
+    }
+}
+
 /// Fresh non-serializable authority for one still-active persisted board
 /// offer. A restart or later use must call `current_offer` again.
 pub struct CurrentDenuoBoardOffer {
@@ -96,6 +146,9 @@ impl core::fmt::Debug for CurrentDenuoBoardOffer {
 /// release gate. Admission authenticates the canonical V2 envelope first,
 /// then obtains current name/coin/network/time authority from the read
 /// runtime, and only then commits the board reducer through one store CAS.
+/// Cancellation admission is a separate negative-authority path: it binds an
+/// authenticated tombstone to the exact persisted listing plus selected
+/// account network/time, but deliberately performs no current-lock query.
 pub struct DenuoBoardRuntime<'a, B, C = SystemClock> {
     hns: &'a HnsAccountReadRuntime<B, C>,
     store: SharedWalletStore,
@@ -164,6 +217,86 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                     revision,
                 })
             }
+        })
+    }
+
+    /// Admit one exact canonical V2 cancellation as a durable negative
+    /// tombstone. The signed cancellation remains admissible after the target
+    /// lock is spent or otherwise unavailable; this path never queries a node
+    /// and does not make the cached listing current or usable for value.
+    ///
+    /// An exact already-persisted tombstone returns `Existing` without a write,
+    /// including after its signed horizon, because no new authority is being
+    /// accepted. Every initial or changed tombstone must be active at the
+    /// runtime-owned clock observation and advance the board watermark.
+    pub fn admit_cancellation(
+        &self,
+        envelope: &[u8],
+        expected_listing_hash: ObjectHash,
+        expected_cancellation_hash: ObjectHash,
+    ) -> Result<DenuoBoardCancellationAdmission, ShakedexError> {
+        self.require_store_authority()?;
+        let (request_id, authenticated) = decode_denuo_authenticated_cancellation(
+            envelope,
+            DenuoRegistryVersion::V2,
+            expected_listing_hash,
+            expected_cancellation_hash,
+        )?;
+        let context = self.hns.observe_board_cancellation_context()?;
+
+        self.store.try_with_store_mut(move |store| {
+            context.verify_unchanged_account(store)?;
+            let mut stored = load_name_market_board(store)?;
+            let persisted = stored
+                .board
+                .offer(expected_listing_hash)
+                .cloned()
+                .ok_or(ShakedexError::InvalidCancellation)?;
+            let listing =
+                authenticate_fixed_price_listing(&persisted.listing_bytes, expected_listing_hash)?;
+            if listing.network() != context.network() {
+                return Err(ShakedexError::InvalidCancellation);
+            }
+
+            if persisted.status == BoardOfferStatus::Cancelled
+                && persisted.cancellation_hash == Some(expected_cancellation_hash)
+                && persisted.cancellation_bytes.as_deref() == Some(authenticated.encoded())
+                && persisted.cancellation_sequence == Some(authenticated.sequence())
+            {
+                return Ok(DenuoBoardCancellationAdmission::Existing {
+                    request_id,
+                    listing_hash: expected_listing_hash,
+                    cancellation_hash: expected_cancellation_hash,
+                    revision: stored.revision,
+                });
+            }
+
+            let cancellation = verify_authenticated_listing_cancellation(
+                authenticated,
+                &listing,
+                context.network(),
+                context.observed_at_unix(),
+            )?;
+            if !stored.board.apply_cancellation(&cancellation)? {
+                return Ok(DenuoBoardCancellationAdmission::Existing {
+                    request_id,
+                    listing_hash: expected_listing_hash,
+                    cancellation_hash: expected_cancellation_hash,
+                    revision: stored.revision,
+                });
+            }
+            let revision = save_name_market_board(
+                store,
+                stored.revision,
+                &stored.board,
+                context.observed_at_unix(),
+            )?;
+            Ok(DenuoBoardCancellationAdmission::Applied {
+                request_id,
+                listing_hash: expected_listing_hash,
+                cancellation_hash: expected_cancellation_hash,
+                revision,
+            })
         })
     }
 

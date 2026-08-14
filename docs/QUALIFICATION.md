@@ -99,6 +99,15 @@ conflict, schema-v1/v2 migration denial, and restart self-validation only. It
 is not hosted CI, CodeQL, normalized packaging, live relay/HRM/HNSA authority,
 board currentness, installed-product, or value-gate qualification.
 
+The board-cancellation tranche adds focused local source regressions for the
+signature/content-authenticated lookup phase, selected-account network/time and
+full-selector revision fence, zero-backend-call admission after lock spend,
+wrong registry/family/signature/network/seller/time rejection, monotonic
+tombstone sequences, zero request ID at the offline board boundary, restart
+watermark preservation, cross-network exact-retry rejection, and exact no-write
+retry after signed expiry. This is not exact-commit CI or live
+transport/product/value qualification and changes no release gate.
+
 CodeQL passed at exact `2229be8`; `ba9f013` remains the historical baseline.
 This repository records no independent security audit, database or resource
 benchmark, multi-process network test, installed-device run, or installed-

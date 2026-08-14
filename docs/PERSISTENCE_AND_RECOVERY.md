@@ -103,10 +103,16 @@ cancellation tombstone advances the watermark, so restart cannot make the
 cancelled listing active or admit the same sequence under another content hash.
 The signed listing target can be re-authenticated from these bytes to process a
 still-active cancellation after restart without recreating locking-coin
-authority. After the listing or cancellation's signed horizon expires, bounded
-inventory filtering hides the object but retains its authenticated watermark,
-so a later listing cannot reset or reuse the seller/name sequence. Relisting
-the same identity replaces its stored object without growing the board. The
+authority. The account-bound board runtime supplies the selected network and
+trusted time, rechecks the complete account selection and exact row revision in
+the board mutation closure, and deliberately performs no node query for this
+negative tombstone. An exact already-persisted cancellation retry remains a
+no-write `Existing` result after its signed horizon; it recognizes durable
+state rather than accepting new authority. After the listing or cancellation's
+signed horizon expires, bounded inventory filtering hides the object but
+retains its authenticated watermark, so a later listing cannot reset or reuse
+the seller/name sequence. Relisting the same identity replaces its stored
+object without growing the board. The
 4,096-distinct-identity ceiling fails closed; durable archival and peer
 admission policy remain required for a live relay. The cache does not persist
 an action capability; current locking-coin/network/time authority must be
@@ -181,12 +187,15 @@ in-process composition authority: record AEAD detects external storage
 tampering, but cannot defend against an authorized writer constructing and
 encrypting another record. This tranche does not redesign that store boundary.
 
-Initial offer admission requires an `AuthenticatedFixedPriceListing`; initial
-cancellation admission requires a `VerifiedListingCancellation` already bound
-to its exact authenticated listing. After that typed boundary, restart relies
-on the authenticated encrypted store plus exact envelope/signature/content-
-identity and state validation. Stored bytes alone are never accepted as fresh
-listing-bound cancellation authority. Likewise, a prepared local handoff does
+Initial offer admission requires an `AuthenticatedFixedPriceListing`. Runtime
+cancellation admission first requires an `AuthenticatedListingCancellation`
+bound to externally expected target and cancellation hashes, then binds it to
+the exact persisted authenticated listing, selected-account network, and
+trusted active time before the tombstone CAS. No current coin is required.
+After that typed boundary, restart relies on the authenticated encrypted store
+plus exact envelope/signature/content-identity and state validation. Stored
+bytes alone are never accepted as fresh listing-bound cancellation authority.
+Likewise, a prepared local handoff does
 not prove that an offer remains current or that a peer accepted it: a future
 authenticated transport adapter must reacquire fresh listing/lock/network/time
 authority before sending the exact stored bytes and supply its own correlated

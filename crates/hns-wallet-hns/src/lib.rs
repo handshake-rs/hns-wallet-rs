@@ -1563,6 +1563,81 @@ pub struct HnsAccountReadSnapshot {
     pub known_names: Vec<KnownName>,
 }
 
+/// Query-scoped selected-account, network, and trusted-time authority for
+/// admitting a negative Denuo board cancellation tombstone.
+///
+/// This object is deliberately non-cloneable and non-serializable. It proves
+/// no current chain state, name ownership, locking coin, publication, signing,
+/// or value authority. The consuming board transaction must call
+/// `verify_unchanged_account` while holding the identical shared store.
+pub struct VerifiedHnsBoardCancellationContext {
+    account_id: [u8; 32],
+    account: HnsAccountRecord,
+    account_revision: u64,
+    network: NetworkBinding,
+    observed_at_unix: u64,
+}
+
+impl VerifiedHnsBoardCancellationContext {
+    pub const fn network(&self) -> NetworkBinding {
+        self.network
+    }
+
+    pub const fn observed_at_unix(&self) -> u64 {
+        self.observed_at_unix
+    }
+
+    /// Recheck the exact selected account row and revision inside the
+    /// consuming store operation. This does not establish store authority by
+    /// itself; the enclosing runtime must already require the identical
+    /// `SharedWalletStore` Arc.
+    pub fn verify_unchanged_account(&self, store: &WalletStore) -> Result<(), HnsWalletError> {
+        if store.is_locked() {
+            return Err(HnsWalletError::StoreLocked);
+        }
+        let accounts = store.list_entities_by_id_prefix::<HnsAccountRecord>(
+            EntityKind::WalletAccount,
+            self.account.config.wallet_id.as_bytes(),
+            MAX_HISTORY_RESULTS,
+        )?;
+        for stored in accounts {
+            if stored.id != account_entity_id(&stored.value.config)
+                || stored.value.config.wallet_id != self.account.config.wallet_id
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            if stored.value.config.account_id != self.account.config.account_id
+                && stored.value.config.account_derivation_index
+                    == self.account.config.account_derivation_index
+            {
+                return Err(HnsWalletError::DuplicateAccountDerivation);
+            }
+        }
+        let stored = store
+            .wallet_account::<HnsAccountRecord>(&self.account_id)?
+            .ok_or(HnsWalletError::StaleAccountRead)?;
+        if stored.id.as_slice() != self.account_id.as_slice()
+            || stored.revision != self.account_revision
+            || stored.value != self.account
+        {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for VerifiedHnsBoardCancellationContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedHnsBoardCancellationContext")
+            .field("account", &"[EXACT ACCOUNT FENCE]")
+            .field("account_revision", &self.account_revision)
+            .field("network", &self.network)
+            .field("observed_at_unix", &self.observed_at_unix)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Synchronized, non-value HNS runtime for product/provider compositions that
 /// already own an exact account and one process-local store authority.
 ///
@@ -1619,6 +1694,48 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
 
     pub fn selected_account(&self) -> Result<HnsAccountRecord, HnsWalletError> {
         self.selector.selected_account()
+    }
+
+    /// Observe the exact selected account, its Shakedex network binding, and
+    /// trusted wall time for one negative board-cancellation admission.
+    /// Selected account state is fenced on both sides of the clock call and no
+    /// backend or node method is invoked.
+    pub fn observe_board_cancellation_context(
+        &self,
+    ) -> Result<VerifiedHnsBoardCancellationContext, HnsWalletError> {
+        let _synchronization = self
+            .synchronization
+            .lock()
+            .map_err(|_| HnsWalletError::RuntimePoisoned)?;
+        let selected = self.selector.selected_account()?;
+        let account_id = account_entity_id(&selected.config);
+        let account_revision = self.store.try_with_store(|store| {
+            if store.is_locked() {
+                return Err(HnsWalletError::StoreLocked);
+            }
+            let stored = store
+                .wallet_account::<HnsAccountRecord>(&account_id)?
+                .ok_or(HnsWalletError::StaleAccountRead)?;
+            if stored.id.as_slice() != account_id.as_slice() || stored.value != selected {
+                return Err(HnsWalletError::StaleAccountRead);
+            }
+            Ok(stored.revision)
+        })?;
+        let observed_at_unix = self.clock.now_unix()?;
+        let selected_after_clock = self.selector.selected_account()?;
+        if selected_after_clock != selected {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        let context = VerifiedHnsBoardCancellationContext {
+            account_id,
+            account: selected,
+            account_revision,
+            network: shakedex_network_binding(selected_after_clock.config.network)?,
+            observed_at_unix,
+        };
+        self.store
+            .try_with_store(|store| context.verify_unchanged_account(store))?;
+        Ok(context)
     }
 
     /// Reconcile every currently supported non-value account projection once.
