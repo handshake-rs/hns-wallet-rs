@@ -75,6 +75,15 @@ independently disabled.
   final chain, mempool, and exact selected-account fences. It is not a lease:
   any future live emitter must reacquire and fence current authority
   immediately before encoding or transport.
+- The board-inventory plan accepts only canonical V2 `GetOfferInventory` with
+  a nonzero correlation ID. Exact selected-account revision, current network,
+  and trusted time are fenced under the same store authority; cancelled,
+  not-yet-active, expired, and other-network rows are omitted without a node
+  query or write. Canonical response bytes and ordered hashes are verified and
+  discarded internally, including the valid empty case. The public plan
+  exposes only request ID, board revision, and count, so it proves no current
+  lock, ownership, HRM/HNSA lineage, publication, transport, or value
+  authority and must be reacquired before future emission.
 - Bitcoin production synchronization has one backend: Kyoto direct P2P with
   BIP157/158. There is no trusted indexer fallback.
 - Handshake node evidence crosses one authenticated loopback HTTP/1.1 boundary.

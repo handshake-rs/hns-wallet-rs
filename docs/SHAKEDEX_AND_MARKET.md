@@ -229,6 +229,23 @@ transport/value capability, and a future emitter must reacquire authority
 again immediately at use time because neither the plan nor
 `CurrentDenuoBoardOffer` is a lease.
 
+The adjacent closed inventory boundary accepts only canonical V2
+`GetOfferInventory` with a nonzero correlation ID; other request and response
+families are rejected before account, clock, store, or backend access. Under
+the literal same store authority, a generalized purpose-minimized HNS board
+context fences the exact selected account and revision on both sides of the
+trusted clock observation and again inside the board read. The snapshot
+contains only active rows whose network exactly matches the current account and
+whose signed window contains the observed time. It performs no node query and
+no write. The corresponding canonical `OfferInventory` response, including an
+allowed empty inventory, is encoded and decoded internally to verify the exact
+correlation ID and ordered hashes, then discarded. The non-cloneable,
+non-serializable plan exposes only correlation ID, board revision, and count;
+it exposes no hashes or response bytes and is neither publication nor a
+transport lease. `GetOffers` remains outside this boundary because a safe
+batch requires an explicit query budget and one aggregate board/account/chain/
+mempool/time fence across every returned current lock.
+
 A separate encrypted `DenuoBoardObject` record holds a dormant, offline-only
 publication outbox. It accepts only exact canonical V2 `Offer` and `Cancel`
 envelopes with nonzero request IDs. Each row binds the canonical listing or

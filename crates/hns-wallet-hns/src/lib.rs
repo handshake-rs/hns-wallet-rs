@@ -1563,8 +1563,8 @@ pub struct HnsAccountReadSnapshot {
     pub known_names: Vec<KnownName>,
 }
 
-/// Query-scoped selected-account, network, and trusted-time authority for
-/// admitting a negative Denuo board cancellation tombstone.
+/// Query-scoped selected-account, network, and trusted-time authority for one
+/// Denuo board metadata read or negative cancellation admission.
 ///
 /// This object is deliberately non-cloneable and non-serializable. It proves
 /// no current chain state, name ownership, locking coin, publication, signing,
@@ -1637,6 +1637,10 @@ impl fmt::Debug for VerifiedHnsBoardCancellationContext {
             .finish_non_exhaustive()
     }
 }
+
+/// Generalized name for the purpose-minimized account/network/time context
+/// shared by closed Denuo board metadata reads and cancellation admission.
+pub type VerifiedHnsBoardContext = VerifiedHnsBoardCancellationContext;
 
 /// Synchronized, non-value HNS runtime for product/provider compositions that
 /// already own an exact account and one process-local store authority.
@@ -1771,12 +1775,10 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
     }
 
     /// Observe the exact selected account, its Shakedex network binding, and
-    /// trusted wall time for one negative board-cancellation admission.
+    /// trusted wall time for one Denuo board metadata operation.
     /// Selected account state is fenced on both sides of the clock call and no
     /// backend or node method is invoked.
-    pub fn observe_board_cancellation_context(
-        &self,
-    ) -> Result<VerifiedHnsBoardCancellationContext, HnsWalletError> {
+    pub fn observe_board_context(&self) -> Result<VerifiedHnsBoardContext, HnsWalletError> {
         let _synchronization = self
             .synchronization
             .lock()
@@ -1810,6 +1812,16 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
         self.store
             .try_with_store(|store| context.verify_unchanged_account(store))?;
         Ok(context)
+    }
+
+    /// Observe the purpose-minimized context used by negative Denuo board
+    /// cancellation admission. This preserves the established cancellation
+    /// API while sharing the exact account/network/time fencing implementation
+    /// with closed board metadata reads.
+    pub fn observe_board_cancellation_context(
+        &self,
+    ) -> Result<VerifiedHnsBoardCancellationContext, HnsWalletError> {
+        self.observe_board_context()
     }
 
     /// Reconcile every currently supported non-value account projection once.

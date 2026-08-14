@@ -45,6 +45,15 @@ response bytes are discarded, and the plan is point-in-time evidence rather
 than a transport lease or permission to encode, send, sign, provide, or move
 value.
 
+The matching closed `GetOfferInventory` boundary accepts only canonical V2
+with a nonzero correlation ID. It uses the same exact store authority and a
+purpose-minimized selected-account/network/trusted-time context to select only
+active, in-window rows for the current network, without a node query or write.
+The canonical `OfferInventory` response is verified and discarded internally;
+an empty board is valid, while the public non-cloneable plan exposes only the
+request ID, board revision, and listing count. It exposes neither hashes nor
+bytes and must be reacquired before any future transport use.
+
 Shakedex creation, discovery, signing, broadcast, and dependent value gates
 remain unavailable to products until the documented qualification is complete.
 See the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)

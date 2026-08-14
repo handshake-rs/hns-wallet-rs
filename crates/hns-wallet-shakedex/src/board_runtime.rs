@@ -1,6 +1,7 @@
 use hns_marketplace_protocol::DenuoRegistryVersion;
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsBackend, HnsClock, SystemClock, VerifiedCurrentShakedexLock,
+    VerifiedHnsBoardContext,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::ObjectHash;
@@ -136,6 +137,27 @@ impl core::fmt::Debug for CurrentDenuoBoardOffer {
             .field("listing_hash", &self.listing.listing_hash())
             .field("current_lock", &self.current_lock)
             .finish_non_exhaustive()
+    }
+}
+
+/// Closed point-in-time view of the active board inventory under one exact
+/// selected-account/network/trusted-time context.
+///
+/// The hashes and account context remain crate-private so this object cannot
+/// be mistaken for a transport response or current-lock/value authority.
+pub(crate) struct CurrentDenuoBoardInventory {
+    board_revision: u64,
+    listing_hashes: Vec<ObjectHash>,
+    _context: VerifiedHnsBoardContext,
+}
+
+impl CurrentDenuoBoardInventory {
+    pub(crate) const fn board_revision(&self) -> u64 {
+        self.board_revision
+    }
+
+    pub(crate) fn listing_hashes(&self) -> &[ObjectHash] {
+        &self.listing_hashes
     }
 }
 
@@ -338,6 +360,42 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
             listing,
             current_lock,
         }))
+    }
+
+    /// Capture active, in-window hashes for the exact currently selected HNS
+    /// network without consulting a node or changing persisted state.
+    ///
+    /// Inventory is discovery metadata only. The retained account context is
+    /// not chain, current-lock, publication, transport, or value authority.
+    /// Any later response emitter must reacquire and fence a fresh view.
+    pub(crate) fn current_inventory(&self) -> Result<CurrentDenuoBoardInventory, ShakedexError> {
+        self.require_store_authority()?;
+        let context = self.hns.observe_board_context()?;
+        let (board_revision, listing_hashes) = self.store.try_with_store(|store| {
+            context.verify_unchanged_account(store)?;
+            let stored = load_name_market_board(store)?;
+            let network = context.network();
+            let now_unix = context.observed_at_unix();
+            let listing_hashes = stored
+                .board
+                .offers()
+                .iter()
+                .filter(|offer| {
+                    offer.network_magic == network.magic
+                        && offer.network_genesis.as_bytes() == network.genesis.as_bytes()
+                        && offer.status == BoardOfferStatus::Active
+                        && offer.created_at_unix <= now_unix
+                        && now_unix < offer.expires_at_unix
+                })
+                .map(|offer| offer.listing_hash)
+                .collect();
+            Ok::<_, ShakedexError>((stored.revision, listing_hashes))
+        })?;
+        Ok(CurrentDenuoBoardInventory {
+            board_revision,
+            listing_hashes,
+            _context: context,
+        })
     }
 
     fn require_store_authority(&self) -> Result<(), ShakedexError> {

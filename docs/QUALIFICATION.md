@@ -135,6 +135,19 @@ response bytes and exposes no listing, lock, transport, provider, or value
 capability. These regressions are included in exact descendant `bc5901f`'s
 passed CI and CodeQL; that changes no product or release gate.
 
+The closed board-inventory tranche adds focused source regressions for exact
+canonical V2 `GetOfferInventory`/`OfferInventory` correlation, mandatory
+nonzero request IDs, valid empty inventory, wrong registry and every other
+request/response family, malformed and trailing input, and rejection before
+account clock or backend access. Read-only repeat and encrypted restart retain
+the board revision; cancellation, not-yet-active, expired, and wrong-current-
+network rows are omitted with zero node calls. A selected-account mutation
+during trusted clock observation fails closed. The opaque plan retains current
+hashes and account context privately but exposes neither hashes nor response
+bytes and exposes no listing, lock, transport, provider, or value capability.
+This remains local source evidence until exact-commit CI/CodeQL and changes no
+release gate.
+
 CI and CodeQL passed at exact current source `bc5901f`; `2229be8` and
 `ba9f013` remain historical baselines.
 This repository records no independent security audit, database or resource
