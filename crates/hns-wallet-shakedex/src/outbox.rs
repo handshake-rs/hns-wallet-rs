@@ -6,10 +6,18 @@ use hns_wallet_types::ObjectHash;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{AuthenticatedFixedPriceListing, ShakedexError, VerifiedListingCancellation};
+use crate::acceptance::{
+    DenuoAcceptanceExpectation, PersistedDenuoPublicationAcceptance,
+    validate_denuo_publication_acceptance, validate_persisted_denuo_publication_acceptance,
+};
+use crate::{
+    AuthenticatedFixedPriceListing, DenuoPublicationAcceptancePolicy,
+    DenuoPublicationAcceptanceSnapshot, ShakedexError, VerifiedListingCancellation,
+};
 
 const LEGACY_DENUO_OUTBOX_SCHEMA_VERSION: u16 = 1;
-const DENUO_OUTBOX_SCHEMA_VERSION: u16 = 2;
+const HANDOFF_DENUO_OUTBOX_SCHEMA_VERSION: u16 = 2;
+const DENUO_OUTBOX_SCHEMA_VERSION: u16 = 3;
 const DENUO_OUTBOX_ENVELOPE_ID_DOMAIN: &[u8] = b"hns-wallet-denuo-outbox-envelope-v1\0";
 const DENUO_OUTBOX_ATTEMPT_ID_DOMAIN: &[u8] = b"hns-wallet-denuo-handoff-attempt-v1\0";
 const DENUO_OUTBOX_RECORD_ID: &[u8] = b"canonical-name-market-outbox-v1";
@@ -38,8 +46,13 @@ pub enum DenuoOutboxState {
     RetryScheduled {
         next_attempt_at_unix: u64,
     },
+    /// Terminal endpoint-signed acceptance of this exact prepared envelope.
+    RelayAccepted {
+        receipt_id: ObjectHash,
+        accepted_at_unix: u64,
+    },
     /// Immutable terminal state retained only for schema-v1 compatibility.
-    /// Schema v2 exposes no API that can create protocol acknowledgement.
+    /// Schemas v2/v3 expose no API that can create protocol acknowledgement.
     Acknowledged {
         acknowledged_at_unix: u64,
     },
@@ -64,6 +77,8 @@ struct DenuoOutboxEntry {
     pub retry_attempts: u16,
     pub created_at_unix: u64,
     pub last_attempt_at_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<PersistedDenuoPublicationAcceptance>,
 }
 
 /// Public outbox construction is deliberately limited to [`Default`] plus the
@@ -215,6 +230,7 @@ impl DenuoPublicationOutbox {
             retry_attempts: 0,
             created_at_unix,
             last_attempt_at_unix: None,
+            acceptance: None,
         };
         self.entries.push(entry);
         self.entries.sort_by_key(|entry| entry.envelope_id);
@@ -243,6 +259,7 @@ impl DenuoPublicationOutbox {
                         next_attempt_at_unix,
                     } => next_attempt_at_unix,
                     DenuoOutboxState::HandoffPrepared { .. }
+                    | DenuoOutboxState::RelayAccepted { .. }
                     | DenuoOutboxState::Acknowledged { .. }
                     | DenuoOutboxState::Exhausted { .. } => return None,
                 };
@@ -268,6 +285,7 @@ impl DenuoPublicationOutbox {
         let mut prepared_entries = 0usize;
         let mut request_ids = BTreeSet::new();
         let mut message_identities = BTreeSet::new();
+        let mut receipt_ids = BTreeSet::new();
         for entry in &self.entries {
             validate_entry(entry)?;
             if matches!(entry.state, DenuoOutboxState::HandoffPrepared { .. }) {
@@ -275,6 +293,11 @@ impl DenuoPublicationOutbox {
             }
             if !request_ids.insert(entry.request_id)
                 || !message_identities.insert((entry.message_kind, entry.content_id))
+            {
+                return Err(ShakedexError::CorruptDenuoOutbox);
+            }
+            if let Some(acceptance) = &entry.acceptance
+                && !receipt_ids.insert(acceptance.receipt_id)
             {
                 return Err(ShakedexError::CorruptDenuoOutbox);
             }
@@ -412,6 +435,15 @@ impl DenuoPreparedHandoff {
             && self.prepared_at_unix == prepared_at_unix
             && self.envelope_bytes == entry.envelope_bytes
     }
+
+    fn matches_identity(&self, entry: &DenuoOutboxEntry) -> bool {
+        self.envelope_id == entry.envelope_id
+            && self.content_id == entry.content_id
+            && self.message_kind == entry.message_kind
+            && self.request_id == entry.request_id
+            && self.attempt_ordinal == entry.retry_attempts + 1
+            && self.envelope_bytes == entry.envelope_bytes
+    }
 }
 
 pub enum DenuoHandoffPreparation {
@@ -425,6 +457,24 @@ pub struct DenuoHandoffFailureResult {
     outbox_revision: u64,
     envelope_id: ObjectHash,
     state: DenuoOutboxState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DenuoHandoffAcceptanceResult {
+    Inserted(DenuoPublicationAcceptanceSnapshot),
+    Existing(DenuoPublicationAcceptanceSnapshot),
+}
+
+impl DenuoHandoffAcceptanceResult {
+    pub const fn snapshot(self) -> DenuoPublicationAcceptanceSnapshot {
+        match self {
+            Self::Inserted(snapshot) | Self::Existing(snapshot) => snapshot,
+        }
+    }
+
+    pub const fn inserted(self) -> bool {
+        matches!(self, Self::Inserted(_))
+    }
 }
 
 impl DenuoHandoffFailureResult {
@@ -497,6 +547,90 @@ pub fn load_prepared_denuo_handoff(
         .prepared_entry()
         .map(|entry| prepared_handoff_from_entry(stored.revision, entry))
         .transpose()
+}
+
+/// Persist endpoint-signed transport acceptance for one exact durable
+/// handoff. This does not prove board inclusion, current listing authority,
+/// chain state, price/quote authority, or authorization to move value.
+pub fn record_denuo_handoff_acceptance(
+    store: &mut WalletStore,
+    handoff: &DenuoPreparedHandoff,
+    policy: &DenuoPublicationAcceptancePolicy,
+    receipt_bytes: &[u8],
+    accepted_at_unix: u64,
+) -> Result<DenuoHandoffAcceptanceResult, ShakedexError> {
+    let canonical = canonical_publication(&handoff.envelope_bytes)?;
+    if canonical.envelope_id != handoff.envelope_id
+        || canonical.content_id != handoff.content_id
+        || canonical.message_kind != handoff.message_kind
+        || canonical.request_id != handoff.request_id
+    {
+        return Err(ShakedexError::DenuoOutboxHandoffMismatch);
+    }
+    let expected = acceptance_expectation(handoff, &canonical);
+    let acceptance =
+        validate_denuo_publication_acceptance(policy, expected, receipt_bytes, accepted_at_unix)?;
+    let mut stored = load_denuo_publication_outbox(store)?;
+    let index = stored
+        .outbox
+        .entries
+        .iter()
+        .position(|entry| entry.envelope_id == handoff.envelope_id)
+        .ok_or(ShakedexError::DenuoOutboxHandoffMismatch)?;
+
+    if let DenuoOutboxState::RelayAccepted {
+        receipt_id,
+        accepted_at_unix: durable_accepted_at,
+    } = stored.outbox.entries[index].state
+    {
+        let entry = &stored.outbox.entries[index];
+        let durable = entry
+            .acceptance
+            .as_ref()
+            .ok_or(ShakedexError::CorruptDenuoOutbox)?;
+        if handoff.matches_identity(entry)
+            && handoff.attempt_id == expected.attempt_id
+            && handoff.prepared_at_unix == expected.prepared_at_unix
+            && receipt_id == acceptance.receipt_id
+            && durable_accepted_at == accepted_at_unix
+            && durable == &acceptance
+        {
+            return Ok(DenuoHandoffAcceptanceResult::Existing(acceptance_snapshot(
+                stored.revision,
+                entry,
+                expected.attempt_id,
+                durable,
+            )));
+        }
+        return Err(ShakedexError::DenuoPublicationAcceptanceConflict);
+    }
+
+    if stored.revision != handoff.outbox_revision {
+        return Err(ShakedexError::StaleRevision);
+    }
+    let entry = &mut stored.outbox.entries[index];
+    if !handoff.matches(stored.revision, entry) {
+        return Err(ShakedexError::DenuoOutboxHandoffMismatch);
+    }
+    entry.state = DenuoOutboxState::RelayAccepted {
+        receipt_id: acceptance.receipt_id,
+        accepted_at_unix,
+    };
+    entry.last_attempt_at_unix = Some(accepted_at_unix);
+    entry.acceptance = Some(acceptance);
+    let revision =
+        save_denuo_publication_outbox(store, stored.revision, &stored.outbox, accepted_at_unix)?;
+    let entry = &stored.outbox.entries[index];
+    let acceptance = entry
+        .acceptance
+        .as_ref()
+        .ok_or(ShakedexError::CorruptDenuoOutbox)?;
+    Ok(DenuoHandoffAcceptanceResult::Inserted(acceptance_snapshot(
+        revision,
+        entry,
+        expected.attempt_id,
+        acceptance,
+    )))
 }
 
 /// Persist a locally observed handoff failure. Consuming the exact artifact
@@ -577,13 +711,31 @@ pub fn load_denuo_publication_outbox(
             let source_schema_version = stored.value.schema_version;
             if !matches!(
                 source_schema_version,
-                LEGACY_DENUO_OUTBOX_SCHEMA_VERSION | DENUO_OUTBOX_SCHEMA_VERSION
-            ) || (source_schema_version == LEGACY_DENUO_OUTBOX_SCHEMA_VERSION
-                && stored
-                    .value
-                    .entries
-                    .iter()
-                    .any(|entry| matches!(entry.state, DenuoOutboxState::HandoffPrepared { .. })))
+                LEGACY_DENUO_OUTBOX_SCHEMA_VERSION
+                    | HANDOFF_DENUO_OUTBOX_SCHEMA_VERSION
+                    | DENUO_OUTBOX_SCHEMA_VERSION
+            ) || stored
+                .value
+                .entries
+                .iter()
+                .any(|entry| match source_schema_version {
+                    LEGACY_DENUO_OUTBOX_SCHEMA_VERSION => {
+                        matches!(
+                            entry.state,
+                            DenuoOutboxState::HandoffPrepared { .. }
+                                | DenuoOutboxState::RelayAccepted { .. }
+                        ) || entry.acceptance.is_some()
+                    }
+                    HANDOFF_DENUO_OUTBOX_SCHEMA_VERSION => {
+                        matches!(
+                            entry.state,
+                            DenuoOutboxState::Acknowledged { .. }
+                                | DenuoOutboxState::RelayAccepted { .. }
+                        ) || entry.acceptance.is_some()
+                    }
+                    DENUO_OUTBOX_SCHEMA_VERSION => false,
+                    _ => true,
+                })
             {
                 return Err(ShakedexError::CorruptDenuoOutbox);
             }
@@ -635,6 +787,44 @@ fn prepared_handoff_from_entry(
         prepared_at_unix,
         envelope_bytes: entry.envelope_bytes.clone(),
     })
+}
+
+fn acceptance_expectation(
+    handoff: &DenuoPreparedHandoff,
+    canonical: &CanonicalPublication,
+) -> DenuoAcceptanceExpectation {
+    DenuoAcceptanceExpectation {
+        network_magic: canonical.network_magic,
+        network_genesis: canonical.network_genesis,
+        attempt_id: handoff.attempt_id,
+        record_sequence: u64::from(handoff.attempt_ordinal),
+        prepared_at_unix: handoff.prepared_at_unix,
+        envelope_id: handoff.envelope_id,
+        envelope_digest: exact_envelope_digest(&handoff.envelope_bytes),
+        content_id: handoff.content_id,
+        message_kind: handoff.message_kind,
+        request_id: handoff.request_id,
+    }
+}
+
+fn acceptance_snapshot(
+    outbox_revision: u64,
+    entry: &DenuoOutboxEntry,
+    attempt_id: ObjectHash,
+    acceptance: &PersistedDenuoPublicationAcceptance,
+) -> DenuoPublicationAcceptanceSnapshot {
+    DenuoPublicationAcceptanceSnapshot {
+        outbox_revision,
+        envelope_id: entry.envelope_id,
+        content_id: entry.content_id,
+        message_kind: entry.message_kind,
+        request_id: entry.request_id,
+        attempt_id,
+        receipt_id: acceptance.receipt_id,
+        policy_fingerprint: acceptance.policy_fingerprint,
+        accepted_at_unix: acceptance.accepted_at_unix,
+        receipt_expires_at_unix: acceptance.receipt_expires_at_unix,
+    }
 }
 
 fn persist_denuo_handoff_failure(
@@ -749,6 +939,7 @@ fn validate_outbox_save_transition(
             !matches!(entry.state, DenuoOutboxState::Pending)
                 || entry.retry_attempts != 0
                 || entry.last_attempt_at_unix.is_some()
+                || entry.acceptance.is_some()
         }) {
             return Err(ShakedexError::InvalidDenuoOutboxTransition);
         }
@@ -776,7 +967,8 @@ fn validate_outbox_save_transition(
         if current.outbox.entry(next_entry.envelope_id).is_none()
             && (!matches!(next_entry.state, DenuoOutboxState::Pending)
                 || next_entry.retry_attempts != 0
-                || next_entry.last_attempt_at_unix.is_some())
+                || next_entry.last_attempt_at_unix.is_some()
+                || next_entry.acceptance.is_some())
         {
             return Err(ShakedexError::InvalidDenuoOutboxTransition);
         }
@@ -814,6 +1006,9 @@ fn validate_entry_save_transition(
             DenuoOutboxState::HandoffPrepared { .. },
             DenuoOutboxState::RetryScheduled { .. } | DenuoOutboxState::Exhausted { .. },
         ) => validate_handoff_failure(current, next)?,
+        (DenuoOutboxState::HandoffPrepared { .. }, DenuoOutboxState::RelayAccepted { .. }) => {
+            validate_handoff_acceptance(current, next)?
+        }
         _ => return Err(ShakedexError::InvalidDenuoOutboxTransition),
     }
     Ok(())
@@ -886,6 +1081,45 @@ fn validate_handoff_failure(
     Ok(())
 }
 
+fn validate_handoff_acceptance(
+    current: &DenuoOutboxEntry,
+    next: &DenuoOutboxEntry,
+) -> Result<(), ShakedexError> {
+    let DenuoOutboxState::HandoffPrepared {
+        attempt_id,
+        prepared_at_unix,
+    } = current.state
+    else {
+        return Err(ShakedexError::InvalidDenuoOutboxTransition);
+    };
+    let DenuoOutboxState::RelayAccepted {
+        receipt_id,
+        accepted_at_unix,
+    } = next.state
+    else {
+        return Err(ShakedexError::InvalidDenuoOutboxTransition);
+    };
+    let acceptance = next
+        .acceptance
+        .as_ref()
+        .ok_or(ShakedexError::InvalidDenuoOutboxTransition)?;
+    if current.acceptance.is_some()
+        || current.retry_attempts != next.retry_attempts
+        || next.last_attempt_at_unix != Some(accepted_at_unix)
+        || accepted_at_unix < prepared_at_unix
+        || receipt_id != acceptance.receipt_id
+        || accepted_at_unix != acceptance.accepted_at_unix
+    {
+        return Err(ShakedexError::InvalidDenuoOutboxTransition);
+    }
+    let expected = validate_persisted_denuo_publication_acceptance(acceptance)
+        .map_err(|_| ShakedexError::InvalidDenuoOutboxTransition)?;
+    if expected.attempt_id != attempt_id || expected.prepared_at_unix != prepared_at_unix {
+        return Err(ShakedexError::InvalidDenuoOutboxTransition);
+    }
+    Ok(())
+}
+
 fn validate_record_time(
     outbox: &DenuoPublicationOutbox,
     updated_at_unix: u64,
@@ -901,6 +1135,13 @@ fn validate_record_time(
                     prepared_at_unix,
                     ..
                 } if prepared_at_unix > updated_at_unix
+            )
+            || matches!(
+                entry.state,
+                DenuoOutboxState::RelayAccepted {
+                    accepted_at_unix,
+                    ..
+                } if accepted_at_unix > updated_at_unix
             )
             || matches!(
                 entry.state,
@@ -925,6 +1166,8 @@ struct CanonicalPublication {
     content_id: ObjectHash,
     message_kind: DenuoOutboxMessageKind,
     request_id: u64,
+    network_magic: u32,
+    network_genesis: ObjectHash,
 }
 
 fn canonical_publication(envelope_bytes: &[u8]) -> Result<CanonicalPublication, ShakedexError> {
@@ -936,7 +1179,7 @@ fn canonical_publication(envelope_bytes: &[u8]) -> Result<CanonicalPublication, 
     if registry != DenuoRegistryVersion::V2 || request_id == 0 {
         return Err(ShakedexError::InvalidDenuoOutboxEnvelope);
     }
-    let (message_kind, content_id) = match &message {
+    let (message_kind, content_id, network) = match &message {
         NameMarketMessage::Offer(listing) => (
             DenuoOutboxMessageKind::Offer,
             ObjectHash::new(
@@ -944,6 +1187,7 @@ fn canonical_publication(envelope_bytes: &[u8]) -> Result<CanonicalPublication, 
                     .listing_hash()
                     .map_err(|_| ShakedexError::InvalidDenuoOutboxEnvelope)?,
             ),
+            listing.network(),
         ),
         NameMarketMessage::Cancel(cancellation) => (
             DenuoOutboxMessageKind::Cancellation,
@@ -952,6 +1196,7 @@ fn canonical_publication(envelope_bytes: &[u8]) -> Result<CanonicalPublication, 
                     .cancellation_hash()
                     .map_err(|_| ShakedexError::InvalidDenuoOutboxEnvelope)?,
             ),
+            cancellation.network,
         ),
         _ => return Err(ShakedexError::InvalidDenuoOutboxEnvelope),
     };
@@ -969,7 +1214,13 @@ fn canonical_publication(envelope_bytes: &[u8]) -> Result<CanonicalPublication, 
         content_id,
         message_kind,
         request_id,
+        network_magic: network.magic,
+        network_genesis: ObjectHash::new(*network.genesis.as_bytes()),
     })
+}
+
+fn exact_envelope_digest(envelope_bytes: &[u8]) -> ObjectHash {
+    ObjectHash::new(Sha256::digest(envelope_bytes).into())
 }
 
 fn validate_entry(entry: &DenuoOutboxEntry) -> Result<(), ShakedexError> {
@@ -984,6 +1235,9 @@ fn validate_entry(entry: &DenuoOutboxEntry) -> Result<(), ShakedexError> {
             .last_attempt_at_unix
             .is_some_and(|attempt| attempt < entry.created_at_unix)
     {
+        return Err(ShakedexError::CorruptDenuoOutbox);
+    }
+    if matches!(entry.state, DenuoOutboxState::RelayAccepted { .. }) != entry.acceptance.is_some() {
         return Err(ShakedexError::CorruptDenuoOutbox);
     }
     match entry.state {
@@ -1025,6 +1279,44 @@ fn validate_entry(entry: &DenuoOutboxEntry) -> Result<(), ShakedexError> {
                 || entry
                     .last_attempt_at_unix
                     .is_none_or(|attempt| next_attempt_at_unix <= attempt)
+            {
+                return Err(ShakedexError::CorruptDenuoOutbox);
+            }
+        }
+        DenuoOutboxState::RelayAccepted {
+            receipt_id,
+            accepted_at_unix,
+        } => {
+            let acceptance = entry
+                .acceptance
+                .as_ref()
+                .ok_or(ShakedexError::CorruptDenuoOutbox)?;
+            let expected = validate_persisted_denuo_publication_acceptance(acceptance)?;
+            let attempt_ordinal = entry
+                .retry_attempts
+                .checked_add(1)
+                .filter(|attempt| *attempt <= MAX_DENUO_OUTBOX_RETRY_ATTEMPTS)
+                .ok_or(ShakedexError::CorruptDenuoOutbox)?;
+            if receipt_id != acceptance.receipt_id
+                || accepted_at_unix != acceptance.accepted_at_unix
+                || entry.last_attempt_at_unix != Some(accepted_at_unix)
+                || expected.network_magic != canonical.network_magic
+                || expected.network_genesis != canonical.network_genesis
+                || expected.record_sequence != u64::from(attempt_ordinal)
+                || expected.prepared_at_unix < entry.created_at_unix
+                || accepted_at_unix < expected.prepared_at_unix
+                || expected.attempt_id
+                    != denuo_handoff_attempt_id(
+                        entry.envelope_id,
+                        entry.request_id,
+                        attempt_ordinal,
+                        expected.prepared_at_unix,
+                    )
+                || expected.envelope_id != entry.envelope_id
+                || expected.envelope_digest != exact_envelope_digest(&entry.envelope_bytes)
+                || expected.content_id != entry.content_id
+                || expected.message_kind != entry.message_kind
+                || expected.request_id != entry.request_id
             {
                 return Err(ShakedexError::CorruptDenuoOutbox);
             }
@@ -1076,9 +1368,48 @@ mod tests {
     use k256::ecdsa::SigningKey;
 
     use super::*;
-    use crate::{authenticate_fixed_price_listing, verify_listing_cancellation};
+    use crate::acceptance::signed_acceptance_for_test;
+    use crate::{
+        DenuoHnsaEndpointBinding, DenuoHrmRootBinding, authenticate_fixed_price_listing,
+        verify_listing_cancellation,
+    };
 
     const CREATED_AT: u64 = 1_800_000_200;
+
+    fn acceptance_policy(
+        network: NetworkBinding,
+        endpoint_key: &SigningKey,
+    ) -> DenuoPublicationAcceptancePolicy {
+        let endpoint_public_key = endpoint_key.verifying_key().to_encoded_point(true);
+        DenuoPublicationAcceptancePolicy::new(
+            network,
+            DenuoHrmRootBinding {
+                subject: ObjectHash::new([0x61; 32]),
+                sequence: 7,
+                envelope_hash: ObjectHash::new([0x62; 32]),
+                chain_height: 500,
+                chain_work_be: [0x63; 32],
+                chain_anchor: ObjectHash::new([0x64; 32]),
+            },
+            DenuoHnsaEndpointBinding {
+                canonical_service_name: b"relay-market".to_vec(),
+                application_profile_id: 0x4452,
+                service_resource_id: ObjectHash::new([0x65; 32]),
+                service_delegation_id: ObjectHash::new([0x66; 32]),
+                service_generation: 3,
+                endpoint_delegation_id: ObjectHash::new([0x67; 32]),
+                endpoint_sequence: 9,
+                endpoint_public_key: endpoint_public_key
+                    .as_bytes()
+                    .try_into()
+                    .expect("compressed endpoint key"),
+                effective_not_before_unix: CREATED_AT - 60,
+                effective_expires_at_unix: CREATED_AT + 600,
+            },
+            120,
+        )
+        .expect("acceptance policy")
+    }
 
     fn publication_fixtures() -> (
         Vec<u8>,
@@ -1305,7 +1636,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system clock")
             .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
+        let temporary_root = std::env::var_os("HNS_WALLET_STORE_TEST_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let directory = temporary_root.join(format!(
             "hns-wallet-shakedex-outbox-{}-{unique}",
             std::process::id()
         ));
@@ -1610,6 +1944,23 @@ mod tests {
             Err(ShakedexError::InvalidDenuoOutboxTransition)
         ));
 
+        let (_schema_v2_ack_cleanup, mut schema_v2_ack_store, _) = test_wallet_store();
+        schema_v2_ack_store
+            .save_denuo_board_object(
+                DENUO_OUTBOX_RECORD_ID,
+                0,
+                &PersistedDenuoPublicationOutbox {
+                    schema_version: HANDOFF_DENUO_OUTBOX_SCHEMA_VERSION,
+                    entries: acknowledged.entries.clone(),
+                },
+                CREATED_AT + 1,
+            )
+            .expect("authorized test writer stores impossible schema-v2 acknowledgement");
+        assert!(matches!(
+            load_denuo_publication_outbox(&schema_v2_ack_store),
+            Err(ShakedexError::CorruptDenuoOutbox)
+        ));
+
         let (_malicious_cleanup, mut malicious_store, _) = test_wallet_store();
         let mut impossible_legacy = pending.entries.clone();
         impossible_legacy[0].state = DenuoOutboxState::HandoffPrepared {
@@ -1823,5 +2174,216 @@ mod tests {
             ),
             Err(ShakedexError::InvalidDenuoOutboxEnvelope)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_v2_prepared_handoff_acceptance_is_durable_and_exactly_idempotent() {
+        let (offer, listing, _, _) = publication_fixtures();
+        let (_cleanup, mut store, database) = test_wallet_store();
+        let mut outbox = DenuoPublicationOutbox::default();
+        let envelope_id = outbox
+            .enqueue_offer(&offer, &listing, CREATED_AT)
+            .expect("enqueue")
+            .envelope_id();
+        let prepared_at_unix = CREATED_AT + 1;
+        let entry = &mut outbox.entries[0];
+        entry.state = DenuoOutboxState::HandoffPrepared {
+            attempt_id: denuo_handoff_attempt_id(
+                entry.envelope_id,
+                entry.request_id,
+                1,
+                prepared_at_unix,
+            ),
+            prepared_at_unix,
+        };
+        let revision = store
+            .save_denuo_board_object(
+                DENUO_OUTBOX_RECORD_ID,
+                0,
+                &PersistedDenuoPublicationOutbox {
+                    schema_version: HANDOFF_DENUO_OUTBOX_SCHEMA_VERSION,
+                    entries: outbox.entries.clone(),
+                },
+                prepared_at_unix,
+            )
+            .expect("inject schema-v2 prepared row");
+        let loaded = load_denuo_publication_outbox(&store).expect("load schema-v2 prepared row");
+        let handoff = prepared_handoff_from_entry(revision, &loaded.outbox.entries[0])
+            .expect("reconstruct exact handoff");
+        let endpoint_key = SigningKey::from_slice(&[0x42; 32]).expect("endpoint key");
+        let policy = acceptance_policy(listing.network(), &endpoint_key);
+        let canonical = canonical_publication(handoff.envelope_bytes()).expect("canonical handoff");
+        let expected = acceptance_expectation(&handoff, &canonical);
+        let accepted_at_unix = CREATED_AT + 2;
+        let receipt = signed_acceptance_for_test(
+            &policy,
+            expected,
+            accepted_at_unix,
+            accepted_at_unix + 60,
+            &endpoint_key,
+        );
+
+        let mut malformed_signature = receipt.clone();
+        *malformed_signature.last_mut().expect("signature byte") ^= 1;
+        assert!(matches!(
+            record_denuo_handoff_acceptance(
+                &mut store,
+                &handoff,
+                &policy,
+                &malformed_signature,
+                accepted_at_unix,
+            ),
+            Err(ShakedexError::InvalidDenuoPublicationAcceptance)
+        ));
+        let overlong = signed_acceptance_for_test(
+            &policy,
+            expected,
+            accepted_at_unix,
+            accepted_at_unix + 121,
+            &endpoint_key,
+        );
+        assert!(matches!(
+            record_denuo_handoff_acceptance(
+                &mut store,
+                &handoff,
+                &policy,
+                &overlong,
+                accepted_at_unix,
+            ),
+            Err(ShakedexError::InvalidDenuoPublicationAcceptance)
+        ));
+        let wrong_content_receipt = signed_acceptance_for_test(
+            &policy,
+            DenuoAcceptanceExpectation {
+                content_id: ObjectHash::new([0x99; 32]),
+                ..expected
+            },
+            accepted_at_unix,
+            accepted_at_unix + 60,
+            &endpoint_key,
+        );
+        assert!(matches!(
+            record_denuo_handoff_acceptance(
+                &mut store,
+                &handoff,
+                &policy,
+                &wrong_content_receipt,
+                accepted_at_unix,
+            ),
+            Err(ShakedexError::InvalidDenuoPublicationAcceptance)
+        ));
+        let still_prepared = load_denuo_publication_outbox(&store)
+            .expect("rejected receipts do not mutate the prepared row");
+        assert_eq!(still_prepared.revision, revision);
+        assert!(matches!(
+            still_prepared.outbox.state(envelope_id),
+            Some(DenuoOutboxState::HandoffPrepared { .. })
+        ));
+
+        let inserted = record_denuo_handoff_acceptance(
+            &mut store,
+            &handoff,
+            &policy,
+            &receipt,
+            accepted_at_unix,
+        )
+        .expect("persist signed relay acceptance");
+        assert!(inserted.inserted());
+        let snapshot = inserted.snapshot();
+        assert_eq!(snapshot.envelope_id, envelope_id);
+        assert_eq!(snapshot.attempt_id, handoff.attempt_id());
+        assert_eq!(snapshot.policy_fingerprint, policy.fingerprint());
+        let accepted_revision = snapshot.outbox_revision;
+        assert_eq!(accepted_revision, revision + 1);
+        assert!(
+            load_prepared_denuo_handoff(&store)
+                .expect("load terminal outbox")
+                .is_none()
+        );
+        assert!(matches!(
+            prepare_next_denuo_handoff(&mut store, accepted_revision, CREATED_AT + 3)
+                .expect("accepted entry is not due"),
+            DenuoHandoffPreparation::NoDue { .. }
+        ));
+
+        let existing = record_denuo_handoff_acceptance(
+            &mut store,
+            &handoff,
+            &policy,
+            &receipt,
+            accepted_at_unix,
+        )
+        .expect("exact replay ignores pre-accept revision");
+        assert!(!existing.inserted());
+        assert_eq!(existing.snapshot(), snapshot);
+        assert_eq!(
+            load_denuo_publication_outbox(&store)
+                .expect("load after replay")
+                .revision,
+            accepted_revision
+        );
+
+        let conflicting_receipt = signed_acceptance_for_test(
+            &policy,
+            expected,
+            accepted_at_unix,
+            accepted_at_unix + 61,
+            &endpoint_key,
+        );
+        assert!(matches!(
+            record_denuo_handoff_acceptance(
+                &mut store,
+                &handoff,
+                &policy,
+                &conflicting_receipt,
+                accepted_at_unix,
+            ),
+            Err(ShakedexError::DenuoPublicationAcceptanceConflict)
+        ));
+
+        let accepted = load_denuo_publication_outbox(&store).expect("load accepted row");
+        let mut corrupt = accepted.outbox.clone();
+        let receipt_bytes = &mut corrupt.entries[0]
+            .acceptance
+            .as_mut()
+            .expect("durable receipt")
+            .receipt_bytes;
+        let final_byte = receipt_bytes.last_mut().expect("receipt byte");
+        *final_byte ^= 1;
+        assert!(matches!(
+            corrupt.validate(),
+            Err(ShakedexError::CorruptDenuoOutbox)
+        ));
+        let persisted = store
+            .denuo_board_object::<PersistedDenuoPublicationOutbox>(DENUO_OUTBOX_RECORD_ID)
+            .expect("read schema-v3 row")
+            .expect("schema-v3 row exists");
+        assert_eq!(persisted.value.schema_version, DENUO_OUTBOX_SCHEMA_VERSION);
+        assert!(matches!(
+            record_denuo_handoff_failure(
+                &mut store,
+                handoff,
+                accepted_at_unix + 1,
+                accepted_at_unix + 2,
+            ),
+            Err(ShakedexError::StaleRevision)
+        ));
+        drop(store);
+
+        let mut reopened = WalletStore::open(&database).expect("reopen wallet store");
+        reopened
+            .unlock("denuo-outbox-test-passphrase")
+            .expect("unlock wallet store");
+        let restarted =
+            load_denuo_publication_outbox(&reopened).expect("receipt self-validates after restart");
+        assert_eq!(restarted.revision, accepted_revision);
+        assert_eq!(
+            restarted.outbox.state(envelope_id),
+            Some(DenuoOutboxState::RelayAccepted {
+                receipt_id: snapshot.receipt_id,
+                accepted_at_unix,
+            })
+        );
     }
 }

@@ -1,6 +1,7 @@
 #![doc = "Release-gated fixed-price Shakedex persistence boundary."]
 #![forbid(unsafe_code)]
 
+mod acceptance;
 mod board;
 mod canonical;
 mod outbox;
@@ -8,6 +9,11 @@ mod plans;
 mod transactions;
 mod value_workflow;
 
+pub use acceptance::{
+    DenuoHnsaEndpointBinding, DenuoHrmRootBinding, DenuoPublicationAcceptancePolicy,
+    DenuoPublicationAcceptanceSnapshot, HNSA_NAMED_SERVICE_RESOURCE_PROFILE,
+    MAX_DENUO_PUBLICATION_ACCEPTANCE_BYTES,
+};
 pub use board::{
     BoardOfferStatus, NameMarketBoard, PersistedBoardOffer, StoredNameMarketBoard,
     load_name_market_board, save_name_market_board,
@@ -20,11 +26,12 @@ pub use canonical::{
     verify_listing_cancellation,
 };
 pub use outbox::{
-    DenuoHandoffFailureResult, DenuoHandoffPreparation, DenuoOutboxEnqueue, DenuoOutboxMessageKind,
-    DenuoOutboxState, DenuoPreparedHandoff, DenuoPublicationOutbox, MAX_DENUO_OUTBOX_ENTRIES,
-    MAX_DENUO_OUTBOX_ENVELOPE_BYTES, MAX_DENUO_OUTBOX_RETRY_ATTEMPTS,
-    MAX_DENUO_OUTBOX_SERIALIZED_BYTES, StoredDenuoPublicationOutbox, load_denuo_publication_outbox,
-    load_prepared_denuo_handoff, prepare_next_denuo_handoff, record_denuo_handoff_failure,
+    DenuoHandoffAcceptanceResult, DenuoHandoffFailureResult, DenuoHandoffPreparation,
+    DenuoOutboxEnqueue, DenuoOutboxMessageKind, DenuoOutboxState, DenuoPreparedHandoff,
+    DenuoPublicationOutbox, MAX_DENUO_OUTBOX_ENTRIES, MAX_DENUO_OUTBOX_ENVELOPE_BYTES,
+    MAX_DENUO_OUTBOX_RETRY_ATTEMPTS, MAX_DENUO_OUTBOX_SERIALIZED_BYTES,
+    StoredDenuoPublicationOutbox, load_denuo_publication_outbox, load_prepared_denuo_handoff,
+    prepare_next_denuo_handoff, record_denuo_handoff_acceptance, record_denuo_handoff_failure,
     recover_denuo_handoff_as_retry, save_denuo_publication_outbox,
 };
 pub use plans::{
@@ -607,6 +614,12 @@ pub enum ShakedexError {
     InvalidDenuoOutboxTransition,
     #[error("Denuo publication outbox retry limit was reached")]
     DenuoOutboxRetryLimit,
+    #[error("Denuo relay acceptance policy is invalid")]
+    InvalidDenuoPublicationAcceptancePolicy,
+    #[error("Denuo relay acceptance is invalid, noncanonical, or mismatched")]
+    InvalidDenuoPublicationAcceptance,
+    #[error("Denuo relay acceptance conflicts with the durable terminal receipt")]
+    DenuoPublicationAcceptanceConflict,
     #[error("verified evidence does not permit this transition")]
     InvalidTransition,
     #[error("name or transaction evidence is invalid")]

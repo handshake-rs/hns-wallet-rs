@@ -22,6 +22,7 @@ hns-transaction.workspace = true
 hns-wallet-hns.workspace = true
 hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true
+k256.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -29,7 +30,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 blake2.workspace = true
-k256.workspace = true
 
 [lints]
 workspace = true
