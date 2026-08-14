@@ -41,6 +41,12 @@ boundary:
   high-watermarks but removes
   its round hash and ID from duplicate detection; the cache provides no quote
   conversion and does not itself confer quote or live-chain authority;
+- deletion-protected encrypted HNSA/HNSR publisher high-water state with exact
+  route-and-endpoint scope, physically independent endpoint-delegation and
+  named-route dimensions, persist-before-use nonzero reservations, safe crash
+  gaps, bounded CAS retry, monotonic clocks, and full-width `u64` values kept
+  separate from SQLite entity revisions. The opaque reservation boundary is
+  crate-internal until reviewed HNSA/HNSR signing dependencies are available;
 - Kyoto-only Bitcoin state and a native-ETH policy/contract verification
   boundary whose settlement permits remain unavailable; and
 - deterministic, non-mainnet fixtures for downstream qualification.

@@ -5,6 +5,10 @@ mod name_workflow;
 mod node_rpc;
 mod shakedex_funding;
 mod shakedex_key;
+// The counter boundary stays crate-private until the immutable hns-rs HNSA/HNSR
+// signing APIs are available to consume its opaque committed reservations.
+#[allow(dead_code)]
+mod hnsa_hnsr_publisher;
 
 pub use name_workflow::{
     AuthorizedNameOperation, HnsNameAction, HnsNameLifecycle, NameActionContextEvidence,

@@ -61,6 +61,7 @@ pub enum EntityKind {
     NameTransfer,
     Shakedex,
     HnsShakedexKeyAllocation,
+    HnsaHnsrPublisherSequence,
     DenuoBoardObject,
     BitcoinHeader,
     BitcoinFilterHeader,
@@ -96,6 +97,7 @@ impl EntityKind {
             Self::NameTransfer => "name_transfer",
             Self::Shakedex => "shakedex",
             Self::HnsShakedexKeyAllocation => "hns_shakedex_key_allocation",
+            Self::HnsaHnsrPublisherSequence => "hnsa_hnsr_publisher_sequence",
             Self::DenuoBoardObject => "denuo_board_object",
             Self::BitcoinHeader => "bitcoin_header",
             Self::BitcoinFilterHeader => "bitcoin_filter_header",
@@ -124,6 +126,7 @@ impl EntityKind {
             self,
             Self::NativeHnsReadProfile
                 | Self::HnsShakedexKeyAllocation
+                | Self::HnsaHnsrPublisherSequence
                 | Self::BitcoinWalletState
                 | Self::BitcoinSwapKeyAllocation
         )
