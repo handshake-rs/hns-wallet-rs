@@ -95,3 +95,9 @@ candidates, and irreversible wallet publication must fail closed until all 19
 current upstream archives are published and each registry archive proves that
 exact revision. The dependency update does not enable any provider, value,
 settlement, or marketplace gate.
+
+Exact source `bc5901f794450d29fa9f5630bab4fbf91e37bedf` passed complete locked
+CI `31812028843`, including Wallet qualification and RustSec, and CodeQL
+`31812028405` for Actions, JavaScript/TypeScript, Rust, and Python on
+2026-08-14. This is source qualification only and does not satisfy publication,
+installed-product, network, value, or release-gate requirements.

@@ -123,10 +123,9 @@ one complete reconciliation and one quote retry; there is no polling loop.
 The reviewed immutable `hns-script` `0.3.0` Git source now supplies transaction
 sigops, sigop-adjusted policy size, minimum-fee construction, and standard
 weight/sigop bounds directly to the wallet. No local formula is copied. The
-historical wallet source passed its complete locked CI gate; the current
-dependency tranche still requires exact-commit qualification, and multi-process
-node/wallet, restart/reorg, adversarial, product, and resource qualification
-remain open.
+exact current wallet source `bc5901f` passed its complete locked CI gate and
+CodeQL; multi-process node/wallet, restart/reorg, adversarial, product, and
+resource qualification remain open.
 `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` therefore remains `false` and the
 wired quote path still cannot authorize value.
 

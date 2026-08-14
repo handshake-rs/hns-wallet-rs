@@ -177,8 +177,9 @@ bytes through encrypted persistence. Final transactions are checked against
 the ordered reconstructed consensus coins: immutable `hns-script` `0.3.0`
 computes sigops, policy virtual size, minimum fee, and standard weight/sigop
 bounds, while exact input/output sums independently reproduce actual fee.
-Legacy or mismatched evidence fails closed. This source has not passed
-consolidated wallet qualification, so
+Legacy or mismatched evidence fails closed. Exact source `bc5901f` passed the
+consolidated locked wallet source gate, but product and network qualification
+remain absent, so
 `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains false; no local copy of the
 node formula is used.
 
@@ -247,7 +248,7 @@ snapshot binding. The terminal workflow evidence and deletion of every
 protected row commit in one CAS transaction. Later reconciliation audits that
 terminal evidence without recreating reservations or rolling the workflow back;
 loss or change of terminal finality returns a recovery-required error. Source
-FINALIZE regressions passed the exact `2229be8` workspace gate; product/startup,
+FINALIZE regressions passed the exact `bc5901f` workspace gate; product/startup,
 live-node, and multi-process restart/reorg qualification remain pending, and
 every release gate remains `false`.
 
