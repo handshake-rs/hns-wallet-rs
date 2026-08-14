@@ -21,9 +21,10 @@ pub use board::{
     load_name_market_board, save_name_market_board,
 };
 pub use board_read::{
-    DenuoBoardOfferResponsePlan, PreparedDenuoBoardInventoryResponse,
-    PreparedDenuoBoardOfferResponse, prepare_denuo_board_inventory_response,
-    prepare_denuo_board_offer_response,
+    DenuoBoardOfferResponsePlan, DenuoBoardOffersResponsePlan, PreparedDenuoBoardInventoryResponse,
+    PreparedDenuoBoardOfferResponse, PreparedDenuoBoardOffersResponse,
+    prepare_denuo_board_inventory_response, prepare_denuo_board_offer_response,
+    prepare_denuo_board_offers_response,
 };
 pub use board_runtime::{
     CurrentDenuoBoardOffer, DenuoBoardCancellationAdmission, DenuoBoardOfferAdmission,

@@ -56,6 +56,19 @@ an empty board is valid, while the public non-cloneable plan exposes only the
 request ID, board revision, and listing count. It exposes neither hashes nor
 bytes and must be reacquired before any future transport use.
 
+Canonical V2 `GetOffers` also has a closed, read-only plan. The wallet narrows
+the protocol's larger request inventory bound to the type-5 response and HNS
+coherent-lock limit of 64 before store or runtime I/O. Missing and cancelled
+rows form an ordered subset; all-absent returns typed local absence with the
+observed board revision and no invalid empty response. A nonempty candidate
+set is aggregate-size-preflighted before node access and verified with one
+ordered account/chain/mempool/network/time current-lock batch. Duplicate
+underlying names and any invalid, expired, wrong-network, stale, or spent
+active candidate fail the whole plan. The exact selected account, board
+revision, and every requested row are fenced after external reads. Internal
+response bytes are authenticated and discarded; only request ID, board
+revision, requested count, and returned count are public.
+
 Shakedex creation, discovery, signing, broadcast, and dependent value gates
 remain unavailable to products until the documented qualification is complete.
 See the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)

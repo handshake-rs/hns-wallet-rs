@@ -158,6 +158,20 @@ continue to bind its exact four-byte little-endian encoding. No release gate
 changes. The correction passes the full local workspace gate; exact-commit
 CI/CodeQL remains required after commit.
 
+The closed batch-offer board-read tranche adds focused local source
+regressions for canonical V2 `GetOffers`, the wallet/type-5 limit of 64 before
+store/backend/clock access despite the protocol's larger request bound, typed
+all-absent board identity without an invalid empty response, exact sorted
+request ordering, missing/cancelled subset behavior, aggregate response-shape
+preflight, and one coherent current-lock batch across three returned offers.
+It also covers shared seller-script deduplication, duplicate underlying names
+failing before backend/clock access, unchanged-board read behavior, exact full
+requested-row and revision races, listing expiry, and unchanged false gates.
+The opaque public projection contains only request ID, board revision, and
+requested/returned counts. This is local source evidence rather than
+exact-commit CI/CodeQL and supplies no transport, provider, publication,
+signing, or value qualification.
+
 `9649098`, `bc5901f`, `2229be8`, and `ba9f013` remain exact historical green
 CI/CodeQL baselines.
 This repository records no independent security audit, database or resource

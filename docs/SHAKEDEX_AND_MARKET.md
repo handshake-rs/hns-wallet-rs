@@ -242,9 +242,30 @@ allowed empty inventory, is encoded and decoded internally to verify the exact
 correlation ID and ordered hashes, then discarded. The non-cloneable,
 non-serializable plan exposes only correlation ID, board revision, and count;
 it exposes no hashes or response bytes and is neither publication nor a
-transport lease. `GetOffers` remains outside this boundary because a safe
-batch requires an explicit query budget and one aggregate board/account/chain/
-mempool/time fence across every returned current lock.
+transport lease.
+
+The closed batch boundary accepts canonical V2 `GetOffers` with the same
+mandatory nonzero correlation. Although the protocol request can carry up to
+4,096 hashes, the corresponding type-5 `Offers` response and the wallet's
+coherent current-lock primitive are both limited to 64; the wallet therefore
+rejects a larger request before account, store, backend, or clock access.
+Hashes remain in their canonical sorted, unique, nonzero request order.
+Missing and cancelled rows are omitted, while an all-absent result retains the
+observed board revision in a typed local plan and deliberately does not invent
+the protocol-invalid empty `Offers` response. Before node access, the actual
+nonempty candidate response is preflighted against the aggregate protocol
+payload bound. Every active candidate is then reauthenticated and joined to
+one ordered HNS current-lock batch sharing a single selected-account, chain,
+mempool, network, and trusted-time authority. A duplicate underlying name,
+expired or wrong-network listing, stale/spent lock, or other invalid active row
+fails the whole plan; there is no sequential fallback. The final store read
+fences the unchanged selected account, board revision, and exact projection of
+every requested row, including missing and cancelled entries. Canonical
+response bytes are encoded and decoded internally under the exact request ID,
+hash subset, ordering, and listing bytes, then discarded. The public plan
+exposes only request ID, board revision, requested count, and returned count;
+it provides no hashes, listings, locks, response bytes, transport, signing,
+provider, publication, or value capability.
 
 A separate encrypted `DenuoBoardObject` record holds a dormant, offline-only
 publication outbox. It accepts only exact canonical V2 `Offer` and `Cancel`

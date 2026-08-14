@@ -1,7 +1,8 @@
-use hns_marketplace_protocol::DenuoRegistryVersion;
+use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketMessage};
 use hns_wallet_hns::{
-    HnsAccountReadRuntime, HnsBackend, HnsClock, SystemClock, VerifiedCurrentShakedexLock,
-    VerifiedHnsBoardContext,
+    CurrentShakedexLockQuery, HnsAccountReadRuntime, HnsBackend, HnsClock,
+    MAX_CURRENT_SHAKEDEX_LOCK_BATCH, SystemClock, VerifiedCurrentShakedexLock,
+    VerifiedCurrentShakedexLockBatch, VerifiedHnsBoardContext,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::ObjectHash;
@@ -158,6 +159,38 @@ impl CurrentDenuoBoardInventory {
 
     pub(crate) fn listing_hashes(&self) -> &[ObjectHash] {
         &self.listing_hashes
+    }
+}
+
+/// Closed query-scoped view of a nonempty subset of requested board offers
+/// under one coherent account, chain, mempool, network, and clock authority.
+///
+/// Request hashes, listings, and current locks remain crate-private. Keeping
+/// the non-cloneable batch alive prevents an individual listing from being
+/// mistaken for independent current-lock or value authority.
+pub(crate) struct CurrentDenuoBoardOffers {
+    board_revision: u64,
+    requested_listing_hashes: Vec<ObjectHash>,
+    listings: Vec<VerifiedFixedPriceListing>,
+    _current_locks: VerifiedCurrentShakedexLockBatch,
+}
+
+pub(crate) enum CurrentDenuoBoardOffersResolution {
+    Absent { board_revision: u64 },
+    Current(Box<CurrentDenuoBoardOffers>),
+}
+
+impl CurrentDenuoBoardOffers {
+    pub(crate) const fn board_revision(&self) -> u64 {
+        self.board_revision
+    }
+
+    pub(crate) fn requested_listing_hashes(&self) -> &[ObjectHash] {
+        &self.requested_listing_hashes
+    }
+
+    pub(crate) fn listings(&self) -> &[VerifiedFixedPriceListing] {
+        &self.listings
     }
 }
 
@@ -398,6 +431,113 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
         })
     }
 
+    /// Resolve one canonical, bounded `GetOffers` hash set against the board,
+    /// then verify every returned active row through one coherent HNS
+    /// current-lock batch.
+    ///
+    /// Missing and cancelled rows are omitted. If every requested row is
+    /// absent or cancelled, an explicit revision-bound absence snapshot is
+    /// returned without node or clock access; callers must not invent an
+    /// invalid empty wire `Offers` response. Any active row that is malformed,
+    /// expired, on another network, duplicated by underlying name, or no
+    /// longer backed by its exact unspent lock makes the whole plan fail
+    /// closed. The actual response payload shape is preflighted before node
+    /// access, and the selected account plus every requested board row/revision
+    /// is fenced again after all external reads.
+    pub(crate) fn current_offers(
+        &self,
+        listing_hashes: &[ObjectHash],
+    ) -> Result<CurrentDenuoBoardOffersResolution, ShakedexError> {
+        validate_current_offer_request_hashes(listing_hashes)?;
+        self.require_store_authority()?;
+        let (board_revision, requested_rows) = self.store.try_with_store(|store| {
+            let stored = load_name_market_board(store)?;
+            let rows = listing_hashes
+                .iter()
+                .map(|listing_hash| stored.board.offer(*listing_hash).cloned())
+                .collect::<Vec<_>>();
+            Ok::<_, ShakedexError>((stored.revision, rows))
+        })?;
+
+        let mut authenticated = Vec::with_capacity(requested_rows.len());
+        for persisted in requested_rows.iter().flatten() {
+            if persisted.status != BoardOfferStatus::Active {
+                continue;
+            }
+            authenticated.push(authenticate_fixed_price_listing(
+                &persisted.listing_bytes,
+                persisted.listing_hash,
+            )?);
+        }
+        if authenticated.is_empty() {
+            return Ok(CurrentDenuoBoardOffersResolution::Absent { board_revision });
+        }
+
+        // The type-5 envelope has an aggregate payload bound in addition to
+        // its 64-row bound. Reject an unencodable candidate set before making
+        // any node or clock call. The nonzero probe ID has the same wire width
+        // as the exact request ID and the bytes are immediately discarded.
+        let response_probe = NameMarketMessage::Offers(
+            authenticated
+                .iter()
+                .map(|listing| listing.canonical().clone())
+                .collect(),
+        )
+        .encode_envelope(DenuoRegistryVersion::V2, 1)
+        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+        drop(response_probe);
+
+        let queries: Vec<_> = authenticated
+            .iter()
+            .map(|listing| CurrentShakedexLockQuery {
+                name: listing.name().to_vec(),
+                seller_public_key: *listing.seller_public_key(),
+            })
+            .collect();
+        let current_locks = self.hns.verify_current_shakedex_locks(&queries)?;
+        if current_locks.len() != authenticated.len() {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        let mut listings = Vec::with_capacity(authenticated.len());
+        for (authenticated, current_lock) in authenticated.into_iter().zip(current_locks.locks()) {
+            let listing = verify_authenticated_fixed_price_listing(
+                authenticated,
+                current_locks.network(),
+                current_locks.observed_at_unix(),
+                current_lock.locking_coin(),
+            )?;
+            if listing.lock_descriptor()? != *current_lock.descriptor() {
+                return Err(ShakedexError::InvalidListing);
+            }
+            listings.push(listing);
+        }
+
+        self.store.try_with_store(|store| {
+            current_locks.verify_unchanged_account(store)?;
+            let current = load_name_market_board(store)?;
+            if current.revision != board_revision
+                || listing_hashes
+                    .iter()
+                    .zip(&requested_rows)
+                    .any(|(listing_hash, expected)| {
+                        current.board.offer(*listing_hash) != expected.as_ref()
+                    })
+            {
+                return Err(ShakedexError::StaleRevision);
+            }
+            Ok(())
+        })?;
+
+        Ok(CurrentDenuoBoardOffersResolution::Current(Box::new(
+            CurrentDenuoBoardOffers {
+                board_revision,
+                requested_listing_hashes: listing_hashes.to_vec(),
+                listings,
+                _current_locks: current_locks,
+            },
+        )))
+    }
+
     fn require_store_authority(&self) -> Result<(), ShakedexError> {
         if !self.hns.shares_store_authority(&self.store) {
             return Err(ShakedexError::StoreAuthorityMismatch);
@@ -424,4 +564,19 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
         }
         Ok((listing, current_lock))
     }
+}
+
+fn validate_current_offer_request_hashes(
+    listing_hashes: &[ObjectHash],
+) -> Result<(), ShakedexError> {
+    if listing_hashes.is_empty()
+        || listing_hashes.len() > MAX_CURRENT_SHAKEDEX_LOCK_BATCH
+        || listing_hashes
+            .iter()
+            .any(|listing_hash| *listing_hash.as_bytes() == [0; 32])
+        || listing_hashes.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(ShakedexError::InvalidDenuoEnvelope);
+    }
+    Ok(())
 }

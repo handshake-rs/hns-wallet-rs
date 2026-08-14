@@ -77,6 +77,19 @@ independently disabled.
   final chain, mempool, and exact selected-account fences. It is not a lease:
   any future live emitter must reacquire and fence current authority
   immediately before encoding or transport.
+- The batch-offer board-read plan accepts only canonical V2 `GetOffers` with a
+  nonzero correlation ID and at most 64 sorted, unique, nonzero hashes; the
+  row cap is enforced before account, store, backend, or clock access. Missing
+  and cancelled rows are omitted, and all-absent retains the observed board
+  revision without constructing an invalid empty response. The actual
+  nonempty type-5 payload is size-preflighted before node access, then every
+  returned active row is bound to one ordered coherent HNS current-lock batch.
+  Duplicate underlying names or any invalid/expired/wrong-network/stale/spent
+  active candidate fail the whole plan without per-offer fallback. The final
+  fence covers the exact selected account, board revision, and full requested
+  row projection. Canonical response bytes are verified and discarded; the
+  public plan exposes only request ID, revision, and requested/returned counts
+  and carries no transport, provider, publication, signing, or value authority.
 - The board-inventory plan accepts only canonical V2 `GetOfferInventory` with
   a nonzero correlation ID. Exact selected-account revision, current network,
   and trusted time are fenced under the same store authority; cancelled,

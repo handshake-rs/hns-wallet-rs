@@ -31,10 +31,12 @@ use hns_wallet_hns::{
 };
 use hns_wallet_shakedex::{
     DenuoBoardCancellationAdmission, DenuoBoardOfferAdmission, DenuoBoardOfferResponsePlan,
-    DenuoBoardRuntime, DenuoNameMarketRequest, SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED,
-    SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED, SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, ShakedexError,
-    encode_denuo_request, load_name_market_board, prepare_denuo_board_inventory_response,
-    prepare_denuo_board_offer_response, save_name_market_board, verify_fixed_price_listing,
+    DenuoBoardOffersResponsePlan, DenuoBoardRuntime, DenuoNameMarketRequest,
+    SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED, SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED,
+    SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, ShakedexError, encode_denuo_request,
+    load_name_market_board, prepare_denuo_board_inventory_response,
+    prepare_denuo_board_offer_response, prepare_denuo_board_offers_response,
+    save_name_market_board, verify_fixed_price_listing,
 };
 use hns_wallet_store::{SharedWalletStore, WalletStore};
 use hns_wallet_types::{AccountId, BaseUnits, ObjectHash, TransactionHash};
@@ -632,6 +634,7 @@ enum BatchBackendFault {
 struct BatchMarketFixture {
     name: Vec<u8>,
     name_hash: [u8; 32],
+    signing_key: SigningKey,
     seller_public_key: [u8; 33],
     locking_coin: Coin,
     owner_outpoint: HnsOutpoint,
@@ -641,7 +644,13 @@ struct BatchMarketFixture {
 }
 
 impl BatchMarketFixture {
-    fn new(name: &[u8], seller_public_key: [u8; 33], tag: u8) -> Self {
+    fn new(name: &[u8], signing_key: SigningKey, tag: u8) -> Self {
+        let seller_public_key = signing_key
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .expect("compressed batch seller key");
         let name_hash = hash_name(name).expect("batch name hash");
         let value = Dollarydoos::new(900_000 + u64::from(tag));
         let mut state = NameState {
@@ -720,6 +729,7 @@ impl BatchMarketFixture {
         Self {
             name: name.to_vec(),
             name_hash: name_hash.into_bytes(),
+            signing_key,
             seller_public_key,
             locking_coin,
             owner_outpoint,
@@ -727,6 +737,35 @@ impl BatchMarketFixture {
             owner_inclusion,
             state: state.encode().expect("batch name state"),
         }
+    }
+
+    fn listing(&self, network: NetworkBinding, sequence: u64, price: u64) -> FixedPriceListing {
+        let mut proof = SwapProof {
+            network,
+            locking_outpoint: self.locking_coin.outpoint,
+            name: self.name.clone(),
+            seller_public_key: self.seller_public_key,
+            payment_address: Address::new(0, vec![0xb0; 20]).expect("batch payment address"),
+            price: Dollarydoos::new(price),
+            lock_time_seconds: NOW_UNIX - 100,
+            signature: None,
+            fee_address: None,
+            fee: Dollarydoos::new(0),
+        };
+        proof
+            .sign(&self.locking_coin, &self.signing_key)
+            .expect("signed batch proof");
+        let mut listing = FixedPriceListing {
+            proof,
+            created_at: NOW_UNIX - 60,
+            expires_at: NOW_UNIX + 3_600,
+            sequence,
+            signature: None,
+        };
+        listing
+            .sign(&self.signing_key)
+            .expect("signed batch listing");
+        listing
     }
 }
 
@@ -741,17 +780,10 @@ impl CurrentLockBatchFixture {
     fn new() -> Self {
         let shared_key = SigningKey::from_slice(&[0x41; 32]).expect("shared batch seller key");
         let distinct_key = SigningKey::from_slice(&[0x42; 32]).expect("distinct batch seller key");
-        let compressed = |key: &SigningKey| -> [u8; 33] {
-            key.verifying_key()
-                .to_encoded_point(true)
-                .as_bytes()
-                .try_into()
-                .expect("compressed batch seller key")
-        };
         let markets = vec![
-            BatchMarketFixture::new(b"batch-alpha", compressed(&shared_key), 1),
-            BatchMarketFixture::new(b"batch-beta", compressed(&distinct_key), 2),
-            BatchMarketFixture::new(b"batch-gamma", compressed(&shared_key), 3),
+            BatchMarketFixture::new(b"batch-alpha", shared_key.clone(), 1),
+            BatchMarketFixture::new(b"batch-beta", distinct_key, 2),
+            BatchMarketFixture::new(b"batch-gamma", shared_key, 3),
         ];
         let genesis = BlockHash::from_hex(REGTEST_GENESIS).expect("regtest genesis");
         Self {
@@ -810,6 +842,14 @@ struct BatchBackendObservations {
     name_order: Mutex<Vec<[u8; 32]>>,
     context_order: Mutex<Vec<[u8; 32]>>,
     spend_outpoints: Mutex<Vec<Vec<HnsOutpoint>>>,
+    query_hook: Mutex<Option<QueryHook>>,
+}
+
+impl BatchBackendObservations {
+    fn install_query_hook(&self, hook: impl FnOnce() + Send + 'static) {
+        let mut installed = self.query_hook.lock().expect("batch query hook mutex");
+        assert!(installed.replace(Box::new(hook)).is_none());
+    }
 }
 
 struct CurrentLockBatchBackend {
@@ -985,6 +1025,15 @@ impl HnsBackend for CurrentLockBatchBackend {
         name_hash: [u8; 32],
         binding: SnapshotBinding,
     ) -> Result<NameEvidence, HnsWalletError> {
+        let hook = self
+            .observations
+            .query_hook
+            .lock()
+            .map_err(|_| HnsWalletError::RuntimePoisoned)?
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
         self.observations.name_calls.fetch_add(1, Ordering::SeqCst);
         self.observations
             .name_order
@@ -1202,6 +1251,38 @@ fn current_lock_batch_queries(fixture: &CurrentLockBatchFixture) -> Vec<CurrentS
             seller_public_key: fixture.markets[index].seller_public_key,
         })
         .collect()
+}
+
+fn persist_batch_listings(
+    store: &SharedWalletStore,
+    network: NetworkBinding,
+    listings: &[(FixedPriceListing, Coin)],
+) -> (u64, Vec<ObjectHash>) {
+    let mut hashes = Vec::with_capacity(listings.len());
+    let mut verified = Vec::with_capacity(listings.len());
+    for (listing, locking_coin) in listings {
+        let hash = ObjectHash::new(listing.listing_hash().expect("batch listing hash"));
+        let listing = verify_fixed_price_listing(
+            &listing.encode().expect("batch listing bytes"),
+            hash,
+            network,
+            NOW_UNIX,
+            locking_coin,
+        )
+        .expect("verified batch listing");
+        hashes.push(hash);
+        verified.push(listing);
+    }
+    let revision = store
+        .try_with_store_mut(|wallet| {
+            let mut stored = load_name_market_board(wallet)?;
+            for listing in &verified {
+                assert!(stored.board.apply_offer(listing)?);
+            }
+            save_name_market_board(wallet, stored.revision, &stored.board, NOW_UNIX)
+        })
+        .expect("persist batch board listings");
+    (revision, hashes)
 }
 
 fn late_runtime(
@@ -1564,6 +1645,421 @@ fn current_lock_batch_rejects_zero_mempool_nonce_and_hostile_spend_batches() {
             assert_eq!(observations.spend_calls.load(Ordering::SeqCst), 1);
         }
     }
+}
+
+#[test]
+fn batch_offers_response_rejects_over_64_pre_io_and_represents_all_absent_without_wire_bytes() {
+    let fixture = Arc::new(CurrentLockBatchFixture::new());
+    let observations = Arc::new(BatchBackendObservations::default());
+    let clock_calls = Arc::new(AtomicU64::new(0));
+    let (store, config) = create_store(":memory:");
+    let hns = current_lock_batch_runtime(
+        store.clone(),
+        config,
+        fixture.clone(),
+        observations.clone(),
+        BatchBackendFault::Healthy,
+        clock_calls.clone(),
+    );
+    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
+    let oversized_hashes = (1_u8..=65)
+        .map(|byte| ObjectHash::new([byte; 32]))
+        .collect();
+    let oversized = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        180,
+        &DenuoNameMarketRequest::Offers(oversized_hashes),
+    )
+    .expect("protocol-valid 65-hash GetOffers request");
+    let one_hash = ObjectHash::new([0xef; 32]);
+    let valid = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        186,
+        &DenuoNameMarketRequest::Offers(vec![one_hash]),
+    )
+    .expect("canonical one-hash GetOffers request");
+    let v1 = encode_denuo_request(
+        DenuoRegistryVersion::V1,
+        187,
+        &DenuoNameMarketRequest::Offers(vec![one_hash]),
+    )
+    .expect("V1 GetOffers request");
+    let inventory = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        188,
+        &DenuoNameMarketRequest::Inventory,
+    )
+    .expect("wrong inventory request family");
+    let response = NameMarketMessage::Offers(vec![fixture.markets[0].listing(
+        fixture.network,
+        188,
+        18_800,
+    )])
+    .encode_envelope(DenuoRegistryVersion::V2, 188)
+    .expect("wrong Offers response family");
+    let mut zero_id = valid.clone();
+    const REQUEST_ID_OFFSET: usize = 4 + (5 * core::mem::size_of::<u16>());
+    zero_id[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + core::mem::size_of::<u64>()]
+        .copy_from_slice(&0_u64.to_le_bytes());
+    let mut trailing = valid;
+    trailing.push(0);
+
+    store.lock().expect("lock store before pre-I/O rejection");
+    assert!(matches!(
+        prepare_denuo_board_offers_response(&oversized, &board),
+        Err(ShakedexError::InvalidDenuoEnvelope)
+    ));
+    for rejected in [
+        inventory.as_slice(),
+        response.as_slice(),
+        zero_id.as_slice(),
+        trailing.as_slice(),
+        &[0x01, 0x02, 0x03],
+    ] {
+        assert!(matches!(
+            prepare_denuo_board_offers_response(rejected, &board),
+            Err(ShakedexError::InvalidDenuoEnvelope)
+        ));
+    }
+    assert!(matches!(
+        prepare_denuo_board_offers_response(&v1, &board),
+        Err(ShakedexError::DenuoRegistryMismatch)
+    ));
+    store
+        .unlock(PASSPHRASE)
+        .expect("unlock store after rejection");
+    assert_eq!(observations.chain_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(observations.mempool_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(observations.name_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(clock_calls.load(Ordering::SeqCst), 0);
+
+    let missing_hash = ObjectHash::new([0xf0; 32]);
+    let missing = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        181,
+        &DenuoNameMarketRequest::Offers(vec![missing_hash]),
+    )
+    .expect("missing GetOffers request");
+    let absent = prepare_denuo_board_offers_response(&missing, &board)
+        .expect("typed all-absent response plan");
+    assert!(matches!(
+        absent,
+        DenuoBoardOffersResponsePlan::Absent {
+            request_id: 181,
+            requested_count: 1,
+            board_revision: 0,
+        }
+    ));
+    assert_eq!(absent.request_id(), 181);
+    assert_eq!(absent.requested_count(), 1);
+    assert_eq!(absent.returned_count(), 0);
+    assert_eq!(absent.board_revision(), 0);
+    assert_eq!(observations.chain_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(observations.mempool_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(observations.name_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(clock_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store
+            .try_with_store(load_name_market_board)
+            .expect("read-only absent board")
+            .revision,
+        0
+    );
+}
+
+#[test]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "a release-gate flip requires explicit review of this coherent batch boundary"
+)]
+fn batch_offers_response_preserves_sorted_request_subset_and_tombstones_without_writes() {
+    let fixture = Arc::new(CurrentLockBatchFixture::new());
+    let listings: Vec<_> = fixture
+        .markets
+        .iter()
+        .enumerate()
+        .map(|(index, market)| {
+            (
+                market.listing(
+                    fixture.network,
+                    200 + u64::try_from(index).expect("bounded listing index"),
+                    20_000 + u64::try_from(index).expect("bounded listing index"),
+                ),
+                market.locking_coin.clone(),
+            )
+        })
+        .collect();
+    let (store, config) = create_store(":memory:");
+    let (revision, listing_hashes) = persist_batch_listings(&store, fixture.network, &listings);
+    assert_eq!(revision, 1);
+    let missing_hash = ObjectHash::new([0xfe; 32]);
+    assert!(!listing_hashes.contains(&missing_hash));
+    let mut requested_hashes = listing_hashes.clone();
+    requested_hashes.push(missing_hash);
+    requested_hashes.sort_unstable();
+    let request = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        182,
+        &DenuoNameMarketRequest::Offers(requested_hashes.clone()),
+    )
+    .expect("sorted GetOffers request");
+    let expected_name_order: Vec<_> = requested_hashes
+        .iter()
+        .filter_map(|requested_hash| {
+            listing_hashes
+                .iter()
+                .position(|listing_hash| listing_hash == requested_hash)
+                .map(|index| fixture.markets[index].name_hash)
+        })
+        .collect();
+
+    let observations = Arc::new(BatchBackendObservations::default());
+    let clock_calls = Arc::new(AtomicU64::new(0));
+    let hns = current_lock_batch_runtime(
+        store.clone(),
+        config.clone(),
+        fixture.clone(),
+        observations.clone(),
+        BatchBackendFault::Healthy,
+        clock_calls.clone(),
+    );
+    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
+    let plan = prepare_denuo_board_offers_response(&request, &board)
+        .expect("coherent current offers response plan");
+    assert_eq!(plan.request_id(), 182);
+    assert_eq!(plan.requested_count(), 4);
+    assert_eq!(plan.returned_count(), 3);
+    assert_eq!(plan.board_revision(), 1);
+    let DenuoBoardOffersResponsePlan::Current(prepared) = &plan else {
+        panic!("expected current batch response plan");
+    };
+    assert_eq!(prepared.request_id(), 182);
+    assert_eq!(prepared.requested_count(), 4);
+    assert_eq!(prepared.returned_count(), 3);
+    assert_eq!(prepared.board_revision(), 1);
+    assert_eq!(
+        *observations
+            .name_order
+            .lock()
+            .expect("batch response name order"),
+        expected_name_order
+    );
+    assert_eq!(observations.chain_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(observations.genesis_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(observations.mempool_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(observations.name_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(observations.context_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(observations.spend_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(clock_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .try_with_store(load_name_market_board)
+            .expect("read-only current batch board")
+            .revision,
+        1
+    );
+
+    let mut cancellation =
+        ListingCancellation::for_listing(&listings[0].0, NOW_UNIX - 1, NOW_UNIX + 4_000, 300)
+            .expect("batch cancellation terms");
+    cancellation
+        .sign(&fixture.markets[0].signing_key)
+        .expect("signed batch cancellation");
+    let cancellation_hash = ObjectHash::new(
+        cancellation
+            .cancellation_hash()
+            .expect("batch cancellation hash"),
+    );
+    let cancellation_envelope = NameMarketMessage::Cancel(cancellation)
+        .encode_envelope(DenuoRegistryVersion::V2, 183)
+        .expect("batch cancellation envelope");
+    board
+        .admit_cancellation(&cancellation_envelope, listing_hashes[0], cancellation_hash)
+        .expect("persist batch cancellation tombstone");
+    drop(plan);
+    drop(board);
+    drop(hns);
+
+    let tombstone_observations = Arc::new(BatchBackendObservations::default());
+    let tombstone_clock_calls = Arc::new(AtomicU64::new(0));
+    let tombstone_hns = current_lock_batch_runtime(
+        store.clone(),
+        config,
+        fixture,
+        tombstone_observations.clone(),
+        BatchBackendFault::Healthy,
+        tombstone_clock_calls.clone(),
+    );
+    let tombstone_board = DenuoBoardRuntime::new(&tombstone_hns, store.clone())
+        .expect("tombstone shared batch store authority");
+    let tombstoned = prepare_denuo_board_offers_response(&request, &tombstone_board)
+        .expect("coherent subset after tombstone");
+    assert_eq!(tombstoned.requested_count(), 4);
+    assert_eq!(tombstoned.returned_count(), 2);
+    assert_eq!(tombstoned.board_revision(), 2);
+    assert_eq!(tombstone_observations.name_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        tombstone_observations.context_calls.load(Ordering::SeqCst),
+        2
+    );
+    assert_eq!(tombstone_observations.spend_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(tombstone_clock_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        store
+            .try_with_store(load_name_market_board)
+            .expect("read-only tombstone batch board")
+            .revision,
+        2
+    );
+
+    assert!(!HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
+    assert!(!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
+    assert!(!SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
+    assert!(!SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+    assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
+}
+
+#[test]
+fn batch_offers_response_rejects_duplicate_active_names_before_backend_or_clock() {
+    let fixture = Arc::new(CurrentLockBatchFixture::new());
+    let first = &fixture.markets[0];
+    let alternate = BatchMarketFixture::new(
+        &first.name,
+        SigningKey::from_slice(&[0x44; 32]).expect("alternate batch seller"),
+        9,
+    );
+    let listings = vec![
+        (
+            first.listing(fixture.network, 400, 40_000),
+            first.locking_coin.clone(),
+        ),
+        (
+            alternate.listing(fixture.network, 401, 40_001),
+            alternate.locking_coin.clone(),
+        ),
+    ];
+    let (store, config) = create_store(":memory:");
+    let (revision, mut hashes) = persist_batch_listings(&store, fixture.network, &listings);
+    hashes.sort_unstable();
+    let request = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        184,
+        &DenuoNameMarketRequest::Offers(hashes),
+    )
+    .expect("same-name distinct-seller GetOffers request");
+    let observations = Arc::new(BatchBackendObservations::default());
+    let clock_calls = Arc::new(AtomicU64::new(0));
+    let hns = current_lock_batch_runtime(
+        store.clone(),
+        config,
+        fixture,
+        observations.clone(),
+        BatchBackendFault::Healthy,
+        clock_calls.clone(),
+    );
+    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
+
+    assert!(matches!(
+        prepare_denuo_board_offers_response(&request, &board),
+        Err(ShakedexError::InvalidEvidence)
+    ));
+    assert_eq!(observations.chain_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(observations.mempool_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(observations.name_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(clock_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        store
+            .try_with_store(load_name_market_board)
+            .expect("unchanged duplicate-name board")
+            .revision,
+        revision
+    );
+}
+
+#[test]
+fn batch_offers_response_fences_board_revision_and_listing_expiry() {
+    let fixture = Arc::new(CurrentLockBatchFixture::new());
+    let listings: Vec<_> = fixture
+        .markets
+        .iter()
+        .enumerate()
+        .map(|(index, market)| {
+            (
+                market.listing(
+                    fixture.network,
+                    500 + u64::try_from(index).expect("bounded listing index"),
+                    50_000 + u64::try_from(index).expect("bounded listing index"),
+                ),
+                market.locking_coin.clone(),
+            )
+        })
+        .collect();
+    let (store, config) = create_store(":memory:");
+    let (revision, mut listing_hashes) = persist_batch_listings(&store, fixture.network, &listings);
+    listing_hashes.sort_unstable();
+    let request = encode_denuo_request(
+        DenuoRegistryVersion::V2,
+        185,
+        &DenuoNameMarketRequest::Offers(listing_hashes),
+    )
+    .expect("board-fenced GetOffers request");
+    let observations = Arc::new(BatchBackendObservations::default());
+    let clock_calls = Arc::new(AtomicU64::new(0));
+    let hns = current_lock_batch_runtime(
+        store.clone(),
+        config.clone(),
+        fixture.clone(),
+        observations.clone(),
+        BatchBackendFault::Healthy,
+        clock_calls,
+    );
+    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
+    let hook_store = store.clone();
+    observations.install_query_hook(move || {
+        hook_store
+            .try_with_store_mut(|wallet| {
+                let stored = load_name_market_board(wallet)?;
+                save_name_market_board(wallet, stored.revision, &stored.board, NOW_UNIX).map(|_| ())
+            })
+            .expect("advance unrelated board revision during batch query");
+    });
+    assert!(matches!(
+        prepare_denuo_board_offers_response(&request, &board),
+        Err(ShakedexError::StaleRevision)
+    ));
+    assert_eq!(
+        store
+            .try_with_store(load_name_market_board)
+            .expect("mutated board revision")
+            .revision,
+        revision + 1
+    );
+    drop(board);
+    drop(hns);
+
+    let late_observations = Arc::new(BatchBackendObservations::default());
+    let selector = HnsExistingAccountSelector::new(store.clone(), config)
+        .expect("late batch exact non-value account selector");
+    let late_hns = HnsAccountReadRuntime::new(
+        CurrentLockBatchBackend {
+            fixture,
+            observations: late_observations.clone(),
+            fault: BatchBackendFault::Healthy,
+        },
+        LateClock,
+        store.clone(),
+        selector,
+    )
+    .expect("late current-lock batch runtime");
+    let late_board =
+        DenuoBoardRuntime::new(&late_hns, store).expect("late shared batch store authority");
+    assert!(matches!(
+        prepare_denuo_board_offers_response(&request, &late_board),
+        Err(ShakedexError::InvalidListing)
+    ));
+    assert_eq!(late_observations.chain_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(late_observations.mempool_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(late_observations.name_calls.load(Ordering::SeqCst), 3);
 }
 
 #[test]
