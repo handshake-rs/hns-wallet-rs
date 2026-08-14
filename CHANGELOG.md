@@ -40,7 +40,13 @@ boundary:
   linked maximum-128-round suffix. Retiring an old row preserves its reporter
   high-watermarks but removes
   its round hash and ID from duplicate detection; the cache provides no quote
-  conversion and does not itself confer quote or live-chain authority;
+  conversion and does not itself confer quote or live-chain authority. A
+  separate offline board runtime now authenticates canonical Denuo V2 offers,
+  requires the identical encrypted-store authority as a non-value HNS account
+  read runtime, obtains runtime-owned time/network plus exact current and
+  unspent Shakedex-lock evidence before each CAS admission, keeps exact retries
+  revision-stable, and reacquires that live authority before returning a cached
+  offer for later use;
 - deletion-protected encrypted HNSA/HNSR publisher high-water state with exact
   route-and-endpoint scope, physically independent endpoint-delegation and
   named-route dimensions, persist-before-use nonzero reservations, safe crash

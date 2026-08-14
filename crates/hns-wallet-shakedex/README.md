@@ -17,6 +17,17 @@ non-zero caller-owned identifier. The receipt does not prove board inclusion
 or currentness, chain/quote authority, or permission to move value. The crate
 performs no network I/O and does not turn on any product release gate.
 
+An independent offline board runtime now composes the canonical Denuo V2 offer
+decoder with one exact non-value HNS account-read runtime and the literal same
+`SharedWalletStore` authority. It accepts an offer into the encrypted CAS board
+only after runtime-owned time/network and a fresh exact current, unspent
+Shakedex lock validate the listing. Exact retries return `Existing` without a
+revision bump; sequence equivocation and stale chain, mempool, account, or
+store authority fail closed. Loading cached bytes is still not authority:
+`current_offer` rechecks the live lock and fences the unchanged board row after
+the node queries. This layer performs no relay I/O and does not use an HRM/HNSA
+receipt as chain authority.
+
 Shakedex creation, discovery, signing, broadcast, and dependent value gates
 remain unavailable to products until the documented qualification is complete.
 See the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)

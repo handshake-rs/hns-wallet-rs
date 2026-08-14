@@ -171,6 +171,32 @@ Persisted board objects are re-decoded on load, but they remain cache data:
 every purchase or value action must reacquire fresh locking-coin and chain
 evidence.
 
+The offline `DenuoBoardRuntime` now supplies that admission/reacquisition join
+without enabling live discovery. Construction requires an
+`HnsAccountReadRuntime` and a clone of its literal same Arc-backed
+`SharedWalletStore`; a separately opened connection to the same path is not the
+same authority. The canonical offer envelope is first decoded as an
+`AuthenticatedFixedPriceListing`, so its signature and exact content hash can
+be checked before any caller-supplied chain projection is accepted. The HNS
+read runtime then obtains a script-free chain binding, an exact seller-lock
+mempool query, canonical current NameState and TRANSFER action context,
+confirmed and mempool unspentness, selected network, and its trusted wall
+clock. It fences chain, mempool, and selected account revision again before
+returning the ephemeral lock; only then may the board reducer commit through
+CAS. Exact retries return `Existing` at the unchanged revision, higher
+sequences replace the same identity, and equivocation/rollback fails closed.
+
+`current_offer` deliberately repeats the current-lock query after restart or
+before later use, verifies the persisted canonical listing against that exact
+coin/network/time, and finally fences the unchanged board revision and row.
+Its non-serializable result is evidence for an enclosing, still-gated value
+workflow, not permission to sign or broadcast. This join performs no Denuo
+transport or relay I/O. The HRM draft supplies the current manifest root and
+HNSA is an HRM `hns.named-service/v1` profile; neither an HRM/HNSA lineage nor
+an endpoint-signed relay receipt substitutes for current HNS locking-coin
+authority. Every canonical Denuo and Shakedex value product gate remains
+`false`.
+
 A separate encrypted `DenuoBoardObject` record holds a dormant, offline-only
 publication outbox. It accepts only exact canonical V2 `Offer` and `Cancel`
 envelopes with nonzero request IDs. Each row binds the canonical listing or

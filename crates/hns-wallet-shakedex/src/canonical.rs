@@ -221,14 +221,15 @@ pub fn verify_fixed_price_listing(
     verified_listing_from_authenticated(authenticated, expected_network, now_unix, locking_coin)
 }
 
-fn verified_listing_from_canonical(
-    listing: FixedPriceListing,
-    expected_hash: ObjectHash,
+/// Complete current coin/network/time verification for an already
+/// authenticated canonical listing. The caller must still obtain
+/// `locking_coin` from fresh current-chain authority rather than persistence.
+pub fn verify_authenticated_fixed_price_listing(
+    authenticated: AuthenticatedFixedPriceListing,
     expected_network: NetworkBinding,
     now_unix: u64,
     locking_coin: &Coin,
 ) -> Result<VerifiedFixedPriceListing, ShakedexError> {
-    let authenticated = authenticated_listing_from_canonical(listing, expected_hash)?;
     verified_listing_from_authenticated(authenticated, expected_network, now_unix, locking_coin)
 }
 
@@ -326,6 +327,26 @@ pub fn decode_denuo_offer(
     now_unix: u64,
     locking_coin: &Coin,
 ) -> Result<(u64, VerifiedFixedPriceListing), ShakedexError> {
+    let (request_id, authenticated) =
+        decode_denuo_authenticated_offer(encoded, expected_registry, expected_hash)?;
+    let listing = verify_authenticated_fixed_price_listing(
+        authenticated,
+        expected_network,
+        now_unix,
+        locking_coin,
+    )?;
+    Ok((request_id, listing))
+}
+
+/// Decode one canonical Denuo offer and authenticate its signed listing plus
+/// exact content hash without accepting caller-supplied chain facts. This is
+/// the safe first phase for runtimes that must query the listing's current
+/// locking coin before completing time/network verification.
+pub fn decode_denuo_authenticated_offer(
+    encoded: &[u8],
+    expected_registry: DenuoRegistryVersion,
+    expected_hash: ObjectHash,
+) -> Result<(u64, AuthenticatedFixedPriceListing), ShakedexError> {
     let (registry, request_id, message) = NameMarketMessage::decode_envelope(encoded)
         .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
     if registry != expected_registry {
@@ -334,14 +355,10 @@ pub fn decode_denuo_offer(
     let NameMarketMessage::Offer(listing) = message else {
         return Err(ShakedexError::InvalidDenuoEnvelope);
     };
-    let listing = verified_listing_from_canonical(
-        listing,
-        expected_hash,
-        expected_network,
-        now_unix,
-        locking_coin,
-    )?;
-    Ok((request_id, listing))
+    Ok((
+        request_id,
+        authenticated_listing_from_canonical(listing, expected_hash)?,
+    ))
 }
 
 pub fn encode_denuo_cancellation(

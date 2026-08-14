@@ -3,6 +3,7 @@
 
 mod acceptance;
 mod board;
+mod board_runtime;
 mod canonical;
 mod outbox;
 mod plans;
@@ -18,12 +19,14 @@ pub use board::{
     BoardOfferStatus, NameMarketBoard, PersistedBoardOffer, StoredNameMarketBoard,
     load_name_market_board, save_name_market_board,
 };
+pub use board_runtime::{CurrentDenuoBoardOffer, DenuoBoardOfferAdmission, DenuoBoardRuntime};
 pub use canonical::{
     AuthenticatedFixedPriceListing, DenuoNameMarketRequest, VerifiedFixedPriceListing,
-    VerifiedListingCancellation, authenticate_fixed_price_listing, decode_denuo_cancellation,
-    decode_denuo_inventory, decode_denuo_offer, decode_denuo_request, encode_denuo_cancellation,
-    encode_denuo_inventory, encode_denuo_offer, encode_denuo_request, verify_fixed_price_listing,
-    verify_listing_cancellation,
+    VerifiedListingCancellation, authenticate_fixed_price_listing,
+    decode_denuo_authenticated_offer, decode_denuo_cancellation, decode_denuo_inventory,
+    decode_denuo_offer, decode_denuo_request, encode_denuo_cancellation, encode_denuo_inventory,
+    encode_denuo_offer, encode_denuo_request, verify_authenticated_fixed_price_listing,
+    verify_fixed_price_listing, verify_listing_cancellation,
 };
 pub use outbox::{
     DenuoHandoffAcceptanceResult, DenuoHandoffFailureResult, DenuoHandoffPreparation,
@@ -600,6 +603,8 @@ pub enum ShakedexError {
     NameMarketBoardCapacity,
     #[error("persisted Denuo name-market board is corrupt or noncanonical")]
     CorruptNameMarketBoard,
+    #[error("Denuo board runtime does not share the HNS account store authority")]
+    StoreAuthorityMismatch,
     #[error("invalid, noncanonical, or unsupported Denuo publication outbox envelope")]
     InvalidDenuoOutboxEnvelope,
     #[error("Denuo publication outbox identity or request correlation conflicts")]
@@ -670,6 +675,7 @@ impl From<hns_wallet_hns::HnsWalletError> for ShakedexError {
             HnsWalletError::RuntimeIntegrationUnavailable | HnsWalletError::MainnetDisabled => {
                 Self::ValueRuntimeUnavailable
             }
+            HnsWalletError::StoreAuthorityMismatch => Self::StoreAuthorityMismatch,
             _ => Self::HnsIntegration,
         }
     }
