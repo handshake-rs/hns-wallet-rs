@@ -65,6 +65,15 @@ bytes to avoid non-zeroizing parser scratch allocations. This does not qualify
 a live node credential or read operation, and changes no provider, browser,
 value, or publication gate.
 
+The later operation-level read tranche adds local source regressions for the
+closed `hnsReadOperationsV1` wire marker, its required `walletOperations`
+dependency, the dedicated six-request host admission path, and strict
+non-settlement/HNS-only response correlation. Only the full synchronized HNS
+read runtime advertises the marker; the account-only runtime and checked-in
+control executable do not. This is contract/source evidence, not a native
+launcher, installed extension, signed artifact, live node, or availability
+qualification. Closed-enum ABI-v2 consumers must adopt the marker in lockstep.
+
 CodeQL passed at exact `2229be8`; `ba9f013` remains the historical baseline.
 This repository records no independent security audit, database or resource
 benchmark, multi-process network test, installed-device run, or installed-

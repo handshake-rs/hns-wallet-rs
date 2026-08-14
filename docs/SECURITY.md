@@ -129,6 +129,21 @@ chain/mempool binding or raw name proof/state/resource/owner/derivation
 evidence. Every failed read locks before retry. The same binding never appears
 in website JSON, and no mobile provider entry point exists.
 
+The private `hnsReadOperationsV1` marker is emitted only by that full
+synchronized runtime and requires the existing coarse wallet-operation
+transport. A dedicated host method admits only status, one-account discovery,
+and Handshake-scoped balance, receive, history, and module-status requests.
+It rejects secrets, lifecycle controls, workflows, and other modules before
+request-ID allocation. Responses fail closed unless locked status exactly
+matches the absence of a nonzero active wallet and lists at most Handshake, the
+account projection is exactly one nonzero Handshake account with a bounded
+printable label and no receive display, balance uses HNS, receive echoes the
+requested account and module with a bounded visible-ASCII target, every history
+entry is Handshake with a unique nonzero transaction ID and no negative zero,
+and module status is an error-free ready snapshot with one equal
+validated/scanned/target height. Any mismatch poisons the session. The marker
+grants no browser/provider authority and changes no availability or value gate.
+
 The injected backend is synchronous and broader than this read subset, but the
 read controller exposes none of its broadcast, fee, signing, action, or value
 methods. Products must enforce backend deadlines and call reads off the UI

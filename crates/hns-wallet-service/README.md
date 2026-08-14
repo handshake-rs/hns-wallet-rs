@@ -15,10 +15,14 @@ pre-existing non-value HNS account configuration, and the authenticated
 loopback-only node RPC configuration. Its provider surface is limited to
 status, accounts, balance, history, receive address, and approval-scoped known
 names plus the existing permission and lock controls. It never advertises
-`valueMovement` or `browserIntegration`. The executable CLI is intentionally
-unchanged: launcher configuration, artifact admission, browser-engine
-authority, transport, approval UI, and installed-product qualification remain
-downstream responsibilities.
+`valueMovement` or `browserIntegration`. This full synchronized-read runtime
+advertises the private `hnsReadOperationsV1` marker alongside the required
+coarse wallet transport; the account-only and checked-in control runtimes do
+not. The marker freezes status, one exact account, and Handshake-scoped
+balance, receive-target, history, and module-status requests. The executable
+CLI is intentionally unchanged: launcher configuration, artifact admission,
+browser-engine authority, transport, approval UI, and installed-product
+qualification remain downstream responsibilities.
 
 The library also provides an inert wallet-owned `NativeHnsReadProfile`
 provisioning boundary. One schema-v1 encrypted compare-and-swap entity stores

@@ -7,14 +7,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hns_wallet_ffi::{
     APPROVAL_SCHEMA_VERSION, ApprovalDecision, ApprovalPrompt, DisconnectReason,
     HostAuthorityFacts, HostFrame, HostHello, HostPlatform, MAX_METHOD_BYTES, MAX_ORIGIN_BYTES,
-    MAX_PROVIDER_METHODS, MAX_PROVIDER_REQUEST_BYTES, MAX_PUBLIC_ITEMS, PROVIDER_SCHEMA_VERSION,
-    ProviderBinding, ProviderCapabilitySnapshot, ProviderEventEnvelope, ProviderEventPayload,
-    ServiceCapability, ServiceErrorCode, ServiceFrame, ServiceHello, ServiceLimits, ServiceRequest,
-    ServiceResponse, SessionEnvelope, WALLET_ABI_VERSION, WalletRequest, WalletResponse,
+    MAX_PROVIDER_METHODS, MAX_PROVIDER_REQUEST_BYTES, MAX_PUBLIC_ITEMS, MAX_PUBLIC_STRING_BYTES,
+    PROVIDER_SCHEMA_VERSION, ProviderBinding, ProviderCapabilitySnapshot, ProviderEventEnvelope,
+    ProviderEventPayload, ServiceCapability, ServiceErrorCode, ServiceFrame, ServiceHello,
+    ServiceLimits, ServiceRequest, ServiceResponse, SessionEnvelope, WALLET_ABI_VERSION,
+    WalletRequest, WalletResponse,
 };
 use hns_wallet_types::{
-    HostAuthorityHandleId, HostSessionId, PROVIDER_METHOD_WIRE_NAMES, ProviderApprovalId,
-    ProviderRequestId, WalletServiceSessionId,
+    AccountId, HostAuthorityHandleId, HostSessionId, ModuleId, PROVIDER_METHOD_WIRE_NAMES,
+    ProviderApprovalId, ProviderRequestId, SyncPhase, WalletAsset, WalletServiceSessionId,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -158,6 +159,8 @@ pub enum HostError {
     HelloMismatch,
     #[error("required negotiated service capability is absent")]
     CapabilityUnavailable,
+    #[error("request is not in the exact HNS read-operations-v1 surface")]
+    InvalidHnsReadRequest,
     #[error("pending request capacity is exhausted")]
     PendingRequestCapacity,
     #[error("authority capacity is exhausted")]
@@ -297,6 +300,7 @@ enum RequestClass {
         method: String,
     },
     Wallet(WalletResponseClass),
+    HnsRead(HnsReadResponseClass),
 }
 
 impl RequestClass {
@@ -308,7 +312,99 @@ impl RequestClass {
             | Self::Capabilities { handle, .. }
             | Self::Provider { handle, .. }
             | Self::Approval { handle, .. } => Some(*handle),
-            Self::Wallet(_) => None,
+            Self::Wallet(_) | Self::HnsRead(_) => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HnsReadResponseClass {
+    Status,
+    Accounts,
+    Balance,
+    ReceiveTarget { account: AccountId },
+    Transactions,
+    ModuleStatus,
+}
+
+impl HnsReadResponseClass {
+    fn for_request(request: &WalletRequest) -> Result<Self, HostError> {
+        match request {
+            WalletRequest::Status => Ok(Self::Status),
+            WalletRequest::ListAccounts => Ok(Self::Accounts),
+            WalletRequest::Balance {
+                module: ModuleId::Handshake,
+                ..
+            } => Ok(Self::Balance),
+            WalletRequest::ReceiveTarget {
+                module: ModuleId::Handshake,
+                account,
+            } => Ok(Self::ReceiveTarget { account: *account }),
+            WalletRequest::TransactionHistory {
+                module: ModuleId::Handshake,
+                ..
+            } => Ok(Self::Transactions),
+            WalletRequest::ModuleStatus {
+                module: ModuleId::Handshake,
+            } => Ok(Self::ModuleStatus),
+            _ => Err(HostError::InvalidHnsReadRequest),
+        }
+    }
+
+    fn matches(self, response: &WalletResponse) -> bool {
+        match (self, response) {
+            (Self::Status, WalletResponse::Status { status }) => {
+                !status.mainnet_settlement_enabled
+                    && status.locked == status.active_wallet.is_none()
+                    && status
+                        .active_wallet
+                        .is_none_or(|wallet| wallet.as_bytes() != &[0_u8; 16])
+                    && status.enabled_modules.len() <= 1
+                    && status
+                        .enabled_modules
+                        .iter()
+                        .all(|module| *module == ModuleId::Handshake)
+            }
+            (Self::Accounts, WalletResponse::Accounts { accounts }) => {
+                matches!(accounts.as_slice(), [account]
+                    if account.module == ModuleId::Handshake
+                        && account.account_id.as_bytes() != &[0_u8; 16]
+                        && !account.label.is_empty()
+                        && account.label.len() <= MAX_PUBLIC_STRING_BYTES
+                        && account
+                            .label
+                            .bytes()
+                            .all(|byte| (0x20..=0x7e).contains(&byte))
+                        && account.receive_display.is_none())
+            }
+            (Self::Balance, WalletResponse::Balance { amount }) => amount.asset == WalletAsset::Hns,
+            (Self::ReceiveTarget { account }, WalletResponse::ReceiveTarget { target }) => {
+                target.module == ModuleId::Handshake
+                    && target.account == account
+                    && !target.display.is_empty()
+                    && target.display.len() <= 512
+                    && target
+                        .display
+                        .bytes()
+                        .all(|byte| (0x21..=0x7e).contains(&byte))
+            }
+            (Self::Transactions, WalletResponse::TransactionHistory { transactions }) => {
+                let mut txids = BTreeSet::new();
+                transactions.iter().all(|transaction| {
+                    transaction.module == ModuleId::Handshake
+                        && transaction.txid.as_bytes() != &[0_u8; 32]
+                        && !(transaction.net_amount.negative
+                            && transaction.net_amount.magnitude.is_zero())
+                        && txids.insert(transaction.txid)
+                })
+            }
+            (Self::ModuleStatus, WalletResponse::ModuleStatus { status }) => {
+                status.phase == SyncPhase::Ready
+                    && status.validated_height == status.scanned_height
+                    && status.target_height == Some(status.validated_height)
+                    && status.last_error.is_none()
+            }
+            _ => false,
         }
     }
 }
@@ -862,6 +958,24 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
         Ok(queued.frame)
     }
 
+    /// Issues one request from the exact private non-value HNS read surface.
+    ///
+    /// This path deliberately remains separate from [`Self::wallet_request`]:
+    /// existing trusted mobile/control callers retain the coarse ABI-v2 API,
+    /// while a browser-native read adapter can require the frozen v1 marker
+    /// and reject secrets, lifecycle controls, workflows, and other modules
+    /// before allocating a request identifier.
+    pub fn hns_read_request(&mut self, request: WalletRequest) -> Result<HostFrame, HostError> {
+        self.require_capability(ServiceCapability::WalletOperations)?;
+        self.require_capability(ServiceCapability::HnsReadOperationsV1)?;
+        let class = HnsReadResponseClass::for_request(&request)?;
+        let queued = self.enqueue(
+            ServiceRequest::Wallet { request },
+            RequestClass::HnsRead(class),
+        )?;
+        Ok(queued.frame)
+    }
+
     /// Accepts one already-decoded private service frame. Any validation
     /// failure poisons the channel and clears every service-derived value;
     /// callers must explicitly start a new generation.
@@ -906,6 +1020,12 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
                 && !hello
                     .capabilities
                     .contains(&ServiceCapability::ProviderDispatch))
+            || (hello
+                .capabilities
+                .contains(&ServiceCapability::HnsReadOperationsV1)
+                && !hello
+                    .capabilities
+                    .contains(&ServiceCapability::WalletOperations))
         {
             return Err(HostError::HelloMismatch);
         }
@@ -1135,6 +1255,11 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
                 ) {
                     self.invalidate_all_provider_state();
                 }
+                Ok(())
+            }
+            (RequestClass::HnsRead(class), ServiceResponse::Wallet { response })
+                if class.matches(response) =>
+            {
                 Ok(())
             }
             _ => Err(HostError::ResponseClassMismatch),
@@ -1998,10 +2123,14 @@ mod tests {
     use std::cell::Cell;
     use std::rc::Rc;
 
-    use hns_wallet_ffi::{ApprovalSummary, HnsNameDisclosure, ProviderNamespace};
+    use hns_wallet_ffi::{
+        AccountSummary, ApprovalSummary, HnsNameDisclosure, ProviderNamespace, SecretString,
+        WalletRuntimeStatus,
+    };
     use hns_wallet_types::{
-        BrowserRuntimeSessionId, PermissionCapability, ProviderAuthorityFingerprint,
-        WalletSessionId,
+        Amount, BaseUnits, BrowserRuntimeSessionId, LocalTransactionStatus, PermissionCapability,
+        ProviderAuthorityFingerprint, ReceiveTarget, SignedBaseUnits, SyncPhase, SyncStatus,
+        TransactionHash, TransactionSummary, WalletId, WalletSessionId, WorkflowId,
     };
 
     use super::*;
@@ -2186,6 +2315,394 @@ mod tests {
             },
         });
         assert!(matches!(result, Err(HostError::HelloMismatch)));
+        assert_eq!(host.connection_state(), ConnectionState::Failed);
+    }
+
+    #[test]
+    fn hns_read_marker_requires_coarse_wallet_operations_at_hello() {
+        let (mut host, _) = new_host();
+        let mut capabilities = required_capabilities();
+        capabilities.insert(ServiceCapability::HnsReadOperationsV1);
+        let result = host.accept_service_frame(ServiceFrame::Hello {
+            hello: ServiceHello {
+                protocol_version: WALLET_ABI_VERSION,
+                platform: host.platform(),
+                host_session_id: host.host_session_id(),
+                service_session_id: service_session(),
+                restart_generation: host.restart_generation(),
+                capabilities,
+                limits: ServiceLimits::default(),
+            },
+        });
+        assert!(matches!(result, Err(HostError::HelloMismatch)));
+        assert_eq!(host.connection_state(), ConnectionState::Failed);
+    }
+
+    #[test]
+    fn exact_hns_read_path_requires_marker_and_rejects_every_other_request() {
+        let account = AccountId::new([33; 16]);
+        let (mut coarse_only, _) = new_host();
+        let mut coarse_capabilities = required_capabilities();
+        coarse_capabilities.insert(ServiceCapability::WalletOperations);
+        negotiate(&mut coarse_only, coarse_capabilities);
+        assert!(matches!(
+            coarse_only.hns_read_request(WalletRequest::Status),
+            Err(HostError::CapabilityUnavailable)
+        ));
+        assert!(coarse_only.pending.is_empty());
+        coarse_only
+            .wallet_request(WalletRequest::Status)
+            .expect("legacy coarse request remains available");
+
+        let (mut exact, _) = new_host();
+        let mut exact_capabilities = required_capabilities();
+        exact_capabilities.extend([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::HnsReadOperationsV1,
+        ]);
+        negotiate(&mut exact, exact_capabilities);
+        for request in [
+            WalletRequest::Status,
+            WalletRequest::ListAccounts,
+            WalletRequest::Balance {
+                module: ModuleId::Handshake,
+                account,
+            },
+            WalletRequest::ReceiveTarget {
+                module: ModuleId::Handshake,
+                account,
+            },
+            WalletRequest::TransactionHistory {
+                module: ModuleId::Handshake,
+                account,
+            },
+            WalletRequest::ModuleStatus {
+                module: ModuleId::Handshake,
+            },
+        ] {
+            exact
+                .hns_read_request(request)
+                .expect("frozen HNS read request");
+        }
+        assert_eq!(exact.pending.len(), 6);
+
+        let (mut rejected, _) = new_host();
+        let mut rejected_capabilities = required_capabilities();
+        rejected_capabilities.extend([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::HnsReadOperationsV1,
+        ]);
+        negotiate(&mut rejected, rejected_capabilities);
+        for request in [
+            WalletRequest::CreateWallet {
+                passphrase: SecretString::new("create secret".to_owned()),
+            },
+            WalletRequest::RestoreWallet {
+                passphrase: SecretString::new("restore secret".to_owned()),
+                recovery_phrase: SecretString::new("recovery secret".to_owned()),
+            },
+            WalletRequest::Unlock {
+                passphrase: SecretString::new("unlock secret".to_owned()),
+            },
+            WalletRequest::Lock,
+            WalletRequest::WorkflowStatus {
+                workflow_id: WorkflowId::new([44; 16]),
+            },
+            WalletRequest::Balance {
+                module: ModuleId::Bitcoin,
+                account,
+            },
+            WalletRequest::ReceiveTarget {
+                module: ModuleId::Ethereum,
+                account,
+            },
+            WalletRequest::TransactionHistory {
+                module: ModuleId::Bitcoin,
+                account,
+            },
+            WalletRequest::ModuleStatus {
+                module: ModuleId::Ethereum,
+            },
+        ] {
+            assert!(matches!(
+                rejected.hns_read_request(request),
+                Err(HostError::InvalidHnsReadRequest)
+            ));
+        }
+        assert!(rejected.pending.is_empty());
+        assert_eq!(rejected.connection_state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn exact_hns_read_responses_are_minimized_and_request_scoped() {
+        let account = AccountId::new([33; 16]);
+        let other_account = AccountId::new([34; 16]);
+        let status_class =
+            HnsReadResponseClass::for_request(&WalletRequest::Status).expect("status class");
+        let status =
+            |locked, active_wallet, modules, mainnet_settlement_enabled| WalletResponse::Status {
+                status: WalletRuntimeStatus {
+                    locked,
+                    active_wallet,
+                    enabled_modules: modules,
+                    mainnet_settlement_enabled,
+                },
+            };
+        assert!(status_class.matches(&status(
+            false,
+            Some(WalletId::new([1; 16])),
+            BTreeSet::from([ModuleId::Handshake]),
+            false,
+        )));
+        for response in [
+            status(
+                false,
+                Some(WalletId::new([1; 16])),
+                BTreeSet::from([ModuleId::Handshake]),
+                true,
+            ),
+            status(
+                false,
+                Some(WalletId::new([1; 16])),
+                BTreeSet::from([ModuleId::Bitcoin]),
+                false,
+            ),
+            status(false, None, BTreeSet::from([ModuleId::Handshake]), false),
+            status(
+                true,
+                Some(WalletId::new([1; 16])),
+                BTreeSet::from([ModuleId::Handshake]),
+                false,
+            ),
+            status(
+                false,
+                Some(WalletId::new([0; 16])),
+                BTreeSet::from([ModuleId::Handshake]),
+                false,
+            ),
+            status(
+                false,
+                Some(WalletId::new([1; 16])),
+                BTreeSet::from([ModuleId::Handshake, ModuleId::Bitcoin]),
+                false,
+            ),
+        ] {
+            assert!(!status_class.matches(&response));
+        }
+
+        let accounts_class =
+            HnsReadResponseClass::for_request(&WalletRequest::ListAccounts).expect("accounts");
+        let account_summary = AccountSummary {
+            account_id: account,
+            module: ModuleId::Handshake,
+            label: "Handshake".to_owned(),
+            receive_display: None,
+        };
+        assert!(accounts_class.matches(&WalletResponse::Accounts {
+            accounts: vec![account_summary.clone()],
+        }));
+        assert!(!accounts_class.matches(&WalletResponse::Accounts { accounts: vec![] }));
+        let mut disclosed = account_summary.clone();
+        disclosed.receive_display = Some("hs1qprivate".to_owned());
+        assert!(!accounts_class.matches(&WalletResponse::Accounts {
+            accounts: vec![disclosed],
+        }));
+        let mut wrong_module = account_summary.clone();
+        wrong_module.module = ModuleId::Bitcoin;
+        assert!(!accounts_class.matches(&WalletResponse::Accounts {
+            accounts: vec![wrong_module],
+        }));
+        let mut zero_account = account_summary.clone();
+        zero_account.account_id = AccountId::new([0; 16]);
+        assert!(!accounts_class.matches(&WalletResponse::Accounts {
+            accounts: vec![zero_account],
+        }));
+        let mut empty_label = account_summary.clone();
+        empty_label.label.clear();
+        assert!(!accounts_class.matches(&WalletResponse::Accounts {
+            accounts: vec![empty_label],
+        }));
+        let mut non_printable_label = account_summary.clone();
+        non_printable_label.label = "Handshake\nWallet".to_owned();
+        assert!(!accounts_class.matches(&WalletResponse::Accounts {
+            accounts: vec![non_printable_label],
+        }));
+        let mut oversized_label = account_summary.clone();
+        oversized_label.label = "H".repeat(MAX_PUBLIC_STRING_BYTES + 1);
+        assert!(!accounts_class.matches(&WalletResponse::Accounts {
+            accounts: vec![oversized_label],
+        }));
+        assert!(!accounts_class.matches(&WalletResponse::Accounts {
+            accounts: vec![account_summary.clone(), account_summary],
+        }));
+
+        let balance_class = HnsReadResponseClass::for_request(&WalletRequest::Balance {
+            module: ModuleId::Handshake,
+            account,
+        })
+        .expect("balance");
+        assert!(balance_class.matches(&WalletResponse::Balance {
+            amount: Amount::new(WalletAsset::Hns, 1),
+        }));
+        assert!(!balance_class.matches(&WalletResponse::Balance {
+            amount: Amount::new(WalletAsset::Btc, 1),
+        }));
+
+        let receive_class = HnsReadResponseClass::for_request(&WalletRequest::ReceiveTarget {
+            module: ModuleId::Handshake,
+            account,
+        })
+        .expect("receive");
+        let receive = |module, account, display| WalletResponse::ReceiveTarget {
+            target: ReceiveTarget {
+                module,
+                account,
+                display,
+                derivation_index: 0,
+            },
+        };
+        assert!(receive_class.matches(&receive(
+            ModuleId::Handshake,
+            account,
+            "hs1qread".to_owned(),
+        )));
+        assert!(!receive_class.matches(&receive(
+            ModuleId::Handshake,
+            other_account,
+            "hs1qread".to_owned(),
+        )));
+        assert!(!receive_class.matches(&receive(
+            ModuleId::Bitcoin,
+            account,
+            "bc1qread".to_owned(),
+        )));
+        for display in [
+            String::new(),
+            "hs1q read".to_owned(),
+            "hs1qread\n".to_owned(),
+            "hs1qréad".to_owned(),
+            "h".repeat(513),
+        ] {
+            assert!(!receive_class.matches(&receive(ModuleId::Handshake, account, display)));
+        }
+
+        let transactions_class =
+            HnsReadResponseClass::for_request(&WalletRequest::TransactionHistory {
+                module: ModuleId::Handshake,
+                account,
+            })
+            .expect("transactions");
+        let transaction = |module, txid_byte, negative, magnitude| TransactionSummary {
+            module,
+            txid: TransactionHash::new([txid_byte; 32]),
+            status: LocalTransactionStatus::Confirmed,
+            net_amount: SignedBaseUnits {
+                negative,
+                magnitude: BaseUnits::new(magnitude),
+            },
+            fee: None,
+            block_height: Some(1),
+            first_seen_unix: Some(1),
+            confirmation_count: 1,
+        };
+        let valid_transaction = transaction(ModuleId::Handshake, 55, false, 1);
+        assert!(
+            transactions_class.matches(&WalletResponse::TransactionHistory {
+                transactions: vec![],
+            })
+        );
+        assert!(
+            transactions_class.matches(&WalletResponse::TransactionHistory {
+                transactions: vec![valid_transaction.clone()],
+            })
+        );
+        for transactions in [
+            vec![transaction(ModuleId::Bitcoin, 55, false, 1)],
+            vec![transaction(ModuleId::Handshake, 0, false, 1)],
+            vec![valid_transaction.clone(), valid_transaction],
+            vec![transaction(ModuleId::Handshake, 56, true, 0)],
+        ] {
+            assert!(
+                !transactions_class.matches(&WalletResponse::TransactionHistory { transactions })
+            );
+        }
+
+        let module_class = HnsReadResponseClass::for_request(&WalletRequest::ModuleStatus {
+            module: ModuleId::Handshake,
+        })
+        .expect("module status");
+        let successful_status = SyncStatus {
+            phase: SyncPhase::Ready,
+            validated_height: 1,
+            scanned_height: 1,
+            target_height: Some(1),
+            last_error: None,
+        };
+        assert!(module_class.matches(&WalletResponse::ModuleStatus {
+            status: successful_status.clone(),
+        }));
+        for status in [
+            SyncStatus {
+                phase: SyncPhase::Degraded,
+                ..successful_status.clone()
+            },
+            SyncStatus {
+                scanned_height: 0,
+                ..successful_status.clone()
+            },
+            SyncStatus {
+                target_height: None,
+                ..successful_status.clone()
+            },
+            SyncStatus {
+                target_height: Some(2),
+                ..successful_status.clone()
+            },
+            SyncStatus {
+                last_error: Some("not ready".to_owned()),
+                ..successful_status
+            },
+        ] {
+            assert!(!module_class.matches(&WalletResponse::ModuleStatus { status }));
+        }
+    }
+
+    #[test]
+    fn exact_hns_read_response_scope_mismatch_poisons_the_channel() {
+        let account = AccountId::new([33; 16]);
+        let (mut host, _) = new_host();
+        let mut capabilities = required_capabilities();
+        capabilities.extend([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::HnsReadOperationsV1,
+        ]);
+        negotiate(&mut host, capabilities);
+        let request_id = request_id(
+            host.hns_read_request(WalletRequest::ReceiveTarget {
+                module: ModuleId::Handshake,
+                account,
+            })
+            .expect("request"),
+        );
+        let frame = response_frame(
+            &host,
+            request_id,
+            1,
+            ServiceResponse::Wallet {
+                response: WalletResponse::ReceiveTarget {
+                    target: ReceiveTarget {
+                        module: ModuleId::Handshake,
+                        account: AccountId::new([34; 16]),
+                        display: "hs1qwrongaccount".to_owned(),
+                        derivation_index: 0,
+                    },
+                },
+            },
+        );
+        assert!(matches!(
+            host.accept_service_frame(frame),
+            Err(HostError::ResponseClassMismatch)
+        ));
         assert_eq!(host.connection_state(), ConnectionState::Failed);
     }
 

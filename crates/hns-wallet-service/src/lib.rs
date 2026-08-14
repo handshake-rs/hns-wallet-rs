@@ -500,6 +500,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsReadRuntime<B, 
     fn capabilities(&self) -> BTreeSet<ServiceCapability> {
         BTreeSet::from([
             ServiceCapability::WalletOperations,
+            ServiceCapability::HnsReadOperationsV1,
             ServiceCapability::ProviderDispatch,
         ])
     }
@@ -711,6 +712,9 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         }
         if !capabilities.contains(&ServiceCapability::ProviderDispatch) {
             capabilities.remove(&ServiceCapability::ValueMovement);
+        }
+        if !capabilities.contains(&ServiceCapability::WalletOperations) {
+            capabilities.remove(&ServiceCapability::HnsReadOperationsV1);
         }
         Ok(Self {
             provider: ProviderCore::new(state, wallet_session_id, true),
@@ -2778,6 +2782,45 @@ mod tests {
         }
     }
 
+    struct HnsReadMarkerOnlyRuntime;
+
+    impl ServiceRuntime for HnsReadMarkerOnlyRuntime {
+        fn capabilities(&self) -> BTreeSet<ServiceCapability> {
+            BTreeSet::from([ServiceCapability::HnsReadOperationsV1])
+        }
+
+        fn supports_provider_method(&self, _: ProviderMethod) -> bool {
+            false
+        }
+
+        fn prepare_approval(
+            &mut self,
+            _: &PendingApproval,
+        ) -> Result<ApprovalSummary, ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ))
+        }
+
+        fn execute_provider(&mut self, _: ApprovedCall) -> Result<Value, ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::ProviderDispatch,
+            ))
+        }
+
+        fn lock_wallet(&mut self) -> Result<(), ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ))
+        }
+
+        fn execute_wallet(&mut self, _: WalletRequest) -> Result<WalletResponse, ServiceFailure> {
+            Err(ServiceFailure::unsupported(
+                ServiceCapability::WalletOperations,
+            ))
+        }
+    }
+
     struct AccountRuntime {
         account: AccountSummary,
         account_join_available: bool,
@@ -3775,6 +3818,11 @@ mod tests {
                 .capabilities
                 .contains(&ServiceCapability::BrowserIntegration)
         );
+        assert!(
+            !hello
+                .capabilities
+                .contains(&ServiceCapability::HnsReadOperationsV1)
+        );
         service
             .provider
             .register_authority(handle(), registration(), NOW_MS)
@@ -3786,6 +3834,27 @@ mod tests {
             panic!("private capabilities")
         };
         assert!(capabilities.methods.is_empty());
+    }
+
+    #[test]
+    fn hns_read_marker_is_removed_without_coarse_wallet_operations() {
+        let mut service =
+            WalletService::new_ephemeral(MemoryProviderState::default(), HnsReadMarkerOnlyRuntime)
+                .expect("service");
+        assert!(
+            !service
+                .capabilities
+                .contains(&ServiceCapability::HnsReadOperationsV1)
+        );
+        let response = service.process_frame(&hello(), 1).expect("hello response");
+        let ServiceFrame::Hello { hello } = decode_service_frame(&response).expect("decode") else {
+            panic!("expected hello")
+        };
+        assert!(
+            !hello
+                .capabilities
+                .contains(&ServiceCapability::HnsReadOperationsV1)
+        );
     }
 
     #[test]
@@ -3838,6 +3907,11 @@ mod tests {
             !first
                 .capabilities
                 .contains(&ServiceCapability::BrowserIntegration)
+        );
+        assert!(
+            !first
+                .capabilities
+                .contains(&ServiceCapability::HnsReadOperationsV1)
         );
         first
             .provider
@@ -4510,6 +4584,11 @@ mod tests {
                 .contains(&ServiceCapability::ProviderDispatch)
         );
         assert!(
+            service
+                .capabilities
+                .contains(&ServiceCapability::HnsReadOperationsV1)
+        );
+        assert!(
             !service
                 .capabilities
                 .contains(&ServiceCapability::ValueMovement)
@@ -4755,6 +4834,11 @@ mod tests {
             !service
                 .capabilities
                 .contains(&ServiceCapability::BrowserIntegration)
+        );
+        assert!(
+            !service
+                .capabilities
+                .contains(&ServiceCapability::HnsReadOperationsV1)
         );
         service
             .provider

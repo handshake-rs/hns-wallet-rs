@@ -109,6 +109,29 @@ the binding generation. Bounded collection and string limits are checked.
 
 Capabilities are a closed enum. Unsupported operations return the typed
 `unsupportedCapability` failure and are never inferred from compiled source.
+`hnsReadOperationsV1` is one fixed private sufficiency marker for exactly six
+non-value wallet requests: status, list accounts, Handshake balance,
+Handshake receive target, Handshake transaction history, and Handshake module
+status. The last four reject every non-Handshake module before request-ID
+allocation. The marker requires the coarse `walletOperations` transport but
+does not imply provider dispatch, browser integration, value movement, or
+product availability.
+
+`WalletHost::hns_read_request` is the strict caller path for that contract.
+It accepts no create, restore, unlock, lock, workflow, signing, value, market,
+or other-module operation. Correlated responses must remain non-settlement and
+HNS-only: locked status is equivalent to the absence of a nonzero active wallet
+and contains at most the Handshake module; the account list contains exactly
+one nonzero Handshake account, a bounded printable nonempty label, and no
+receive display; balances are HNS; receive targets match the requested account
+and module and use a bounded nonempty visible-ASCII display; every history
+entry belongs to Handshake with a unique nonzero transaction ID and no negative
+zero amount; and module status is an error-free `ready` snapshot whose
+validated, scanned, and target heights are equal. A scope or response class
+mismatch poisons the private channel. The established generic
+`wallet_request` path remains available for trusted mobile/control consumers;
+its presence alone is not evidence that any read operation is implemented.
+
 The authority-scoped private `providerCapabilities` request returns a typed
 snapshot with exactly `providerSchemaVersion: 1`, `approvalSchemaVersion: 3`,
 `walletSessionId`, `permissionGeneration`, and `methods`. Its session and
@@ -137,6 +160,7 @@ and project exactly `{abiVersion,available,walletSession,permissionGeneration,me
 The checked-in subprocess is an existing-database control runtime. It starts
 locked, shares one store/key authority with encrypted provider permissions, and
 advertises wallet operations, persistent permissions, and provider dispatch.
+It does not advertise `hnsReadOperationsV1`.
 After ABI unlock its provider subset is exactly `wallet_getCapabilities`,
 `wallet_getStatus`, `wallet_getPermissions`, `wallet_revokePermissions`, and
 `wallet_lock`. Wallet creation/restoration, generic permission creation,
@@ -161,6 +185,12 @@ The encrypted native-HNS-read profile is a wallet library provisioning record,
 not an ABI request, response, capability, or browser message. The checked-in
 subprocess does not load it. Provisioning it therefore does not make any read
 operation or provider available and does not alter the v2 frame vocabulary.
+
+Because service capabilities are a closed enum, an older ABI-v2 decoder rejects
+a hello that contains `hnsReadOperationsV1`. The native read service, trusted
+host, and downstream extension adapter must therefore adopt this unreleased v2
+addition together. Older consumers of the checked-in control executable remain
+unaffected because that executable never emits the marker.
 
 ## Machine-readable contracts
 

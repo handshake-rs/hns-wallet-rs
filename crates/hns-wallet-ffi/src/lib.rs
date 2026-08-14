@@ -55,6 +55,7 @@ pub enum ServiceCapability {
     StructuredApprovals,
     TypedEvents,
     WalletOperations,
+    HnsReadOperationsV1,
     ProviderDispatch,
     ValueMovement,
     BrowserIntegration,
@@ -1274,6 +1275,12 @@ fn validate_service_frame(frame: &ServiceFrame) -> Result<(), AbiError> {
                 || hello.restart_generation == 0
                 || hello.limits != ServiceLimits::default()
                 || hello.capabilities.len() > MAX_PUBLIC_ITEMS
+                || (hello
+                    .capabilities
+                    .contains(&ServiceCapability::HnsReadOperationsV1)
+                    && !hello
+                        .capabilities
+                        .contains(&ServiceCapability::WalletOperations))
             {
                 return Err(AbiError::InvalidEnvelope);
             }
@@ -1616,6 +1623,49 @@ mod tests {
         assert_eq!(
             decode_host_frame(&encoded).expect("decode"),
             decode_host_frame(&encoded).expect("decode twice")
+        );
+    }
+
+    #[test]
+    fn hns_read_operations_v1_is_exact_and_requires_wallet_operations() {
+        assert_json_round_trip(
+            &ServiceCapability::HnsReadOperationsV1,
+            serde_json::json!("hnsReadOperationsV1"),
+        );
+        assert!(
+            serde_json::from_value::<ServiceCapability>(serde_json::json!("hnsReadOperationsV2"))
+                .is_err()
+        );
+
+        let service_hello = |capabilities| ServiceFrame::Hello {
+            hello: ServiceHello {
+                protocol_version: WALLET_ABI_VERSION,
+                platform: HostPlatform::ChromiumNativeHost,
+                host_session_id: host_session(),
+                service_session_id: service_session(),
+                restart_generation: 7,
+                capabilities,
+                limits: ServiceLimits::default(),
+            },
+        };
+        assert_eq!(
+            encode_service_frame(&service_hello(BTreeSet::from([
+                ServiceCapability::HnsReadOperationsV1,
+            ]))),
+            Err(AbiError::InvalidEnvelope)
+        );
+
+        let framed = encode_service_frame(&service_hello(BTreeSet::from([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::HnsReadOperationsV1,
+        ])))
+        .expect("exact HNS read hello");
+        assert_eq!(
+            decode_service_frame(&framed).expect("decode exact HNS read hello"),
+            service_hello(BTreeSet::from([
+                ServiceCapability::WalletOperations,
+                ServiceCapability::HnsReadOperationsV1,
+            ]))
         );
     }
 

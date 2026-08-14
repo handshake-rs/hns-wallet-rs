@@ -379,6 +379,7 @@
         "structuredApprovals",
         "typedEvents",
         "walletOperations",
+        "hnsReadOperationsV1",
         "providerDispatch",
         "valueMovement",
         "browserIntegration"
@@ -440,7 +441,21 @@
           "items": { "$ref": "#/$defs/serviceCapability" }
         },
         "limits": { "$ref": "#/$defs/serviceLimits" }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capabilities": { "contains": { "const": "hnsReadOperationsV1" } }
+            }
+          },
+          "then": {
+            "properties": {
+              "capabilities": { "contains": { "const": "walletOperations" } }
+            }
+          }
+        }
+      ]
     },
     "providerNamespace": {
       "enum": ["hns", "icann"]

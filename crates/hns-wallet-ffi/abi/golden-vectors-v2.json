@@ -30,7 +30,7 @@
             "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
             "serviceSessionId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
             "restartGeneration": 1,
-            "capabilities": [],
+            "capabilities": ["walletOperations", "hnsReadOperationsV1"],
             "limits": {
               "outerFrameBytes": 1048576,
               "providerRequestBytes": 65536,
@@ -542,6 +542,12 @@
       "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
       "reason": "wire IDs reject the all-zero sentinel",
       "value": { "frameType": "hello", "hello": { "protocolVersion": 2, "platform": "ios", "hostSessionId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "restartGeneration": 1 } }
+    },
+    {
+      "name": "privateServiceHelloHnsReadsWithoutWalletOperations",
+      "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
+      "reason": "the exact HNS read-operations-v1 marker requires the coarse private wallet operation transport",
+      "value": { "frameType": "hello", "hello": { "protocolVersion": 2, "platform": "chromiumNativeHost", "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "serviceSessionId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI", "restartGeneration": 1, "capabilities": ["hnsReadOperationsV1"], "limits": { "outerFrameBytes": 1048576, "providerRequestBytes": 65536, "providerResultBytes": 262144, "providerEventBytes": 65536, "approvalFrameBytes": 16384, "approvalLifetimeMs": 90000 } } }
     },
     {
       "name": "privateSnapshotUnknownMethod",
