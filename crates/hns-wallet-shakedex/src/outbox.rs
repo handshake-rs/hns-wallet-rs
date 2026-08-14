@@ -1430,16 +1430,34 @@ mod tests {
         Vec<u8>,
         VerifiedListingCancellation,
     ) {
+        publication_fixtures_with_network_and_sequence(
+            NetworkBinding {
+                magic: 0x5b6e_c393,
+                genesis: BlockHash::new([0x11; 32]),
+            },
+            sequence,
+            offer_request_id,
+            cancellation_request_id,
+        )
+    }
+
+    fn publication_fixtures_with_network_and_sequence(
+        network: NetworkBinding,
+        sequence: u64,
+        offer_request_id: u64,
+        cancellation_request_id: u64,
+    ) -> (
+        Vec<u8>,
+        AuthenticatedFixedPriceListing,
+        Vec<u8>,
+        VerifiedListingCancellation,
+    ) {
         let signing_key = SigningKey::from_slice(&[0x31; 32]).expect("seller key");
         let seller_public_key = signing_key.verifying_key().to_encoded_point(true);
         let seller_public_key = seller_public_key
             .as_bytes()
             .try_into()
             .expect("compressed seller key");
-        let network = NetworkBinding {
-            magic: 0x5b6e_c393,
-            genesis: BlockHash::new([0x11; 32]),
-        };
         let mut proof = SwapProof {
             network,
             locking_outpoint: Outpoint {
@@ -2178,8 +2196,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn schema_v2_prepared_handoff_acceptance_is_durable_and_exactly_idempotent() {
-        let (offer, listing, _, _) = publication_fixtures();
+    fn schema_v2_zero_magic_handoff_acceptance_is_durable_exact_and_idempotent() {
+        let network = NetworkBinding {
+            magic: 0,
+            genesis: BlockHash::new([0x11; 32]),
+        };
+        let (offer, listing, _, _) =
+            publication_fixtures_with_network_and_sequence(network, 41, 101, 102);
         let (_cleanup, mut store, database) = test_wallet_store();
         let mut outbox = DenuoPublicationOutbox::default();
         let envelope_id = outbox
@@ -2213,6 +2236,14 @@ mod tests {
             .expect("reconstruct exact handoff");
         let endpoint_key = SigningKey::from_slice(&[0x42; 32]).expect("endpoint key");
         let policy = acceptance_policy(listing.network(), &endpoint_key);
+        let wrong_network_policy = acceptance_policy(
+            NetworkBinding {
+                magic: 1,
+                genesis: network.genesis,
+            },
+            &endpoint_key,
+        );
+        assert_ne!(policy.fingerprint(), wrong_network_policy.fingerprint());
         let canonical = canonical_publication(handoff.envelope_bytes()).expect("canonical handoff");
         let expected = acceptance_expectation(&handoff, &canonical);
         let accepted_at_unix = CREATED_AT + 2;
@@ -2269,6 +2300,23 @@ mod tests {
                 &handoff,
                 &policy,
                 &wrong_content_receipt,
+                accepted_at_unix,
+            ),
+            Err(ShakedexError::InvalidDenuoPublicationAcceptance)
+        ));
+        let wrong_network_receipt = signed_acceptance_for_test(
+            &wrong_network_policy,
+            expected,
+            accepted_at_unix,
+            accepted_at_unix + 60,
+            &endpoint_key,
+        );
+        assert!(matches!(
+            record_denuo_handoff_acceptance(
+                &mut store,
+                &handoff,
+                &wrong_network_policy,
+                &wrong_network_receipt,
                 accepted_at_unix,
             ),
             Err(ShakedexError::InvalidDenuoPublicationAcceptance)

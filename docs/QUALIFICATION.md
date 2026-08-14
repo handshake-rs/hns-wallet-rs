@@ -145,11 +145,21 @@ network rows are omitted with zero node calls. A selected-account mutation
 during trusted clock observation fails closed. The opaque plan retains current
 hashes and account context privately but exposes neither hashes nor response
 bytes and exposes no listing, lock, transport, provider, or value capability.
-This remains local source evidence until exact-commit CI/CodeQL and changes no
+These regressions passed exact-commit CI/CodeQL at `9649098` and change no
 release gate.
 
-CI and CodeQL passed at exact current source `bc5901f`; `2229be8` and
-`ba9f013` remain historical baselines.
+The HNSA/HRM network-magic correction adds a public-boundary signed-receipt
+regression with an exact zero-valued configured magic and nonzero genesis. It
+persists and reopens the terminal receipt, preserves exact idempotent replay,
+and rejects an otherwise valid receipt whose configured magic is one without
+mutating the prepared row. Zero is therefore neither a sentinel nor a
+wildcard; policy fingerprints, receipt signatures, and handoff comparison
+continue to bind its exact four-byte little-endian encoding. No release gate
+changes. The correction passes the full local workspace gate; exact-commit
+CI/CodeQL remains required after commit.
+
+`9649098`, `bc5901f`, `2229be8`, and `ba9f013` remain exact historical green
+CI/CodeQL baselines.
 This repository records no independent security audit, database or resource
 benchmark, multi-process network test, installed-device run, or installed-
 browser wallet run for the package boundary. Downstream candidate source does

@@ -95,8 +95,7 @@ impl DenuoPublicationAcceptancePolicy {
     fn validate_fields(&self) -> Result<(), ShakedexError> {
         let endpoint_key_is_valid =
             VerifyingKey::from_sec1_bytes(&self.hnsa.endpoint_public_key).is_ok();
-        if self.network_magic == 0
-            || is_zero(self.network_genesis)
+        if is_zero(self.network_genesis)
             || is_zero(self.hrm.subject)
             || is_zero(self.hrm.envelope_hash)
             || is_zero(self.hrm.chain_anchor)

@@ -9,6 +9,8 @@ Schema v3 can terminally retain a bounded, canonical, endpoint-signed receipt
 that a named relay accepted that exact prepared envelope. The receipt binds
 the configured network, HRM root, HNSA service/delegation lineage, endpoint
 key, attempt, request, and envelope bytes and self-validates after restart.
+Network identity is the exact `(u32 magic, nonzero genesis)` pair: magic zero
+is a valid configured value, never a wildcard, and must match the handoff.
 
 The wallet-defined receipt binds an `hns.named-service/v1` HRM resource. That
 resource-profile identifier is defined by the draft, but no Denuo application

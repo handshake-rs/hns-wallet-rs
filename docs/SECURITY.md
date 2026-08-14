@@ -46,7 +46,9 @@ independently disabled.
   database snapshot. The schema-v3 publication outbox can separately retain a
   canonical endpoint-signed receipt for one exact prepared envelope. Its full
   wallet-supplied HRM/HNSA policy, endpoint window, maximum lifetime, exact
-  handoff identity, and signature are revalidated after restart, but the
+  handoff identity, and signature are revalidated after restart. Network
+  identity is the exact `(u32 magic, nonzero genesis)` pair: magic zero is a
+  valid configured value, never a wildcard, and must match the handoff. The
   receipt proves only that configured endpoint accepted those bytes. It does
   not prove that the HRM/HNSA lineage is current, that a board included or
   retained the listing, that the lock remains unspent, or that any price or

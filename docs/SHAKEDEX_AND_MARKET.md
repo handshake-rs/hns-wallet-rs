@@ -294,11 +294,13 @@ by the configured HNSA endpoint key. The receipt binds the network, exact HRM
 root tuple, HNSA service/delegation/endpoint identifiers, caller-owned nonzero
 Denuo application-profile ID, endpoint validity, maximum receipt lifetime,
 attempt, request, content identity, and exact-envelope digest. The complete
-policy and receipt bytes are encrypted with the row and re-parsed, exactly
-re-encoded, fingerprinted, lifetime-checked, and signature-verified after every
-restart. An exact retry returns the existing terminal snapshot without a
-revision change; a different valid receipt conflicts with the first terminal
-receipt.
+network identity is `(u32 magic, nonzero genesis)`; magic zero is a valid
+configured value, never a wildcard, and must exactly match the handoff. The
+complete policy and receipt bytes are encrypted with the row and re-parsed,
+exactly re-encoded, fingerprinted, lifetime-checked, and signature-verified
+after every restart. An exact retry returns the existing terminal snapshot
+without a revision change; a different valid receipt conflicts with the first
+terminal receipt.
 
 This is wallet-defined relay transport evidence only. It does not establish a
 current HRM/HNSA authority, board inclusion or currentness, live chain or quote
