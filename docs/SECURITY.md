@@ -34,7 +34,16 @@ independently disabled.
   network/genesis, active time window, and exact locking coin locally. The
   protocol verifier does not establish that caller-supplied coin as current or
   unspent; only fresh authenticated HNS adapter evidence may do so. Persisted
-  cache bytes never become action authority after restart.
+  cache bytes never become action authority after restart. Separately, the
+  price-round cache accepts canonical zero-ID gossip under an exact local policy
+  and a caller-owned trusted `accepted_at_unix` clock. An explicit predecessor
+  checkpoint authenticates only that predecessor and its current link, not
+  earlier ancestry. Canonical reporter-aligned sequence high-watermarks survive
+  omission and pruning from the authenticated maximum-128-round suffix, while
+  a pruned round hash/ID leaves duplicate detection. Full retained-row restart
+  validation still supplies neither a live chain anchor nor quote/value
+  authority, and it does not detect rollback of the complete authenticated
+  database snapshot.
 - Bitcoin production synchronization has one backend: Kyoto direct P2P with
   BIP157/158. There is no trusted indexer fallback.
 - Handshake node evidence crosses one authenticated loopback HTTP/1.1 boundary.

@@ -148,7 +148,8 @@ gate stays false.
 - `hns-wallet-provider`: hostile-page request, permission, and approval core.
 - `hns-wallet-shakedex`: release-gated persisted seller/buyer/recovery and
   post-TRANSFER script-FINALIZE schemas.
-- `hns-wallet-market`: price-bound reservations and atomic-swap recovery.
+- `hns-wallet-market`: price-bound reservations, atomic-swap recovery, and a
+  release-unavailable encrypted canonical price-round gossip cache.
 - `hns-wallet-mobile`: platform-neutral, single-account Android/iOS lifecycle
   controller plus an injected, synchronized, minimized HNS read composition;
   no concrete device backend or value/provider surface.

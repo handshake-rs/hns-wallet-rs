@@ -1,6 +1,8 @@
 #![doc = "Chain-neutral, evidence-driven market and atomic-swap workflow state."]
 #![forbid(unsafe_code)]
 
+mod price_board;
+
 use std::collections::BTreeMap;
 
 use hns_wallet_store::{StoreError, WalletStore};
@@ -9,6 +11,12 @@ use hns_wallet_types::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+pub use price_board::{
+    DenuoPriceRoundAdmission, DenuoPriceRoundPolicy, DenuoPriceRoundSnapshot,
+    MAX_DENUO_PRICE_ROUND_HISTORY, admit_denuo_price_round, bootstrap_denuo_price_round_cache,
+    load_denuo_price_round_cache,
+};
 
 pub const MAX_ACTIVE_RESERVATIONS: usize = 64;
 pub const MAX_CONCURRENT_SWAP_SESSIONS: usize = 16;
@@ -517,6 +525,16 @@ pub enum MarketError {
     InvalidIntent,
     #[error("invalid or stale verified quote")]
     InvalidQuote,
+    #[error("invalid Denuo price-round admission policy")]
+    InvalidDenuoPriceRoundPolicy,
+    #[error("invalid or unexpected canonical Denuo V2 price-round envelope")]
+    InvalidDenuoPriceRound,
+    #[error("Denuo price-round cache was created under another admission policy")]
+    DenuoPriceRoundPolicyMismatch,
+    #[error("Denuo price-round replay, rollback, or equivocation was rejected")]
+    DenuoPriceRoundReplay,
+    #[error("persisted Denuo price-round cache is corrupt or noncanonical")]
+    CorruptDenuoPriceRoundCache,
     #[error("unsupported or inconsistent asset pair")]
     InvalidPair,
     #[error("quantity reservation rejected")]
@@ -540,8 +558,12 @@ pub enum MarketError {
 }
 
 impl From<StoreError> for MarketError {
-    fn from(_: StoreError) -> Self {
-        Self::Persistence
+    fn from(error: StoreError) -> Self {
+        if matches!(error, StoreError::StaleRevision { .. }) {
+            Self::StaleRevision
+        } else {
+            Self::Persistence
+        }
     }
 }
 

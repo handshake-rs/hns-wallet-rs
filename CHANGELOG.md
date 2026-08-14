@@ -32,7 +32,15 @@ boundary:
   product and value gates remain disabled, including a bounded encrypted/CAS
   offline Denuo V2 offer/cancellation outbox with exact-envelope restart
   validation, persist-before-return single-flight handoff journaling, explicit
-  crash-as-retry recovery, and monotonic bounded failure state;
+  crash-as-retry recovery, and monotonic bounded failure state, plus a bounded
+  encrypted canonical V2 price-round zero-ID gossip cache with exact local-
+  policy binding, optional exact predecessor-checkpoint bootstrap, a caller-
+  owned trusted `accepted_at_unix` clock, durable canonical reporter-aligned
+  current and retired-prefix sequence high-watermarks, and full validation of a
+  linked maximum-128-round suffix. Retiring an old row preserves its reporter
+  high-watermarks but removes
+  its round hash and ID from duplicate detection; the cache provides no quote
+  conversion and does not itself confer quote or live-chain authority;
 - Kyoto-only Bitcoin state and a native-ETH policy/contract verification
   boundary whose settlement permits remain unavailable; and
 - deterministic, non-mainnet fixtures for downstream qualification.

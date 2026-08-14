@@ -13,10 +13,16 @@ readme = "README.md"
 publish = ["crates-io"]
 
 [dependencies]
+hns-marketplace-protocol.workspace = true
 hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true
+hex.workspace = true
 serde.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+hns-primitives.workspace = true
 
 [lints]
 workspace = true

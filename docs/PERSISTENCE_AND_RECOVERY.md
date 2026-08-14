@@ -112,6 +112,39 @@ admission policy remain required for a live relay. The cache does not persist
 an action capability; current locking-coin/network/time authority must be
 reacquired before a listing can drive value behavior.
 
+The price-round cache uses the encrypted `PriceRound` namespace separately.
+Its CAS head binds the exact caller-owned network, pair, canonical verification
+policy, admitted reporter keys, and admitted source IDs by a domain-separated
+fingerprint. Price rounds are exact canonical V2 zero-request-ID gossip, not
+correlated responses. A fresh cache accepts no predecessor only when the
+current round has a zero previous hash. Otherwise it requires the exact
+canonical predecessor checkpoint and linked current round, and atomically
+installs predecessor, current, and head from absent expected-revision-zero
+records. The predecessor may already be expired; verification authenticates
+its intrinsic fields and policy through the current link, but does not prove
+ancestry before a non-genesis checkpoint.
+
+`accepted_at_unix` is supplied by a trusted caller-owned local/product clock,
+never by a peer or browser page. Freshness statements are relative only to that
+input. The head stores aligned durable-overall and retired-prefix high-watermark
+positions for every reporter in the policy's canonical sorted reporter list;
+zero means unseen, and every later observation from a seen reporter must have a
+strictly greater nonzero sequence. Those encrypted high-watermarks remain when
+a reporter is omitted or an old round is retired, and full load replays the
+retained suffix from the authenticated retired-prefix boundary.
+
+Immutable round records retain exact canonical bytes. The authenticated linked
+suffix has a fixed maximum of 128 rounds; advancing it atomically deletes the
+oldest record. That preserves reporter sequence high-watermarks, but the
+deleted round hash and round ID leave duplicate detection. Load boundedly
+re-decodes and exactly re-encodes every retained row, validates every adjacent
+link and caller policy, and reconciles retained observation sequences with the
+durable high-watermarks. This detects inconsistency inside the retained state,
+not rollback of an entire authenticated database snapshot. Expiry does not
+delete the rollback suffix. Neither stored price/anchor fields nor the public
+snapshot prove current chains or confer price/value authority; the cache
+provides no quote conversion. All Denuo and value release gates remain false.
+
 The offline name-market publication outbox uses a second fixed record ID in
 the encrypted `DenuoBoardObject` namespace and its own store CAS revision. It
 retains at most 1,024 exact canonical V2 offer/cancellation envelopes (16 KiB
@@ -386,8 +419,10 @@ The product runtime must:
    revalidate split committed-proof/current name views; replace legacy watch-
    only rows with exact canonical summaries; and reacquire rather than restore
    any ephemeral ownership or Shakedex spend authority;
-9. expire price rounds, intents, fill grants, persisted workflow approvals, and replay rows only
-   after their authenticated metadata verifies;
+9. fully revalidate the retained price-round suffix and reporter sequence high-
+   watermarks, treat expired round metadata as non-current without deleting the
+   suffix, and expire intents, fill grants, persisted workflow approvals, and
+   replay rows only after their authenticated metadata verifies;
 10. restore swap sessions and independently verify every recorded funding,
    redemption, refund, Shakedex structural plan, and Shakedex value child
    workflow against newly acquired chain authority and its exact protected

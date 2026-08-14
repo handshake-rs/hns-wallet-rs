@@ -277,6 +277,26 @@ Canonical reporter observations, quorum rounds, intents, fill grants, name
 offers, cancellations, and swap messages live in the
 `hns-marketplace-protocol` boundary in `hns-rs`. The wallet consumes it only at
 the pinned immutable revision, never through a sibling path. The fixed-price
-name board now consumes its canonical Denuo envelopes; price governance,
-reporter enrollment, outlier/circuit-breaker qualification, peer
-cooldown/scoring, and live node/browser relay integration remain unavailable.
+name board consumes its canonical Denuo envelopes. A separate wallet-market
+cache admits only canonical V2 zero-request-ID `PriceRound` gossip whose
+network, pair, signatures, quorum, sources, time bounds, linked interval, and
+circuit breaker satisfy an exact caller-owned policy. A fresh cache accepts an
+unlinked current round or an exact predecessor checkpoint plus its linked
+current round; it does not prove ancestry before a non-genesis checkpoint. The
+caller supplies `accepted_at_unix` from a trusted local/product clock, never
+from the peer or browser, and freshness is relative only to that input.
+
+The encrypted CAS head aligns durable-overall and retired-prefix sequence high-
+watermarks with the policy's canonical sorted reporter list and advances an
+authenticated linked suffix capped at 128 rounds. A seen reporter must advance
+its nonzero sequence even after omission or suffix pruning. Pruning removes the
+old round hash and ID from duplicate detection while retaining those reporter
+high-watermarks. Load re-decodes and exactly re-encodes every retained row,
+verifies all adjacent links and policy bindings, and replays retained
+observations from the authenticated retired-prefix boundary to the durable
+high-watermarks. The public snapshot remains metadata only, provides no
+automatic quote conversion, and does not itself confer price, chain, or value
+authority. Stored anchors are not checked against live chains. Price governance,
+reporter enrollment, peer cooldown/scoring, live anchor verification, relay/
+browser integration, and product qualification remain unavailable; every
+release gate remains false.

@@ -914,9 +914,13 @@ dependencies = [
 name = "hns-wallet-market"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "hns-marketplace-protocol",
+ "hns-primitives",
  "hns-wallet-store",
  "hns-wallet-types",
  "serde",
+ "sha2",
  "thiserror",
 ]
 

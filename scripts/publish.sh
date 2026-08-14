@@ -126,6 +126,10 @@ dry_run_with_local_dependencies() {
             ;;
         hns-wallet-market)
             dry_run_package "$package" \
+                --config "patch.crates-io.hns-marketplace-protocol.git=\"$protocol_repository\"" \
+                --config "patch.crates-io.hns-marketplace-protocol.rev=\"$protocol_revision\"" \
+                --config "patch.crates-io.hns-primitives.git=\"$protocol_repository\"" \
+                --config "patch.crates-io.hns-primitives.rev=\"$protocol_revision\"" \
                 --config 'patch.crates-io.hns-wallet-store.path="crates/hns-wallet-store"' \
                 --config 'patch.crates-io.hns-wallet-types.path="crates/hns-wallet-types"'
             ;;

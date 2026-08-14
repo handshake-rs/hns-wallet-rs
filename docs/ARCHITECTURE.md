@@ -17,16 +17,20 @@ hostile website
 ```
 
 Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
-proofs, signed fixed-price listings/cancellations, and Denuo name-market
-envelopes remain in `hns-rs`. This workspace consumes the required protocol
-crates from reviewed immutable revision `b24b66c`; its exact source and lock
-coherence are checked before the workspace gate. The wallet owns only the
-protocol-verification boundary and encrypted replay/tombstone board state. Node
-indexes and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
+proofs, signed fixed-price listings/cancellations, Denuo name-market envelopes,
+and zero-ID price-round gossip remain in `hns-rs`. This workspace consumes the
+required protocol crates from reviewed immutable revision `b24b66c`; its exact
+source and lock coherence are checked before the workspace gate. The wallet
+owns protocol verification, encrypted replay/tombstone board state, and an
+exact-policy-bound price-round cache with predecessor-checkpoint bootstrap,
+trusted local `accepted_at_unix`, canonical reporter-aligned durable sequence
+high-watermarks, and a fully validated maximum-128-round suffix. Node indexes
+and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
 remains in `hns-dane-engine`. Browser JavaScript and platform UI remain in the
 browser repositories. This workspace owns keys, encrypted local state, wallet
 semantics, approvals, typed canonical transaction planning, and recoverable
-application workflows.
+application workflows; the cache owns no relay, live-chain, quote, value, or
+release-gate authority.
 
 ## Crate boundaries
 
@@ -38,7 +42,7 @@ application workflows.
 | `hns-wallet-hns` | exact-existing-account selector, synchronized non-value account-read runtime, HNS key roles, protected Shakedex seller-key allocation and purpose-bound signing, store-global lock-source plus account funding reservations, runtime-owned Shakedex time/chain observations, shared three-branch restoration/reconciliation, snapshot MTP, address/coin/name evidence and workflows | canonical encodings or market terms |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
 | `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact listing/cancellation protocol verification, canonical fulfillment/recovery/script-FINALIZE planning, encrypted parent-plan CAS, durable buyer-fulfillment/seller-recovery/seller-script-FINALIZE value aggregate, canonical Denuo adapter, encrypted sequence/tombstone board, bounded encrypted offline publication outbox with persist-before-return single-flight handoff recovery | proof/listing/Denuo codecs, raw HNS keys, product coin selection, network/relay transport, remote acceptance, caller-asserted clock/chain truth, or release qualification |
-| `hns-wallet-market` | reservations and evidence-driven cross-chain sessions | chain networking |
+| `hns-wallet-market` | reservations, evidence-driven cross-chain sessions, and an encrypted exact-policy canonical zero-ID price-round gossip cache with optional predecessor checkpoint, trusted local acceptance clock, durable reporter sequence high-watermarks, and a fully revalidated maximum-128-round suffix | chain networking, reporter governance, relay transport, live chain-anchor evidence, quote/value authority, or release qualification |
 | `hns-wallet-mobile` | one platform-neutral lifecycle controller plus a backend-injected synchronized HNS read controller, both owning exact shared store/host/service composition; atomic single-HNS-account bootstrap, private ABI-v2 lifecycle controls, and minimized serializable balance/receive/history/already-known-name/module-status reads | raw platform keys, a concrete device backend, WebView/provider entry points, name import, value actions, or marketplace transport |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
