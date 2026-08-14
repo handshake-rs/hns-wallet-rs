@@ -11,9 +11,10 @@ mod shakedex_key;
 mod hnsa_hnsr_publisher;
 
 pub use name_workflow::{
-    AuthorizedNameOperation, HnsNameAction, HnsNameLifecycle, NameActionContextEvidence,
-    NameActionIneligibility, NameOperation, NameOperationState, PrepareNameFinalize,
-    PrepareNameTransfer, PreparedNameOperation, VerifiedCurrentShakedexLock,
+    AuthorizedNameOperation, CurrentShakedexLockQuery, HnsNameAction, HnsNameLifecycle,
+    NameActionContextEvidence, NameActionIneligibility, NameOperation, NameOperationState,
+    PrepareNameFinalize, PrepareNameTransfer, PreparedNameOperation, VerifiedCurrentShakedexLock,
+    VerifiedCurrentShakedexLockBatch, VerifiedCurrentShakedexLockEntry,
     VerifiedCurrentShakedexTransfer, VerifiedOutgoingNameTransfer,
 };
 pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
@@ -108,6 +109,9 @@ pub const HNS_LOCKTIME_THRESHOLD: u64 = 500_000_000;
 pub const MAX_SCAN_PAGE_RESULTS: usize = 256;
 pub const MAX_MEMPOOL_SCAN_RESULTS: usize = 1_024;
 pub const MAX_OUTPOINT_SPEND_BATCH: usize = 256;
+/// Maximum number of exact name/seller lock queries that may share one
+/// selected-account, chain, mempool, and trusted-time observation.
+pub const MAX_CURRENT_SHAKEDEX_LOCK_BATCH: usize = 64;
 pub const MAX_SCAN_CURSOR_BYTES: usize = 4_096;
 pub const MAX_SCAN_PAGES: usize = 128;
 pub const MAX_SNAPSHOT_RESTARTS: usize = 3;

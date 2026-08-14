@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -19,13 +20,14 @@ use hns_swap::{
 use hns_transaction::{Address, Coin, Input, Outpoint, Output, Transaction, Witness};
 use hns_wallet_hns::{
     BlockHashEvidence, ChainTip, ConfirmedWalletPage, ConfirmedWalletPageRequest,
-    HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED, HNS_VALUE_RUNTIME_RELEASE_QUALIFIED,
-    HnsAccountReadRuntime, HnsAccountRecord, HnsBackend, HnsBootstrapPolicy, HnsClock,
-    HnsExistingAccountSelector, HnsNameAction, HnsNameLifecycle, HnsNetwork, HnsOutpoint,
-    HnsRuntimeConfig, HnsTransactionFeeQuote, HnsWalletBootstrap, HnsWalletError,
-    MempoolSnapshotBinding, MempoolWalletPage, MempoolWalletPageRequest, NameActionContextEvidence,
-    NameEvidence, NameProofResponse, OutpointSpendEntry, OutpointSpendEvidence, SnapshotBinding,
-    SpendingTransactionEvidence, TransactionEvidence,
+    CurrentShakedexLockQuery, HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED,
+    HNS_VALUE_RUNTIME_RELEASE_QUALIFIED, HnsAccountReadRuntime, HnsAccountRecord, HnsBackend,
+    HnsBootstrapPolicy, HnsClock, HnsExistingAccountSelector, HnsNameAction, HnsNameLifecycle,
+    HnsNetwork, HnsOutpoint, HnsRuntimeConfig, HnsTransactionFeeQuote, HnsWalletBootstrap,
+    HnsWalletError, MAX_CURRENT_SHAKEDEX_LOCK_BATCH, MempoolSnapshotBinding, MempoolWalletPage,
+    MempoolWalletPageRequest, NameActionContextEvidence, NameEvidence, NameProofResponse,
+    OutpointSpendEntry, OutpointSpendEvidence, SnapshotBinding, SpendingTransactionEvidence,
+    TransactionEvidence, WalletAddressKey,
 };
 use hns_wallet_shakedex::{
     DenuoBoardCancellationAdmission, DenuoBoardOfferAdmission, DenuoBoardOfferResponsePlan,
@@ -330,6 +332,8 @@ struct BackendControl {
     restart_chain_on_fence: Arc<AtomicBool>,
     chain_snapshot_count: Arc<AtomicU64>,
     restart_mempool_on_fence: Arc<AtomicBool>,
+    mempool_query_count: Arc<AtomicU64>,
+    spend_query_count: Arc<AtomicU64>,
     reject_queries: Arc<AtomicBool>,
     query_count: Arc<AtomicU64>,
     query_hook: Arc<Mutex<Option<QueryHook>>>,
@@ -342,6 +346,8 @@ impl BackendControl {
             restart_chain_on_fence: Arc::new(AtomicBool::new(false)),
             chain_snapshot_count: Arc::new(AtomicU64::new(0)),
             restart_mempool_on_fence: Arc::new(AtomicBool::new(false)),
+            mempool_query_count: Arc::new(AtomicU64::new(0)),
+            spend_query_count: Arc::new(AtomicU64::new(0)),
             reject_queries: Arc::new(AtomicBool::new(false)),
             query_count: Arc::new(AtomicU64::new(0)),
             query_hook: Arc::new(Mutex::new(None)),
@@ -436,6 +442,9 @@ impl HnsBackend for TestBackend {
         request: MempoolWalletPageRequest<'_>,
     ) -> Result<MempoolWalletPage, HnsWalletError> {
         self.record_query("get_mempool_wallet_page")?;
+        self.control
+            .mempool_query_count
+            .fetch_add(1, Ordering::SeqCst);
         let seller_public_key = self
             .market
             .signing_key
@@ -487,6 +496,9 @@ impl HnsBackend for TestBackend {
         binding: SnapshotBinding,
     ) -> Result<OutpointSpendEvidence, HnsWalletError> {
         self.record_query("get_outpoint_spend_evidence")?;
+        self.control
+            .spend_query_count
+            .fetch_add(1, Ordering::SeqCst);
         if binding != self.market.binding || outpoints != [self.market.owner_outpoint] {
             return Err(HnsWalletError::InvalidEvidence);
         }
@@ -607,6 +619,462 @@ impl HnsBackend for TestBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchBackendFault {
+    Healthy,
+    ZeroMempoolNonce,
+    SpendWrongLength,
+    SpendWrongOrder,
+    SpendWrongEcho,
+    SpendOneEntry,
+}
+
+struct BatchMarketFixture {
+    name: Vec<u8>,
+    name_hash: [u8; 32],
+    seller_public_key: [u8; 33],
+    locking_coin: Coin,
+    owner_outpoint: HnsOutpoint,
+    owner_transaction: Vec<u8>,
+    owner_inclusion: hns_wallet_hns::TransactionInclusion,
+    state: Vec<u8>,
+}
+
+impl BatchMarketFixture {
+    fn new(name: &[u8], seller_public_key: [u8; 33], tag: u8) -> Self {
+        let name_hash = hash_name(name).expect("batch name hash");
+        let value = Dollarydoos::new(900_000 + u64::from(tag));
+        let mut state = NameState {
+            name_hash,
+            name: name.to_vec(),
+            height: Height::new(u32::from(tag)),
+            renewal: Height::new(100),
+            owner: CanonicalOutpoint::NULL,
+            value,
+            highest: value,
+            resource_data: Vec::new(),
+            transfer: Height::new(0),
+            revoked: Height::new(0),
+            claimed: Height::new(0),
+            renewals: 0,
+            registered: true,
+            expired: false,
+            weak: false,
+        };
+        let covenant = FinalizeCovenant::new(
+            name.to_vec(),
+            state.height,
+            state.weak,
+            state.claimed,
+            state.renewals,
+            BlockHash::new([tag.wrapping_add(40); 32]),
+        )
+        .expect("batch finalize covenant")
+        .to_covenant()
+        .expect("batch canonical covenant");
+        let transaction = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    transaction_hash: CanonicalTransactionHash::new([tag; 32]),
+                    index: 1,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value,
+                address: Address::new(0, lock_script_hash(&seller_public_key).to_vec())
+                    .expect("batch lock address"),
+                covenant,
+            }],
+            locktime: 0,
+        };
+        let transaction_hash = transaction.transaction_hash().expect("batch owner hash");
+        state.owner = CanonicalOutpoint {
+            transaction_hash,
+            index: 0,
+        };
+        let owner_outpoint = HnsOutpoint {
+            transaction: TransactionHash::new(transaction_hash.into_bytes()),
+            output_index: 0,
+        };
+        let owner_inclusion = hns_wallet_hns::TransactionInclusion {
+            block_hash: [tag.wrapping_add(80); 32],
+            height: 120 + u64::from(tag),
+            transaction_index: Some(u32::from(tag)),
+        };
+        let locking_coin = Coin {
+            outpoint: Outpoint {
+                transaction_hash,
+                index: 0,
+            },
+            value,
+            height: Height::new(
+                u32::try_from(owner_inclusion.height).expect("bounded inclusion height"),
+            ),
+            coinbase: false,
+            address: transaction.outputs[0].address.clone(),
+            covenant: transaction.outputs[0].covenant.clone(),
+        };
+        Self {
+            name: name.to_vec(),
+            name_hash: name_hash.into_bytes(),
+            seller_public_key,
+            locking_coin,
+            owner_outpoint,
+            owner_transaction: transaction.encode().expect("batch owner transaction"),
+            owner_inclusion,
+            state: state.encode().expect("batch name state"),
+        }
+    }
+}
+
+struct CurrentLockBatchFixture {
+    markets: Vec<BatchMarketFixture>,
+    network: NetworkBinding,
+    binding: SnapshotBinding,
+    mempool: MempoolSnapshotBinding,
+}
+
+impl CurrentLockBatchFixture {
+    fn new() -> Self {
+        let shared_key = SigningKey::from_slice(&[0x41; 32]).expect("shared batch seller key");
+        let distinct_key = SigningKey::from_slice(&[0x42; 32]).expect("distinct batch seller key");
+        let compressed = |key: &SigningKey| -> [u8; 33] {
+            key.verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .expect("compressed batch seller key")
+        };
+        let markets = vec![
+            BatchMarketFixture::new(b"batch-alpha", compressed(&shared_key), 1),
+            BatchMarketFixture::new(b"batch-beta", compressed(&distinct_key), 2),
+            BatchMarketFixture::new(b"batch-gamma", compressed(&shared_key), 3),
+        ];
+        let genesis = BlockHash::from_hex(REGTEST_GENESIS).expect("regtest genesis");
+        Self {
+            markets,
+            network: NetworkBinding {
+                magic: 0xae38_95cf,
+                genesis,
+            },
+            binding: SnapshotBinding {
+                tip: ChainTip {
+                    height: 500,
+                    block_hash: [0x91; 32],
+                    // An empty-tree proof is valid for every queried key. The
+                    // separately authenticated current view supplies each
+                    // post-proof canonical NameState.
+                    tree_root: [0; 32],
+                    median_time_past: NOW_UNIX - 20,
+                },
+                chain_epoch: 17,
+            },
+            mempool: MempoolSnapshotBinding {
+                instance_nonce: [0x92; 32],
+                generation: 19,
+            },
+        }
+    }
+
+    fn market(&self, name_hash: [u8; 32]) -> Option<&BatchMarketFixture> {
+        self.markets
+            .iter()
+            .find(|market| market.name_hash == name_hash)
+    }
+
+    fn expected_scripts(&self) -> Vec<WalletAddressKey> {
+        self.markets
+            .iter()
+            .map(|market| WalletAddressKey {
+                version: 0,
+                hash: lock_script_hash(&market.seller_public_key).to_vec(),
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct BatchBackendObservations {
+    chain_calls: AtomicU64,
+    genesis_calls: AtomicU64,
+    mempool_calls: AtomicU64,
+    name_calls: AtomicU64,
+    context_calls: AtomicU64,
+    spend_calls: AtomicU64,
+    mempool_scripts: Mutex<Vec<Vec<WalletAddressKey>>>,
+    name_order: Mutex<Vec<[u8; 32]>>,
+    context_order: Mutex<Vec<[u8; 32]>>,
+    spend_outpoints: Mutex<Vec<Vec<HnsOutpoint>>>,
+}
+
+struct CurrentLockBatchBackend {
+    fixture: Arc<CurrentLockBatchFixture>,
+    observations: Arc<BatchBackendObservations>,
+    fault: BatchBackendFault,
+}
+
+impl CurrentLockBatchBackend {
+    fn unexpected(method: &str) -> HnsWalletError {
+        HnsWalletError::Backend(format!("unexpected lock batch backend call: {method}"))
+    }
+}
+
+impl HnsBackend for CurrentLockBatchBackend {
+    fn get_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError> {
+        self.observations.chain_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(self.fixture.binding)
+    }
+
+    fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
+        Err(Self::unexpected("get_chain_tip"))
+    }
+
+    fn get_block_hash(
+        &self,
+        height: u64,
+        binding: SnapshotBinding,
+    ) -> Result<BlockHashEvidence, HnsWalletError> {
+        self.observations
+            .genesis_calls
+            .fetch_add(1, Ordering::SeqCst);
+        if height != 0 || binding != self.fixture.binding {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        Ok(BlockHashEvidence {
+            binding,
+            height,
+            block_hash: Some(self.fixture.network.genesis.into_bytes()),
+        })
+    }
+
+    fn get_confirmed_wallet_page(
+        &self,
+        _: ConfirmedWalletPageRequest<'_>,
+    ) -> Result<ConfirmedWalletPage, HnsWalletError> {
+        Err(Self::unexpected("get_confirmed_wallet_page"))
+    }
+
+    fn get_mempool_wallet_page(
+        &self,
+        request: MempoolWalletPageRequest<'_>,
+    ) -> Result<MempoolWalletPage, HnsWalletError> {
+        let call = self
+            .observations
+            .mempool_calls
+            .fetch_add(1, Ordering::SeqCst);
+        self.observations
+            .mempool_scripts
+            .lock()
+            .expect("mempool-script observations")
+            .push(request.scripts.to_vec());
+        let expected_mempool = match call {
+            0 => None,
+            1 => Some(self.fixture.mempool),
+            _ => return Err(HnsWalletError::InvalidEvidence),
+        };
+        if request.binding != self.fixture.binding
+            || request.scripts != self.fixture.expected_scripts()
+            || request.expected_mempool != expected_mempool
+            || request.cursor.is_some()
+            || request.limit != 1
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let mempool = if self.fault == BatchBackendFault::ZeroMempoolNonce {
+            MempoolSnapshotBinding {
+                instance_nonce: [0; 32],
+                generation: self.fixture.mempool.generation,
+            }
+        } else {
+            self.fixture.mempool
+        };
+        Ok(MempoolWalletPage {
+            binding: self.fixture.binding,
+            mempool,
+            next_cursor: None,
+            history: Vec::new(),
+        })
+    }
+
+    fn get_transaction_evidence(
+        &self,
+        _: TransactionHash,
+        _: SnapshotBinding,
+        _: Option<MempoolSnapshotBinding>,
+    ) -> Result<TransactionEvidence, HnsWalletError> {
+        Err(Self::unexpected("get_transaction_evidence"))
+    }
+
+    fn get_outpoint_spend_evidence(
+        &self,
+        outpoints: &[HnsOutpoint],
+        binding: SnapshotBinding,
+    ) -> Result<OutpointSpendEvidence, HnsWalletError> {
+        self.observations.spend_calls.fetch_add(1, Ordering::SeqCst);
+        self.observations
+            .spend_outpoints
+            .lock()
+            .expect("spend observations")
+            .push(outpoints.to_vec());
+        if binding != self.fixture.binding
+            || outpoints.iter().any(|outpoint| {
+                !self
+                    .fixture
+                    .markets
+                    .iter()
+                    .any(|market| market.owner_outpoint == *outpoint)
+            })
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let mut entries: Vec<_> = outpoints
+            .iter()
+            .copied()
+            .map(|outpoint| OutpointSpendEntry {
+                outpoint,
+                spending: None,
+            })
+            .collect();
+        match self.fault {
+            BatchBackendFault::SpendWrongLength => {
+                entries.pop();
+            }
+            BatchBackendFault::SpendWrongOrder => entries.swap(0, 1),
+            BatchBackendFault::SpendWrongEcho => {
+                entries[0].outpoint.output_index ^= 1;
+            }
+            BatchBackendFault::SpendOneEntry => {
+                entries[1].spending = Some(SpendingTransactionEvidence {
+                    transaction: TransactionHash::new([0xa1; 32]),
+                    input_position: 0,
+                    block_hash: [0xa2; 32],
+                    height: binding.tip.height,
+                });
+            }
+            BatchBackendFault::Healthy | BatchBackendFault::ZeroMempoolNonce => {}
+        }
+        Ok(OutpointSpendEvidence { binding, entries })
+    }
+
+    fn broadcast_transaction(&self, _: &[u8]) -> Result<TransactionHash, HnsWalletError> {
+        Err(Self::unexpected("broadcast_transaction"))
+    }
+
+    fn quote_transaction_fee(
+        &self,
+        _: &[u8],
+        _: &[Coin],
+        _: u16,
+        _: SnapshotBinding,
+        _: MempoolSnapshotBinding,
+    ) -> Result<HnsTransactionFeeQuote, HnsWalletError> {
+        Err(Self::unexpected("quote_transaction_fee"))
+    }
+
+    fn estimate_fee_rate(&self, _: u16) -> Result<BaseUnits, HnsWalletError> {
+        Err(Self::unexpected("estimate_fee_rate"))
+    }
+
+    fn get_name_evidence(
+        &self,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
+    ) -> Result<NameEvidence, HnsWalletError> {
+        self.observations.name_calls.fetch_add(1, Ordering::SeqCst);
+        self.observations
+            .name_order
+            .lock()
+            .expect("name observations")
+            .push(name_hash);
+        let market = self
+            .fixture
+            .market(name_hash)
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        if binding != self.fixture.binding {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        Ok(NameEvidence {
+            binding,
+            proof: NameProofResponse {
+                name_hash,
+                tree_root: binding.tip.tree_root,
+                proof: vec![0, 0, 0, 0],
+                proof_height: binding.tip.height,
+            },
+            proof_state: None,
+            proof_owner_outpoint: None,
+            proof_owner_transaction: None,
+            proof_owner_inclusion: None,
+            current_state: Some(market.state.clone()),
+            current_owner_outpoint: Some(market.owner_outpoint),
+            current_owner_transaction: Some(market.owner_transaction.clone()),
+            current_owner_inclusion: Some(market.owner_inclusion),
+            untrusted_current_raw_resource: Some(Vec::new()),
+        })
+    }
+
+    fn get_name_action_context(
+        &self,
+        action: HnsNameAction,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
+        mempool: MempoolSnapshotBinding,
+    ) -> Result<NameActionContextEvidence, HnsWalletError> {
+        self.observations
+            .context_calls
+            .fetch_add(1, Ordering::SeqCst);
+        self.observations
+            .context_order
+            .lock()
+            .expect("context observations")
+            .push(name_hash);
+        let market = self
+            .fixture
+            .market(name_hash)
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        if action != HnsNameAction::Transfer
+            || binding != self.fixture.binding
+            || mempool != self.fixture.mempool
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        Ok(NameActionContextEvidence {
+            binding,
+            mempool,
+            network: HnsNetwork::Regtest,
+            network_id: 2,
+            genesis_hash: self.fixture.network.genesis.into_bytes(),
+            context_version: 1,
+            consensus_profile: "hns-consensus/name-policy-v1".to_owned(),
+            action,
+            name_hash,
+            current_state: market.state.clone(),
+            owner_outpoint: market.owner_outpoint,
+            owner_transaction: market.owner_transaction.clone(),
+            owner_inclusion: market.owner_inclusion,
+            candidate_inclusion_height: binding.tip.height + 1,
+            lifecycle: HnsNameLifecycle::Closed,
+            action_eligible: true,
+            ineligibility_reasons: Vec::new(),
+            transfer_height: None,
+            transfer_lockup: None,
+            finalize_eligible_height: None,
+            finalize_mature: None,
+            renewal_maturity: None,
+            renewal_period: None,
+            renewal_block_height: None,
+            renewal_block_hash: None,
+            renewal_valid_at_candidate: None,
+            mempool_spender: None,
+        })
+    }
+}
+
 fn blake2b_256(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Blake2bVar::new(32).expect("BLAKE2b output length");
     for part in parts {
@@ -685,6 +1153,57 @@ fn runtime(
         .expect("account read runtime")
 }
 
+fn counting_runtime(
+    store: SharedWalletStore,
+    config: HnsRuntimeConfig,
+    market: Arc<MarketFixture>,
+    control: BackendControl,
+    clock_calls: Arc<AtomicU64>,
+) -> HnsAccountReadRuntime<TestBackend, CountingClock> {
+    let selector = HnsExistingAccountSelector::new(store.clone(), config)
+        .expect("exact non-value account selector");
+    HnsAccountReadRuntime::new(
+        TestBackend { market, control },
+        CountingClock { calls: clock_calls },
+        store,
+        selector,
+    )
+    .expect("counting account read runtime")
+}
+
+fn current_lock_batch_runtime(
+    store: SharedWalletStore,
+    config: HnsRuntimeConfig,
+    fixture: Arc<CurrentLockBatchFixture>,
+    observations: Arc<BatchBackendObservations>,
+    fault: BatchBackendFault,
+    clock_calls: Arc<AtomicU64>,
+) -> HnsAccountReadRuntime<CurrentLockBatchBackend, CountingClock> {
+    let selector = HnsExistingAccountSelector::new(store.clone(), config)
+        .expect("batch exact non-value account selector");
+    HnsAccountReadRuntime::new(
+        CurrentLockBatchBackend {
+            fixture,
+            observations,
+            fault,
+        },
+        CountingClock { calls: clock_calls },
+        store,
+        selector,
+    )
+    .expect("current-lock batch runtime")
+}
+
+fn current_lock_batch_queries(fixture: &CurrentLockBatchFixture) -> Vec<CurrentShakedexLockQuery> {
+    [2_usize, 0, 1]
+        .into_iter()
+        .map(|index| CurrentShakedexLockQuery {
+            name: fixture.markets[index].name.clone(),
+            seller_public_key: fixture.markets[index].seller_public_key,
+        })
+        .collect()
+}
+
 fn late_runtime(
     store: SharedWalletStore,
     config: HnsRuntimeConfig,
@@ -735,6 +1254,315 @@ impl TestDirectory {
 impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn current_lock_batch_rejects_all_bad_input_before_store_backend_or_clock_io() {
+    let market = Arc::new(MarketFixture::new());
+    let control = BackendControl::new();
+    let clock_calls = Arc::new(AtomicU64::new(0));
+    let (store, config) = create_store(":memory:");
+    let hns = counting_runtime(
+        store.clone(),
+        config,
+        market.clone(),
+        control.clone(),
+        clock_calls.clone(),
+    );
+    let seller_public_key: [u8; 33] = market
+        .signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .try_into()
+        .expect("compressed seller key");
+    let valid = CurrentShakedexLockQuery {
+        name: market.name.clone(),
+        seller_public_key,
+    };
+    let oversized = vec![valid.clone(); MAX_CURRENT_SHAKEDEX_LOCK_BATCH + 1];
+    let invalid_name = CurrentShakedexLockQuery {
+        name: b"invalid.name".to_vec(),
+        seller_public_key,
+    };
+    let invalid_key = CurrentShakedexLockQuery {
+        name: market.name.clone(),
+        seller_public_key: [0; 33],
+    };
+    let duplicate = [valid.clone(), valid];
+    let alternate_key = SigningKey::from_slice(&[0x32; 32]).expect("alternate seller key");
+    let same_name_alternate_seller = [
+        duplicate[0].clone(),
+        CurrentShakedexLockQuery {
+            name: market.name.clone(),
+            seller_public_key: alternate_key
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .expect("alternate compressed seller key"),
+        },
+    ];
+
+    // A locked store makes an accidental account/store read observable in the
+    // returned error, while the backend and clock counters cover the remaining
+    // external boundaries.
+    store.lock().expect("lock shared wallet store");
+    assert!(matches!(
+        hns.verify_current_shakedex_locks(&[]),
+        Err(HnsWalletError::InvalidEvidence)
+    ));
+    assert!(matches!(
+        hns.verify_current_shakedex_locks(&oversized),
+        Err(HnsWalletError::InvalidEvidence)
+    ));
+    assert!(matches!(
+        hns.verify_current_shakedex_locks(&[invalid_name]),
+        Err(HnsWalletError::InvalidName)
+    ));
+    assert!(matches!(
+        hns.verify_current_shakedex_locks(&[invalid_key]),
+        Err(HnsWalletError::InvalidEvidence)
+    ));
+    assert!(matches!(
+        hns.verify_current_shakedex_locks(&duplicate),
+        Err(HnsWalletError::InvalidEvidence)
+    ));
+    assert!(matches!(
+        hns.verify_current_shakedex_locks(&same_name_alternate_seller),
+        Err(HnsWalletError::InvalidEvidence)
+    ));
+    assert!(matches!(
+        hns.verify_current_shakedex_lock(&[b'a'; 64], seller_public_key),
+        Err(HnsWalletError::InvalidName)
+    ));
+    assert_eq!(control.query_count.load(Ordering::SeqCst), 0);
+    assert_eq!(clock_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn current_lock_batch_retains_one_fenced_authority_without_store_writes() {
+    let market = Arc::new(MarketFixture::new());
+    let control = BackendControl::new();
+    let clock_calls = Arc::new(AtomicU64::new(0));
+    let (store, config) = create_store(":memory:");
+    let account_id = {
+        let mut id = [0_u8; 32];
+        id[..16].copy_from_slice(config.wallet_id.as_bytes());
+        id[16..].copy_from_slice(config.account_id.as_bytes());
+        id
+    };
+    let revision_before = store
+        .try_with_store(|wallet| {
+            wallet
+                .wallet_account::<HnsAccountRecord>(&account_id)?
+                .map(|stored| stored.revision)
+                .ok_or(HnsWalletError::StaleAccountRead)
+        })
+        .expect("initial account revision");
+    let hns = counting_runtime(
+        store.clone(),
+        config,
+        market.clone(),
+        control.clone(),
+        clock_calls.clone(),
+    );
+    let seller_public_key: [u8; 33] = market
+        .signing_key
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .try_into()
+        .expect("compressed seller key");
+    let batch = hns
+        .verify_current_shakedex_locks(&[CurrentShakedexLockQuery {
+            name: market.name.clone(),
+            seller_public_key,
+        }])
+        .expect("coherent current-lock batch");
+
+    assert_eq!(batch.len(), 1);
+    assert!(!batch.is_empty());
+    assert_eq!(batch.binding(), market.binding);
+    assert_eq!(batch.mempool_binding(), market.mempool);
+    assert_eq!(batch.observed_at_unix(), NOW_UNIX);
+    assert_eq!(batch.network(), market.network);
+    assert_eq!(batch.locks()[0].descriptor().name, market.name);
+    assert_eq!(
+        batch.locks()[0].descriptor().seller_public_key,
+        seller_public_key
+    );
+    assert_eq!(
+        batch.locks()[0].locking_coin().outpoint,
+        market.locking_coin.outpoint
+    );
+    store
+        .try_with_store(|wallet| batch.verify_unchanged_account(wallet))
+        .expect("unchanged account fence");
+    let revision_after = store
+        .try_with_store(|wallet| {
+            wallet
+                .wallet_account::<HnsAccountRecord>(&account_id)?
+                .map(|stored| stored.revision)
+                .ok_or(HnsWalletError::StaleAccountRead)
+        })
+        .expect("final account revision");
+    assert_eq!(revision_after, revision_before);
+    assert_eq!(clock_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(control.chain_snapshot_count.load(Ordering::SeqCst), 2);
+    assert_eq!(control.mempool_query_count.load(Ordering::SeqCst), 2);
+    assert_eq!(control.spend_query_count.load(Ordering::SeqCst), 1);
+    assert_eq!(control.query_count.load(Ordering::SeqCst), 8);
+}
+
+#[test]
+fn three_current_locks_share_one_ordered_deduplicated_snapshot_authority() {
+    let fixture = Arc::new(CurrentLockBatchFixture::new());
+    let observations = Arc::new(BatchBackendObservations::default());
+    let clock_calls = Arc::new(AtomicU64::new(0));
+    let (store, config) = create_store(":memory:");
+    let runtime = current_lock_batch_runtime(
+        store.clone(),
+        config,
+        fixture.clone(),
+        observations.clone(),
+        BatchBackendFault::Healthy,
+        clock_calls.clone(),
+    );
+    let queries = current_lock_batch_queries(&fixture);
+    let expected_name_hashes: Vec<_> = queries
+        .iter()
+        .map(|query| {
+            hash_name(&query.name)
+                .expect("query name hash")
+                .into_bytes()
+        })
+        .collect();
+    let expected_outpoints: Vec<_> = expected_name_hashes
+        .iter()
+        .map(|name_hash| {
+            fixture
+                .market(*name_hash)
+                .expect("query fixture")
+                .owner_outpoint
+        })
+        .collect();
+
+    let batch = runtime
+        .verify_current_shakedex_locks(&queries)
+        .expect("three-lock coherent batch");
+    assert_eq!(batch.len(), 3);
+    assert_eq!(batch.binding(), fixture.binding);
+    assert_eq!(batch.mempool_binding(), fixture.mempool);
+    assert_eq!(batch.observed_at_unix(), NOW_UNIX);
+    assert_eq!(batch.network(), fixture.network);
+    for (lock, query) in batch.locks().iter().zip(&queries) {
+        let market = fixture
+            .market(
+                hash_name(&query.name)
+                    .expect("ordered name hash")
+                    .into_bytes(),
+            )
+            .expect("ordered market fixture");
+        assert_eq!(lock.descriptor().name, query.name);
+        assert_eq!(lock.descriptor().seller_public_key, query.seller_public_key);
+        assert_eq!(lock.locking_coin(), &market.locking_coin);
+    }
+    store
+        .try_with_store(|wallet| batch.verify_unchanged_account(wallet))
+        .expect("batch account authority remains current");
+
+    let expected_scripts = fixture.expected_scripts();
+    assert_eq!(
+        expected_scripts.len(),
+        2,
+        "the shared seller key is deduped"
+    );
+    assert!(expected_scripts.windows(2).all(|pair| pair[0] < pair[1]));
+    assert_eq!(
+        *observations
+            .mempool_scripts
+            .lock()
+            .expect("mempool script observations"),
+        vec![expected_scripts.clone(), expected_scripts]
+    );
+    assert_eq!(
+        *observations
+            .name_order
+            .lock()
+            .expect("name call observations"),
+        expected_name_hashes
+    );
+    assert_eq!(
+        *observations
+            .context_order
+            .lock()
+            .expect("context call observations"),
+        expected_name_hashes
+    );
+    assert_eq!(
+        *observations
+            .spend_outpoints
+            .lock()
+            .expect("spend call observations"),
+        vec![expected_outpoints]
+    );
+    assert_eq!(observations.chain_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(observations.genesis_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(observations.mempool_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(observations.name_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(observations.context_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(observations.spend_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(clock_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn current_lock_batch_rejects_zero_mempool_nonce_and_hostile_spend_batches() {
+    for (fault, expected_stale) in [
+        (BatchBackendFault::ZeroMempoolNonce, true),
+        (BatchBackendFault::SpendWrongLength, true),
+        (BatchBackendFault::SpendWrongOrder, false),
+        (BatchBackendFault::SpendWrongEcho, false),
+        (BatchBackendFault::SpendOneEntry, false),
+    ] {
+        let fixture = Arc::new(CurrentLockBatchFixture::new());
+        let observations = Arc::new(BatchBackendObservations::default());
+        let clock_calls = Arc::new(AtomicU64::new(0));
+        let (store, config) = create_store(":memory:");
+        let runtime = current_lock_batch_runtime(
+            store,
+            config,
+            fixture.clone(),
+            observations.clone(),
+            fault,
+            clock_calls.clone(),
+        );
+        let result = runtime.verify_current_shakedex_locks(&current_lock_batch_queries(&fixture));
+        if expected_stale {
+            assert!(
+                matches!(result, Err(HnsWalletError::StaleNodeSnapshot)),
+                "unexpected {fault:?} result: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(HnsWalletError::InvalidEvidence)),
+                "unexpected {fault:?} result: {result:?}"
+            );
+        }
+        assert_eq!(clock_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(observations.chain_calls.load(Ordering::SeqCst), 1);
+        if fault == BatchBackendFault::ZeroMempoolNonce {
+            assert_eq!(observations.mempool_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(observations.name_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(observations.context_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(observations.spend_calls.load(Ordering::SeqCst), 0);
+        } else {
+            assert_eq!(observations.mempool_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(observations.name_calls.load(Ordering::SeqCst), 3);
+            assert_eq!(observations.context_calls.load(Ordering::SeqCst), 3);
+            assert_eq!(observations.spend_calls.load(Ordering::SeqCst), 1);
+        }
     }
 }
 
