@@ -47,7 +47,7 @@ release-gate authority.
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
 | `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact two-phase listing/cancellation protocol verification, runtime-bound negative cancellation admission, canonical fulfillment/recovery/script-FINALIZE planning, encrypted parent-plan CAS, durable buyer-fulfillment/seller-recovery/seller-script-FINALIZE value aggregate, canonical Denuo adapter, encrypted sequence/tombstone board, bounded encrypted offline publication outbox with persist-before-return single-flight handoff recovery | proof/listing/Denuo codecs, raw HNS keys, product coin selection, network/relay transport, remote acceptance, caller-asserted clock/chain truth, or release qualification |
 | `hns-wallet-market` | reservations, evidence-driven cross-chain sessions, and an encrypted exact-policy canonical zero-ID price-round gossip cache with optional predecessor checkpoint, trusted local acceptance clock, durable reporter sequence high-watermarks, and a fully revalidated maximum-128-round suffix | chain networking, reporter governance, relay transport, live chain-anchor evidence, quote/value authority, or release qualification |
-| `hns-wallet-mobile` | one platform-neutral lifecycle controller plus a backend-injected synchronized HNS read controller, both owning exact shared store/host/service composition; atomic single-HNS-account bootstrap, private ABI-v2 lifecycle controls, and minimized serializable balance/receive/history/already-known-name/module-status reads | raw platform keys, a concrete device backend, WebView/provider entry points, name import, value actions, or marketplace transport |
+| `hns-wallet-mobile` | one platform-neutral lifecycle controller plus a backend-injected synchronized HNS read controller, both owning exact shared store/host/service composition; atomic single-HNS-account bootstrap, private ABI-v2 lifecycle controls, minimized serializable balance/receive/history/known-name/module-status reads, and trusted-native exact-text name import with minimized output | raw platform keys, a concrete device backend, WebView/provider import or value entry points, value actions, or marketplace transport |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
 | `hns-wallet-ffi` | strict ABI v2 framing, canonical service IDs, typed approvals/events, and the closed exact HNS read-operations-v1 marker | raw keys/native commands or engine authority objects |
@@ -117,6 +117,12 @@ it. The trusted-native mobile composition obtains the same snapshot directly
 from its composed service only long enough to build a minimized serializable
 result containing both distinct targets; its public snapshot omits the binding
 and all raw name proof/state/resource/owner/derivation evidence.
+Its direct native exact-text import shares the synchronization lock, validates
+before backend calls, and stages no node I/O under store closures. A fresh
+canonical ownership classification rotates `last_used_name`, `next_name_index`,
+and the trailing scan gap only for exact wallet-owned, incoming-transfer, or
+outgoing-transfer `HnsName` derivations. WalletAccount and KnownName use one
+atomic CAS batch; watch-only/non-wallet imports never advance derivation state.
 
 Historical persisted accounts with a value or settlement bit set have one
 explicit recovery-only opening path. Structural validation is separated from

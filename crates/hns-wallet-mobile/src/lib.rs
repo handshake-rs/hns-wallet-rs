@@ -25,7 +25,8 @@ use hns_wallet_host::{
     Clock, ClockError, HostError, HostOutput, SystemClock, SystemEntropy, WalletHost,
 };
 use hns_wallet_service::{
-    MAX_JAVASCRIPT_SAFE_INTEGER, PersistentHnsAccountConfig, PersistentHnsAccountRuntime,
+    MAX_JAVASCRIPT_SAFE_INTEGER, NativeHnsNameOwnershipStatus, NativeHnsNameResourceStatus,
+    NativeHnsNameSummary, PersistentHnsAccountConfig, PersistentHnsAccountRuntime,
     PersistentHnsReadConfig, PersistentHnsReadRuntime, ServiceError, ServiceRuntime, WalletService,
 };
 use hns_wallet_store::{SharedWalletStore, StoreError, WalletStore};
@@ -637,6 +638,32 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
         Ok(self.synchronize()?.known_names)
     }
 
+    /// Import one exact canonical Handshake name through the trusted native
+    /// service boundary. The text is passed through byte-for-byte: this method
+    /// never trims, lowercases, applies IDNA, normalizes Unicode, or removes a
+    /// trailing dot. Only the minimized name summary is returned.
+    pub fn import_name_exact_text(
+        &mut self,
+        name: &str,
+    ) -> Result<MobileHnsNameSummary, MobileWalletError> {
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        match self
+            .session
+            .service
+            .import_trusted_native_hns_name_exact_text(name)
+        {
+            Ok(summary) => mobile_native_hns_name_summary(summary),
+            Err(failure) => {
+                if failure.code != ServiceErrorCode::InvalidRequest {
+                    self.session.lock_after_request_error();
+                }
+                Err(mobile_service_failure(failure))
+            }
+        }
+    }
+
     /// Return module status from one new bounded synchronization.
     pub fn module_status(&mut self) -> Result<SyncStatus, MobileWalletError> {
         Ok(self.synchronize()?.module_status)
@@ -778,6 +805,63 @@ fn mobile_hns_name_summary(name: &KnownName) -> Result<MobileHnsNameSummary, Mob
         registered,
         expired,
     })
+}
+
+fn mobile_native_hns_name_summary(
+    name: NativeHnsNameSummary,
+) -> Result<MobileHnsNameSummary, MobileWalletError> {
+    let resource_status = match name.resource_status {
+        NativeHnsNameResourceStatus::UnavailableCanonicalBinding => {
+            MobileHnsNameResourceStatus::UnavailableCanonicalBinding
+        }
+        NativeHnsNameResourceStatus::NoCurrentState => MobileHnsNameResourceStatus::NoCurrentState,
+        NativeHnsNameResourceStatus::Empty => MobileHnsNameResourceStatus::Empty,
+        NativeHnsNameResourceStatus::CanonicalDecoded => {
+            MobileHnsNameResourceStatus::CanonicalDecoded
+        }
+        NativeHnsNameResourceStatus::CanonicalOpaque => {
+            MobileHnsNameResourceStatus::CanonicalOpaque
+        }
+    };
+    let ownership_status = match name.ownership_status {
+        NativeHnsNameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable => {
+            MobileHnsNameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable
+        }
+        NativeHnsNameOwnershipStatus::WalletContextUnavailable => {
+            MobileHnsNameOwnershipStatus::WalletContextUnavailable
+        }
+        NativeHnsNameOwnershipStatus::NoCurrentOwner => {
+            MobileHnsNameOwnershipStatus::NoCurrentOwner
+        }
+        NativeHnsNameOwnershipStatus::NotWalletOwned => {
+            MobileHnsNameOwnershipStatus::NotWalletOwned
+        }
+        NativeHnsNameOwnershipStatus::WalletOwned => MobileHnsNameOwnershipStatus::WalletOwned,
+        NativeHnsNameOwnershipStatus::IncomingTransfer => {
+            MobileHnsNameOwnershipStatus::IncomingTransfer
+        }
+        NativeHnsNameOwnershipStatus::OutgoingTransfer => {
+            MobileHnsNameOwnershipStatus::OutgoingTransfer
+        }
+    };
+    let summary = MobileHnsNameSummary {
+        name: name.name,
+        name_hash: name.name_hash,
+        proof_height: name.proof_height,
+        resource_status,
+        ownership_status,
+        registered: name.registered,
+        expired: name.expired,
+    };
+    if summary.proof_height > MAX_JAVASCRIPT_SAFE_INTEGER {
+        return Err(MobileWalletError::Hns(HnsWalletError::InvalidEvidence));
+    }
+    HnsNameDisclosure {
+        name: summary.name.clone(),
+        name_hash: summary.name_hash.clone(),
+    }
+    .validate()?;
+    Ok(summary)
 }
 
 fn lowercase_hex(bytes: &[u8]) -> String {
@@ -1380,6 +1464,87 @@ mod tests {
         assert_eq!(
             reads.balance().expect("balance after backend recovery"),
             Amount::new(WalletAsset::Hns, 0)
+        );
+    }
+
+    #[test]
+    fn exact_text_name_import_rejects_input_without_poisoning_and_locks_on_runtime_fault() {
+        let directory = private_tempdir();
+        let path = directory.path().join("name-import-errors.sqlite3");
+        let key = MobileDatabaseKey::new([0x93; MOBILE_DATABASE_KEY_BYTES]).expect("database key");
+        let creation = MobileWalletController::create(
+            &path,
+            &key,
+            MobilePlatform::Android,
+            HnsBootstrapPolicy::new(HnsNetwork::Regtest, 0),
+        )
+        .expect("create lifecycle controller");
+        let (controller, _recovery_phrase) = creation.into_parts();
+        let probe = Arc::new(MockReadProbe::default());
+        let mut reads = controller
+            .into_hns_reads_with_clock(MockReadBackend::new(probe.clone()), MockReadClock)
+            .expect("compose name import controller");
+        reads.unlock(&key).expect("unlock name import controller");
+
+        assert!(matches!(
+            reads.import_name_exact_text(" Alpha"),
+            Err(MobileWalletError::ServiceFailure {
+                code: ServiceErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+        assert!(!reads.status().expect("status after invalid input").locked);
+        assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.evidence_calls.load(Ordering::SeqCst), 0);
+
+        assert!(matches!(
+            reads.import_name_exact_text("alpha"),
+            Err(MobileWalletError::ServiceFailure {
+                code: ServiceErrorCode::RuntimeFailure,
+                ..
+            })
+        ));
+        assert!(reads.status().expect("status after backend fault").locked);
+        assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.evidence_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.forbidden_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_import_summary_projection_is_minimized_and_exact() {
+        let summary = mobile_native_hns_name_summary(NativeHnsNameSummary {
+            name: "alpha".to_owned(),
+            name_hash: "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af"
+                .to_owned(),
+            proof_height: 99,
+            resource_status: NativeHnsNameResourceStatus::CanonicalDecoded,
+            ownership_status: NativeHnsNameOwnershipStatus::IncomingTransfer,
+            registered: Some(true),
+            expired: Some(false),
+        })
+        .expect("mobile native name summary");
+        assert_eq!(summary.name, "alpha");
+        assert_eq!(
+            summary.ownership_status,
+            MobileHnsNameOwnershipStatus::IncomingTransfer
+        );
+        let encoded = serde_json::to_value(summary).expect("serialize minimized import result");
+        assert_eq!(
+            encoded
+                .as_object()
+                .expect("summary object")
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "expired",
+                "name",
+                "nameHash",
+                "ownershipStatus",
+                "proofHeight",
+                "registered",
+                "resourceStatus",
+            ])
         );
     }
 

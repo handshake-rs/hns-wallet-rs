@@ -24,6 +24,14 @@ CLI is intentionally unchanged: launcher configuration, artifact admission,
 browser-engine authority, transport, approval UI, and installed-product
 qualification remain downstream responsibilities.
 
+Trusted native Rust callers may use
+`import_trusted_native_hns_name_exact_text`. The call is deliberately absent
+from `ServiceRuntime`, provider dispatch, the browser ABI, and capability
+negotiation. It preflights the maximum-64 persisted native name result before
+node I/O and returns only a minimized name/hash/status summary. Invalid text is
+an ordinary non-poisoning request error; bound, evidence, snapshot, and store
+faults remain fail-closed runtime errors.
+
 The library also provides a wallet-owned `NativeHnsReadProfile`
 provisioning boundary. One schema-v1 encrypted compare-and-swap entity stores
 an exact non-value HNS account configuration, a literal loopback node socket,

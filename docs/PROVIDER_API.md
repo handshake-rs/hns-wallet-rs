@@ -239,8 +239,10 @@ bounded printable ASCII.
 
 The checked-in subprocess still uses `PersistentControlRuntime`, advertises no
 HNS account or read method, and has no account/backend construction inputs.
-HNS send, name import, transfer/finalize, signing, module control, and every
-settlement method remain unsupported in the read composition. This source
+HNS send, website/provider name import, transfer/finalize, signing, module
+control, and every settlement method remain unsupported in the read
+composition. The separate trusted-native Rust import API is not provider
+vocabulary or browser authority. This source
 boundary is not browser product availability and changes no value gate.
 
 ## Explicitly forbidden

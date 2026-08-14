@@ -41,6 +41,16 @@ wrong-branch, wrong-index, or ambiguous name-target evidence fails the whole
 read. This read projection does not allocate a key or change any value,
 settlement, provider, or browser capability.
 
+The ordinary non-value read runtime also exposes `import_name_exact_text` for
+a trusted native caller. It performs no trimming, lowercasing, IDNA, Unicode
+normalization, or dot handling. Valid text is checked before backend I/O, fresh
+canonical evidence is classified against the exact derived `HnsName`
+change-zero branch, and WalletAccount plus KnownName commit in one revision-
+checked batch. Wallet-owned and incoming/outgoing-transfer evidence advances a
+monotonic derivation high-water with the complete trailing gap; watch-only and
+non-wallet evidence persists without advancing. The existing full-runtime raw
+`import_name(&[u8])` API is unchanged.
+
 Its value and settlement configurations remain fail-closed until the embedding
 product completes the documented adapter and runtime qualification. See the
 [workspace repository](https://github.com/handshake-rs/hns-wallet-rs) for the

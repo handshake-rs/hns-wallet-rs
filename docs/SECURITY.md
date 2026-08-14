@@ -388,6 +388,15 @@ ownership statuses, and registered/expired flags. Raw/current proof bytes,
 resource bytes, outpoints, derivations, node bindings, and internal epochs are
 never disclosed. Labels and display strings must be nonempty printable ASCII
 within their bounds.
+
+Trusted-native exact-text name import is outside provider/ABI dispatch. It
+validates the untouched UTF-8 bytes before any backend call, serializes with
+account synchronization, and keeps every node call outside shared-store
+closures. Fresh wallet-bearing ownership must match one exact selected-account
+`HnsName`/change-zero/index derivation. Its monotonic high-water/trailing-gap
+rotation and KnownName evidence commit atomically; non-wallet classifications
+never rotate. The native display bound is preflighted before node I/O, and the
+returned summary omits all proof, resource, owner, and derivation material.
 Host restart/reset independently drops every service-derived handle revision,
 pending request and approval, private binding, and event cursor. A response
 kind mismatch, stale session, sequence gap/replay, unknown request ID, or stale

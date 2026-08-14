@@ -39,9 +39,15 @@ directly and never exposes its binding or raw name proof, state, resource,
 owner, or derivation evidence. A failed read locks the wallet before another
 request can proceed.
 
-Known-name output can only revalidate and minimize names already persisted by a
-separately authorized workflow. This crate does not add a mobile name-import
-path. It also does not ship a production device backend: the existing
+`import_name_exact_text` is a direct trusted-native Rust API. It sends the
+caller's string byte-for-byte to the synchronized service/runtime path, never
+trims, changes case, applies IDNA or Unicode normalization, or removes dots,
+and returns only `MobileHnsNameSummary`. Invalid input does not poison the
+controller; bound, backend, evidence, snapshot, and persistence failures lock
+before retry. No private ABI, WebView/provider, JNI, C, Kotlin, or Swift import
+binding is added in this repository, so downstream shells must adopt and
+qualify that Rust API explicitly. This crate also does not ship a production
+device backend: the existing
 `HnsNodeRpcBackend` and `HnsNodeRpcConfig` are re-exported here for downstream
 composition, but remain an authenticated loopback node adapter rather than an
 Android or iOS wallet-index integration. The downstream Android/iOS 0.5.9

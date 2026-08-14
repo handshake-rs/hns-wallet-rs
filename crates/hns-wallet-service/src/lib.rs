@@ -51,6 +51,40 @@ pub const MAX_SERVICE_PENDING_APPROVALS: usize = 128;
 pub const MAX_PROVIDER_HNS_READ_ITEMS: usize = 128;
 pub const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
+/// Minimized canonical name state returned only to trusted native callers.
+/// Derivations, owner outputs, proof/state bytes, and resources stay inside
+/// the HNS runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeHnsNameSummary {
+    pub name: String,
+    pub name_hash: String,
+    pub proof_height: u64,
+    pub resource_status: NativeHnsNameResourceStatus,
+    pub ownership_status: NativeHnsNameOwnershipStatus,
+    pub registered: Option<bool>,
+    pub expired: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeHnsNameResourceStatus {
+    UnavailableCanonicalBinding,
+    NoCurrentState,
+    Empty,
+    CanonicalDecoded,
+    CanonicalOpaque,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeHnsNameOwnershipStatus {
+    WatchOnlyCanonicalStateDecoderUnavailable,
+    WalletContextUnavailable,
+    NoCurrentOwner,
+    NotWalletOwned,
+    WalletOwned,
+    IncomingTransfer,
+    OutgoingTransfer,
+}
+
 type HnsReadPermissionExtension = (
     BTreeSet<PermissionCapability>,
     BTreeSet<hns_wallet_types::AccountId>,
@@ -439,8 +473,9 @@ type PersistentNativeRecoveryReadOnlyRuntime =
     PersistentRecoveryReadOnlyHnsRuntime<HnsNodeRpcBackend, HnsSystemClock>;
 
 /// Product-composable HNS account runtime that performs one live, bounded
-/// reconciliation for every balance/history/receive/name result. It exposes
-/// no value, signing, import, module, marketplace, or settlement path.
+/// reconciliation for every balance/history/receive/name result. Its exact-
+/// text name import is trusted-native only; it exposes no provider import,
+/// value, signing, module, marketplace, or settlement path.
 pub struct PersistentHnsReadRuntime<B, C> {
     store: SharedWalletStore,
     runtime: HnsAccountReadRuntime<B, C>,
@@ -499,6 +534,14 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsReadRuntime<B, C> {
             return Err(hns_read_failure(HnsWalletError::StaleAccountRead));
         }
         Ok(snapshot)
+    }
+
+    fn import_name_exact_text(&self, name: &str) -> Result<NativeHnsNameSummary, ServiceFailure> {
+        let imported = self
+            .runtime
+            .import_name_exact_text_bounded(name, MAX_HNS_NAME_DISCLOSURES)
+            .map_err(hns_native_name_import_failure)?;
+        native_hns_name_summary(&imported)
     }
 
     fn unlock(&self, passphrase: &str) -> Result<(), ServiceFailure> {
@@ -2223,6 +2266,18 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsR
         }
         Ok(snapshot)
     }
+
+    /// Import one exact canonical name through the trusted native boundary.
+    /// This method is intentionally absent from `ServiceRuntime`, provider
+    /// dispatch, the browser ABI, and the capability vocabulary. The runtime
+    /// preflights the native persisted-name bound before backend I/O and
+    /// returns only a minimized summary after one atomic account/name commit.
+    pub fn import_trusted_native_hns_name_exact_text(
+        &self,
+        name: &str,
+    ) -> Result<NativeHnsNameSummary, ServiceFailure> {
+        self.runtime.import_name_exact_text(name)
+    }
 }
 
 impl WalletService<SharedWalletStore, PersistentNativeHnsReadRuntime> {
@@ -2502,6 +2557,56 @@ fn hns_name_disclosure(name: &KnownName) -> Result<HnsNameDisclosure, ServiceFai
         .validate()
         .map_err(|_| hns_read_failure(HnsWalletError::InvalidEvidence))?;
     Ok(disclosure)
+}
+
+fn native_hns_name_summary(name: &KnownName) -> Result<NativeHnsNameSummary, ServiceFailure> {
+    if name.proof_height > MAX_JAVASCRIPT_SAFE_INTEGER {
+        return Err(invalid_request(
+            "known HNS name proof height exceeds JavaScript integer precision",
+        ));
+    }
+    let disclosure = hns_name_disclosure(name)?;
+    let resource_status = match name.resource_status {
+        NameResourceStatus::UnavailableCanonicalBinding => {
+            NativeHnsNameResourceStatus::UnavailableCanonicalBinding
+        }
+        NameResourceStatus::NoCurrentState => NativeHnsNameResourceStatus::NoCurrentState,
+        NameResourceStatus::Empty => NativeHnsNameResourceStatus::Empty,
+        NameResourceStatus::CanonicalDecoded => NativeHnsNameResourceStatus::CanonicalDecoded,
+        NameResourceStatus::CanonicalOpaque => NativeHnsNameResourceStatus::CanonicalOpaque,
+    };
+    let ownership_status = match &name.ownership_status {
+        NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable => {
+            NativeHnsNameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable
+        }
+        NameOwnershipStatus::WalletContextUnavailable => {
+            NativeHnsNameOwnershipStatus::WalletContextUnavailable
+        }
+        NameOwnershipStatus::NoCurrentOwner => NativeHnsNameOwnershipStatus::NoCurrentOwner,
+        NameOwnershipStatus::NotWalletOwned => NativeHnsNameOwnershipStatus::NotWalletOwned,
+        NameOwnershipStatus::WalletOwned { .. } => NativeHnsNameOwnershipStatus::WalletOwned,
+        NameOwnershipStatus::IncomingTransfer { .. } => {
+            NativeHnsNameOwnershipStatus::IncomingTransfer
+        }
+        NameOwnershipStatus::OutgoingTransfer { .. } => {
+            NativeHnsNameOwnershipStatus::OutgoingTransfer
+        }
+    };
+    let (registered, expired) = name
+        .canonical_current_state
+        .as_ref()
+        .map_or((None, None), |state| {
+            (Some(state.registered), Some(state.expired))
+        });
+    Ok(NativeHnsNameSummary {
+        name: disclosure.name,
+        name_hash: disclosure.name_hash,
+        proof_height: name.proof_height,
+        resource_status,
+        ownership_status,
+        registered,
+        expired,
+    })
 }
 
 fn canonical_hns_name(name: &KnownName) -> Result<&str, ServiceFailure> {
@@ -2905,6 +3010,15 @@ fn hns_read_failure(error: HnsWalletError) -> ServiceFailure {
         code,
         message: message.to_owned(),
         unsupported_capability: None,
+    }
+}
+
+fn hns_native_name_import_failure(error: HnsWalletError) -> ServiceFailure {
+    match error {
+        HnsWalletError::InvalidName => invalid_request(
+            "HNS name must be exact canonical text without trimming or normalization",
+        ),
+        error => hns_read_failure(error),
     }
 }
 
@@ -4101,6 +4215,48 @@ mod tests {
         let mut unsafe_name = production_followup_known_name();
         unsafe_name.proof_height = MAX_JAVASCRIPT_SAFE_INTEGER + 1;
         assert!(public_hns_name_summary(&unsafe_name).is_err());
+    }
+
+    #[test]
+    fn trusted_native_name_import_output_is_minimized_and_errors_are_typed() {
+        let name = production_followup_known_name();
+        let summary = native_hns_name_summary(&name).expect("minimized native name");
+        assert_eq!(summary.name, "alpha");
+        assert_eq!(summary.name_hash, lowercase_hex(&name.name_hash));
+        assert_eq!(summary.proof_height, 99);
+        assert_eq!(
+            summary.resource_status,
+            NativeHnsNameResourceStatus::CanonicalDecoded
+        );
+        assert_eq!(
+            summary.ownership_status,
+            NativeHnsNameOwnershipStatus::WalletContextUnavailable
+        );
+        assert_eq!(summary.registered, Some(true));
+        assert_eq!(summary.expired, Some(false));
+        let debug = format!("{summary:?}");
+        for forbidden in [
+            "proof_state",
+            "current_state",
+            "owner_outpoint",
+            "raw_resource",
+            "derivation",
+        ] {
+            assert!(!debug.contains(forbidden));
+        }
+
+        assert_eq!(
+            hns_native_name_import_failure(HnsWalletError::InvalidName).code,
+            ServiceErrorCode::InvalidRequest
+        );
+        assert_eq!(
+            hns_native_name_import_failure(HnsWalletError::HistoryLimit).code,
+            ServiceErrorCode::RuntimeFailure
+        );
+        assert_eq!(
+            hns_native_name_import_failure(HnsWalletError::InvalidEvidence).code,
+            ServiceErrorCode::PersistenceFailure
+        );
     }
 
     #[test]

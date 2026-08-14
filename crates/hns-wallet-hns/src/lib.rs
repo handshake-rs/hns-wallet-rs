@@ -1644,8 +1644,11 @@ impl fmt::Debug for VerifiedHnsBoardCancellationContext {
 /// Local encrypted state is staged under short `SharedWalletStore` closures,
 /// every node call runs after the closure has returned, and the result commits
 /// only after an exact account/entity revision fence is re-authenticated. This
-/// type exposes no signing, broadcasting, import, allocation, or settlement
-/// method and does not alter either HNS value release gate. Before deriving or
+/// type exposes no signing, broadcasting, value, allocation, or settlement
+/// method and does not alter either HNS value release gate. Its only mutation
+/// outside synchronization is a trusted-native exact-text name import which
+/// atomically persists canonical evidence and rotates restoration metadata.
+/// Before deriving or
 /// transmitting any wallet script identifiers, synchronization obtains a
 /// script-free chain binding and binds height-zero evidence to the selected
 /// account network.
@@ -1694,6 +1697,77 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
 
     pub fn selected_account(&self) -> Result<HnsAccountRecord, HnsWalletError> {
         self.selector.selected_account()
+    }
+
+    /// Import one canonical Handshake name from exact native text.
+    ///
+    /// The input is never trimmed, lowercased, IDNA-converted, normalized, or
+    /// split on dots. Invalid text is rejected before any backend method is
+    /// called. Wallet ownership is established only from fresh canonical name
+    /// evidence and an exact persisted `HnsName` change-zero derivation. The
+    /// account derivation high-water and name row commit in one store batch.
+    pub fn import_name_exact_text(&self, name: &str) -> Result<KnownName, HnsWalletError> {
+        self.import_name_exact_text_bounded(name, MAX_HISTORY_RESULTS)
+    }
+
+    /// Exact-text import with a caller-owned persisted-name result bound.
+    /// Existing names remain re-importable at the bound; a new row is rejected
+    /// before node I/O. Native service/mobile projections use this so a
+    /// successful mutation can never become undisplayable afterward.
+    pub fn import_name_exact_text_bounded(
+        &self,
+        name: &str,
+        maximum_persisted_names: usize,
+    ) -> Result<KnownName, HnsWalletError> {
+        let name_bytes = name.as_bytes();
+        if !validate_name(name_bytes) {
+            return Err(HnsWalletError::InvalidName);
+        }
+        let name_hash = hash_name(name_bytes)
+            .map_err(|_| HnsWalletError::InvalidName)?
+            .into_bytes();
+        if maximum_persisted_names == 0 || maximum_persisted_names > MAX_HISTORY_RESULTS {
+            return Err(HnsWalletError::HistoryLimit);
+        }
+
+        let _synchronization = self
+            .synchronization
+            .lock()
+            .map_err(|_| HnsWalletError::RuntimePoisoned)?;
+        let selected = self.selector.selected_account()?;
+        let preparation = self.store.try_with_store(|store| {
+            prepare_hns_name_import(store, &selected, name_hash, maximum_persisted_names)
+        })?;
+        if preparation
+            .existing_name
+            .as_ref()
+            .is_some_and(|stored| stored.value.name.as_slice() != name_bytes)
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+
+        let binding = self.backend.get_chain_snapshot()?;
+        verify_hns_read_chain_identity(&self.backend, selected.config.network, binding)?;
+        // Preserve the script-free snapshot/genesis ordering: derive wallet
+        // identifiers only after network identity is authenticated, under a
+        // second exact account/name fence which returns before node evidence.
+        let name_addresses = self
+            .store
+            .try_with_store(|store| derive_hns_name_import_addresses(store, &preparation))?;
+        let imported =
+            validated_name_evidence(&self.backend, name_bytes, binding, Some(&name_addresses))?
+                .known_name;
+        let now_unix = self.clock.now_unix()?;
+        if self.selector.selected_account()? != preparation.account.value {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        if self.backend.get_chain_snapshot()? != binding {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        self.store.try_with_store_mut(|store| {
+            commit_hns_name_import(store, &preparation, &name_addresses, &imported, now_unix)
+        })?;
+        Ok(imported)
     }
 
     /// Observe the exact selected account, its Shakedex network binding, and
@@ -2176,6 +2250,12 @@ struct HnsReadPreparation {
     coins: Vec<StoredEntity<TrackedHnsCoin>>,
     transactions: Vec<StoredEntity<HnsTransactionRecord>>,
     names: Vec<StoredEntity<KnownName>>,
+}
+
+struct HnsNameImportPreparation {
+    account: StoredEntity<HnsAccountRecord>,
+    names: Vec<StoredEntity<KnownName>>,
+    existing_name: Option<StoredEntity<KnownName>>,
 }
 
 struct HnsReadScan {
@@ -4237,6 +4317,211 @@ fn map_shared_store_error(error: StoreError) -> HnsWalletError {
         StoreError::Locked => HnsWalletError::StoreLocked,
         _ => HnsWalletError::Store,
     }
+}
+
+fn prepare_hns_name_import(
+    store: &WalletStore,
+    selected: &HnsAccountRecord,
+    name_hash: [u8; 32],
+    maximum_persisted_names: usize,
+) -> Result<HnsNameImportPreparation, HnsWalletError> {
+    if store.is_locked() {
+        return Err(HnsWalletError::StoreLocked);
+    }
+    HnsAccountReadMode::OrdinaryNonValue.validate_config(&selected.config)?;
+    let account_id = account_entity_id(&selected.config);
+    let account = store
+        .wallet_account::<HnsAccountRecord>(&account_id)?
+        .ok_or(HnsWalletError::AccountConfigurationMismatch)?;
+    if account.id.as_slice() != account_id.as_slice() || account.value != *selected {
+        return Err(HnsWalletError::StaleAccountRead);
+    }
+    let names = store.list_entities_by_id_prefix::<KnownName>(
+        EntityKind::KnownName,
+        &account_entity_prefix(&selected.config),
+        MAX_HISTORY_RESULTS,
+    )?;
+    let mut existing_name = None;
+    let expected_name_id = namespaced_name_id(&selected.config, name_hash);
+    let mut unique_hashes = BTreeSet::new();
+    let mut unique_names = BTreeSet::new();
+    for stored in &names {
+        let actual_hash = hash_name(&stored.value.name)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?
+            .into_bytes();
+        if stored.id != namespaced_name_id(&selected.config, stored.value.name_hash)
+            || stored.value.name_hash != actual_hash
+            || !validate_name(&stored.value.name)
+            || !unique_hashes.insert(stored.value.name_hash)
+            || !unique_names.insert(stored.value.name.clone())
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        if stored.id.as_slice() == expected_name_id.as_slice() {
+            existing_name = Some(stored.clone());
+        }
+    }
+    if names.len() > maximum_persisted_names
+        || (names.len() == maximum_persisted_names && existing_name.is_none())
+    {
+        return Err(HnsWalletError::HistoryLimit);
+    }
+    Ok(HnsNameImportPreparation {
+        account,
+        names,
+        existing_name,
+    })
+}
+
+fn derive_hns_name_import_addresses(
+    store: &WalletStore,
+    preparation: &HnsNameImportPreparation,
+) -> Result<Vec<DerivedHnsAddress>, HnsWalletError> {
+    if store.is_locked() {
+        return Err(HnsWalletError::StoreLocked);
+    }
+    let config = &preparation.account.value.config;
+    let account_id = account_entity_id(config);
+    let current_account = store
+        .wallet_account::<HnsAccountRecord>(&account_id)?
+        .ok_or(HnsWalletError::StaleAccountRead)?;
+    let current_names = store.list_entities_by_id_prefix::<KnownName>(
+        EntityKind::KnownName,
+        &account_entity_prefix(config),
+        MAX_HISTORY_RESULTS,
+    )?;
+    if current_account != preparation.account || current_names != preparation.names {
+        return Err(HnsWalletError::StaleAccountRead);
+    }
+    let addresses = derive_restore_addresses(store, &preparation.account.value, KeyRole::HnsName)?;
+    validate_wallet_name_addresses(&addresses)?;
+    Ok(addresses)
+}
+
+fn imported_wallet_derivation(status: &NameOwnershipStatus) -> Option<DerivationReference> {
+    match status {
+        NameOwnershipStatus::WalletOwned { derivation } => Some(*derivation),
+        NameOwnershipStatus::IncomingTransfer {
+            recipient_derivation,
+            ..
+        } => Some(*recipient_derivation),
+        NameOwnershipStatus::OutgoingTransfer {
+            owner_derivation, ..
+        } => Some(*owner_derivation),
+        NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable
+        | NameOwnershipStatus::WalletContextUnavailable
+        | NameOwnershipStatus::NoCurrentOwner
+        | NameOwnershipStatus::NotWalletOwned => None,
+    }
+}
+
+fn rotate_imported_name_derivation(
+    account: &mut HnsAccountRecord,
+    name_addresses: &[DerivedHnsAddress],
+    status: &NameOwnershipStatus,
+) -> Result<(), HnsWalletError> {
+    let Some(derivation) = imported_wallet_derivation(status) else {
+        return Ok(());
+    };
+    if derivation.role != KeyRole::HnsName
+        || derivation.account != account.config.account_derivation_index
+        || derivation.change != 0
+        || derivation.index > account.name_scan_end
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let mut exact = name_addresses.iter().filter(|address| {
+        address.account_id == account.config.account_id && address.derivation == derivation
+    });
+    if exact.next().is_none() || exact.next().is_some() {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+
+    let last_used = account
+        .last_used_name
+        .map_or(derivation.index, |current| current.max(derivation.index));
+    ensure_trailing_gap(Some(last_used), account.config.restore_lookahead)?;
+    let next_index = last_used
+        .checked_add(1)
+        .filter(|next| *next < MAX_RESTORE_LOOKAHEAD)
+        .ok_or(HnsWalletError::ScanCapacityExhausted)?;
+    let scan_end = required_scan_end(
+        Some(last_used),
+        account.name_scan_end,
+        account.config.restore_lookahead,
+    );
+    checked_scan_address_count(&[scan_end])?;
+    account.last_used_name = Some(last_used);
+    account.next_name_index = account.next_name_index.max(next_index);
+    account.name_scan_end = account.name_scan_end.max(scan_end);
+    Ok(())
+}
+
+fn commit_hns_name_import(
+    store: &mut WalletStore,
+    preparation: &HnsNameImportPreparation,
+    name_addresses: &[DerivedHnsAddress],
+    imported: &KnownName,
+    now_unix: u64,
+) -> Result<(), HnsWalletError> {
+    if store.is_locked() {
+        return Err(HnsWalletError::StoreLocked);
+    }
+    if !validate_name(&imported.name) {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let imported_hash = hash_name(&imported.name)
+        .map_err(|_| HnsWalletError::InvalidEvidence)?
+        .into_bytes();
+    if imported_hash != imported.name_hash {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let account_id = account_entity_id(&preparation.account.value.config);
+    let current_account = store
+        .wallet_account::<HnsAccountRecord>(&account_id)?
+        .ok_or(HnsWalletError::StaleAccountRead)?;
+    let current_names = store.list_entities_by_id_prefix::<KnownName>(
+        EntityKind::KnownName,
+        &account_entity_prefix(&preparation.account.value.config),
+        MAX_HISTORY_RESULTS,
+    )?;
+    if current_account != preparation.account || current_names != preparation.names {
+        return Err(HnsWalletError::StaleAccountRead);
+    }
+
+    let name_id = namespaced_name_id(&preparation.account.value.config, imported.name_hash);
+    if preparation
+        .existing_name
+        .as_ref()
+        .is_some_and(|stored| stored.id.as_slice() != name_id.as_slice())
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let mut account = preparation.account.value.clone();
+    rotate_imported_name_derivation(&mut account, name_addresses, &imported.ownership_status)?;
+    let account_save = EntityBatchSave {
+        id: preparation.account.id.clone(),
+        expected_revision: preparation.account.revision,
+        value: account,
+        updated_at_unix: now_unix,
+    };
+    let name_save = EntityBatchSave {
+        id: name_id.to_vec(),
+        expected_revision: preparation
+            .existing_name
+            .as_ref()
+            .map_or(0, |stored| stored.revision),
+        value: imported.clone(),
+        updated_at_unix: now_unix,
+    };
+    store
+        .apply_account_and_entity_batch(&account_save, EntityKind::KnownName, &[name_save], &[])
+        .map(|_| ())
+        .map_err(|error| match error {
+            StoreError::Locked => HnsWalletError::StoreLocked,
+            StoreError::StaleRevision { .. } => HnsWalletError::StaleAccountRead,
+            _ => HnsWalletError::Store,
+        })
 }
 
 fn prepare_hns_account_read(
@@ -8191,7 +8476,7 @@ impl From<serde_json::Error> for HnsWalletError {
 mod tests {
     use super::*;
     use hns_primitives::{BlockHash, Height, Outpoint as CanonicalOutpoint};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -8652,6 +8937,194 @@ mod tests {
         }
     }
 
+    struct NativeNameImportBackend {
+        store: SharedWalletStore,
+        account_id: [u8; 32],
+        network: HnsNetwork,
+        evidence: NameEvidence,
+        mutate_account_on_evidence: AtomicBool,
+        snapshot_calls: AtomicUsize,
+        evidence_calls: AtomicUsize,
+    }
+
+    impl NativeNameImportBackend {
+        fn new(
+            store: SharedWalletStore,
+            config: &HnsRuntimeConfig,
+            evidence: NameEvidence,
+        ) -> Self {
+            Self {
+                store,
+                account_id: account_entity_id(config),
+                network: config.network,
+                evidence,
+                mutate_account_on_evidence: AtomicBool::new(false),
+                snapshot_calls: AtomicUsize::new(0),
+                evidence_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn with_stale_account_mutation(self) -> Self {
+            self.mutate_account_on_evidence
+                .store(true, Ordering::SeqCst);
+            self
+        }
+
+        fn binding() -> SnapshotBinding {
+            SnapshotBinding {
+                tip: ChainTip {
+                    height: 500,
+                    block_hash: [81; 32],
+                    tree_root: [0; 32],
+                    median_time_past: 1_700_000_000,
+                },
+                chain_epoch: 12,
+            }
+        }
+
+        fn prove_store_mutex_is_released(&self) -> Result<(), HnsWalletError> {
+            let store = self.store.clone();
+            let (sender, receiver) = mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let result = store.with_store(|_| Ok(())).is_ok();
+                let _ = sender.send(result);
+            });
+            match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(true) => Ok(()),
+                _ => Err(HnsWalletError::Backend(
+                    "backend was invoked while the shared store mutex was held".to_owned(),
+                )),
+            }
+        }
+
+        fn unexpected(method: &str) -> HnsWalletError {
+            HnsWalletError::Backend(format!(
+                "unexpected backend method during native name import: {method}"
+            ))
+        }
+    }
+
+    impl HnsBackend for NativeNameImportBackend {
+        fn get_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Self::binding())
+        }
+
+        fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
+            Err(Self::unexpected("get_chain_tip"))
+        }
+
+        fn get_block_hash(
+            &self,
+            height: u64,
+            binding: SnapshotBinding,
+        ) -> Result<BlockHashEvidence, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            if height != 0 || binding != Self::binding() {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            Ok(BlockHashEvidence {
+                binding,
+                height,
+                block_hash: Some(name_workflow::expected_chain_identity(self.network)?.1),
+            })
+        }
+
+        fn get_confirmed_wallet_page(
+            &self,
+            _: ConfirmedWalletPageRequest<'_>,
+        ) -> Result<ConfirmedWalletPage, HnsWalletError> {
+            Err(Self::unexpected("get_confirmed_wallet_page"))
+        }
+
+        fn get_mempool_wallet_page(
+            &self,
+            _: MempoolWalletPageRequest<'_>,
+        ) -> Result<MempoolWalletPage, HnsWalletError> {
+            Err(Self::unexpected("get_mempool_wallet_page"))
+        }
+
+        fn get_transaction_evidence(
+            &self,
+            _: TransactionHash,
+            _: SnapshotBinding,
+            _: Option<MempoolSnapshotBinding>,
+        ) -> Result<TransactionEvidence, HnsWalletError> {
+            Err(Self::unexpected("get_transaction_evidence"))
+        }
+
+        fn get_outpoint_spend_evidence(
+            &self,
+            _: &[HnsOutpoint],
+            _: SnapshotBinding,
+        ) -> Result<OutpointSpendEvidence, HnsWalletError> {
+            Err(Self::unexpected("get_outpoint_spend_evidence"))
+        }
+
+        fn broadcast_transaction(&self, _: &[u8]) -> Result<TransactionHash, HnsWalletError> {
+            Err(Self::unexpected("broadcast_transaction"))
+        }
+
+        fn quote_transaction_fee(
+            &self,
+            _: &[u8],
+            _: &[Coin],
+            _: u16,
+            _: SnapshotBinding,
+            _: MempoolSnapshotBinding,
+        ) -> Result<HnsTransactionFeeQuote, HnsWalletError> {
+            Err(Self::unexpected("quote_transaction_fee"))
+        }
+
+        fn estimate_fee_rate(&self, _: u16) -> Result<BaseUnits, HnsWalletError> {
+            Err(Self::unexpected("estimate_fee_rate"))
+        }
+
+        fn get_name_evidence(
+            &self,
+            name_hash: [u8; 32],
+            binding: SnapshotBinding,
+        ) -> Result<NameEvidence, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            self.evidence_calls.fetch_add(1, Ordering::SeqCst);
+            if name_hash != self.evidence.proof.name_hash || binding != Self::binding() {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            if self
+                .mutate_account_on_evidence
+                .swap(false, Ordering::SeqCst)
+            {
+                self.store
+                    .with_store_mut(|store| {
+                        let stored = store
+                            .wallet_account::<HnsAccountRecord>(&self.account_id)?
+                            .ok_or(StoreError::CorruptMetadata)?;
+                        let mut changed = stored.value;
+                        changed.next_receive_index = changed
+                            .next_receive_index
+                            .checked_add(1)
+                            .ok_or(StoreError::RevisionOverflow)?;
+                        store
+                            .save_wallet_account(&self.account_id, stored.revision, &changed, 102)
+                            .map(|_| ())
+                    })
+                    .map_err(HnsWalletError::from)?;
+            }
+            Ok(self.evidence.clone())
+        }
+
+        fn get_name_action_context(
+            &self,
+            _: HnsNameAction,
+            _: [u8; 32],
+            _: SnapshotBinding,
+            _: MempoolSnapshotBinding,
+        ) -> Result<NameActionContextEvidence, HnsWalletError> {
+            Err(Self::unexpected("get_name_action_context"))
+        }
+    }
+
     #[derive(Clone, Copy)]
     struct ProductionFollowupClock;
 
@@ -8793,6 +9266,91 @@ mod tests {
         (name, state, transaction, outpoint)
     }
 
+    fn native_import_evidence(
+        name: &[u8],
+        current: Option<(NameState, Transaction, HnsOutpoint)>,
+    ) -> NameEvidence {
+        let binding = NativeNameImportBackend::binding();
+        let name_hash = hash_name(name).expect("import name hash").into_bytes();
+        let (current_state, current_owner_outpoint, current_owner_transaction, current_inclusion) =
+            current.map_or(
+                (None, None, None, None),
+                |(state, transaction, outpoint)| {
+                    let height = u64::from(state.transfer.get().max(1));
+                    (
+                        Some(state.encode().expect("current name state")),
+                        Some(outpoint),
+                        Some(transaction.encode().expect("current owner transaction")),
+                        Some(TransactionInclusion {
+                            block_hash: [82; 32],
+                            height,
+                            transaction_index: Some(0),
+                        }),
+                    )
+                },
+            );
+        let current_resource = current_state.as_ref().map(|raw| {
+            NameState::decode(NameHash::new(name_hash), raw)
+                .expect("decode current import state")
+                .resource_data
+        });
+        NameEvidence {
+            binding,
+            proof: NameProofResponse {
+                name_hash,
+                tree_root: binding.tip.tree_root,
+                proof: vec![0, 0, 0, 0],
+                proof_height: binding.tip.height,
+            },
+            proof_state: None,
+            proof_owner_outpoint: None,
+            proof_owner_transaction: None,
+            proof_owner_inclusion: None,
+            current_state,
+            current_owner_outpoint,
+            current_owner_transaction,
+            current_owner_inclusion: current_inclusion,
+            untrusted_current_raw_resource: current_resource,
+        }
+    }
+
+    fn native_import_store() -> (SharedWalletStore, HnsRuntimeConfig, DerivedHnsAddress) {
+        let (store, config) = production_followup_read_store();
+        let address = store
+            .try_with_store_mut(|wallet| {
+                let account = wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .ok_or(HnsWalletError::StaleAccountRead)?
+                    .value;
+                let addresses = derive_restore_addresses(wallet, &account, KeyRole::HnsName)?;
+                persist_derived_addresses(wallet, &config, &addresses, 2)?;
+                addresses
+                    .into_iter()
+                    .next()
+                    .ok_or(HnsWalletError::InvalidEvidence)
+            })
+            .expect("prepare exact name derivation evidence");
+        (store, config, address)
+    }
+
+    fn native_import_runtime(
+        store: SharedWalletStore,
+        config: HnsRuntimeConfig,
+        evidence: NameEvidence,
+        stale_account: bool,
+    ) -> HnsAccountReadRuntime<NativeNameImportBackend, ProductionFollowupClock> {
+        let selector = HnsExistingAccountSelector::new(store.clone(), config.clone())
+            .expect("native import selector");
+        let backend = NativeNameImportBackend::new(store.clone(), &config, evidence);
+        let backend = if stale_account {
+            backend.with_stale_account_mutation()
+        } else {
+            backend
+        };
+        HnsAccountReadRuntime::new(backend, ProductionFollowupClock, store, selector)
+            .expect("native import runtime")
+    }
+
     fn validate_test_name_view(
         name: &[u8],
         state: &NameState,
@@ -8844,6 +9402,264 @@ mod tests {
 
         let coin_role = test_derived_address(KeyRole::HnsCoin, 31);
         assert!(validate_wallet_name_addresses(&[coin_role]).is_err());
+    }
+
+    #[test]
+    fn native_exact_text_name_import_rejects_before_every_backend_call() {
+        let (store, config, _) = native_import_store();
+        let evidence = native_import_evidence(b"alpha", None);
+        let runtime = native_import_runtime(store.clone(), config.clone(), evidence, false);
+        for invalid in [
+            "",
+            " alpha",
+            "alpha ",
+            "ALPHA",
+            "alpha.",
+            "alpha.beta",
+            "alph\u{00e1}",
+            "alpha\n",
+        ] {
+            assert!(matches!(
+                runtime.import_name_exact_text(invalid),
+                Err(HnsWalletError::InvalidName)
+            ));
+        }
+        assert_eq!(runtime.backend.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.backend.evidence_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            store
+                .with_store(|wallet| wallet.list_entities_by_id_prefix::<KnownName>(
+                    EntityKind::KnownName,
+                    &account_entity_prefix(&config),
+                    MAX_HISTORY_RESULTS,
+                ))
+                .expect("unchanged name store")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_name_import_rejects_same_id_with_different_exact_text_before_backend() {
+        let (store, config, _) = native_import_store();
+        let alpha_hash = hash_name(b"alpha").expect("alpha hash").into_bytes();
+        let corrupt = KnownName {
+            name: b"beta".to_vec(),
+            name_hash: alpha_hash,
+            proof_height: 1,
+            unbound_proof_owner_outpoint: None,
+            unbound_current_owner_outpoint: None,
+            proof_state: None,
+            current_state: None,
+            canonical_proof_state: None,
+            canonical_current_state: None,
+            current_raw_resource: None,
+            resource_status: NameResourceStatus::NoCurrentState,
+            ownership_status: NameOwnershipStatus::NoCurrentOwner,
+        };
+        store
+            .with_store_mut(|wallet| {
+                wallet
+                    .save_known_name(&namespaced_name_id(&config, alpha_hash), 0, &corrupt, 3)
+                    .map(|_| ())
+            })
+            .expect("inject authenticated corrupt hash/text row");
+        let evidence = native_import_evidence(b"alpha", None);
+        let runtime = native_import_runtime(store, config, evidence, false);
+        assert!(matches!(
+            runtime.import_name_exact_text("alpha"),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+        assert_eq!(runtime.backend.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.backend.evidence_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_name_import_rotates_only_exact_wallet_ownership_classes() {
+        #[derive(Clone, Copy)]
+        enum ImportClass {
+            WalletOwned,
+            IncomingTransfer,
+            OutgoingTransfer,
+            NotWalletOwned,
+            NoCurrentOwner,
+        }
+
+        for class in [
+            ImportClass::WalletOwned,
+            ImportClass::IncomingTransfer,
+            ImportClass::OutgoingTransfer,
+            ImportClass::NotWalletOwned,
+            ImportClass::NoCurrentOwner,
+        ] {
+            let (store, config, address) = native_import_store();
+            let current = match class {
+                ImportClass::WalletOwned => {
+                    let (_, state, transaction, outpoint) =
+                        canonical_name_view(address.program.clone(), Vec::new(), None);
+                    Some((state, transaction, outpoint))
+                }
+                ImportClass::IncomingTransfer => {
+                    let recipient =
+                        Address::new(0, address.program.clone()).expect("wallet recipient");
+                    let (_, state, transaction, outpoint) =
+                        canonical_name_view(vec![91; 20], Vec::new(), Some(recipient));
+                    Some((state, transaction, outpoint))
+                }
+                ImportClass::OutgoingTransfer => {
+                    let recipient = Address::new(0, vec![92; 20]).expect("external recipient");
+                    let (_, state, transaction, outpoint) =
+                        canonical_name_view(address.program.clone(), Vec::new(), Some(recipient));
+                    Some((state, transaction, outpoint))
+                }
+                ImportClass::NotWalletOwned => {
+                    let (_, state, transaction, outpoint) =
+                        canonical_name_view(vec![93; 20], Vec::new(), None);
+                    Some((state, transaction, outpoint))
+                }
+                ImportClass::NoCurrentOwner => None,
+            };
+            let evidence = native_import_evidence(b"alpha", current);
+            let runtime = native_import_runtime(store.clone(), config.clone(), evidence, false);
+            let imported = runtime
+                .import_name_exact_text("alpha")
+                .expect("exact native name import");
+            match class {
+                ImportClass::WalletOwned => assert!(matches!(
+                    imported.ownership_status,
+                    NameOwnershipStatus::WalletOwned { derivation }
+                        if derivation == address.derivation
+                )),
+                ImportClass::IncomingTransfer => assert!(matches!(
+                    imported.ownership_status,
+                    NameOwnershipStatus::IncomingTransfer {
+                        recipient_derivation,
+                        ..
+                    } if recipient_derivation == address.derivation
+                )),
+                ImportClass::OutgoingTransfer => assert!(matches!(
+                    imported.ownership_status,
+                    NameOwnershipStatus::OutgoingTransfer {
+                        owner_derivation,
+                        ..
+                    } if owner_derivation == address.derivation
+                )),
+                ImportClass::NotWalletOwned => assert_eq!(
+                    imported.ownership_status,
+                    NameOwnershipStatus::NotWalletOwned
+                ),
+                ImportClass::NoCurrentOwner => assert_eq!(
+                    imported.ownership_status,
+                    NameOwnershipStatus::NoCurrentOwner
+                ),
+            }
+            let wallet_bearing = matches!(
+                class,
+                ImportClass::WalletOwned
+                    | ImportClass::IncomingTransfer
+                    | ImportClass::OutgoingTransfer
+            );
+            store
+                .with_store(|wallet| {
+                    let account = wallet
+                        .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                        .ok_or(StoreError::CorruptMetadata)?;
+                    assert_eq!(account.value.last_used_name, wallet_bearing.then_some(0));
+                    assert_eq!(account.value.next_name_index, u32::from(wallet_bearing));
+                    assert_eq!(account.value.name_scan_end, u32::from(wallet_bearing));
+                    let stored = wallet
+                        .known_name::<KnownName>(&namespaced_name_id(&config, imported.name_hash))?
+                        .ok_or(StoreError::CorruptMetadata)?;
+                    assert_eq!(stored.value, imported);
+                    Ok(())
+                })
+                .expect("atomic account and name import");
+        }
+    }
+
+    #[test]
+    fn native_name_import_stale_account_cannot_partially_persist_or_rotate() {
+        let (store, config, address) = native_import_store();
+        let (_, state, transaction, outpoint) =
+            canonical_name_view(address.program, Vec::new(), None);
+        let evidence = native_import_evidence(b"alpha", Some((state, transaction, outpoint)));
+        let runtime = native_import_runtime(store.clone(), config.clone(), evidence, true);
+        assert!(matches!(
+            runtime.import_name_exact_text("alpha"),
+            Err(HnsWalletError::StaleAccountRead)
+        ));
+        store
+            .with_store(|wallet| {
+                let account = wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .ok_or(StoreError::CorruptMetadata)?;
+                assert_eq!(account.value.next_receive_index, 1);
+                assert_eq!(account.value.last_used_name, None);
+                assert_eq!(account.value.next_name_index, 0);
+                assert_eq!(account.value.name_scan_end, 0);
+                assert!(
+                    wallet
+                        .known_name::<KnownName>(&namespaced_name_id(
+                            &config,
+                            hash_name(b"alpha").expect("hash").into_bytes(),
+                        ))?
+                        .is_none()
+                );
+                Ok(())
+            })
+            .expect("no partial name mutation");
+    }
+
+    #[test]
+    fn native_name_import_is_bounded_idempotent_and_monotonic_after_restart() {
+        let (store, config, address) = native_import_store();
+        let (_, state, transaction, outpoint) =
+            canonical_name_view(address.program, Vec::new(), None);
+        let owned = native_import_evidence(b"alpha", Some((state, transaction, outpoint)));
+        let runtime = native_import_runtime(store.clone(), config.clone(), owned, false);
+        let first = runtime
+            .import_name_exact_text_bounded("alpha", 1)
+            .expect("initial bounded import");
+        drop(runtime);
+
+        let beta = native_import_evidence(b"beta", None);
+        let bounded = native_import_runtime(store.clone(), config.clone(), beta, false);
+        assert!(matches!(
+            bounded.import_name_exact_text_bounded("beta", 1),
+            Err(HnsWalletError::HistoryLimit)
+        ));
+        assert_eq!(bounded.backend.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(bounded.backend.evidence_calls.load(Ordering::SeqCst), 0);
+        drop(bounded);
+
+        let reused = native_import_evidence(b"alpha", None);
+        let restarted = native_import_runtime(store.clone(), config.clone(), reused, false);
+        let second = restarted
+            .import_name_exact_text_bounded("alpha", 1)
+            .expect("idempotent import at the bound after restart");
+        assert_eq!(second.name, first.name);
+        assert_eq!(second.name_hash, first.name_hash);
+        assert_eq!(second.ownership_status, NameOwnershipStatus::NoCurrentOwner);
+        store
+            .with_store(|wallet| {
+                let account = wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .ok_or(StoreError::CorruptMetadata)?;
+                assert_eq!(account.value.last_used_name, Some(0));
+                assert_eq!(account.value.next_name_index, 1);
+                assert_eq!(account.value.name_scan_end, 1);
+                assert_eq!(
+                    wallet
+                        .list_entities_by_id_prefix::<KnownName>(
+                            EntityKind::KnownName,
+                            &account_entity_prefix(&config),
+                            MAX_HISTORY_RESULTS,
+                        )?
+                        .len(),
+                    1
+                );
+                Ok(())
+            })
+            .expect("monotonic idempotent import state");
     }
 
     #[test]

@@ -38,7 +38,14 @@ contains both the ordinary HNS coin `ReceiveTarget` and a structurally distinct
 `HnsNameReceiveTarget`, derived only from `HnsName`, change zero, at the exact
 post-scan `next_name_index`. The mobile facade exposes the latter through a
 freshly synchronized `name_receive_target()` call and the serialized
-`nameReceiveTarget` field. It does not add that target to website/provider JSON
+`nameReceiveTarget` field. The same trusted-native controller now accepts one
+canonical HNS name through `import_name_exact_text()`. It passes UTF-8 bytes
+through unchanged, rejects trimming/case/IDNA/Unicode/dot transformations
+before node I/O, and atomically commits fresh canonical evidence with any
+exact wallet `HnsName` derivation high-water rotation. The native persisted-name
+bound is checked before evidence lookup, and the result is the same minimized
+name summary rather than proof, owner, resource, or derivation material. It
+does not add that target or import to website/provider JSON
 or change any provider, signing, value, settlement, or marketplace capability.
 It obtains the durable epoch and exact tip through a script-free chain snapshot,
 binds height-zero evidence to the selected account network, and only then
@@ -89,8 +96,9 @@ or set change, and persists only the unchanged displayed hashes. This
 approval-v3 shape is incompatible with consumers that omit or do not understand
 `hnsNames`; browser adapters must negotiate, adopt, and render it exactly before
 provider Names access is available. The native read controller is a distinct
-trusted-app surface: it minimizes only already-persisted known names and exposes
-no provider authority or name-import path. The checked-in executable still has
+trusted-app surface: exact-text import exists only as a direct Rust native API,
+is serialized with synchronization, and exposes no provider authority. The
+checked-in executable still has
 no account-selection or backend inputs, so it remains the control-only runtime.
 The native controllers are library-only compositions. Downstream mobile
 candidate wrappers do not supply a production wallet-index backend or make the

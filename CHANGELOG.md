@@ -34,6 +34,12 @@ boundary:
   before deriving or transmitting any wallet ScriptId. The authenticated
   loopback backend is re-exported for native composition, but no production
   device transport or product read gate is supplied here;
+- trusted-native exact-text HNS name import serialized with synchronized reads,
+  with pre-backend canonical validation, native-bound preflight, fresh proof and
+  ownership classification, atomic WalletAccount/KnownName persistence,
+  monotonic wallet-bearing `HnsName` derivation rotation, non-wallet
+  non-advancement, and minimized service/mobile output. Provider/browser import
+  and all value gates remain unavailable;
 - persistence-first Shakedex and chain-neutral market state machines whose live
   product and value gates remain disabled, including a bounded encrypted/CAS
   offline Denuo V2 offer/cancellation outbox with exact-envelope restart
