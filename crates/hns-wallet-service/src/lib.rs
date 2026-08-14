@@ -1,6 +1,7 @@
 #![doc = "Private wallet service composition without browser-engine policy."]
 #![forbid(unsafe_code)]
 
+mod native_read_bootstrap;
 mod native_read_profile;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -34,6 +35,10 @@ use hns_wallet_types::{
 use serde_json::{Value, json};
 use thiserror::Error;
 
+pub use native_read_bootstrap::{
+    NativeHnsReadBootstrapError, NativeHnsReadBootstrapPassphrase, NativeHnsReadProfileFence,
+    ProfileBackedNativeHnsReadRuntime,
+};
 pub use native_read_profile::{
     LoadedNativeHnsReadProfile, NATIVE_HNS_READ_PROFILE_ID, NATIVE_HNS_READ_PROFILE_SCHEMA_VERSION,
     NativeHnsReadProfile, NativeHnsReadProfileError, NativeHnsReadProfileMetadata,
@@ -58,6 +63,14 @@ type HnsReadPermissionExtension = (
 /// browser capability is never inferred merely because protocol source exists.
 pub trait ServiceRuntime {
     fn capabilities(&self) -> BTreeSet<ServiceCapability>;
+
+    /// Admit one decoded service request before any provider or wallet state
+    /// can change. Ordinary runtimes preserve the complete private service
+    /// vocabulary; closed compositions can narrow it without modifying the
+    /// shared ABI schema.
+    fn admit_service_request(&self, _: &ServiceRequest) -> Result<(), ServiceFailure> {
+        Ok(())
+    }
 
     fn supports_provider_method(&self, method: ProviderMethod) -> bool;
 
@@ -921,6 +934,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         request: ServiceRequest,
         now_unix_ms: u64,
     ) -> Result<ServiceResponse, ServiceFailure> {
+        self.runtime.admit_service_request(&request)?;
         match request {
             ServiceRequest::RegisterAuthority {
                 authority_handle,
@@ -3243,6 +3257,11 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn native_hns_bootstrap_passphrase(value: &str) -> NativeHnsReadBootstrapPassphrase {
+        NativeHnsReadBootstrapPassphrase::new(zeroize::Zeroizing::new(value.to_owned()))
+    }
+
+    #[cfg(target_os = "linux")]
     fn production_hns_service(
         store: SharedWalletStore,
         config: HnsRuntimeConfig,
@@ -4544,6 +4563,454 @@ mod tests {
             load_native_hns_read_profile(&nested_unknown_store),
             Err(NativeHnsReadProfileError::Store(StoreError::Json(_)))
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn profile_backed_native_hns_bootstrap_returns_unlocked_exact_six_read_service() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        const AUTHORIZATION: &str = "Bearer profile-bootstrap-authority-67c2";
+        let directory = native_hns_read_tempdir();
+        let account = production_hns_config(9, 0);
+        let store = native_hns_profile_store(&directory.path().join("wallet.sqlite3"), &account);
+        let profile = native_hns_profile(
+            account.clone(),
+            "127.0.0.1:24191",
+            AUTHORIZATION,
+            "Handshake",
+        );
+        assert_eq!(
+            provision_native_hns_read_profile(&store, 0, &profile, 100)
+                .expect("provision bootstrap profile"),
+            1
+        );
+        store.lock().expect("lock before bootstrap");
+
+        let passphrase = native_hns_bootstrap_passphrase(PASSPHRASE);
+        let passphrase_debug = format!("{passphrase:?}");
+        assert!(passphrase_debug.contains("[REDACTED]"));
+        assert!(!passphrase_debug.contains(PASSPHRASE));
+        let mut service = WalletService::new_profile_backed_native_hns_reads(
+            store.clone(),
+            passphrase,
+            NativeHnsReadProfileFence::new(1, 100),
+        )
+        .expect("profile-backed native HNS reads");
+
+        assert!(!store.is_locked().expect("bootstrap leaves store unlocked"));
+        assert!(service.runtime.shares_store_authority(&store));
+        assert_eq!(
+            service.runtime.capabilities(),
+            BTreeSet::from([
+                ServiceCapability::WalletOperations,
+                ServiceCapability::HnsReadOperationsV1,
+            ])
+        );
+        assert!(
+            service
+                .capabilities
+                .contains(&ServiceCapability::HnsReadOperationsV1)
+        );
+        for capability in [
+            ServiceCapability::ProviderDispatch,
+            ServiceCapability::ValueMovement,
+            ServiceCapability::BrowserIntegration,
+        ] {
+            assert!(!service.capabilities.contains(&capability));
+        }
+
+        let allowed = [
+            WalletRequest::Status,
+            WalletRequest::ListAccounts,
+            WalletRequest::Balance {
+                module: ModuleId::Handshake,
+                account: account.account_id,
+            },
+            WalletRequest::ReceiveTarget {
+                module: ModuleId::Handshake,
+                account: account.account_id,
+            },
+            WalletRequest::TransactionHistory {
+                module: ModuleId::Handshake,
+                account: account.account_id,
+            },
+            WalletRequest::ModuleStatus {
+                module: ModuleId::Handshake,
+            },
+        ];
+        assert_eq!(allowed.len(), 6);
+        assert!(
+            allowed
+                .iter()
+                .all(ProfileBackedNativeHnsReadRuntime::admits_wallet_request)
+        );
+
+        let ServiceResponse::Wallet {
+            response: WalletResponse::Status { status },
+        } = service
+            .dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::Status,
+                },
+                NOW_MS,
+            )
+            .expect("already-unlocked status")
+        else {
+            panic!("status response")
+        };
+        assert!(!status.locked);
+        assert_eq!(status.active_wallet, Some(account.wallet_id));
+        let ServiceResponse::Wallet {
+            response: WalletResponse::Accounts { accounts },
+        } = service
+            .dispatch(
+                ServiceRequest::Wallet {
+                    request: WalletRequest::ListAccounts,
+                },
+                NOW_MS + 1,
+            )
+            .expect("already-unlocked account list")
+        else {
+            panic!("accounts response")
+        };
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].account_id, account.account_id);
+
+        let rejected = [
+            WalletRequest::Unlock {
+                passphrase: hns_wallet_ffi::SecretString::new(PASSPHRASE.to_owned()),
+            },
+            WalletRequest::Lock,
+            WalletRequest::CreateWallet {
+                passphrase: hns_wallet_ffi::SecretString::new("create secret".to_owned()),
+            },
+            WalletRequest::RestoreWallet {
+                passphrase: hns_wallet_ffi::SecretString::new("restore secret".to_owned()),
+                recovery_phrase: hns_wallet_ffi::SecretString::new(
+                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+                        .to_owned(),
+                ),
+            },
+            WalletRequest::WorkflowStatus {
+                workflow_id: hns_wallet_types::WorkflowId::new([7_u8; 16]),
+            },
+            WalletRequest::Balance {
+                module: ModuleId::Bitcoin,
+                account: account.account_id,
+            },
+            WalletRequest::ReceiveTarget {
+                module: ModuleId::Ethereum,
+                account: account.account_id,
+            },
+            WalletRequest::TransactionHistory {
+                module: ModuleId::Bitcoin,
+                account: account.account_id,
+            },
+            WalletRequest::ModuleStatus {
+                module: ModuleId::Ethereum,
+            },
+        ];
+        for (index, request) in rejected.into_iter().enumerate() {
+            assert!(!ProfileBackedNativeHnsReadRuntime::admits_wallet_request(
+                &request
+            ));
+            assert!(matches!(
+                service.dispatch(
+                    ServiceRequest::Wallet { request },
+                    NOW_MS + 2 + u64::try_from(index).expect("bounded request index"),
+                ),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::UnsupportedCapability,
+                    unsupported_capability: Some(ServiceCapability::WalletOperations),
+                    ..
+                })
+            ));
+            assert!(!store.is_locked().expect("rejection does not run ABI lock"));
+        }
+
+        let authority = HostAuthorityFacts {
+            origin: "https://wallet.example".to_owned(),
+            namespace: ProviderNamespace::Hns,
+            runtime_session_id: BrowserRuntimeSessionId::from_bytes([31_u8; 16])
+                .expect("runtime session"),
+            runtime_generation: 1,
+            policy_generation: 1,
+            navigation_generation: 1,
+            decision_fingerprint: ProviderAuthorityFingerprint::from_bytes([32_u8; 32])
+                .expect("authority fingerprint"),
+            valid_until_unix_ms: NOW_MS + 60_000,
+        };
+        let provider_requests = vec![
+            ServiceRequest::RegisterAuthority {
+                authority_handle: handle(),
+                authority: authority.clone(),
+            },
+            ServiceRequest::ReplaceAuthority {
+                authority_handle: handle(),
+                expected_authority_revision: 1,
+                authority,
+            },
+            ServiceRequest::RevokeAuthority {
+                authority_handle: handle(),
+                expected_authority_revision: 1,
+            },
+            ServiceRequest::ProviderCapabilities {
+                authority_handle: handle(),
+                authority_revision: 1,
+            },
+            ServiceRequest::ProviderRequest {
+                authority_handle: handle(),
+                authority_revision: 1,
+                request_nonce: 1,
+                method: ProviderMethod::WalletGetStatus.wire_name().to_owned(),
+                params: Value::Null,
+            },
+            ServiceRequest::ApprovalDecision {
+                authority_handle: handle(),
+                authority_revision: 1,
+                approval_id: ProviderApprovalId::from_bytes([33_u8; 16])
+                    .expect("provider approval ID"),
+                decision: hns_wallet_ffi::ApprovalDecision::Reject,
+            },
+        ];
+        for (index, request) in provider_requests.into_iter().enumerate() {
+            assert!(matches!(
+                service.dispatch(
+                    request,
+                    NOW_MS + 20 + u64::try_from(index).expect("bounded provider request index"),
+                ),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::UnsupportedCapability,
+                    unsupported_capability: Some(ServiceCapability::ProviderDispatch),
+                    ..
+                })
+            ));
+            assert!(
+                !store
+                    .is_locked()
+                    .expect("provider rejection leaves active read service unlocked")
+            );
+        }
+
+        drop(service);
+        assert!(
+            store
+                .is_locked()
+                .expect("service drop relocks shared store")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn profile_backed_native_hns_bootstrap_rejects_wrong_secret_absence_and_revocation_locked() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let directory = native_hns_read_tempdir();
+        let account = production_hns_config(9, 0);
+
+        let wrong_secret_store =
+            native_hns_profile_store(&directory.path().join("wrong-secret.sqlite3"), &account);
+        let profile = native_hns_profile(
+            account.clone(),
+            "127.0.0.1:24191",
+            "Bearer wrong-secret-fixture",
+            "Handshake",
+        );
+        provision_native_hns_read_profile(&wrong_secret_store, 0, &profile, 100)
+            .expect("provision wrong-secret fixture");
+        wrong_secret_store
+            .lock()
+            .expect("lock wrong-secret fixture");
+        assert!(matches!(
+            WalletService::new_profile_backed_native_hns_reads(
+                wrong_secret_store.clone(),
+                native_hns_bootstrap_passphrase("incorrect passphrase"),
+                NativeHnsReadProfileFence::new(1, 100),
+            ),
+            Err(NativeHnsReadBootstrapError::Store(
+                StoreError::InvalidPassphrase
+            ))
+        ));
+        assert!(
+            wrong_secret_store
+                .is_locked()
+                .expect("wrong secret relocks")
+        );
+
+        let absent_store =
+            native_hns_profile_store(&directory.path().join("absent.sqlite3"), &account);
+        absent_store.lock().expect("lock absent fixture");
+        assert!(matches!(
+            WalletService::new_profile_backed_native_hns_reads(
+                absent_store.clone(),
+                native_hns_bootstrap_passphrase(PASSPHRASE),
+                NativeHnsReadProfileFence::new(1, 100),
+            ),
+            Err(NativeHnsReadBootstrapError::ProfileAbsent)
+        ));
+        assert!(absent_store.is_locked().expect("absence relocks"));
+
+        let revoked_store =
+            native_hns_profile_store(&directory.path().join("revoked.sqlite3"), &account);
+        provision_native_hns_read_profile(&revoked_store, 0, &profile, 100)
+            .expect("provision revoked fixture");
+        assert_eq!(
+            revoke_native_hns_read_profile(&revoked_store, 1, 101)
+                .expect("revoke bootstrap profile"),
+            2
+        );
+        revoked_store.lock().expect("lock revoked fixture");
+        assert!(matches!(
+            WalletService::new_profile_backed_native_hns_reads(
+                revoked_store.clone(),
+                native_hns_bootstrap_passphrase(PASSPHRASE),
+                NativeHnsReadProfileFence::new(2, 101),
+            ),
+            Err(NativeHnsReadBootstrapError::ProfileRevoked {
+                revision: 2,
+                updated_at_unix: 101,
+            })
+        ));
+        assert!(revoked_store.is_locked().expect("revocation relocks"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn profile_backed_native_hns_bootstrap_rejects_stale_fence_and_value_profile_locked() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let directory = native_hns_read_tempdir();
+        let account = production_hns_config(9, 0);
+        let stale_store =
+            native_hns_profile_store(&directory.path().join("stale.sqlite3"), &account);
+        let profile = native_hns_profile(
+            account.clone(),
+            "127.0.0.1:24191",
+            "Bearer stale-fence-fixture",
+            "Handshake",
+        );
+        provision_native_hns_read_profile(&stale_store, 0, &profile, 100)
+            .expect("provision stale fixture");
+        stale_store.lock().expect("lock stale fixture");
+        assert!(matches!(
+            WalletService::new_profile_backed_native_hns_reads(
+                stale_store.clone(),
+                native_hns_bootstrap_passphrase(PASSPHRASE),
+                NativeHnsReadProfileFence::new(1, 99),
+            ),
+            Err(NativeHnsReadBootstrapError::ProfileFenceMismatch {
+                expected_revision: 1,
+                expected_updated_at_unix: 99,
+                actual_revision: 1,
+                actual_updated_at_unix: 100,
+            })
+        ));
+        assert!(stale_store.is_locked().expect("stale fence relocks"));
+
+        for (index, field) in ["value_operations_enabled", "settlement_enabled"]
+            .into_iter()
+            .enumerate()
+        {
+            let value_store = native_hns_profile_store(
+                &directory.path().join(format!("value-{index}.sqlite3")),
+                &account,
+            );
+            let mut persisted_account =
+                serde_json::to_value(&account).expect("encode invalid profile account");
+            persisted_account[field] = json!(true);
+            let record = json!({
+                "state": "active",
+                "schemaVersion": 1,
+                "account": persisted_account,
+                "nodeEndpoint": "127.0.0.1:24191",
+                "nodeAuthorization": "Bearer invalid-value-fixture",
+                "accountLabel": "Handshake",
+            });
+            value_store
+                .with_store_mut(|wallet| {
+                    wallet
+                        .save_native_hns_read_profile(NATIVE_HNS_READ_PROFILE_ID, 0, &record, 100)
+                        .map(|_| ())
+                })
+                .expect("persist invalid value profile fixture");
+            value_store.lock().expect("lock invalid value fixture");
+            assert!(matches!(
+                WalletService::new_profile_backed_native_hns_reads(
+                    value_store.clone(),
+                    native_hns_bootstrap_passphrase(PASSPHRASE),
+                    NativeHnsReadProfileFence::new(1, 100),
+                ),
+                Err(NativeHnsReadBootstrapError::Profile(
+                    NativeHnsReadProfileError::InvalidConfiguration
+                ))
+            ));
+            assert!(value_store.is_locked().expect("invalid value relocks"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn profile_backed_native_hns_reads_lock_on_live_profile_rotation_or_revocation() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let directory = native_hns_read_tempdir();
+        let account = production_hns_config(9, 0);
+
+        for (index, revoke) in [false, true].into_iter().enumerate() {
+            let store = native_hns_profile_store(
+                &directory
+                    .path()
+                    .join(format!("live-profile-{index}.sqlite3")),
+                &account,
+            );
+            let first = native_hns_profile(
+                account.clone(),
+                "127.0.0.1:24191",
+                "Bearer live-profile-first",
+                "Handshake",
+            );
+            provision_native_hns_read_profile(&store, 0, &first, 100)
+                .expect("provision live profile");
+            store.lock().expect("lock live profile before bootstrap");
+            let mut service = WalletService::new_profile_backed_native_hns_reads(
+                store.clone(),
+                native_hns_bootstrap_passphrase(PASSPHRASE),
+                NativeHnsReadProfileFence::new(1, 100),
+            )
+            .expect("bootstrap live profile");
+
+            if revoke {
+                assert_eq!(
+                    revoke_native_hns_read_profile(&store, 1, 101)
+                        .expect("revoke active service profile"),
+                    2
+                );
+            } else {
+                let rotated = native_hns_profile(
+                    account.clone(),
+                    "127.0.0.1:24192",
+                    "Bearer live-profile-rotated",
+                    "Rotated Handshake",
+                );
+                assert_eq!(
+                    provision_native_hns_read_profile(&store, 1, &rotated, 101)
+                        .expect("rotate active service profile"),
+                    2
+                );
+            }
+
+            assert!(matches!(
+                service.dispatch(
+                    ServiceRequest::Wallet {
+                        request: WalletRequest::Status,
+                    },
+                    NOW_MS,
+                ),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::PersistenceFailure,
+                    unsupported_capability: None,
+                    ..
+                })
+            ));
+            assert!(store.is_locked().expect("profile change locks service"));
+        }
     }
 
     #[cfg(target_os = "linux")]

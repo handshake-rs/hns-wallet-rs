@@ -144,6 +144,22 @@ and module status is an error-free ready snapshot with one equal
 validated/scanned/target height. Any mismatch poisons the session. The marker
 grants no browser/provider authority and changes no availability or value gate.
 
+The profile-backed native-read constructor narrows this further without adding
+wire vocabulary. It accepts the literal locked shared authority, an owned
+zeroizing/redacted/non-cloneable/non-serializable passphrase, and exact active
+profile revision/update time. It unlocks only to authenticate and consume the
+encrypted singleton, relocks before ordinary native-read construction,
+performs a private internal unlock, and authenticates the same fence again
+before returning. Its runtime-level request admission executes before the
+shared service dispatcher, so every authority, provider, approval, ABI
+unlock/lock, create/restore, workflow, and non-HNS module request is rejected;
+only the six marker reads remain. The active profile fence is loaded before and
+after each admitted read. A mismatch, tombstone, absence, malformed profile, or
+store failure suppresses the read result and clears the key. Drop also
+best-effort clears the same shared key. This is process-local containment, not
+a cross-process database lease or secret-delivery mechanism; installed
+products still need both and must terminate the process on lease invalidation.
+
 The injected backend is synchronous and broader than this read subset, but the
 read controller exposes none of its broadcast, fee, signing, action, or value
 methods. Products must enforce backend deadlines and call reads off the UI

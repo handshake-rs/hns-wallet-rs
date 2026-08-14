@@ -24,7 +24,7 @@ CLI is intentionally unchanged: launcher configuration, artifact admission,
 browser-engine authority, transport, approval UI, and installed-product
 qualification remain downstream responsibilities.
 
-The library also provides an inert wallet-owned `NativeHnsReadProfile`
+The library also provides a wallet-owned `NativeHnsReadProfile`
 provisioning boundary. One schema-v1 encrypted compare-and-swap entity stores
 an exact non-value HNS account configuration, a literal loopback node socket,
 a zeroizing/redacted escape-free Authorization value, and a bounded display
@@ -38,11 +38,25 @@ so a later re-provision cannot reset the authenticated revision/update-time
 high-water. Account/seed authentication and profile CAS share one
 process-local store critical section; a separate process still requires
 exclusive database ownership. Tombstoning is not secure erasure from SQLite
-WALs or backups, so revocation also requires rotating the node credential. A
-future trusted launcher must lock the store again before service construction,
-deliver unlock outside argv and the environment, revalidate the profile
-revision around admission, and terminate an active service when rotating or
-revoking it.
+WALs or backups, so revocation also requires rotating the node credential.
+
+`WalletService::new_profile_backed_native_hns_reads` is the process-local
+composition for that record. It consumes the same locked `SharedWalletStore`,
+a non-cloneable/non-serializable passphrase wrapper whose allocation is already
+zeroizing, and an exact active revision/update-time fence. It briefly unlocks
+to load and authenticate the profile, relocks before calling the ordinary
+native-read constructor, performs a private internal unlock, and revalidates
+the same fence before returning an already-unlocked service. That closed
+variant admits only the six `hnsReadOperationsV1` wallet reads at the complete
+service-request boundary; it rejects lifecycle, recovery, workflow, provider,
+authority, approval, value, and other-module requests. It revalidates the
+active fence before and after every admitted read, discards the result and
+locks if the profile changed, and best-effort locks on drop. The passphrase and
+profile are not new ABI or Serde vocabulary. No checked-in executable calls
+this API. Exclusive cross-process database ownership, private one-shot secret
+delivery outside argv/environment/native messages, process termination on
+lease loss, artifact admission, and installed-product qualification remain
+downstream responsibilities.
 
 The library-only persistent HNS read composition also offers one explicitly
 trusted-native synchronization entry point for `hns-wallet-mobile`. It returns

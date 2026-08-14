@@ -455,7 +455,7 @@ checked-in subprocess selects neither HNS composition, and steps 9 through 13
 plus all value supervision remain uncomposed there.
 
 The encrypted `NativeHnsReadProfile` namespace is a library-only provisioning
-input for a future trusted native-read composition. Its fixed schema-v1 record
+input for a trusted native-read composition. Its fixed schema-v1 record
 atomically stores the exact HNS runtime configuration, literal loopback node
 socket, zeroizing Authorization secret, and display label. The persisted
 Authorization subset excludes JSON quote/backslash escape bytes so decoding
@@ -481,15 +481,26 @@ ownership. A tombstone also does not securely erase older encrypted pages,
 WAL entries, or backups; operational revocation must rotate the node-side
 Authorization credential.
 
-This profile does not change the required startup sequence above. A future
-launcher must exclusively own the database, briefly unlock to authenticate and
-consume the profile, lock before constructing the existing native-read
-service, and require a fresh private-ABI unlock before reads. It must also bind
-the admitted live session to the loaded profile revision and kill or
-revalidate that session on rotation/revocation. The tombstone does not by
-itself terminate a process. The current executable does none of those things,
-and the profile is not authority for a browser,
-provider, signing, value, settlement, or marketplace operation.
+`WalletService::new_profile_backed_native_hns_reads` implements the
+process-local part of the startup sequence on the identical
+`SharedWalletStore`: require locked state, privately unlock, load/authenticate
+one Active profile at the exact caller-supplied revision/update-time fence,
+lock, call the ordinary locked native-read constructor, privately unlock the
+new runtime, and reload the same fence before returning. The post-bootstrap
+runtime rejects ABI lifecycle/recovery/workflow and all provider/authority
+requests, leaving exactly the six Handshake reads. It retains the fence,
+revalidates it before and after every admitted read, suppresses the result and
+locks on any absent/revoked/rotated/malformed state, and best-effort locks on
+drop. Every constructor failure also clears the shared record key. Its owned
+passphrase input is zeroizing, redacted, non-cloneable, and non-serializable.
+
+This does not establish cross-process ownership or secret transport. A product
+launcher must still exclusively own the database, deliver the one-shot secret
+outside argv, environment, and native messages, bind the process to a lease,
+and terminate it on lease loss before the wallet app rotates or revokes the
+profile. The tombstone does not by itself terminate another process. The
+current executable calls none of this API, and the profile is not authority for
+a browser, provider, signing, value, settlement, or marketplace operation.
 
 The HNS source implements the concrete synchronous authenticated node adapter,
 bounded coin/name/Shakedex-role chain/mempool snapshot reconciliation, and

@@ -185,6 +185,11 @@ The encrypted native-HNS-read profile is a wallet library provisioning record,
 not an ABI request, response, capability, or browser message. The checked-in
 subprocess does not load it. Provisioning it therefore does not make any read
 operation or provider available and does not alter the v2 frame vocabulary.
+The library-only profile-backed constructor consumes an owned zeroizing
+passphrase and exact nonsecret profile fence without adding either to this
+schema. Its returned runtime admits only the six marker reads at the decoded
+`ServiceRequest` boundary and rejects ABI unlock/lock and every provider or
+authority request. No checked-in executable invokes that constructor.
 
 Because service capabilities are a closed enum, an older ABI-v2 decoder rejects
 a hello that contains `hnsReadOperationsV1`. The native read service, trusted
