@@ -921,9 +921,9 @@ mod tests {
     use hns_wallet_hns::{
         BlockHashEvidence, CanonicalNameStateSummary, ChainTip, ConfirmedWalletPage,
         ConfirmedWalletPageRequest, HnsNameAction, HnsOutpoint, HnsTransactionFeeQuote,
-        MempoolSnapshotBinding, MempoolWalletPage, MempoolWalletPageRequest,
-        NameActionContextEvidence, NameEvidence, OutpointSpendEvidence, SnapshotBinding,
-        TransactionEvidence,
+        IncomingTransfersPage, IncomingTransfersPageRequest, MempoolSnapshotBinding,
+        MempoolWalletPage, MempoolWalletPageRequest, NameActionContextEvidence, NameEvidence,
+        OutpointSpendEvidence, SnapshotBinding, TransactionEvidence,
     };
     use hns_wallet_store::EntityKind;
     use hns_wallet_types::{BaseUnits, TransactionHash};
@@ -936,6 +936,7 @@ mod tests {
         snapshot_calls: AtomicUsize,
         tip_calls: AtomicUsize,
         confirmed_calls: AtomicUsize,
+        incoming_calls: AtomicUsize,
         mempool_calls: AtomicUsize,
         evidence_calls: AtomicUsize,
         forbidden_calls: AtomicUsize,
@@ -1067,6 +1068,27 @@ mod tests {
                 mempool: Self::mempool(),
                 next_cursor: None,
                 history: Vec::new(),
+            })
+        }
+
+        fn get_incoming_transfers_page(
+            &self,
+            request: IncomingTransfersPageRequest<'_>,
+        ) -> Result<IncomingTransfersPage, HnsWalletError> {
+            self.probe.incoming_calls.fetch_add(1, Ordering::SeqCst);
+            if request.binding != Self::binding()
+                || request.scripts.is_empty()
+                || request.cursor.is_some()
+                || request.limit == 0
+            {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            Ok(IncomingTransfersPage {
+                projection_version: 1,
+                binding: Self::binding(),
+                entries: Vec::new(),
+                script_examinations: request.scripts.len(),
+                next_cursor: None,
             })
         }
 
@@ -1400,6 +1422,7 @@ mod tests {
         assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), before + 6);
         assert_eq!(probe.tip_calls.load(Ordering::SeqCst), 0);
         assert!(probe.confirmed_calls.load(Ordering::SeqCst) > 0);
+        assert!(probe.incoming_calls.load(Ordering::SeqCst) > 0);
         assert!(probe.mempool_calls.load(Ordering::SeqCst) > 0);
         assert_eq!(probe.evidence_calls.load(Ordering::SeqCst), 0);
         assert_eq!(probe.forbidden_calls.load(Ordering::SeqCst), 0);
@@ -1465,6 +1488,7 @@ mod tests {
             reads.balance().expect("balance after backend recovery"),
             Amount::new(WalletAsset::Hns, 0)
         );
+        assert!(probe.incoming_calls.load(Ordering::SeqCst) > 0);
     }
 
     #[test]
