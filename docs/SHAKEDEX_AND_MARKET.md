@@ -158,20 +158,62 @@ rebroadcast path. Reconciliation also recovers an `Authorized` row when its
 persisted bytes were broadcast outside the recorded submit path. There is no
 submission polling loop and no caller-authored clock or chain status input.
 
-The encrypted `DenuoBoardObject` namespace now has a versioned, bounded board
-reducer and CAS load/save boundary. It persists canonical listing and
-cancellation bytes, content hashes, network/genesis, name hash, seller key,
-expiry, and per-seller/name sequence watermarks. One current record is retained
-per identity; a higher sequence replaces it without consuming another slot.
-Exact repeats are idempotent; sequence rollback, replay after a tombstone,
-registry substitution, corrupt restart state, and board overflow fail closed.
-Inventory contains only active, unexpired content hashes. Watermarks remain
-durable after expiry to preserve the protocol's monotonic sequence rule. The
-board therefore refuses a 4,097th distinct seller/name identity; bounded
-archival/admission policy is still required before live relay enablement.
-Persisted board objects are re-decoded on load, but they remain cache data:
-every purchase or value action must reacquire fresh locking-coin and chain
-evidence.
+The name-market portion of the encrypted `DenuoBoardObject` namespace now writes
+normalized `HeadV2Indexed` persistence. Its encrypted head carries the logical
+board revision and compact row selectors. Each selector binds the identity-row
+digest, physical revision and update time, row-value commitment, and listing
+hash; the head also commits to the complete row-value and listing-index metadata
+sets. Each seller/name identity has one strict, domain-separated digest-addressed
+encrypted row containing its current canonical listing or cancellation and
+durable sequence watermark. Each identity row also has one strict encrypted
+index addressed by a domain-separated digest of its stored listing hash and
+pointing to the identity-row digest.
+
+A full load captures the exact bounded namespace in one coherent store snapshot,
+authenticates every row and index, verifies the head commitments and exact
+listing-index/row bijection, and then reconstructs and validates the logical
+board. A mutation performs that full load, retains unchanged child physical
+revisions through authenticated compare-only assertions, changes only affected
+children, and consumes a ciphertext-fingerprinted exact namespace lease in the
+immediate write transaction. A concurrent namespace insertion, deletion,
+revision change, or same-metadata ciphertext replacement therefore fails closed.
+
+Runtime offer and cancellation mutations add a second compare-only
+`WalletAccount` prefix guard. The HNS runtime captures the selected wallet's
+complete account prefix before node or clock work. The mutation closure consumes
+and refreshes that guard in the same coherent snapshot that loads the board,
+then both the board lease and account guard are checked in the board write
+transaction. The public `verify_unchanged_account` helper is read-only and
+non-atomic with a later write; mutation paths instead consume
+`revalidate_unchanged_account` and the refreshed account lease.
+
+A sole legacy-v1 aggregate remains readable and is atomically replaced by
+indexed storage on its next successful mutation; legacy/head coexistence and
+torn state are rejected. Historical normalized `HeadV2` plus row objects also
+remain strictly readable. Targeted requests use the full semantic loader for
+that format, and its next mutation preserves unchanged row revisions while
+atomically adding listing indexes and installing `HeadV2Indexed`.
+
+Indexed listing-hash reads always perform O(N) complete row/index metadata and
+selector comparison against the authenticated head, including equality with the
+exact listing-index ID set derived from selector listing hashes. If every
+requested hash has an index, only O(K) encrypted index and row values are
+authenticated for K hits in requested order. A head/index-only miss cannot rule
+out a row whose authenticated semantics disagree with its selector, so any
+missing requested index invokes the O(N) full semantic row/index loader before
+returning authoritative absence. This is not an O(1) lookup. Legacy-v1 and
+pre-index `HeadV2` targeted reads, plus inventory, always use a full logical-
+board load.
+
+One current record is retained per identity; a higher sequence replaces it
+without consuming another slot. Exact repeats are idempotent; sequence rollback,
+replay after a tombstone, registry substitution, corrupt restart state, and
+board overflow fail closed. Inventory contains only active, unexpired content
+hashes. Watermarks remain durable after expiry to preserve the protocol's
+monotonic sequence rule. The board therefore refuses a 4,097th distinct
+seller/name identity; bounded archival/admission policy is still required
+before live relay enablement. Persisted board state remains cache data: every
+purchase or value action must reacquire fresh locking-coin and chain evidence.
 
 The offline `DenuoBoardRuntime` now supplies that admission/reacquisition join
 without enabling live discovery. Construction requires an
@@ -180,30 +222,38 @@ without enabling live discovery. Construction requires an
 same authority. The canonical offer envelope is first decoded as an
 `AuthenticatedFixedPriceListing`, so its signature and exact content hash can
 be checked before any caller-supplied chain projection is accepted. The HNS
-read runtime then obtains a script-free chain binding, an exact seller-lock
-mempool query, canonical current NameState and TRANSFER action context,
-confirmed and mempool unspentness, selected network, and its trusted wall
-clock. It fences chain, mempool, and selected account revision again before
-returning the ephemeral lock; only then may the board reducer commit through
-CAS. Exact retries return `Existing` at the unchanged revision, higher
-sequences replace the same identity, and equivocation/rollback fails closed.
+read runtime first authenticates the complete selected-wallet account prefix and
+captures its ciphertext-fingerprinted lease. It then obtains a script-free chain
+binding, an exact seller-lock mempool query, canonical current NameState and
+TRANSFER action context, confirmed and mempool unspentness, selected network,
+and its trusted wall clock. It fences chain and mempool again, then refreshes
+the account lease in the coherent mutation snapshot that fully loads the board.
+Only the immediate transaction that checks both the account guard and board
+namespace lease may commit the reducer. Exact retries return `Existing` at the
+unchanged revision, higher sequences replace the same identity, and
+equivocation/rollback fails closed.
 
 Cancellation admission uses an intentionally narrower authority. A first
 phase authenticates the canonical V2 cancellation signature plus externally
 expected target and content hashes without treating it as time- or
 listing-bound. The HNS runtime then observes only the exact selected account,
-its network, and trusted wall time; it performs no backend query. One bounded
-store mutation rechecks the full account selection and exact account revision,
-reauthenticates the persisted target listing, verifies the cancellation's
-active window and seller/network binding, advances the tombstone watermark,
-and saves by board CAS. A spent or missing lock does not block this negative
-replay-prevention action. Exact persisted retries remain no-write `Existing`
+its network, and trusted wall time; it performs no backend query. It captures
+the complete `WalletAccount` prefix lease before the clock observation, then
+refreshes that guard beside the full board load. One bounded store mutation
+reauthenticates the persisted target listing, verifies the cancellation's active
+window and seller/network binding, advances the tombstone watermark, and saves
+only while both the account guard and board namespace lease remain exact. A
+spent or missing lock does not block this negative replay-prevention action.
+Exact persisted retries remain no-write `Existing`
 results after restart or signed expiry; changed cancellations must still be
 currently valid and strictly advance the watermark.
 
 `current_offer` deliberately repeats the current-lock query after restart or
 before later use, verifies the persisted canonical listing against that exact
 coin/network/time, and finally fences the unchanged board revision and row.
+On indexed storage, both board projections use the targeted path above when the
+hash hits; a missing index, the legacy aggregate, or historical pre-index
+`HeadV2` uses the full semantic fallback.
 Its non-serializable result is evidence for an enclosing, still-gated value
 workflow, not permission to sign or broadcast. This join performs no Denuo
 transport or relay I/O. The HRM draft supplies the current manifest root and
@@ -217,13 +267,15 @@ closed read boundary. Denuo requires a nonzero correlation ID for both this
 type-6 request and its singular type-7 `Offer` response; this differs from the
 zero-ID cancellation/tombstone case. Inventory, batch, response-family, V1,
 zero-ID, malformed, and noncanonical inputs are rejected before current-lock
-lookup. Missing or cancelled rows return typed absence without querying a
-node. Otherwise the runtime reacquires and fences `current_offer`, encodes the
+lookup. Missing or cancelled rows return typed absence without querying a node;
+a missing indexed hash first takes the full semantic board fallback described
+above. Otherwise the runtime reacquires and fences `current_offer`, encodes the
 singular response internally, authenticates its exact request ID, listing hash,
 and canonical listing bytes, then discards both encoded and decoded response
-objects. Runtime clock observation occurs before the final chain, mempool, and
-exact selected-account revision/value fences, so a clock-time account mutation
-cannot survive into the plan. The non-cloneable, non-serializable plan exposes
+objects. Runtime clock observation occurs before the final chain and mempool
+fences and the same-snapshot refresh of the complete selected-account prefix,
+so a clock-time account mutation or same-metadata ciphertext replacement cannot
+survive into the plan. The non-cloneable, non-serializable plan exposes
 only correlation ID, hash, and board revision. It carries no response bytes or
 transport/value capability, and a future emitter must reacquire authority
 again immediately at use time because neither the plan nor
@@ -233,12 +285,15 @@ The adjacent closed inventory boundary accepts only canonical V2
 `GetOfferInventory` with a nonzero correlation ID; other request and response
 families are rejected before account, clock, store, or backend access. Under
 the literal same store authority, a generalized purpose-minimized HNS board
-context fences the exact selected account and revision on both sides of the
-trusted clock observation and again inside the board read. The snapshot
-contains only active rows whose network exactly matches the current account and
+context captures the complete selected-wallet account prefix before the trusted
+clock observation and refreshes its metadata and ciphertext fingerprints inside
+the board-read snapshot. The snapshot contains only active rows whose network
+exactly matches the current account and
 whose signed window contains the observed time. It performs no node query and
-no write. The corresponding canonical `OfferInventory` response, including an
-allowed empty inventory, is encoded and decoded internally to verify the exact
+no write. This inventory operation intentionally uses the full logical-board
+load rather than the targeted listing-hash path. The corresponding canonical
+`OfferInventory` response, including an allowed empty inventory, is encoded and
+decoded internally to verify the exact
 correlation ID and ordered hashes, then discarded. The non-cloneable,
 non-serializable plan exposes only correlation ID, board revision, and count;
 it exposes no hashes or response bytes and is neither publication nor a
@@ -254,14 +309,18 @@ Missing and cancelled rows are omitted, while an all-absent result retains the
 observed board revision in a typed local plan and deliberately does not invent
 the protocol-invalid empty `Offers` response. Before node access, the actual
 nonempty candidate response is preflighted against the aggregate protocol
-payload bound. Every active candidate is then reauthenticated and joined to
+payload bound. Indexed storage always performs the O(N) metadata/selector scan;
+all-hit requests authenticate O(K) values, while any missing index performs the
+O(N) full semantic fallback before the subset is accepted. Every active
+candidate is then reauthenticated and joined to
 one ordered HNS current-lock batch sharing a single selected-account, chain,
 mempool, network, and trusted-time authority. A duplicate underlying name,
 expired or wrong-network listing, stale/spent lock, or other invalid active row
-fails the whole plan; there is no sequential fallback. The final store read
-fences the unchanged selected account, board revision, and exact projection of
-every requested row, including missing and cancelled entries. Canonical
-response bytes are encoded and decoded internally under the exact request ID,
+fails the whole plan; there is no sequential fallback. The final store snapshot
+refreshes the complete selected-account prefix and fences the board revision and
+exact projection of every requested row, including authoritative full-semantic
+absence and cancelled entries. Canonical response bytes are encoded and decoded
+internally under the exact request ID,
 hash subset, ordering, and listing bytes, then discarded. The public plan
 exposes only request ID, board revision, requested count, and returned count;
 it provides no hashes, listings, locks, response bytes, transport, signing,

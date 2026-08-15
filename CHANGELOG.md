@@ -62,6 +62,25 @@ boundary:
   through an exact persisted-listing/account-network/trusted-time fence without
   requiring a still-live lock; this negative path performs no node call, keeps
   exact restart/expiry retries revision-stable, and changes no release gate.
+  Canonical board writes now emit an encrypted `HeadV2Indexed`, one
+  digest-addressed row per seller/name identity, and one encrypted
+  digest-addressed listing-hash index per row. Each compact authenticated head
+  selector binds the row identity, physical revision/update time, row-value
+  commitment, and listing hash, from which the exact listing-index ID set is
+  derived. Full loads authenticate the exact bounded namespace and row/index
+  bijection. Targeted normalized reads always perform O(N) complete metadata and
+  selector comparison. All-hit queries authenticate O(K) index/row values for K
+  requested hashes, while any missing requested index triggers the O(N) full
+  semantic row/index loader before absence is returned. This authenticates both
+  the exact derived index-ID set and the row semantics that a head-only negative
+  could not exclude. Writes consume the board namespace lease and, for runtime
+  admissions, a second ciphertext-
+  fingerprinted `WalletAccount` prefix guard captured before node/clock work and
+  refreshed in the same account-plus-board snapshot. Both guards are rechecked
+  in the board write transaction. The public unchanged-account verifier remains
+  read-only and non-atomic; writes use consume-and-revalidate plus the guard.
+  The aggregate legacy-v1 board and historical pre-index `HeadV2` remain strict
+  read formats and atomically migrate on their next successful mutation.
   Closed canonical V2 board reads cover singular offers, inventory, and a
   maximum-64 `GetOffers` subset. The batch path preflights its aggregate
   response, verifies every active row under one coherent HNS current-lock
@@ -107,7 +126,7 @@ CI `31812028843`, including Wallet qualification and RustSec, and CodeQL
 2026-08-14. This is source qualification only and does not satisfy publication,
 installed-product, network, value, or release-gate requirements.
 
-Exact current source `3f52586c8befd85d21df5bb89a7ceb0097a0f2bb` passed complete
+Exact historical source `3f52586c8befd85d21df5bb89a7ceb0097a0f2bb` passed complete
 locked CI `31837067925`, including Wallet qualification and RustSec, and
 CodeQL `31837067848` for Actions, JavaScript/TypeScript, Rust, and Python on
 2026-08-14. This descendant includes the coherent current-lock batch and

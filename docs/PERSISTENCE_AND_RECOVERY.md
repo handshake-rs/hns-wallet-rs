@@ -53,6 +53,25 @@ Duplicate `(entity kind, record ID)` operations and stale writers fail before a
 partial batch becomes visible. Secret record IDs cannot change kinds; recovery
 seed bytes are additionally immutable once inserted.
 
+Entity readers may instead run inside a callback-scoped coherent SQLite
+snapshot. Complete bounded binary-prefix projections expose only untrusted
+identity, revision, and update-time metadata for fail-closed set comparison;
+metadata never substitutes for loading and authenticating an encrypted value.
+Compare-only revision assertions authenticate unchanged entities without
+rewriting them. A snapshot may also capture an opaque single-use lease over one
+exact prefix set. In addition to untrusted metadata, the lease privately retains
+a fixed-size fingerprint of every matching ciphertext, detecting replacement
+that preserves revision and update time without treating the fingerprint as
+value authority. A later coherent snapshot may consume and refresh the lease;
+any metadata, ciphertext, capacity, database, or scope change fails closed.
+
+The lease-gated batch rechecks its database, entity kind, prefix, bound,
+metadata, and ciphertext fingerprints under an immediate write transaction,
+and every save, delete, or assertion must remain within the primary namespace.
+An optional second prefix lease may cover another entity kind as a compare-only
+guard in that same transaction. It scopes no write but must remain exactly
+unchanged before the primary batch can commit.
+
 The native HNS create/restore bootstrap has a narrower atomic initializer. It
 accepts exactly the 64-byte output of BIP-39 seed derivation and one exact
 initial `WalletAccount`, requires both the recovery-seed and wallet-account
@@ -92,27 +111,79 @@ restored on-chain Shakedex index, and reserves the configured trailing scan
 gap, so concurrent writers to one wallet store cannot allocate through an
 incomplete mnemonic scan and reuse a discovered lock key.
 
-The fixed-price Denuo board is one versioned encrypted `DenuoBoardObject` with
-an explicit 4,096-offer/watermark bound and a store-owned CAS revision. It
-retains one canonical latest listing/cancellation record plus network/genesis,
-name hash, seller key, expiry, status, and the exact highest observed sequence
-for each seller/name identity. A higher valid listing replaces that identity's
-older record without consuming another slot. Load re-decodes every object and
-rejects unsorted, duplicate, mismatched, rolled-back, or malformed state. A
-cancellation tombstone advances the watermark, so restart cannot make the
-cancelled listing active or admit the same sequence under another content hash.
-The signed listing target can be re-authenticated from these bytes to process a
-still-active cancellation after restart without recreating locking-coin
-authority. The account-bound board runtime supplies the selected network and
-trusted time, rechecks the complete account selection and exact row revision in
-the board mutation closure, and deliberately performs no node query for this
-negative tombstone. An exact already-persisted cancellation retry remains a
-no-write `Existing` result after its signed horizon; it recognizes durable
-state rather than accepting new authority. After the listing or cancellation's
-signed horizon expires, bounded inventory filtering hides the object but
-retains its authenticated watermark, so a later listing cannot reset or reuse
-the seller/name sequence. Relisting the same identity replaces its stored
-object without growing the board. The
+The fixed-price Denuo board now uses normalized encrypted persistence rather
+than one aggregate `DenuoBoardObject`. Its indexed schema-v2 namespace contains
+one `HeadV2Indexed`, one domain-separated digest-addressed row per seller/name
+identity, and one encrypted domain-separated listing-hash index per row. Each
+strict row retains the canonical latest listing or cancellation together with
+its durable identity watermark. The head separates the public logical board
+revision from physical entity revisions. Each compact row selector binds the
+row identity digest, physical revision and update time, row-value commitment,
+and listing hash. The head also commits to the complete row-value and listing-
+index metadata sets.
+
+A full load captures the exact bounded namespace in one coherent snapshot. It
+rejects an oversized or malformed namespace, legacy/head coexistence, missing
+or extra rows or indexes, metadata drift, a row-value commitment mismatch, or a
+non-bijective listing-index-to-row mapping. It authenticates and strictly
+decodes every encrypted row and index before reconstructing the logical board.
+Each entity remains subject to the store's 1 MiB per-record bound, and the
+loader authenticates one ciphertext buffer at a time rather than allocating the
+advertised row count times that bound up front.
+
+An indexed targeted read first authenticates `HeadV2Indexed`, derives the exact
+sorted listing-index ID set from all committed selector listing hashes, and
+requires the complete O(N) index metadata set to match those IDs and the head
+commitment. When every requested hash has an index, the reader authenticates
+only O(K) encrypted index and row values for K hits and verifies each row's
+identity, physical metadata, listing hash, and row-value commitment against its
+selector. A head/index-only miss cannot exclude an authenticated row whose
+semantics disagree with its selector, so any requested index absence falls back
+to the full semantic loader and authenticates O(N) row and index values before
+returning authoritative absence. Unrequested row ciphertexts remain
+unauthenticated only on the all-hit targeted path.
+
+A save compares the expected logical revision, rejects any transition that
+removes, rolls back, or rewrites durable identity lineage, and advances only
+changed child entities. Unchanged rows and indexes retain their physical
+revision and update time through compare-only authenticated assertions. The
+head save, changed children, removals, and assertions then consume the exact
+board namespace lease in one immediate transaction, so a concurrent insert,
+delete, revision change, or same-metadata ciphertext replacement fails without
+a partial commit.
+
+Runtime offer and cancellation writes carry an additional `WalletAccount`
+prefix lease. The HNS runtime captures the complete selected-wallet account set
+before any node or clock work. Inside the mutation closure it consumes and
+refreshes that ciphertext-fingerprinted lease in the same coherent snapshot that
+fully loads the board, then supplies it as the second compare-only guard in the
+board write transaction. The public `verify_unchanged_account` method performs
+only a coherent read check and returns no guard, so it is not an atomic
+precondition for a later write. Mutation paths instead consume
+`revalidate_unchanged_account` and the refreshed prefix lease.
+
+A legacy-v1 aggregate is accepted only as the sole namespace record and is
+deleted in the same atomic batch that installs indexed v2, preserving logical
+revision progression. Historical normalized `HeadV2` plus row objects are also
+strictly readable; targeted reads fall back to full authentication, and the
+next successful mutation keeps unchanged row revisions while atomically adding
+the indexes and replacing the head with `HeadV2Indexed`.
+
+A higher valid listing still replaces its identity's older record without
+consuming another slot. A cancellation tombstone advances the watermark, so
+restart cannot make the cancelled listing active or admit the same sequence
+under another content hash. The signed listing target can be re-authenticated
+from these bytes to process a still-active cancellation after restart without
+recreating locking-coin authority. The account-bound board runtime supplies the
+selected network and trusted time, refreshes the complete account-prefix guard
+beside the exact logical board projection in the mutation closure, and
+deliberately performs no node query for this negative tombstone. An exact
+already-persisted cancellation retry remains a no-write `Existing` result after its signed
+horizon; it recognizes durable state rather than accepting new authority. After
+the listing or cancellation's signed horizon expires, bounded inventory
+filtering hides the object but retains its authenticated watermark, so a later
+listing cannot reset or reuse the seller/name sequence. Relisting the same
+identity replaces its stored row without growing the board. The
 4,096-distinct-identity ceiling fails closed; durable archival and peer
 admission policy remain required for a live relay. The cache does not persist
 an action capability; current locking-coin/network/time authority must be

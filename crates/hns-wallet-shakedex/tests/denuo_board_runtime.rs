@@ -3561,3 +3561,38 @@ fn board_cancellation_context_rejects_changed_exact_account_revision() {
     ));
     assert_eq!(control.query_count.load(Ordering::SeqCst), 0);
 }
+
+#[test]
+fn board_context_revalidation_rejects_same_metadata_account_aba() {
+    let market = Arc::new(MarketFixture::new());
+    let control = BackendControl::new();
+    control.reject_queries.store(true, Ordering::SeqCst);
+    let (store, config) = create_store(":memory:");
+    let hns = runtime(store.clone(), config, market, control.clone());
+    let context = hns
+        .observe_board_context()
+        .expect("account-set lease context");
+    store
+        .try_with_store_mut(|wallet| {
+            let mut accounts = wallet.wallet_accounts::<HnsAccountRecord>(2)?;
+            let stored = accounts.pop().expect("selected account row");
+            assert!(accounts.is_empty());
+            assert!(wallet.delete_wallet_account(&stored.id, stored.revision)?);
+            assert_eq!(
+                wallet.save_wallet_account(&stored.id, 0, &stored.value, stored.updated_at_unix,)?,
+                stored.revision
+            );
+            Ok::<_, hns_wallet_store::StoreError>(())
+        })
+        .expect("delete and recreate exact account metadata");
+
+    assert!(matches!(
+        store.try_with_store(|wallet| {
+            wallet.try_with_entity_read_snapshot(|snapshot| {
+                context.revalidate_unchanged_account(snapshot)
+            })
+        }),
+        Err(HnsWalletError::StaleAccountRead)
+    ));
+    assert_eq!(control.query_count.load(Ordering::SeqCst), 0);
+}

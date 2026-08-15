@@ -977,6 +977,7 @@ name = "hns-wallet-shakedex"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "hex",
  "hns-covenants",
  "hns-marketplace-protocol",
  "hns-primitives",

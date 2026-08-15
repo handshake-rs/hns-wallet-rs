@@ -661,7 +661,10 @@ pub enum ShakedexError {
 
 impl From<StoreError> for ShakedexError {
     fn from(error: StoreError) -> Self {
-        if matches!(error, StoreError::StaleRevision { .. }) {
+        if matches!(
+            error,
+            StoreError::StaleRevision { .. } | StoreError::StaleEntitySet
+        ) {
             Self::StaleRevision
         } else {
             Self::Persistence

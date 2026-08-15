@@ -162,7 +162,7 @@ and
 [14-crate normalized release preflight](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31424201574)
 on 2026-08-10. The earlier exact implementation commit
 `ba9f013a098679fe8e3d812a7e09020803e27d53` remains a historical CI/CodeQL
-baseline. Exact current implementation source
+baseline. Exact historical qualified implementation source
 `bc5901f794450d29fa9f5630bab4fbf91e37bedf` passed complete locked
 [CI](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31812028843),
 including Wallet qualification and RustSec, and

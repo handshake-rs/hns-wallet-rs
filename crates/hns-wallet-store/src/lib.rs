@@ -16,7 +16,7 @@ use hmac::{Hmac, Mac};
 use hns_wallet_types::{ApprovalId, WorkflowId, WorkflowKind};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -40,6 +40,8 @@ pub const RECOVERY_SEED_BYTES: usize = 64;
 const DATABASE_ID_BYTES: usize = 16;
 const SALT_BYTES: usize = 16;
 const NONCE_BYTES: usize = 24;
+const TAG_BYTES: usize = 16;
+const MAX_ENCRYPTED_RECORD_BYTES: usize = MAX_SECRET_BYTES + NONCE_BYTES + TAG_BYTES;
 const KEY_BYTES: usize = 32;
 const SENTINEL: &[u8] = b"hns-wallet-store-key-check-v1";
 const AAD_DOMAIN: &[u8] = b"hns-wallet-store/record/v1";
@@ -142,6 +144,151 @@ pub struct StoredEntity<T> {
     pub updated_at_unix: u64,
 }
 
+/// Untrusted encrypted-entity identity and CAS metadata without a value.
+///
+/// This projection is safe only for fail-closed set comparison. A caller must
+/// load every expected entity individually before treating any metadata or
+/// value as authenticated authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredEntityMetadata {
+    pub kind: EntityKind,
+    pub id: Vec<u8>,
+    pub revision: u64,
+    pub updated_at_unix: u64,
+}
+
+/// One coherent read-only SQLite snapshot over encrypted wallet entities.
+///
+/// The snapshot is callback-scoped and cannot outlive the transaction which
+/// owns its database view. Values loaded through it are authenticated normally;
+/// prefix metadata remains untrusted and is suitable only for fail-closed set
+/// comparison or for capturing an [`EntityPrefixSetLease`].
+pub struct EntityReadSnapshot<'snapshot> {
+    connection: &'snapshot Connection,
+    key: &'snapshot [u8; KEY_BYTES],
+    database_id: &'snapshot [u8; DATABASE_ID_BYTES],
+}
+
+/// An opaque, single-consumption compare-and-swap token for one exact entity
+/// prefix set observed inside an [`EntityReadSnapshot`].
+///
+/// The lease owns untrusted SQLite identity/revision metadata plus private,
+/// fixed-size ciphertext fingerprints. A leased batch still authenticates every
+/// entity it reads, saves, deletes, or asserts. Its private database,
+/// entity-kind, prefix, and bound prevent a token from being replayed against
+/// another namespace or wallet database.
+pub struct EntityPrefixSetLease {
+    database_id: [u8; DATABASE_ID_BYTES],
+    kind: EntityKind,
+    prefix: Vec<u8>,
+    limit: usize,
+    metadata: Vec<StoredEntityMetadata>,
+    encrypted_value_fingerprints: Vec<[u8; 32]>,
+}
+
+impl EntityPrefixSetLease {
+    /// Return the exact bounded metadata captured by this lease.
+    ///
+    /// These rows are untrusted until the caller authenticates the corresponding
+    /// entities. The batch API consumes the lease and compares this complete set
+    /// again under its immediate write transaction.
+    pub fn metadata(&self) -> &[StoredEntityMetadata] {
+        &self.metadata
+    }
+}
+
+impl EntityReadSnapshot<'_> {
+    /// Load and authenticate one typed entity from this coherent snapshot.
+    pub fn load_entity<T: for<'de> Deserialize<'de>>(
+        &self,
+        kind: EntityKind,
+        id: &[u8],
+    ) -> Result<Option<StoredEntity<T>>, StoreError> {
+        load_entity_from_connection(self.connection, self.key, self.database_id, kind, id)
+    }
+
+    /// Load and authenticate one complete bounded typed prefix set from this
+    /// coherent snapshot. A matching set larger than `limit` fails rather
+    /// than returning a truncated authority view.
+    pub fn list_entities_by_id_prefix<T: for<'de> Deserialize<'de>>(
+        &self,
+        kind: EntityKind,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredEntity<T>>, StoreError> {
+        list_entities_by_id_prefix_from_connection(
+            self.connection,
+            self.key,
+            self.database_id,
+            kind,
+            prefix,
+            limit,
+        )
+    }
+
+    /// Return a complete bounded untrusted prefix projection from this coherent
+    /// snapshot. A matching set larger than `limit` fails instead of truncating.
+    pub fn list_untrusted_entity_metadata_by_id_prefix(
+        &self,
+        kind: EntityKind,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredEntityMetadata>, StoreError> {
+        list_untrusted_entity_metadata_by_id_prefix_from_connection(
+            self.connection,
+            kind,
+            prefix,
+            limit,
+        )
+    }
+
+    /// Capture a single-consumption lease for one exact complete prefix set.
+    pub fn entity_prefix_set_lease(
+        &self,
+        kind: EntityKind,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<EntityPrefixSetLease, StoreError> {
+        let (metadata, encrypted_value_fingerprints) =
+            load_entity_prefix_set_lease_projection(self.connection, kind, prefix, limit)?;
+        Ok(EntityPrefixSetLease {
+            database_id: *self.database_id,
+            kind,
+            prefix: prefix.to_vec(),
+            limit,
+            metadata,
+            encrypted_value_fingerprints,
+        })
+    }
+
+    /// Revalidate and consume a previously captured lease against this exact
+    /// snapshot. A successful result can be carried forward to a later atomic
+    /// batch; any metadata, ciphertext, capacity, database, or scope change
+    /// fails closed.
+    pub fn refresh_entity_prefix_set_lease(
+        &self,
+        lease: EntityPrefixSetLease,
+    ) -> Result<EntityPrefixSetLease, StoreError> {
+        validate_entity_prefix_set_lease_shape(self.database_id, &lease)?;
+        let current = load_entity_prefix_set_lease_projection(
+            self.connection,
+            lease.kind,
+            &lease.prefix,
+            lease.limit,
+        );
+        match current {
+            Ok((metadata, encrypted_value_fingerprints))
+                if metadata == lease.metadata
+                    && encrypted_value_fingerprints == lease.encrypted_value_fingerprints =>
+            {
+                Ok(lease)
+            }
+            Ok(_) | Err(StoreError::ListCapacity) => Err(StoreError::StaleEntitySet),
+            Err(error) => Err(error),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntityBatchSave<T> {
     pub id: Vec<u8>,
@@ -152,6 +299,14 @@ pub struct EntityBatchSave<T> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntityBatchDelete {
+    pub id: Vec<u8>,
+    pub expected_revision: u64,
+}
+
+/// Compare-only entity CAS condition checked in the same transaction as a
+/// batch write. The asserted entity is authenticated but not rewritten.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntityRevisionAssertion {
     pub id: Vec<u8>,
     pub expected_revision: u64,
 }
@@ -907,6 +1062,46 @@ impl WalletStore {
         Ok(true)
     }
 
+    /// Run one bounded entity read callback inside a coherent deferred SQLite
+    /// transaction.
+    ///
+    /// The callback cannot retain the snapshot. On WAL databases, a writer on
+    /// another connection may commit while the callback runs, but every read
+    /// through `snapshot` continues to observe the exact view established by
+    /// its first query.
+    pub fn try_with_entity_read_snapshot<T, E>(
+        &self,
+        operation: impl FnOnce(&EntityReadSnapshot<'_>) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let key = self
+            .key
+            .as_ref()
+            .ok_or(StoreError::Locked)
+            .map_err(E::from)?;
+        let transaction = self
+            .connection
+            .unchecked_transaction()
+            .map_err(StoreError::from)
+            .map_err(E::from)?;
+        let result = {
+            let snapshot = EntityReadSnapshot {
+                connection: &transaction,
+                key,
+                database_id: &self.database_id,
+            };
+            operation(&snapshot)
+        };
+        let rollback = transaction.rollback().map_err(StoreError::from);
+        match (result, rollback) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(E::from(error)),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
     /// Saves one typed entity with compare-and-swap semantics. The entity kind,
     /// database identity, and record ID are authenticated with the ciphertext.
     pub fn save_entity<T: Serialize>(
@@ -978,32 +1173,7 @@ impl WalletStore {
     ) -> Result<Option<StoredEntity<T>>, StoreError> {
         validate_id(id)?;
         let key = self.key.as_ref().ok_or(StoreError::Locked)?;
-        let row: Option<(u64, Vec<u8>, u64)> = self
-            .connection
-            .query_row(
-                "SELECT revision, encrypted_value, updated_at_unix
-                 FROM encrypted_entities WHERE entity_kind=?1 AND record_id=?2",
-                params![kind.label(), id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        row.map(|(revision, encrypted, updated_at_unix)| {
-            let clear = decrypt_record(
-                key,
-                &self.database_id,
-                &entity_label(kind),
-                &revisioned_aad_id(id, revision, updated_at_unix, None)?,
-                &encrypted,
-            )?;
-            Ok(StoredEntity {
-                kind,
-                id: id.to_vec(),
-                revision,
-                value: serde_json::from_slice(&clear)?,
-                updated_at_unix,
-            })
-        })
-        .transpose()
+        load_entity_from_connection(&self.connection, key, &self.database_id, kind, id)
     }
 
     pub fn list_entities<T: for<'de> Deserialize<'de>>(
@@ -1064,54 +1234,40 @@ impl WalletStore {
             return Err(StoreError::InvalidListLimit);
         }
         let key = self.key.as_ref().ok_or(StoreError::Locked)?;
-        let query_limit = limit
-            .checked_add(1)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or(StoreError::InvalidListLimit)?;
-        let prefix_length = i64::try_from(prefix.len()).map_err(|_| StoreError::InvalidRecordId)?;
-        let mut statement = self.connection.prepare(
-            "SELECT record_id, revision, encrypted_value, updated_at_unix
-             FROM encrypted_entities
-             WHERE entity_kind=?1 AND substr(record_id, 1, ?2)=?3
-             ORDER BY record_id LIMIT ?4",
-        )?;
-        let rows = statement.query_map(
-            params![kind.label(), prefix_length, prefix, query_limit],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, u64>(3)?,
-                ))
-            },
-        )?;
-        let mut encrypted_entities = Vec::new();
-        for row in rows {
-            encrypted_entities.push(row?);
+        list_entities_by_id_prefix_from_connection(
+            &self.connection,
+            key,
+            &self.database_id,
+            kind,
+            prefix,
+            limit,
+        )
+    }
+
+    /// Return the complete bounded untrusted metadata set for one record-ID
+    /// prefix without loading any encrypted value.
+    ///
+    /// This is intended only for compact authenticated indexes which compare
+    /// the complete set, then individually load and authenticate every indexed
+    /// value. Metadata alone is never authority. A matching set larger than
+    /// `limit` fails instead of truncating.
+    pub fn list_untrusted_entity_metadata_by_id_prefix(
+        &self,
+        kind: EntityKind,
+        prefix: &[u8],
+        limit: usize,
+    ) -> Result<Vec<StoredEntityMetadata>, StoreError> {
+        validate_id(prefix)?;
+        if limit == 0 || limit > MAX_ENTITY_LIST_RESULTS {
+            return Err(StoreError::InvalidListLimit);
         }
-        if encrypted_entities.len() > limit {
-            return Err(StoreError::ListCapacity);
-        }
-        let mut entities = Vec::with_capacity(encrypted_entities.len());
-        for (id, revision, encrypted, updated_at_unix) in encrypted_entities {
-            validate_id(&id)?;
-            let clear = decrypt_record(
-                key,
-                &self.database_id,
-                &entity_label(kind),
-                &revisioned_aad_id(&id, revision, updated_at_unix, None)?,
-                &encrypted,
-            )?;
-            entities.push(StoredEntity {
-                kind,
-                id,
-                revision,
-                value: serde_json::from_slice(&clear)?,
-                updated_at_unix,
-            });
-        }
-        Ok(entities)
+        self.key.as_ref().ok_or(StoreError::Locked)?;
+        list_untrusted_entity_metadata_by_id_prefix_from_connection(
+            &self.connection,
+            kind,
+            prefix,
+            limit,
+        )
     }
 
     pub fn delete_entity(
@@ -1842,6 +1998,146 @@ impl WalletStore {
             &prepared_entities,
             deletes,
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically apply an entity batch only while every compare-only entity
+    /// remains at its exact authenticated revision.
+    ///
+    /// Assertions are disjoint from saves and deletes and do not advance a
+    /// revision. They let a compact aggregate head fence unchanged child rows
+    /// without rewriting those rows on every logical aggregate revision.
+    pub fn apply_entity_batch_with_assertions<E: Serialize>(
+        &mut self,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+        assertions: &[EntityRevisionAssertion],
+    ) -> Result<(), StoreError> {
+        let prepared_entities = prepare_entity_batch(saves, deletes)?;
+        validate_entity_revision_assertions(saves, deletes, assertions)?;
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let encrypted_saves = authenticate_entity_batch(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            &prepared_entities,
+            deletes,
+        )?;
+        authenticate_entity_revision_assertions(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            assertions,
+        )?;
+        write_entity_batch_in_transaction(&transaction, entity_kind, &encrypted_saves, deletes)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically apply one asserted entity batch only while an exact complete
+    /// prefix set remains unchanged from a coherent read snapshot.
+    ///
+    /// The lease is consumed even when the batch fails. Its database, kind,
+    /// prefix, limit, and complete metadata set are checked under the immediate
+    /// transaction before any current ciphertext is authenticated and before
+    /// any write occurs. Every batch operation must belong to the leased prefix.
+    pub fn apply_entity_batch_with_assertions_and_prefix_lease<E: Serialize>(
+        &mut self,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+        assertions: &[EntityRevisionAssertion],
+        prefix_lease: EntityPrefixSetLease,
+    ) -> Result<(), StoreError> {
+        self.apply_entity_batch_with_assertions_and_prefix_lease_guard_inner(
+            entity_kind,
+            saves,
+            deletes,
+            assertions,
+            prefix_lease,
+            None,
+        )
+    }
+
+    /// Atomically apply one leased entity batch while a second, independently
+    /// captured prefix set also remains unchanged.
+    ///
+    /// The primary lease scopes every batch operation. The guard lease may
+    /// cover another entity kind and is compare-only; both complete sets and
+    /// their private ciphertext fingerprints are rechecked under the same
+    /// immediate write transaction before any mutation occurs.
+    pub fn apply_entity_batch_with_assertions_and_prefix_lease_guard<E: Serialize>(
+        &mut self,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+        assertions: &[EntityRevisionAssertion],
+        prefix_lease: EntityPrefixSetLease,
+        guard_prefix_lease: EntityPrefixSetLease,
+    ) -> Result<(), StoreError> {
+        self.apply_entity_batch_with_assertions_and_prefix_lease_guard_inner(
+            entity_kind,
+            saves,
+            deletes,
+            assertions,
+            prefix_lease,
+            Some(guard_prefix_lease),
+        )
+    }
+
+    fn apply_entity_batch_with_assertions_and_prefix_lease_guard_inner<E: Serialize>(
+        &mut self,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+        assertions: &[EntityRevisionAssertion],
+        prefix_lease: EntityPrefixSetLease,
+        guard_prefix_lease: Option<EntityPrefixSetLease>,
+    ) -> Result<(), StoreError> {
+        let prepared_entities = prepare_entity_batch(saves, deletes)?;
+        validate_entity_revision_assertions(saves, deletes, assertions)?;
+        validate_entity_prefix_set_lease(
+            &self.database_id,
+            entity_kind,
+            saves,
+            deletes,
+            assertions,
+            &prefix_lease,
+        )?;
+        if let Some(guard) = &guard_prefix_lease {
+            validate_entity_prefix_set_lease_shape(&self.database_id, guard)?;
+        }
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        assert_entity_prefix_set_lease(&transaction, &prefix_lease)?;
+        if let Some(guard) = &guard_prefix_lease {
+            assert_entity_prefix_set_lease(&transaction, guard)?;
+        }
+        let encrypted_saves = authenticate_entity_batch(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            &prepared_entities,
+            deletes,
+        )?;
+        authenticate_entity_revision_assertions(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            assertions,
+        )?;
+        write_entity_batch_in_transaction(&transaction, entity_kind, &encrypted_saves, deletes)?;
         transaction.commit()?;
         Ok(())
     }
@@ -2644,6 +2940,207 @@ impl core::fmt::Debug for PendingApproval {
     }
 }
 
+fn load_entity_from_connection<T: for<'de> Deserialize<'de>>(
+    connection: &Connection,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    kind: EntityKind,
+    id: &[u8],
+) -> Result<Option<StoredEntity<T>>, StoreError> {
+    validate_id(id)?;
+    let row: Option<(u64, Vec<u8>, u64)> = connection
+        .query_row(
+            "SELECT revision, encrypted_value, updated_at_unix
+             FROM encrypted_entities WHERE entity_kind=?1 AND record_id=?2",
+            params![kind.label(), id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    row.map(|(revision, encrypted, updated_at_unix)| {
+        let clear = decrypt_record(
+            key,
+            database_id,
+            &entity_label(kind),
+            &revisioned_aad_id(id, revision, updated_at_unix, None)?,
+            &encrypted,
+        )?;
+        Ok(StoredEntity {
+            kind,
+            id: id.to_vec(),
+            revision,
+            value: serde_json::from_slice(&clear)?,
+            updated_at_unix,
+        })
+    })
+    .transpose()
+}
+
+fn list_entities_by_id_prefix_from_connection<T: for<'de> Deserialize<'de>>(
+    connection: &Connection,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    kind: EntityKind,
+    prefix: &[u8],
+    limit: usize,
+) -> Result<Vec<StoredEntity<T>>, StoreError> {
+    validate_id(prefix)?;
+    if limit == 0 || limit > MAX_ENTITY_LIST_RESULTS {
+        return Err(StoreError::InvalidListLimit);
+    }
+    let query_limit = limit
+        .checked_add(1)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(StoreError::InvalidListLimit)?;
+    let prefix_length = i64::try_from(prefix.len()).map_err(|_| StoreError::InvalidRecordId)?;
+    let mut statement = connection.prepare(
+        "SELECT record_id, revision, encrypted_value, updated_at_unix
+         FROM encrypted_entities
+         WHERE entity_kind=?1 AND substr(record_id, 1, ?2)=?3
+         ORDER BY record_id LIMIT ?4",
+    )?;
+    let rows = statement.query_map(
+        params![kind.label(), prefix_length, prefix, query_limit],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, u64>(3)?,
+            ))
+        },
+    )?;
+    let mut encrypted_entities = Vec::new();
+    for row in rows {
+        encrypted_entities.push(row?);
+    }
+    if encrypted_entities.len() > limit {
+        return Err(StoreError::ListCapacity);
+    }
+    let mut entities = Vec::with_capacity(encrypted_entities.len());
+    for (id, revision, encrypted, updated_at_unix) in encrypted_entities {
+        validate_id(&id)?;
+        let clear = decrypt_record(
+            key,
+            database_id,
+            &entity_label(kind),
+            &revisioned_aad_id(&id, revision, updated_at_unix, None)?,
+            &encrypted,
+        )?;
+        entities.push(StoredEntity {
+            kind,
+            id,
+            revision,
+            value: serde_json::from_slice(&clear)?,
+            updated_at_unix,
+        });
+    }
+    Ok(entities)
+}
+
+fn list_untrusted_entity_metadata_by_id_prefix_from_connection(
+    connection: &Connection,
+    kind: EntityKind,
+    prefix: &[u8],
+    limit: usize,
+) -> Result<Vec<StoredEntityMetadata>, StoreError> {
+    validate_id(prefix)?;
+    if limit == 0 || limit > MAX_ENTITY_LIST_RESULTS {
+        return Err(StoreError::InvalidListLimit);
+    }
+    let query_limit = limit
+        .checked_add(1)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(StoreError::InvalidListLimit)?;
+    let prefix_length = i64::try_from(prefix.len()).map_err(|_| StoreError::InvalidRecordId)?;
+    let mut statement = connection.prepare(
+        "SELECT record_id, revision, updated_at_unix
+         FROM encrypted_entities
+         WHERE entity_kind=?1 AND substr(record_id, 1, ?2)=?3
+         ORDER BY record_id LIMIT ?4",
+    )?;
+    let rows = statement.query_map(
+        params![kind.label(), prefix_length, prefix, query_limit],
+        |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        },
+    )?;
+    let mut metadata = Vec::new();
+    for row in rows {
+        let (id, revision, updated_at_unix) = row?;
+        if metadata.len() == limit {
+            return Err(StoreError::ListCapacity);
+        }
+        validate_id(&id)?;
+        metadata.push(StoredEntityMetadata {
+            kind,
+            id,
+            revision,
+            updated_at_unix,
+        });
+    }
+    Ok(metadata)
+}
+
+fn load_entity_prefix_set_lease_projection(
+    connection: &Connection,
+    kind: EntityKind,
+    prefix: &[u8],
+    limit: usize,
+) -> Result<(Vec<StoredEntityMetadata>, Vec<[u8; 32]>), StoreError> {
+    validate_id(prefix)?;
+    if limit == 0 || limit > MAX_ENTITY_LIST_RESULTS {
+        return Err(StoreError::InvalidListLimit);
+    }
+    let query_limit = limit
+        .checked_add(1)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or(StoreError::InvalidListLimit)?;
+    let prefix_length = i64::try_from(prefix.len()).map_err(|_| StoreError::InvalidRecordId)?;
+    let mut statement = connection.prepare(
+        "SELECT length(record_id), record_id, revision, updated_at_unix,
+                length(encrypted_value), encrypted_value
+         FROM encrypted_entities
+         WHERE entity_kind=?1 AND substr(record_id, 1, ?2)=?3
+         ORDER BY record_id LIMIT ?4",
+    )?;
+    let mut rows = statement.query(params![kind.label(), prefix_length, prefix, query_limit])?;
+    let mut metadata = Vec::new();
+    let mut encrypted_value_fingerprints = Vec::new();
+    while let Some(row) = rows.next()? {
+        if metadata.len() == limit {
+            return Err(StoreError::ListCapacity);
+        }
+        let id_length =
+            usize::try_from(row.get::<_, i64>(0)?).map_err(|_| StoreError::InvalidRecordId)?;
+        if id_length == 0 || id_length > MAX_RECORD_ID_BYTES {
+            return Err(StoreError::InvalidRecordId);
+        }
+        let id = row.get::<_, Vec<u8>>(1)?;
+        let revision = row.get::<_, u64>(2)?;
+        let updated_at_unix = row.get::<_, u64>(3)?;
+        let encrypted_value_length =
+            usize::try_from(row.get::<_, i64>(4)?).map_err(|_| StoreError::Encryption)?;
+        validate_encrypted_record_length(encrypted_value_length)?;
+        let encrypted_value = row.get::<_, Vec<u8>>(5)?;
+        if encrypted_value.len() != encrypted_value_length {
+            return Err(StoreError::Encryption);
+        }
+        validate_id(&id)?;
+        metadata.push(StoredEntityMetadata {
+            kind,
+            id,
+            revision,
+            updated_at_unix,
+        });
+        encrypted_value_fingerprints.push(Sha256::digest(encrypted_value).into());
+    }
+    Ok((metadata, encrypted_value_fingerprints))
+}
+
 type PreparedEntityBatch = Vec<(Vec<u8>, u64, Zeroizing<Vec<u8>>, u64)>;
 type AuthenticatedEntityWrites = Vec<(Vec<u8>, u64, Vec<u8>, u64)>;
 
@@ -2683,6 +3180,117 @@ fn prepare_entity_batch<E: Serialize>(
         }
     }
     Ok(prepared)
+}
+
+fn validate_entity_revision_assertions<E>(
+    saves: &[EntityBatchSave<E>],
+    deletes: &[EntityBatchDelete],
+    assertions: &[EntityRevisionAssertion],
+) -> Result<(), StoreError> {
+    if saves
+        .len()
+        .checked_add(deletes.len())
+        .and_then(|count| count.checked_add(assertions.len()))
+        .is_none_or(|count| count > MAX_ENTITY_BATCH_OPERATIONS)
+    {
+        return Err(StoreError::BatchCapacity);
+    }
+    let mut ids = BTreeSet::new();
+    for save in saves {
+        validate_id(&save.id)?;
+        if !ids.insert(save.id.clone()) {
+            return Err(StoreError::DuplicateBatchEntity);
+        }
+    }
+    for delete in deletes {
+        validate_id(&delete.id)?;
+        if !ids.insert(delete.id.clone()) {
+            return Err(StoreError::DuplicateBatchEntity);
+        }
+    }
+    for assertion in assertions {
+        validate_id(&assertion.id)?;
+        if assertion.expected_revision == 0 || !ids.insert(assertion.id.clone()) {
+            return Err(if assertion.expected_revision == 0 {
+                StoreError::InvalidRevision
+            } else {
+                StoreError::DuplicateBatchEntity
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_entity_prefix_set_lease<E>(
+    database_id: &[u8; DATABASE_ID_BYTES],
+    kind: EntityKind,
+    saves: &[EntityBatchSave<E>],
+    deletes: &[EntityBatchDelete],
+    assertions: &[EntityRevisionAssertion],
+    lease: &EntityPrefixSetLease,
+) -> Result<(), StoreError> {
+    validate_entity_prefix_set_lease_shape(database_id, lease)?;
+    let invalid_scope = lease.kind != kind
+        || saves
+            .iter()
+            .any(|operation| !operation.id.starts_with(&lease.prefix))
+        || deletes
+            .iter()
+            .any(|operation| !operation.id.starts_with(&lease.prefix))
+        || assertions
+            .iter()
+            .any(|operation| !operation.id.starts_with(&lease.prefix));
+    if invalid_scope {
+        return Err(StoreError::InvalidEntityPrefixLease);
+    }
+    Ok(())
+}
+
+fn validate_entity_prefix_set_lease_shape(
+    database_id: &[u8; DATABASE_ID_BYTES],
+    lease: &EntityPrefixSetLease,
+) -> Result<(), StoreError> {
+    let invalid_shape = lease.database_id != *database_id
+        || lease.limit == 0
+        || lease.limit > MAX_ENTITY_LIST_RESULTS
+        || lease.metadata.len() > lease.limit
+        || lease.encrypted_value_fingerprints.len() != lease.metadata.len()
+        || validate_id(&lease.prefix).is_err()
+        || lease
+            .metadata
+            .iter()
+            .any(|entry| entry.kind != lease.kind || !entry.id.starts_with(&lease.prefix))
+        || lease
+            .metadata
+            .windows(2)
+            .any(|entries| entries[0].id >= entries[1].id);
+    if invalid_shape {
+        return Err(StoreError::InvalidEntityPrefixLease);
+    }
+    Ok(())
+}
+
+fn assert_entity_prefix_set_lease(
+    transaction: &rusqlite::Transaction<'_>,
+    lease: &EntityPrefixSetLease,
+) -> Result<(), StoreError> {
+    let current = load_entity_prefix_set_lease_projection(
+        transaction,
+        lease.kind,
+        &lease.prefix,
+        lease.limit,
+    );
+    match current {
+        Ok((metadata, encrypted_value_fingerprints))
+            if metadata.as_slice() == lease.metadata.as_slice()
+                && encrypted_value_fingerprints.as_slice()
+                    == lease.encrypted_value_fingerprints.as_slice() =>
+        {
+            Ok(())
+        }
+        Ok(_) | Err(StoreError::ListCapacity) => Err(StoreError::StaleEntitySet),
+        Err(error) => Err(error),
+    }
 }
 
 fn authenticated_pending_approval(
@@ -2855,6 +3463,27 @@ fn authenticate_entity_batch(
         }
     }
     Ok(encrypted_saves)
+}
+
+fn authenticate_entity_revision_assertions(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    kind: EntityKind,
+    assertions: &[EntityRevisionAssertion],
+) -> Result<(), StoreError> {
+    for assertion in assertions {
+        let actual =
+            authenticated_entity_revision(transaction, key, database_id, kind, &assertion.id)?
+                .unwrap_or(0);
+        if actual != assertion.expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: assertion.expected_revision,
+                actual,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn write_entity_batch_in_transaction(
@@ -3839,9 +4468,7 @@ fn decrypt_record(
     id: &[u8],
     envelope: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, StoreError> {
-    if envelope.len() <= NONCE_BYTES || envelope.len() > MAX_SECRET_BYTES + NONCE_BYTES + 16 {
-        return Err(StoreError::Encryption);
-    }
+    validate_encrypted_record_length(envelope.len())?;
     let (nonce, ciphertext) = envelope.split_at(NONCE_BYTES);
     let aad = record_aad(database_id, kind, id)?;
     let cipher = XChaCha20Poly1305::new(key.into());
@@ -3855,6 +4482,13 @@ fn decrypt_record(
         )
         .map(Zeroizing::new)
         .map_err(|_| StoreError::Encryption)
+}
+
+fn validate_encrypted_record_length(length: usize) -> Result<(), StoreError> {
+    if length <= NONCE_BYTES || length > MAX_ENCRYPTED_RECORD_BYTES {
+        return Err(StoreError::Encryption);
+    }
+    Ok(())
 }
 
 fn record_aad(
@@ -4073,6 +4707,10 @@ pub enum StoreError {
     NewerSchema(u32),
     #[error("stale workflow revision: expected {expected}, actual {actual}")]
     StaleRevision { expected: u64, actual: u64 },
+    #[error("encrypted entity prefix set changed since its coherent snapshot")]
+    StaleEntitySet,
+    #[error("entity prefix-set lease does not match this database, kind, prefix, or batch")]
+    InvalidEntityPrefixLease,
     #[error("workflow revision overflow")]
     RevisionOverflow,
     #[error("request nonce has already been consumed")]
@@ -5292,6 +5930,892 @@ mod tests {
             .expect("relocate ciphertext");
         assert!(matches!(
             store.bitcoin_utxo::<serde_json::Value>(&[5_u8; 36]),
+            Err(StoreError::Encryption)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entity_read_snapshot_remains_coherent_across_another_connection_commit() {
+        const PASSPHRASE: &str = "coherent entity snapshot";
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("coherent-entity-snapshot.sqlite3");
+        let id = b"snapshot/row".to_vec();
+        let prefix = b"snapshot/";
+        let mut writer = WalletStore::create_with_kdf(&database, PASSPHRASE, KdfConfig::testing())
+            .expect("writer store");
+        writer
+            .save_denuo_board_object(&id, 0, &json!({"generation": 1}), 10)
+            .expect("initial row");
+        let mut reader = WalletStore::open(&database).expect("reader store");
+        reader.unlock(PASSPHRASE).expect("unlock reader");
+
+        reader
+            .try_with_entity_read_snapshot(|snapshot| {
+                let first: StoredEntity<serde_json::Value> = snapshot
+                    .load_entity(EntityKind::DenuoBoardObject, &id)?
+                    .expect("first snapshot row");
+                assert_eq!(first.revision, 1);
+                assert_eq!(first.value, json!({"generation": 1}));
+
+                writer
+                    .save_denuo_board_object(&id, 1, &json!({"generation": 2}), 11)
+                    .expect("concurrent committed row");
+
+                let second: StoredEntity<serde_json::Value> = snapshot
+                    .load_entity(EntityKind::DenuoBoardObject, &id)?
+                    .expect("second snapshot row");
+                let metadata = snapshot.list_untrusted_entity_metadata_by_id_prefix(
+                    EntityKind::DenuoBoardObject,
+                    prefix,
+                    1,
+                )?;
+                assert_eq!(second, first);
+                assert_eq!(metadata.len(), 1);
+                assert_eq!(metadata[0].revision, 1);
+                assert_eq!(metadata[0].updated_at_unix, 10);
+                Ok::<_, StoreError>(())
+            })
+            .expect("coherent snapshot");
+
+        let current: StoredEntity<serde_json::Value> = reader
+            .denuo_board_object(&id)
+            .expect("current row lookup")
+            .expect("current row");
+        assert_eq!(current.revision, 2);
+        assert_eq!(current.value, json!({"generation": 2}));
+    }
+
+    #[test]
+    fn entity_prefix_set_lease_allows_one_exact_namespace_batch() {
+        let prefix = b"lease/success/";
+        let stable_id = b"lease/success/stable".to_vec();
+        let saved_id = b"lease/success/saved".to_vec();
+        let mut store =
+            WalletStore::create_in_memory("entity prefix lease success").expect("store");
+        store
+            .save_denuo_board_object(&stable_id, 0, &json!({"stable": true}), 20)
+            .expect("stable row");
+        let lease = store
+            .try_with_entity_read_snapshot(|snapshot| {
+                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 2)
+            })
+            .expect("prefix lease");
+        assert_eq!(lease.metadata().len(), 1);
+
+        store
+            .apply_entity_batch_with_assertions_and_prefix_lease(
+                EntityKind::DenuoBoardObject,
+                &[EntityBatchSave {
+                    id: saved_id.clone(),
+                    expected_revision: 0,
+                    value: json!({"saved": true}),
+                    updated_at_unix: 21,
+                }],
+                &[],
+                &[EntityRevisionAssertion {
+                    id: stable_id.clone(),
+                    expected_revision: 1,
+                }],
+                lease,
+            )
+            .expect("lease-gated batch");
+        assert!(
+            store
+                .denuo_board_object::<serde_json::Value>(&saved_id)
+                .expect("saved lookup")
+                .is_some()
+        );
+        assert_eq!(
+            store
+                .denuo_board_object::<serde_json::Value>(&stable_id)
+                .expect("stable lookup")
+                .expect("stable row")
+                .revision,
+            1
+        );
+    }
+
+    #[test]
+    fn entity_prefix_set_lease_rejects_ciphertext_aba_and_rolls_back_batch() {
+        let prefix = b"lease/aba/";
+        let substituted_id = b"lease/aba/substituted".to_vec();
+        let retained_id = b"lease/aba/retained".to_vec();
+        let planned_id = b"lease/aba/planned".to_vec();
+        let mut store = WalletStore::create_in_memory("entity prefix lease aba").expect("store");
+        store
+            .save_denuo_board_object(&substituted_id, 0, &json!({"value": "original"}), 50)
+            .expect("original row");
+        store
+            .save_denuo_board_object(&retained_id, 0, &json!({"retained": true}), 51)
+            .expect("retained row");
+
+        let lease = store
+            .try_with_entity_read_snapshot(|snapshot| {
+                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 3)
+            })
+            .expect("prefix lease");
+        let leased_metadata = lease.metadata().to_vec();
+
+        assert!(
+            store
+                .delete_denuo_board_object(&substituted_id, 1)
+                .expect("delete original row")
+        );
+        assert_eq!(
+            store
+                .save_denuo_board_object(&substituted_id, 0, &json!({"value": "substituted"}), 50,)
+                .expect("recreate substituted row"),
+            1
+        );
+        assert_eq!(
+            store
+                .list_untrusted_entity_metadata_by_id_prefix(
+                    EntityKind::DenuoBoardObject,
+                    prefix,
+                    3,
+                )
+                .expect("current metadata"),
+            leased_metadata,
+            "the ABA must restore the exact public lease metadata"
+        );
+
+        assert!(matches!(
+            store.apply_entity_batch_with_assertions_and_prefix_lease(
+                EntityKind::DenuoBoardObject,
+                &[EntityBatchSave {
+                    id: planned_id.clone(),
+                    expected_revision: 0,
+                    value: json!({"must_not_commit": true}),
+                    updated_at_unix: 52,
+                }],
+                &[EntityBatchDelete {
+                    id: retained_id.clone(),
+                    expected_revision: 1,
+                }],
+                &[EntityRevisionAssertion {
+                    id: substituted_id.clone(),
+                    expected_revision: 1,
+                }],
+                lease,
+            ),
+            Err(StoreError::StaleEntitySet)
+        ));
+        assert!(
+            store
+                .denuo_board_object::<serde_json::Value>(&planned_id)
+                .expect("rolled-back save lookup")
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .denuo_board_object::<serde_json::Value>(&retained_id)
+                .expect("rolled-back delete lookup")
+                .expect("retained row")
+                .value,
+            json!({"retained": true})
+        );
+        let substituted: StoredEntity<serde_json::Value> = store
+            .denuo_board_object(&substituted_id)
+            .expect("substituted row lookup")
+            .expect("substituted row");
+        assert_eq!(substituted.revision, 1);
+        assert_eq!(substituted.updated_at_unix, 50);
+        assert_eq!(substituted.value, json!({"value": "substituted"}));
+    }
+
+    #[test]
+    fn entity_prefix_set_lease_rejects_oversized_ciphertext_before_fingerprinting() {
+        let prefix = b"lease/oversized/";
+        let id = b"lease/oversized/row".to_vec();
+        let mut store =
+            WalletStore::create_in_memory("entity prefix lease oversized").expect("store");
+        store
+            .save_denuo_board_object(&id, 0, &json!({"valid": true}), 50)
+            .expect("valid row");
+        store
+            .connection
+            .execute(
+                "UPDATE encrypted_entities
+                 SET encrypted_value=zeroblob(?1)
+                 WHERE entity_kind=?2 AND record_id=?3",
+                params![
+                    i64::try_from(MAX_ENCRYPTED_RECORD_BYTES + 1)
+                        .expect("encrypted record bound fits SQLite"),
+                    EntityKind::DenuoBoardObject.label(),
+                    &id,
+                ],
+            )
+            .expect("oversized ciphertext substitution");
+
+        assert!(matches!(
+            store.try_with_entity_read_snapshot(|snapshot| {
+                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 1)
+            }),
+            Err(StoreError::Encryption)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cross_kind_guard_lease_rejects_account_aba_and_insertions() {
+        const PASSPHRASE: &str = "cross-kind account guard";
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("cross-kind-account-guard.sqlite3");
+        let account_prefix = b"account/";
+        let account_id = b"account/selected".to_vec();
+        let duplicate_id = b"account/duplicate".to_vec();
+        let board_prefix = b"board/";
+        let planned_id = b"board/planned".to_vec();
+        let mut writer = WalletStore::create_with_kdf(&database, PASSPHRASE, KdfConfig::testing())
+            .expect("writer store");
+        writer
+            .save_entity(
+                EntityKind::WalletAccount,
+                &account_id,
+                0,
+                &json!({"generation": 1}),
+                70,
+            )
+            .expect("initial account");
+        let mut reader = WalletStore::open(&database).expect("reader store");
+        reader.unlock(PASSPHRASE).expect("unlock reader");
+
+        let (refresh_lease, guard_lease, primary_lease) = reader
+            .try_with_entity_read_snapshot(|snapshot| {
+                Ok::<_, StoreError>((
+                    snapshot.entity_prefix_set_lease(
+                        EntityKind::WalletAccount,
+                        account_prefix,
+                        2,
+                    )?,
+                    snapshot.entity_prefix_set_lease(
+                        EntityKind::WalletAccount,
+                        account_prefix,
+                        2,
+                    )?,
+                    snapshot.entity_prefix_set_lease(
+                        EntityKind::DenuoBoardObject,
+                        board_prefix,
+                        1,
+                    )?,
+                ))
+            })
+            .expect("coherent guard leases");
+        assert!(
+            writer
+                .delete_entity(EntityKind::WalletAccount, &account_id, 1)
+                .expect("delete selected account")
+        );
+        assert_eq!(
+            writer
+                .save_entity(
+                    EntityKind::WalletAccount,
+                    &account_id,
+                    0,
+                    &json!({"generation": 2}),
+                    70,
+                )
+                .expect("recreate selected account"),
+            1
+        );
+
+        assert!(matches!(
+            reader.try_with_entity_read_snapshot(|snapshot| {
+                snapshot.refresh_entity_prefix_set_lease(refresh_lease)
+            }),
+            Err(StoreError::StaleEntitySet)
+        ));
+        assert!(matches!(
+            reader.apply_entity_batch_with_assertions_and_prefix_lease_guard(
+                EntityKind::DenuoBoardObject,
+                &[EntityBatchSave {
+                    id: planned_id.clone(),
+                    expected_revision: 0,
+                    value: json!({"must_not_commit": "aba"}),
+                    updated_at_unix: 71,
+                }],
+                &[],
+                &[],
+                primary_lease,
+                guard_lease,
+            ),
+            Err(StoreError::StaleEntitySet)
+        ));
+        assert!(
+            reader
+                .denuo_board_object::<serde_json::Value>(&planned_id)
+                .expect("ABA rollback lookup")
+                .is_none()
+        );
+
+        let (guard_lease, primary_lease) = reader
+            .try_with_entity_read_snapshot(|snapshot| {
+                Ok::<_, StoreError>((
+                    snapshot.entity_prefix_set_lease(
+                        EntityKind::WalletAccount,
+                        account_prefix,
+                        2,
+                    )?,
+                    snapshot.entity_prefix_set_lease(
+                        EntityKind::DenuoBoardObject,
+                        board_prefix,
+                        1,
+                    )?,
+                ))
+            })
+            .expect("insertion guard leases");
+        writer
+            .save_entity(
+                EntityKind::WalletAccount,
+                &duplicate_id,
+                0,
+                &json!({"duplicate": true}),
+                72,
+            )
+            .expect("insert duplicate account");
+        assert!(matches!(
+            reader.apply_entity_batch_with_assertions_and_prefix_lease_guard(
+                EntityKind::DenuoBoardObject,
+                &[EntityBatchSave {
+                    id: planned_id.clone(),
+                    expected_revision: 0,
+                    value: json!({"must_not_commit": "insertion"}),
+                    updated_at_unix: 73,
+                }],
+                &[],
+                &[],
+                primary_lease,
+                guard_lease,
+            ),
+            Err(StoreError::StaleEntitySet)
+        ));
+        assert!(
+            reader
+                .denuo_board_object::<serde_json::Value>(&planned_id)
+                .expect("insertion rollback lookup")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn entity_prefix_set_lease_rejects_insert_revision_and_capacity_races() {
+        const PASSPHRASE: &str = "entity prefix lease races";
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("entity-prefix-lease-races.sqlite3");
+        let prefix = b"lease/race/";
+        let stable_id = b"lease/race/stable".to_vec();
+        let injected_id = b"lease/race/injected".to_vec();
+        let overflow_id = b"lease/race/overflow".to_vec();
+        let planned_id = b"lease/race/planned".to_vec();
+        let mut store = WalletStore::create_with_kdf(&database, PASSPHRASE, KdfConfig::testing())
+            .expect("leased store");
+        store
+            .save_denuo_board_object(&stable_id, 0, &json!({"revision": 1}), 30)
+            .expect("stable row");
+        let mut concurrent = WalletStore::open(&database).expect("concurrent store");
+        concurrent.unlock(PASSPHRASE).expect("unlock concurrent");
+
+        let insertion_lease = store
+            .try_with_entity_read_snapshot(|snapshot| {
+                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 4)
+            })
+            .expect("insertion lease");
+        concurrent
+            .save_denuo_board_object(&injected_id, 0, &json!({"injected": true}), 31)
+            .expect("concurrent insertion");
+        assert!(matches!(
+            store.apply_entity_batch_with_assertions_and_prefix_lease(
+                EntityKind::DenuoBoardObject,
+                &[EntityBatchSave {
+                    id: planned_id.clone(),
+                    expected_revision: 0,
+                    value: json!({"must_not_commit": true}),
+                    updated_at_unix: 32,
+                }],
+                &[],
+                &[EntityRevisionAssertion {
+                    id: stable_id.clone(),
+                    expected_revision: 1,
+                }],
+                insertion_lease,
+            ),
+            Err(StoreError::StaleEntitySet)
+        ));
+        assert!(
+            store
+                .denuo_board_object::<serde_json::Value>(&planned_id)
+                .expect("rolled-back planned lookup")
+                .is_none()
+        );
+
+        let revision_lease = store
+            .try_with_entity_read_snapshot(|snapshot| {
+                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 4)
+            })
+            .expect("revision lease");
+        concurrent
+            .save_denuo_board_object(&stable_id, 1, &json!({"revision": 2}), 33)
+            .expect("concurrent revision");
+        assert!(matches!(
+            store.apply_entity_batch_with_assertions_and_prefix_lease::<serde_json::Value>(
+                EntityKind::DenuoBoardObject,
+                &[],
+                &[],
+                &[],
+                revision_lease,
+            ),
+            Err(StoreError::StaleEntitySet)
+        ));
+
+        let capacity_lease = store
+            .try_with_entity_read_snapshot(|snapshot| {
+                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 2)
+            })
+            .expect("capacity lease");
+        concurrent
+            .save_denuo_board_object(&overflow_id, 0, &json!({"overflow": true}), 34)
+            .expect("capacity-crossing insertion");
+        assert!(matches!(
+            store.apply_entity_batch_with_assertions_and_prefix_lease::<serde_json::Value>(
+                EntityKind::DenuoBoardObject,
+                &[],
+                &[],
+                &[],
+                capacity_lease,
+            ),
+            Err(StoreError::StaleEntitySet)
+        ));
+    }
+
+    #[test]
+    fn entity_prefix_set_lease_rejects_wrong_database_kind_prefix_and_capture_capacity() {
+        let prefix = b"lease/shape/";
+        let first_id = b"lease/shape/first".to_vec();
+        let second_id = b"lease/shape/second".to_vec();
+        let mut first = WalletStore::create_in_memory("entity prefix lease first").expect("first");
+        let mut second =
+            WalletStore::create_in_memory("entity prefix lease second").expect("second");
+        first
+            .save_denuo_board_object(&first_id, 0, &json!({"first": true}), 40)
+            .expect("first row");
+        first
+            .save_denuo_board_object(&second_id, 0, &json!({"second": true}), 41)
+            .expect("second row");
+
+        assert!(matches!(
+            first.try_with_entity_read_snapshot(|snapshot| {
+                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 1)
+            }),
+            Err(StoreError::ListCapacity)
+        ));
+
+        let wrong_database = first
+            .try_with_entity_read_snapshot(|snapshot| {
+                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 2)
+            })
+            .expect("wrong-database lease");
+        assert!(matches!(
+            second.apply_entity_batch_with_assertions_and_prefix_lease::<serde_json::Value>(
+                EntityKind::DenuoBoardObject,
+                &[],
+                &[],
+                &[],
+                wrong_database,
+            ),
+            Err(StoreError::InvalidEntityPrefixLease)
+        ));
+
+        let wrong_kind = first
+            .try_with_entity_read_snapshot(|snapshot| {
+                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 2)
+            })
+            .expect("wrong-kind lease");
+        assert!(matches!(
+            first.apply_entity_batch_with_assertions_and_prefix_lease::<serde_json::Value>(
+                EntityKind::HnsUtxo,
+                &[],
+                &[],
+                &[],
+                wrong_kind,
+            ),
+            Err(StoreError::InvalidEntityPrefixLease)
+        ));
+
+        let wrong_prefix = first
+            .try_with_entity_read_snapshot(|snapshot| {
+                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 2)
+            })
+            .expect("wrong-prefix lease");
+        assert!(matches!(
+            first.apply_entity_batch_with_assertions_and_prefix_lease(
+                EntityKind::DenuoBoardObject,
+                &[EntityBatchSave {
+                    id: b"outside/leased/prefix".to_vec(),
+                    expected_revision: 0,
+                    value: json!({"outside": true}),
+                    updated_at_unix: 42,
+                }],
+                &[],
+                &[],
+                wrong_prefix,
+            ),
+            Err(StoreError::InvalidEntityPrefixLease)
+        ));
+    }
+
+    #[test]
+    fn entity_revision_assertion_succeeds_without_mutating_asserted_entity() {
+        let mut store = WalletStore::create_in_memory("entity assertion success").expect("store");
+        let asserted_id = b"assertion/unchanged".to_vec();
+        let deleted_id = b"assertion/deleted".to_vec();
+        let saved_id = b"assertion/saved".to_vec();
+        store
+            .save_denuo_board_object(&asserted_id, 0, &json!({"stable": true}), 11)
+            .expect("asserted fixture");
+        store
+            .save_denuo_board_object(&deleted_id, 0, &json!({"delete": true}), 12)
+            .expect("delete fixture");
+        let before: StoredEntity<serde_json::Value> = store
+            .denuo_board_object(&asserted_id)
+            .expect("read asserted fixture")
+            .expect("asserted fixture present");
+
+        store
+            .apply_entity_batch_with_assertions(
+                EntityKind::DenuoBoardObject,
+                &[EntityBatchSave {
+                    id: saved_id.clone(),
+                    expected_revision: 0,
+                    value: json!({"saved": true}),
+                    updated_at_unix: 13,
+                }],
+                &[EntityBatchDelete {
+                    id: deleted_id.clone(),
+                    expected_revision: 1,
+                }],
+                &[EntityRevisionAssertion {
+                    id: asserted_id.clone(),
+                    expected_revision: 1,
+                }],
+            )
+            .expect("assertion-gated batch");
+
+        let after: StoredEntity<serde_json::Value> = store
+            .denuo_board_object(&asserted_id)
+            .expect("read asserted entity")
+            .expect("asserted entity present");
+        assert_eq!(after, before);
+        assert!(
+            store
+                .denuo_board_object::<serde_json::Value>(&saved_id)
+                .expect("read saved entity")
+                .is_some()
+        );
+        assert!(
+            store
+                .denuo_board_object::<serde_json::Value>(&deleted_id)
+                .expect("read deleted entity")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn entity_revision_assertion_failures_roll_back_every_write_and_delete() {
+        for case in ["stale", "missing", "tampered"] {
+            let mut store =
+                WalletStore::create_in_memory(&format!("entity assertion {case}")).expect("store");
+            let asserted_id = b"assertion/current".to_vec();
+            let deleted_id = b"assertion/retained".to_vec();
+            let saved_id = b"assertion/not-written".to_vec();
+            store
+                .save_denuo_board_object(&asserted_id, 0, &json!({"current": true}), 20)
+                .expect("asserted fixture");
+            store
+                .save_denuo_board_object(&deleted_id, 0, &json!({"retained": true}), 21)
+                .expect("delete fixture");
+
+            let assertion = match case {
+                "stale" => EntityRevisionAssertion {
+                    id: asserted_id.clone(),
+                    expected_revision: 2,
+                },
+                "missing" => EntityRevisionAssertion {
+                    id: b"assertion/missing".to_vec(),
+                    expected_revision: 1,
+                },
+                "tampered" => {
+                    let mut ciphertext: Vec<u8> = store
+                        .connection
+                        .query_row(
+                            "SELECT encrypted_value FROM encrypted_entities
+                             WHERE entity_kind=?1 AND record_id=?2",
+                            params![EntityKind::DenuoBoardObject.label(), &asserted_id],
+                            |row| row.get(0),
+                        )
+                        .expect("asserted ciphertext");
+                    ciphertext[0] ^= 0x80;
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE encrypted_entities SET encrypted_value=?1
+                             WHERE entity_kind=?2 AND record_id=?3",
+                            params![
+                                ciphertext,
+                                EntityKind::DenuoBoardObject.label(),
+                                &asserted_id
+                            ],
+                        )
+                        .expect("tamper asserted ciphertext");
+                    EntityRevisionAssertion {
+                        id: asserted_id.clone(),
+                        expected_revision: 1,
+                    }
+                }
+                _ => unreachable!(),
+            };
+            let result = store.apply_entity_batch_with_assertions(
+                EntityKind::DenuoBoardObject,
+                &[EntityBatchSave {
+                    id: saved_id.clone(),
+                    expected_revision: 0,
+                    value: json!({"must_not_commit": true}),
+                    updated_at_unix: 22,
+                }],
+                &[EntityBatchDelete {
+                    id: deleted_id.clone(),
+                    expected_revision: 1,
+                }],
+                &[assertion],
+            );
+            match case {
+                "stale" | "missing" => {
+                    assert!(matches!(result, Err(StoreError::StaleRevision { .. })))
+                }
+                "tampered" => assert!(matches!(result, Err(StoreError::Encryption))),
+                _ => unreachable!(),
+            }
+            assert!(
+                store
+                    .denuo_board_object::<serde_json::Value>(&saved_id)
+                    .expect("read rolled-back save")
+                    .is_none()
+            );
+            assert_eq!(
+                store
+                    .denuo_board_object::<serde_json::Value>(&deleted_id)
+                    .expect("read rolled-back delete")
+                    .expect("delete rolled back")
+                    .value,
+                json!({"retained": true})
+            );
+        }
+    }
+
+    #[test]
+    fn entity_revision_assertions_reject_zero_duplicate_and_cross_operation_ids() {
+        let mut store = WalletStore::create_in_memory("entity assertion shape").expect("store");
+        let id = b"assertion/overlap".to_vec();
+        store
+            .save_denuo_board_object(&id, 0, &json!({"present": true}), 30)
+            .expect("fixture");
+
+        assert!(matches!(
+            store.apply_entity_batch_with_assertions::<serde_json::Value>(
+                EntityKind::DenuoBoardObject,
+                &[],
+                &[],
+                &[EntityRevisionAssertion {
+                    id: id.clone(),
+                    expected_revision: 0,
+                }],
+            ),
+            Err(StoreError::InvalidRevision)
+        ));
+        assert!(matches!(
+            store.apply_entity_batch_with_assertions::<serde_json::Value>(
+                EntityKind::DenuoBoardObject,
+                &[],
+                &[],
+                &[
+                    EntityRevisionAssertion {
+                        id: id.clone(),
+                        expected_revision: 1,
+                    },
+                    EntityRevisionAssertion {
+                        id: id.clone(),
+                        expected_revision: 1,
+                    },
+                ],
+            ),
+            Err(StoreError::DuplicateBatchEntity)
+        ));
+        assert!(matches!(
+            store.apply_entity_batch_with_assertions(
+                EntityKind::DenuoBoardObject,
+                &[EntityBatchSave {
+                    id: id.clone(),
+                    expected_revision: 1,
+                    value: json!({"changed": true}),
+                    updated_at_unix: 31,
+                }],
+                &[],
+                &[EntityRevisionAssertion {
+                    id: id.clone(),
+                    expected_revision: 1,
+                }],
+            ),
+            Err(StoreError::DuplicateBatchEntity)
+        ));
+        assert!(matches!(
+            store.apply_entity_batch_with_assertions(
+                EntityKind::DenuoBoardObject,
+                &[EntityBatchSave {
+                    id: id.clone(),
+                    expected_revision: 1,
+                    value: json!({"changed": true}),
+                    updated_at_unix: 31,
+                }],
+                &[EntityBatchDelete {
+                    id: id.clone(),
+                    expected_revision: 1,
+                }],
+                &[],
+            ),
+            Err(StoreError::DuplicateBatchEntity)
+        ));
+        assert!(matches!(
+            store.apply_entity_batch_with_assertions::<serde_json::Value>(
+                EntityKind::DenuoBoardObject,
+                &[],
+                &[EntityBatchDelete {
+                    id: id.clone(),
+                    expected_revision: 1,
+                }],
+                &[EntityRevisionAssertion {
+                    id,
+                    expected_revision: 1,
+                }],
+            ),
+            Err(StoreError::DuplicateBatchEntity)
+        ));
+    }
+
+    #[test]
+    fn entity_revision_assertion_capacity_counts_every_operation_class() {
+        let saves = vec![EntityBatchSave {
+            id: b"capacity/save".to_vec(),
+            expected_revision: 0,
+            value: (),
+            updated_at_unix: 1,
+        }];
+        let deletes = vec![EntityBatchDelete {
+            id: b"capacity/delete".to_vec(),
+            expected_revision: 1,
+        }];
+        let assertions = (0..MAX_ENTITY_BATCH_OPERATIONS - 2)
+            .map(|index| {
+                let mut id = b"capacity/assert/".to_vec();
+                id.extend_from_slice(&index.to_be_bytes());
+                EntityRevisionAssertion {
+                    id,
+                    expected_revision: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_entity_revision_assertions(&saves, &deletes, &assertions).is_ok());
+        let mut over_capacity = assertions;
+        over_capacity.push(EntityRevisionAssertion {
+            id: b"capacity/one-too-many".to_vec(),
+            expected_revision: 1,
+        });
+        assert!(matches!(
+            validate_entity_revision_assertions(&saves, &deletes, &over_capacity),
+            Err(StoreError::BatchCapacity)
+        ));
+    }
+
+    #[test]
+    fn untrusted_prefix_metadata_is_bounded_sorted_locked_and_never_authority() {
+        let prefix = b"metadata/binary/\0";
+        let mut store = WalletStore::create_in_memory("metadata projection").expect("store");
+        let mut ids = [vec![0xff], vec![0x00, 0xff], vec![0x7f]].map(|suffix| {
+            let mut id = prefix.to_vec();
+            id.extend_from_slice(&suffix);
+            id
+        });
+        for (updated_at_unix, id) in ids.iter().rev().enumerate() {
+            store
+                .save_denuo_board_object(
+                    id,
+                    0,
+                    &json!({"order": updated_at_unix}),
+                    u64::try_from(updated_at_unix + 1).expect("bounded timestamp"),
+                )
+                .expect("metadata fixture");
+        }
+        ids.sort();
+        let metadata = store
+            .list_untrusted_entity_metadata_by_id_prefix(
+                EntityKind::DenuoBoardObject,
+                prefix,
+                ids.len(),
+            )
+            .expect("complete metadata");
+        assert_eq!(
+            metadata.iter().map(|entry| &entry.id).collect::<Vec<_>>(),
+            ids.iter().collect::<Vec<_>>()
+        );
+        assert!(metadata.iter().all(|entry| entry.revision == 1));
+        assert!(matches!(
+            store.list_untrusted_entity_metadata_by_id_prefix(
+                EntityKind::DenuoBoardObject,
+                prefix,
+                ids.len() - 1,
+            ),
+            Err(StoreError::ListCapacity)
+        ));
+        store.lock();
+        assert!(matches!(
+            store.list_untrusted_entity_metadata_by_id_prefix(
+                EntityKind::DenuoBoardObject,
+                prefix,
+                ids.len(),
+            ),
+            Err(StoreError::Locked)
+        ));
+
+        let mut tampered =
+            WalletStore::create_in_memory("metadata is not authority").expect("store");
+        let tampered_id = b"metadata/tampered/row".to_vec();
+        tampered
+            .save_denuo_board_object(&tampered_id, 0, &json!({"authentic": true}), 41)
+            .expect("tamper fixture");
+        tampered
+            .connection
+            .execute(
+                "UPDATE encrypted_entities
+                 SET revision=0, encrypted_value=?1
+                 WHERE entity_kind=?2 AND record_id=?3",
+                params![
+                    vec![0x42_u8; NONCE_BYTES + TAG_BYTES + 1],
+                    EntityKind::DenuoBoardObject.label(),
+                    &tampered_id
+                ],
+            )
+            .expect("malformed untrusted row");
+        let projected = tampered
+            .list_untrusted_entity_metadata_by_id_prefix(
+                EntityKind::DenuoBoardObject,
+                b"metadata/tampered/",
+                1,
+            )
+            .expect("untrusted metadata remains enumerable");
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].revision, 0);
+        assert!(matches!(
+            tampered.denuo_board_object::<serde_json::Value>(&tampered_id),
             Err(StoreError::Encryption)
         ));
     }

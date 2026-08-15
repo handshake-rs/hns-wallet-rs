@@ -7,11 +7,15 @@ use hns_wallet_hns::{
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::ObjectHash;
 
+use crate::board::{
+    load_name_market_board_offers, load_name_market_board_offers_from_snapshot,
+    load_name_market_board_state_from_snapshot, save_loaded_name_market_board_with_guard,
+};
 use crate::{
     AuthenticatedFixedPriceListing, BoardOfferStatus, ShakedexError, VerifiedFixedPriceListing,
     authenticate_fixed_price_listing, decode_denuo_authenticated_cancellation,
-    decode_denuo_authenticated_offer, load_name_market_board, save_name_market_board,
-    verify_authenticated_fixed_price_listing, verify_authenticated_listing_cancellation,
+    decode_denuo_authenticated_offer, verify_authenticated_fixed_price_listing,
+    verify_authenticated_listing_cancellation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,30 +239,42 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
         self.require_store_authority()?;
         let (request_id, authenticated) =
             decode_denuo_authenticated_offer(envelope, DenuoRegistryVersion::V2, expected_hash)?;
-        let (listing, _current_lock) = self.bind_current_listing(authenticated)?;
+        let (listing, current_lock) = self.bind_current_listing(authenticated)?;
         let listing_hash = listing.listing_hash();
         let network = listing.network();
         let name_hash = listing.name_hash()?;
         let seller_public_key = listing.seller_public_key().to_vec();
         let updated_at_unix = listing.verified_at_unix();
 
-        self.store.try_with_store_mut(|store| {
-            let mut stored = load_name_market_board(store)?;
-            let replaced_identity = stored.board.offers().iter().any(|offer| {
+        self.store.try_with_store_mut(move |store| {
+            let (current_lock, loaded) = store.try_with_entity_read_snapshot(|snapshot| {
+                let current_lock = current_lock.revalidate_unchanged_account(snapshot)?;
+                let loaded = load_name_market_board_state_from_snapshot(snapshot)?;
+                Ok::<_, ShakedexError>((current_lock, loaded))
+            })?;
+            let mut board = loaded.board.clone();
+            let replaced_identity = board.offers().iter().any(|offer| {
                 offer.network_magic == network.magic
                     && offer.network_genesis.as_bytes() == network.genesis.as_bytes()
                     && offer.name_hash == name_hash
                     && offer.seller_public_key == seller_public_key
             });
-            if !stored.board.apply_offer(&listing)? {
+            if !board.apply_offer(&listing)? {
                 return Ok(DenuoBoardOfferAdmission::Existing {
                     request_id,
                     listing_hash,
-                    revision: stored.revision,
+                    revision: loaded.logical_revision,
                 });
             }
-            let revision =
-                save_name_market_board(store, stored.revision, &stored.board, updated_at_unix)?;
+            let account_prefix_lease = current_lock.into_account_prefix_lease()?;
+            let revision = save_loaded_name_market_board_with_guard(
+                store,
+                loaded.logical_revision,
+                &board,
+                updated_at_unix,
+                loaded,
+                account_prefix_lease,
+            )?;
             if replaced_identity {
                 Ok(DenuoBoardOfferAdmission::Updated {
                     request_id,
@@ -300,10 +316,13 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
         let context = self.hns.observe_board_cancellation_context()?;
 
         self.store.try_with_store_mut(move |store| {
-            context.verify_unchanged_account(store)?;
-            let mut stored = load_name_market_board(store)?;
-            let persisted = stored
-                .board
+            let (context, loaded) = store.try_with_entity_read_snapshot(|snapshot| {
+                let context = context.revalidate_unchanged_account(snapshot)?;
+                let loaded = load_name_market_board_state_from_snapshot(snapshot)?;
+                Ok::<_, ShakedexError>((context, loaded))
+            })?;
+            let mut board = loaded.board.clone();
+            let persisted = board
                 .offer(expected_listing_hash)
                 .cloned()
                 .ok_or(ShakedexError::InvalidCancellation)?;
@@ -322,7 +341,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                     request_id,
                     listing_hash: expected_listing_hash,
                     cancellation_hash: expected_cancellation_hash,
-                    revision: stored.revision,
+                    revision: loaded.logical_revision,
                 });
             }
 
@@ -332,19 +351,23 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                 context.network(),
                 context.observed_at_unix(),
             )?;
-            if !stored.board.apply_cancellation(&cancellation)? {
+            if !board.apply_cancellation(&cancellation)? {
                 return Ok(DenuoBoardCancellationAdmission::Existing {
                     request_id,
                     listing_hash: expected_listing_hash,
                     cancellation_hash: expected_cancellation_hash,
-                    revision: stored.revision,
+                    revision: loaded.logical_revision,
                 });
             }
-            let revision = save_name_market_board(
+            let observed_at_unix = context.observed_at_unix();
+            let account_prefix_lease = context.into_account_prefix_lease();
+            let revision = save_loaded_name_market_board_with_guard(
                 store,
-                stored.revision,
-                &stored.board,
-                context.observed_at_unix(),
+                loaded.logical_revision,
+                &board,
+                observed_at_unix,
+                loaded,
+                account_prefix_lease,
             )?;
             Ok(DenuoBoardCancellationAdmission::Applied {
                 request_id,
@@ -364,8 +387,9 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
     ) -> Result<Option<CurrentDenuoBoardOffer>, ShakedexError> {
         self.require_store_authority()?;
         let (board_revision, persisted) = self.store.try_with_store(|store| {
-            let stored = load_name_market_board(store)?;
-            Ok::<_, ShakedexError>((stored.revision, stored.board.offer(listing_hash).cloned()))
+            let mut stored = load_name_market_board_offers(store, &[listing_hash])?;
+            let persisted = stored.offers.pop().flatten();
+            Ok::<_, ShakedexError>((stored.revision, persisted))
         })?;
         let Some(persisted) = persisted else {
             return Ok(None);
@@ -379,14 +403,19 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
         )?;
         let (listing, current_lock) = self.bind_current_listing(authenticated)?;
 
-        self.store.try_with_store(|store| {
-            let current = load_name_market_board(store)?;
-            if current.revision != board_revision
-                || current.board.offer(listing_hash) != Some(&persisted)
-            {
-                return Err(ShakedexError::StaleRevision);
-            }
-            Ok(())
+        let current_lock = self.store.try_with_store(|store| {
+            store.try_with_entity_read_snapshot(|snapshot| {
+                let current_lock = current_lock.revalidate_unchanged_account(snapshot)?;
+                let current =
+                    load_name_market_board_offers_from_snapshot(snapshot, &[listing_hash])?;
+                if current.revision != board_revision
+                    || current.offers.len() != 1
+                    || current.offers[0].as_ref() != Some(&persisted)
+                {
+                    return Err(ShakedexError::StaleRevision);
+                }
+                Ok::<_, ShakedexError>(current_lock)
+            })
         })?;
         Ok(Some(CurrentDenuoBoardOffer {
             board_revision,
@@ -404,25 +433,27 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
     pub(crate) fn current_inventory(&self) -> Result<CurrentDenuoBoardInventory, ShakedexError> {
         self.require_store_authority()?;
         let context = self.hns.observe_board_context()?;
-        let (board_revision, listing_hashes) = self.store.try_with_store(|store| {
-            context.verify_unchanged_account(store)?;
-            let stored = load_name_market_board(store)?;
-            let network = context.network();
-            let now_unix = context.observed_at_unix();
-            let listing_hashes = stored
-                .board
-                .offers()
-                .iter()
-                .filter(|offer| {
-                    offer.network_magic == network.magic
-                        && offer.network_genesis.as_bytes() == network.genesis.as_bytes()
-                        && offer.status == BoardOfferStatus::Active
-                        && offer.created_at_unix <= now_unix
-                        && now_unix < offer.expires_at_unix
-                })
-                .map(|offer| offer.listing_hash)
-                .collect();
-            Ok::<_, ShakedexError>((stored.revision, listing_hashes))
+        let (context, board_revision, listing_hashes) = self.store.try_with_store(|store| {
+            store.try_with_entity_read_snapshot(|snapshot| {
+                let context = context.revalidate_unchanged_account(snapshot)?;
+                let stored = load_name_market_board_state_from_snapshot(snapshot)?;
+                let network = context.network();
+                let now_unix = context.observed_at_unix();
+                let listing_hashes = stored
+                    .board
+                    .offers()
+                    .iter()
+                    .filter(|offer| {
+                        offer.network_magic == network.magic
+                            && offer.network_genesis.as_bytes() == network.genesis.as_bytes()
+                            && offer.status == BoardOfferStatus::Active
+                            && offer.created_at_unix <= now_unix
+                            && now_unix < offer.expires_at_unix
+                    })
+                    .map(|offer| offer.listing_hash)
+                    .collect();
+                Ok::<_, ShakedexError>((context, stored.logical_revision, listing_hashes))
+            })
         })?;
         Ok(CurrentDenuoBoardInventory {
             board_revision,
@@ -451,12 +482,8 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
         validate_current_offer_request_hashes(listing_hashes)?;
         self.require_store_authority()?;
         let (board_revision, requested_rows) = self.store.try_with_store(|store| {
-            let stored = load_name_market_board(store)?;
-            let rows = listing_hashes
-                .iter()
-                .map(|listing_hash| stored.board.offer(*listing_hash).cloned())
-                .collect::<Vec<_>>();
-            Ok::<_, ShakedexError>((stored.revision, rows))
+            let stored = load_name_market_board_offers(store, listing_hashes)?;
+            Ok::<_, ShakedexError>((stored.revision, stored.offers))
         })?;
 
         let mut authenticated = Vec::with_capacity(requested_rows.len());
@@ -512,20 +539,16 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
             listings.push(listing);
         }
 
-        self.store.try_with_store(|store| {
-            current_locks.verify_unchanged_account(store)?;
-            let current = load_name_market_board(store)?;
-            if current.revision != board_revision
-                || listing_hashes
-                    .iter()
-                    .zip(&requested_rows)
-                    .any(|(listing_hash, expected)| {
-                        current.board.offer(*listing_hash) != expected.as_ref()
-                    })
-            {
-                return Err(ShakedexError::StaleRevision);
-            }
-            Ok(())
+        let current_locks = self.store.try_with_store(|store| {
+            store.try_with_entity_read_snapshot(|snapshot| {
+                let current_locks = current_locks.revalidate_unchanged_account(snapshot)?;
+                let current =
+                    load_name_market_board_offers_from_snapshot(snapshot, listing_hashes)?;
+                if current.revision != board_revision || current.offers != requested_rows {
+                    return Err(ShakedexError::StaleRevision);
+                }
+                Ok::<_, ShakedexError>(current_locks)
+            })
         })?;
 
         Ok(CurrentDenuoBoardOffersResolution::Current(Box::new(

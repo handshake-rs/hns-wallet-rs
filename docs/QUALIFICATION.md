@@ -27,7 +27,7 @@ and
 That baseline predates the final mobile script-free binding order and is retained
 only as historical evidence.
 
-Exact current implementation source
+Exact historical qualified implementation source
 `bc5901f794450d29fa9f5630bab4fbf91e37bedf` passed complete locked
 [`CI` run `31812028843`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31812028843),
 including Wallet qualification and RustSec, and
@@ -58,14 +58,14 @@ release preflight is recorded for this wallet source.
 | --- | --- | --- | --- | --- |
 | Types and chain traits | complete locked workspace CI passed at `2229be8` | n/a | no product dependency | exact source recorded; API review remains |
 | Encrypted store/schema v3 | exact `2229be8` CI passed, including atomic bootstrap, rollback, migrations, encrypted CRUD/CAS, and Unix filesystem regressions | source reopen/restart tests; no installed Android/iOS secure-store runtime evidence in this package boundary | downstream mobile candidate source contains Keystore/Keychain wrapping, but device filesystem/runtime qualification remains external | platform qualification pending |
-| HNS wallet and names | exact current `bc5901f` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, dedicated name targets, trusted exact-text import, name workflows, and fail-closed value gates | source restart/reorg paths; no multi-process regtest | wallet RPC source pairs with node `2b267ffe`; selected qualified node main `2712d1d` contains that API; current protocol source pins exact `hns-rs` `0.3.0` revision `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e` | HNS funding, value, and fee gates remain `false` |
+| HNS wallet and names | exact historical `bc5901f` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, dedicated name targets, trusted exact-text import, name workflows, and fail-closed value gates | source restart/reorg paths; no multi-process regtest | wallet RPC source pairs with node `2b267ffe`; selected qualified node main `2712d1d` contains that API; current protocol source pins exact `hns-rs` `0.3.0` revision `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e` | HNS funding, value, and fee gates remain `false` |
 | Provider core | exact `2229be8` CI passed, including account binding, scoped reads, exact Names consent, and unavailable-method ordering | grants persist; pending approval/UI authority remains process-local | no installed-browser wallet consent or backend E2E | browser and value exposure unavailable |
 | Fixed-price Shakedex | exact `2229be8` CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Denuo, provider, trusted UI, or product coin selection | every Shakedex and dependent HNS value gate remains `false` |
 | Market sessions | exact `2229be8` workspace CI passed | CAS journal source; recovery evidence incomplete | no pair E2E, rendezvous, or relay transport | unavailable |
 | Bitcoin Kyoto | exact `2229be8` CI passed, including encrypted BDK persistence, allocation regressions, and the ahead-tip crash edge | exact source restart resume; no multi-process rollback run | no regtest/P2P/broadcast run | send and settlement hard-disabled; normalized or chunked backend pending |
 | Ethereum | exact `2229be8` CI and deterministic contract check passed | offline derivation and dormant primitives only | no embedded Helios/local-chain run; no contract audit | synchronization, history, send, signing, settlement, and mainnet unavailable |
 | ABI, service, and host | exact `2229be8` CI passed, including canonical framed projections, approval-v3, session handling, and host retention | private process session/authority state; no installed restart E2E | downstream browser/future-mobile-provider adoption and rendering pending; trusted-native reads are a separate non-provider surface | private control only; browser/value unavailable |
-| Mobile controller | exact current `bc5901f` CI passed the lifecycle, synchronized-read, same-authority, fresh-read, script-free snapshot, zero-script-query wrong-network, trusted import, and failure-lock/retry regressions | atomic seed/account bootstrap and source reopen coverage; installed platform restart remains downstream | downstream Android/iOS 0.5.9 candidate source still requires exact import-binding/UI adoption; no archive-capable production device wallet-index backend, installed-device synchronization, resource benchmark, or production network qualification; the loopback adapter is not device transport | `bc5901f` supplies only the library projection; no device import UI is qualified, product backend availability remains false, and provider/value/HNSA/HNSR/settlement/market remain unavailable |
+| Mobile controller | exact historical `bc5901f` CI passed the lifecycle, synchronized-read, same-authority, fresh-read, script-free snapshot, zero-script-query wrong-network, trusted import, and failure-lock/retry regressions | atomic seed/account bootstrap and source reopen coverage; installed platform restart remains downstream | downstream Android/iOS 0.5.9 candidate source still requires exact import-binding/UI adoption; no archive-capable production device wallet-index backend, installed-device synchronization, resource benchmark, or production network qualification; the loopback adapter is not device transport | `bc5901f` supplies only the library projection; no device import UI is qualified, product backend availability remains false, and provider/value/HNSA/HNSR/settlement/market remain unavailable |
 | Browser products | separate repositories | platform integration pending | no installed/signed E2E | unavailable |
 
 The later native-HNS-read profile/bootstrap tranche adds local source regressions
@@ -108,7 +108,7 @@ publisher files absent; focused warning-denied Clippy and rustdoc also passed.
 That evidence covers canonical endpoint signatures, exact receipt replay and
 conflict, schema-v1/v2 migration denial, and restart self-validation only. It
 was not hosted CI or CodeQL at that intermediate commit; the code is included
-in exact descendant `bc5901f`, whose current CI and CodeQL passed. Neither
+in exact descendant `bc5901f`, whose qualified CI and CodeQL passed. Neither
 record supplies live relay/HRM/HNSA authority, board currentness,
 installed-product, or value-gate qualification.
 
@@ -174,6 +174,38 @@ requested/returned counts. Exact source
 `31837067925`, including Wallet qualification and RustSec, and four-language
 CodeQL `31837067848`. This supplies no transport, provider, publication,
 signing, or value qualification.
+
+The settled normalized-board persistence and query-scale working-tree tranche
+contains focused source regressions for coherent read snapshots; bounded,
+sorted, never-authoritative prefix metadata; ciphertext-fingerprinted lease
+refresh; exact-prefix-set insertion, revision, capacity, and same-metadata ABA
+races; cross-kind guard rollback; compare-only assertions; and invalid assertion
+or lease shape. Board regressions cover compact `HeadV2Indexed` selectors that
+bind row identity/revision/time/value commitment/listing hash, exact derived
+listing-index ID sets, all-hit targeted selection, miss-triggered full semantic
+fallback, selected-row ciphertext ABA, selector permutation/remapping,
+commitment and bijection checks, missing/extra/substituted/torn state, strict
+nested schemas, monotonic identity lineage, unchanged-row physical revision
+retention, per-record head/row bounds, a cryptographically real 32-row
+roundtrip, atomic legacy-v1 migration, and strict pre-index `HeadV2` read plus
+next-mutation migration. Runtime regressions cover selected-wallet account lease
+capture before external work, refresh in the same account-plus-board snapshot,
+the second ciphertext-fingerprinted write guard, and the read-only/non-atomic
+unchanged-account diagnostic distinction.
+
+Local final-source runs passed 38 Store library tests, 73 HNS library tests, 42
+Shakedex library tests with one ignored, and 26 Denuo board-runtime integration
+tests. The focused normalized-storage run passed 18 tests with the same one
+ignored; it is an overlapping subset/re-run, not 18 additional independent
+tests. The ignored case was then run explicitly in optimized release mode: the
+4,096-row persistence qualification passed 1/1, with 47.20s build time and
+15.92s test time.
+
+These are local working-tree results, not exact-commit hosted evidence. No
+exact-commit CI or CodeQL record, database or broader resource benchmark,
+multi-process network test, installed-product evidence, or live transport
+evidence has yet been recorded for this tranche. It changes no release gate and
+must not inherit any earlier commit's evidence.
 
 `3f52586`, `b8c430d`, `2061a27`, `9649098`, `bc5901f`, `2229be8`, and
 `ba9f013` remain exact historical green CI/CodeQL baselines.

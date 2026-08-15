@@ -61,7 +61,14 @@ independently disabled.
   NameState/action context, exact locking coin, and confirmed/mempool
   unspentness before a board CAS. Exact retries do not write. Cached active
   bytes are re-authenticated against a newly acquired lock and an unchanged
-  board row before later use. Cancellation admission instead authenticates the
+  board row before later use. Before node or clock work, the HNS runtime also
+  authenticates the complete selected-wallet `WalletAccount` prefix and captures
+  a ciphertext-fingerprinted lease. A mutation refreshes that lease in the same
+  coherent snapshot as the full board load and consumes it as a second guard in
+  the board write transaction. The public `verify_unchanged_account` helper is
+  read-only and is not atomic with a later write; mutation paths consume
+  `revalidate_unchanged_account` and the refreshed guard. Cancellation admission
+  instead authenticates the
   exact signed target/content and fences selected-account network, trusted wall
   time, the full account selection, and board CAS without consulting a node or
   requiring the target lock to remain live. That negative tombstone only
@@ -69,9 +76,36 @@ independently disabled.
   authority. This is still offline source composition: it supplies no live
   relay supervision, HRM/HNSA-currentness adapter, approval, signing,
   broadcast, quote, or product availability authority.
+- Board persistence treats SQLite identity, revision, and update-time metadata
+  as untrusted. Canonical writes use authenticated encrypted `HeadV2Indexed`,
+  digest-addressed seller/name identity rows, and encrypted digest-addressed
+  listing-hash indexes. Every compact head selector binds its row identity,
+  revision/update time, row-value commitment, and listing hash. A full load
+  captures the exact bounded namespace in one coherent snapshot, authenticates
+  every row and index, verifies the head commitments and exact index/row
+  bijection, and rejects overflow, unknown, missing, extra, torn, substituted,
+  permuted, or malformed state.
+- Indexed targeted reads always perform O(N) complete metadata and selector
+  comparison, including equality with the exact listing-index ID set derived
+  from the head. An all-hit K-hash query authenticates O(K) index/row values and
+  checks each selected row against its committed selector. Because a head-only
+  negative cannot exclude an authenticated row/selector semantic remap, any
+  missing requested index invokes the O(N) full semantic loader before absence
+  is returned. Metadata alone is never authority.
+- Mutations begin with the full board load and consume an opaque single-use
+  exact-prefix-set lease under an immediate transaction. Leases compare private
+  ciphertext fingerprints as well as metadata, so insertion, deletion,
+  revision, capacity, and same-metadata ciphertext-ABA races fail before any
+  partial write. Runtime admissions additionally consume the independently
+  captured `WalletAccount` prefix as a second cross-kind compare-only guard in
+  that transaction. A sole legacy-v1 aggregate and historical pre-index
+  `HeadV2` are strict read formats and migrate on their next successful
+  mutation. None of these cache-integrity properties supplies chain,
+  publication, quote, signing, or value authority.
 - The single-offer board-read plan accepts only canonical V2 `GetOffer` with a
   nonzero correlation ID and internally verifies the paired singular type-7
-  `Offer`; missing and cancelled rows require no node query. It retains no
+  `Offer`; missing and cancelled rows require no node query, but an indexed miss
+  first takes the full semantic board fallback. It retains no
   response bytes and exposes no listing or current-lock handle. Its private
   point-in-time evidence is returned only after runtime clock observation and
   final chain, mempool, and exact selected-account fences. It is not a lease:
@@ -81,7 +115,9 @@ independently disabled.
   nonzero correlation ID and at most 64 sorted, unique, nonzero hashes; the
   row cap is enforced before account, store, backend, or clock access. Missing
   and cancelled rows are omitted, and all-absent retains the observed board
-  revision without constructing an invalid empty response. The actual
+  revision without constructing an invalid empty response. Any missing index is
+  resolved through the full semantic fallback before that absence is accepted.
+  The actual
   nonempty type-5 payload is size-preflighted before node access, then every
   returned active row is bound to one ordered coherent HNS current-lock batch.
   Duplicate underlying names or any invalid/expired/wrong-network/stale/spent

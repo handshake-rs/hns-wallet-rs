@@ -225,6 +225,7 @@ pub struct VerifiedCurrentShakedexLock {
     descriptor: hns_swap::ShakedexLockDescriptor,
     locking_coin: Coin,
     current_state: NameState,
+    board_context: Option<VerifiedHnsBoardContext>,
 }
 
 /// Exact caller-owned input for one query-scoped Shakedex lock lookup.
@@ -282,10 +283,10 @@ impl fmt::Debug for VerifiedCurrentShakedexLockEntry {
 ///
 /// The batch is intentionally non-cloneable and non-serializable. All entries
 /// share one selected account row/revision, chain/genesis snapshot, mempool
-/// instance/generation, and trusted clock observation. A consuming operation
-/// that also reads or changes the wallet store must call
-/// [`Self::verify_unchanged_account`] while holding the identical shared-store
-/// authority.
+/// instance/generation, and trusted clock observation. A related board read
+/// must consume the batch through [`Self::revalidate_unchanged_account`] in
+/// the same snapshot. `verify_unchanged_account` is a read-only diagnostic,
+/// not an atomic precondition for a later write.
 pub struct VerifiedCurrentShakedexLockBatch {
     binding: SnapshotBinding,
     mempool: MempoolSnapshotBinding,
@@ -322,11 +323,22 @@ impl VerifiedCurrentShakedexLockBatch {
         self.locks.is_empty()
     }
 
-    /// Re-authenticate the exact selected account row and revision inside a
-    /// consuming store operation. Identical shared-store authority must be
-    /// established separately by the enclosing runtime.
+    /// Perform a coherent read-only recheck of the exact selected account row
+    /// and revision. This returns no guard for a later write. Identical
+    /// shared-store authority must be established separately by the enclosing
+    /// runtime.
     pub fn verify_unchanged_account(&self, store: &WalletStore) -> Result<(), HnsWalletError> {
         self.context.verify_unchanged_account(store)
+    }
+
+    /// Consume and refresh the exact selected-account set inside the same
+    /// coherent snapshot used by a downstream board read.
+    pub fn revalidate_unchanged_account(
+        mut self,
+        snapshot: &EntityReadSnapshot<'_>,
+    ) -> Result<Self, HnsWalletError> {
+        self.context = self.context.revalidate_unchanged_account(snapshot)?;
+        Ok(self)
     }
 
     fn into_single(self) -> Result<VerifiedCurrentShakedexLock, HnsWalletError> {
@@ -347,6 +359,7 @@ impl VerifiedCurrentShakedexLockBatch {
             descriptor: lock.descriptor,
             locking_coin: lock.locking_coin,
             current_state: lock.current_state,
+            board_context: Some(context),
         })
     }
 }
@@ -392,6 +405,29 @@ impl VerifiedCurrentShakedexLock {
 
     pub const fn current_name_state(&self) -> &NameState {
         &self.current_state
+    }
+
+    /// Consume and refresh the exact selected-account set inside the same
+    /// coherent snapshot used by a downstream board read.
+    pub fn revalidate_unchanged_account(
+        mut self,
+        snapshot: &EntityReadSnapshot<'_>,
+    ) -> Result<Self, HnsWalletError> {
+        let context = self
+            .board_context
+            .take()
+            .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)?;
+        self.board_context = Some(context.revalidate_unchanged_account(snapshot)?);
+        Ok(self)
+    }
+
+    /// Consume the account-read authority into an atomic account-prefix
+    /// guard. Value-runtime locks intentionally do not carry this capability.
+    pub fn into_account_prefix_lease(mut self) -> Result<EntityPrefixSetLease, HnsWalletError> {
+        self.board_context
+            .take()
+            .map(VerifiedHnsBoardContext::into_account_prefix_lease)
+            .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)
     }
 }
 
@@ -1704,17 +1740,13 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             .map_err(|_| HnsWalletError::RuntimePoisoned)?;
         let selected = self.selector.selected_account()?;
         let account_id = account_entity_id(&selected.config);
-        let account_revision = self.store.try_with_store(|store| {
+        let (account_revision, account_prefix_lease) = self.store.try_with_store(|store| {
             if store.is_locked() {
                 return Err(HnsWalletError::StoreLocked);
             }
-            let stored = store
-                .wallet_account::<HnsAccountRecord>(&account_id)?
-                .ok_or(HnsWalletError::StaleAccountRead)?;
-            if stored.id.as_slice() != account_id.as_slice() || stored.value != selected {
-                return Err(HnsWalletError::StaleAccountRead);
-            }
-            Ok(stored.revision)
+            store.try_with_entity_read_snapshot(|snapshot| {
+                capture_hns_board_account_snapshot(snapshot, &account_id, &selected)
+            })
         })?;
 
         let binding = self.backend.get_chain_snapshot()?;
@@ -1786,11 +1818,15 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             account_id,
             account: selected,
             account_revision,
+            account_prefix_lease,
             network,
             observed_at_unix,
         };
-        self.store
-            .try_with_store(|store| context.verify_unchanged_account(store))?;
+        let context = self.store.try_with_store(|store| {
+            store.try_with_entity_read_snapshot(|snapshot| {
+                context.revalidate_unchanged_account(snapshot)
+            })
+        })?;
 
         Ok(VerifiedCurrentShakedexLockBatch {
             binding,
@@ -2967,6 +3003,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             descriptor,
             locking_coin,
             current_state: current.state,
+            board_context: None,
         })
     }
 

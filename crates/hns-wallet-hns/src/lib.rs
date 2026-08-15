@@ -72,8 +72,8 @@ use hns_wallet_chain_api::{
     VerifySettlementLockRequest,
 };
 use hns_wallet_store::{
-    EntityBatchDelete, EntityBatchSave, EntityKind, SecretKind, SharedWalletStore, StoreError,
-    StoredEntity, StoredWorkflow, WalletStore,
+    EntityBatchDelete, EntityBatchSave, EntityKind, EntityPrefixSetLease, EntityReadSnapshot,
+    SecretKind, SharedWalletStore, StoreError, StoredEntity, StoredWorkflow, WalletStore,
 };
 use hns_wallet_types::{
     AccountId, Amount, ApprovalId, BaseUnits, ChainCapabilities, DerivationReference, FeeModel,
@@ -1572,14 +1572,64 @@ pub struct HnsAccountReadSnapshot {
 ///
 /// This object is deliberately non-cloneable and non-serializable. It proves
 /// no current chain state, name ownership, locking coin, publication, signing,
-/// or value authority. The consuming board transaction must call
-/// `verify_unchanged_account` while holding the identical shared store.
+/// or value authority. A related read must consume it through
+/// `revalidate_unchanged_account` inside the same entity snapshot. A related
+/// write must additionally consume its prefix lease as a guard in the same
+/// immediate transaction as that write.
 pub struct VerifiedHnsBoardCancellationContext {
     account_id: [u8; 32],
     account: HnsAccountRecord,
     account_revision: u64,
+    account_prefix_lease: EntityPrefixSetLease,
     network: NetworkBinding,
     observed_at_unix: u64,
+}
+
+fn validate_hns_board_account_snapshot(
+    snapshot: &EntityReadSnapshot<'_>,
+    account_id: &[u8; 32],
+    expected_account: &HnsAccountRecord,
+) -> Result<u64, HnsWalletError> {
+    let accounts = snapshot.list_entities_by_id_prefix::<HnsAccountRecord>(
+        EntityKind::WalletAccount,
+        expected_account.config.wallet_id.as_bytes(),
+        MAX_HISTORY_RESULTS,
+    )?;
+    let mut selected_revision = None;
+    for stored in accounts {
+        if stored.id != account_entity_id(&stored.value.config)
+            || stored.value.config.wallet_id != expected_account.config.wallet_id
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        if stored.value.config.account_id != expected_account.config.account_id
+            && stored.value.config.account_derivation_index
+                == expected_account.config.account_derivation_index
+        {
+            return Err(HnsWalletError::DuplicateAccountDerivation);
+        }
+        if stored.id.as_slice() == account_id.as_slice()
+            && (stored.value != *expected_account
+                || selected_revision.replace(stored.revision).is_some())
+        {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+    }
+    selected_revision.ok_or(HnsWalletError::StaleAccountRead)
+}
+
+fn capture_hns_board_account_snapshot(
+    snapshot: &EntityReadSnapshot<'_>,
+    account_id: &[u8; 32],
+    expected_account: &HnsAccountRecord,
+) -> Result<(u64, EntityPrefixSetLease), HnsWalletError> {
+    let revision = validate_hns_board_account_snapshot(snapshot, account_id, expected_account)?;
+    let lease = snapshot.entity_prefix_set_lease(
+        EntityKind::WalletAccount,
+        expected_account.config.wallet_id.as_bytes(),
+        MAX_HISTORY_RESULTS,
+    )?;
+    Ok((revision, lease))
 }
 
 impl VerifiedHnsBoardCancellationContext {
@@ -1591,42 +1641,51 @@ impl VerifiedHnsBoardCancellationContext {
         self.observed_at_unix
     }
 
-    /// Recheck the exact selected account row and revision inside the
-    /// consuming store operation. This does not establish store authority by
-    /// itself; the enclosing runtime must already require the identical
-    /// `SharedWalletStore` Arc.
+    /// Consume and revalidate the exact encrypted account prefix set inside a
+    /// caller-owned coherent entity snapshot. The refreshed context remains
+    /// usable as a read authority or can be consumed as an atomic write guard.
+    pub fn revalidate_unchanged_account(
+        mut self,
+        snapshot: &EntityReadSnapshot<'_>,
+    ) -> Result<Self, HnsWalletError> {
+        let revision =
+            validate_hns_board_account_snapshot(snapshot, &self.account_id, &self.account)?;
+        if revision != self.account_revision {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        self.account_prefix_lease = snapshot
+            .refresh_entity_prefix_set_lease(self.account_prefix_lease)
+            .map_err(|error| match error {
+                StoreError::StaleEntitySet => HnsWalletError::StaleAccountRead,
+                _ => HnsWalletError::from(error),
+            })?;
+        Ok(self)
+    }
+
+    /// Consume this read authority into the ABA-resistant account-set lease
+    /// used to guard a related entity batch in the same immediate transaction.
+    pub fn into_account_prefix_lease(self) -> EntityPrefixSetLease {
+        self.account_prefix_lease
+    }
+
+    /// Perform a coherent read-only recheck of the exact selected account row
+    /// and revision. This method returns no write guard and is not an atomic
+    /// precondition for a later mutation on an independent connection. Writes
+    /// must instead consume `revalidate_unchanged_account` and
+    /// `into_account_prefix_lease`. The enclosing runtime must separately
+    /// require the identical `SharedWalletStore` Arc.
     pub fn verify_unchanged_account(&self, store: &WalletStore) -> Result<(), HnsWalletError> {
         if store.is_locked() {
             return Err(HnsWalletError::StoreLocked);
         }
-        let accounts = store.list_entities_by_id_prefix::<HnsAccountRecord>(
-            EntityKind::WalletAccount,
-            self.account.config.wallet_id.as_bytes(),
-            MAX_HISTORY_RESULTS,
-        )?;
-        for stored in accounts {
-            if stored.id != account_entity_id(&stored.value.config)
-                || stored.value.config.wallet_id != self.account.config.wallet_id
-            {
-                return Err(HnsWalletError::InvalidEvidence);
+        store.try_with_entity_read_snapshot(|snapshot| {
+            let revision =
+                validate_hns_board_account_snapshot(snapshot, &self.account_id, &self.account)?;
+            if revision != self.account_revision {
+                return Err(HnsWalletError::StaleAccountRead);
             }
-            if stored.value.config.account_id != self.account.config.account_id
-                && stored.value.config.account_derivation_index
-                    == self.account.config.account_derivation_index
-            {
-                return Err(HnsWalletError::DuplicateAccountDerivation);
-            }
-        }
-        let stored = store
-            .wallet_account::<HnsAccountRecord>(&self.account_id)?
-            .ok_or(HnsWalletError::StaleAccountRead)?;
-        if stored.id.as_slice() != self.account_id.as_slice()
-            || stored.revision != self.account_revision
-            || stored.value != self.account
-        {
-            return Err(HnsWalletError::StaleAccountRead);
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }
 
@@ -1789,17 +1848,13 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             .map_err(|_| HnsWalletError::RuntimePoisoned)?;
         let selected = self.selector.selected_account()?;
         let account_id = account_entity_id(&selected.config);
-        let account_revision = self.store.try_with_store(|store| {
+        let (account_revision, account_prefix_lease) = self.store.try_with_store(|store| {
             if store.is_locked() {
                 return Err(HnsWalletError::StoreLocked);
             }
-            let stored = store
-                .wallet_account::<HnsAccountRecord>(&account_id)?
-                .ok_or(HnsWalletError::StaleAccountRead)?;
-            if stored.id.as_slice() != account_id.as_slice() || stored.value != selected {
-                return Err(HnsWalletError::StaleAccountRead);
-            }
-            Ok(stored.revision)
+            store.try_with_entity_read_snapshot(|snapshot| {
+                capture_hns_board_account_snapshot(snapshot, &account_id, &selected)
+            })
         })?;
         let observed_at_unix = self.clock.now_unix()?;
         let selected_after_clock = self.selector.selected_account()?;
@@ -1810,12 +1865,15 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             account_id,
             account: selected,
             account_revision,
+            account_prefix_lease,
             network: shakedex_network_binding(selected_after_clock.config.network)?,
             observed_at_unix,
         };
-        self.store
-            .try_with_store(|store| context.verify_unchanged_account(store))?;
-        Ok(context)
+        self.store.try_with_store(|store| {
+            store.try_with_entity_read_snapshot(|snapshot| {
+                context.revalidate_unchanged_account(snapshot)
+            })
+        })
     }
 
     /// Observe the purpose-minimized context used by negative Denuo board
