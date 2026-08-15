@@ -46,7 +46,8 @@ use blake2::Blake2bVar;
 use blake2::digest::VariableOutput;
 use hkdf::Hkdf;
 use hns_covenants::{
-    Covenant, CovenantKind, FinalizeCovenant, NameState, TransferCovenant, hash_name, validate_name,
+    Covenant, CovenantKind, FinalizeCovenant, MAX_RESOURCE_SIZE, NameState, TransferCovenant,
+    hash_name, validate_name,
 };
 use hns_primitives::{
     BlockHash, Dollarydoos, Height, NameHash, TransactionHash as CanonicalTransactionHash, TreeRoot,
@@ -114,6 +115,12 @@ pub const MAX_OUTPOINT_SPEND_BATCH: usize = 256;
 pub const MAX_CURRENT_SHAKEDEX_LOCK_BATCH: usize = 64;
 pub const MAX_SCAN_CURSOR_BYTES: usize = 4_096;
 pub const MAX_SCAN_PAGES: usize = 128;
+/// Incoming TRANSFER pages can return after the first nonempty script, so one
+/// candidate on each supported name derivation can require one page per row.
+/// The additive term covers pages that consume only the endpoint's bounded
+/// batch of empty script prefixes.
+const MAX_INCOMING_TRANSFER_PAGES: usize =
+    MAX_HISTORY_RESULTS + MAX_RESTORE_SCRIPTS_PER_QUERY.div_ceil(MAX_SCAN_PAGE_RESULTS);
 pub const MAX_SNAPSHOT_RESTARTS: usize = 3;
 pub const DEFAULT_FEE_TARGET_BLOCKS: u16 = 6;
 /// Canonical HSD fee-policy algebra is available from the reviewed immutable
@@ -457,6 +464,15 @@ pub trait HnsBackend {
         &self,
         request: ConfirmedWalletPageRequest<'_>,
     ) -> Result<ConfirmedWalletPage, HnsWalletError>;
+    /// Pages active confirmed TRANSFERs whose covenant recipient matches the
+    /// complete sorted script set. These rows are derivation-discovery hints
+    /// only: their Coin is still locked to the old owner's output address.
+    fn get_incoming_transfers_page(
+        &self,
+        _request: IncomingTransfersPageRequest<'_>,
+    ) -> Result<IncomingTransfersPage, HnsWalletError> {
+        Err(HnsWalletError::RuntimeIntegrationUnavailable)
+    }
     /// Pages mempool history at one node-instance/generation pair, also tied
     /// to the confirmed chain binding and exact script set. The adapter must
     /// reject a stale instance, generation, script set, or cursor.
@@ -501,6 +517,16 @@ pub trait HnsBackend {
         name_hash: [u8; 32],
         binding: SnapshotBinding,
     ) -> Result<NameEvidence, HnsWalletError>;
+    /// Returns the exact active UTXO selected by the current NameState without
+    /// requiring retained transaction or block bytes. This is trusted-node
+    /// discovery evidence, never signing or mutation authority.
+    fn get_active_name_owner_coin(
+        &self,
+        _name_hash: [u8; 32],
+        _binding: SnapshotBinding,
+    ) -> Result<ActiveNameOwnerCoinEvidence, HnsWalletError> {
+        Err(HnsWalletError::RuntimeIntegrationUnavailable)
+    }
     /// Returns candidate-height TRANSFER/FINALIZE policy, exact owner, active
     /// chain, and owner-spender evidence from one authenticated chain/mempool
     /// snapshot. The wallet independently validates every projection.
@@ -603,6 +629,44 @@ pub struct ConfirmedWalletPage {
     pub next_cursor: Option<Vec<u8>>,
     pub history: Vec<HistoryEntry>,
     pub utxos: Vec<IndexedWalletCoin>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingTransfersPageRequest<'a> {
+    pub scripts: &'a [WalletAddressKey],
+    pub binding: SnapshotBinding,
+    pub cursor: Option<&'a [u8]>,
+    pub limit: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncomingTransferSourceBinding {
+    RetainedBodyVerified,
+    PrunedTrustedNodeProjection,
+}
+
+/// One active TRANSFER addressed by covenant to a requested derivation. The
+/// embedded Coin remains the old owner's active TRANSFER output and must never
+/// be reconciled into the recipient wallet's UTXO set or balance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingTransferCandidate {
+    pub script_index: u32,
+    pub recipient: WalletAddressKey,
+    pub name_hash: [u8; 32],
+    pub start_height: u32,
+    pub transfer_coin: Coin,
+    pub inclusion: TransactionInclusion,
+    pub source_output_count: u32,
+    pub source_binding: IncomingTransferSourceBinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncomingTransfersPage {
+    pub projection_version: u8,
+    pub binding: SnapshotBinding,
+    pub entries: Vec<IncomingTransferCandidate>,
+    pub script_examinations: usize,
+    pub next_cursor: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -721,6 +785,24 @@ pub struct NameEvidence {
     /// accepts these bytes only when they exactly equal canonical
     /// `NameState::resource_data` for `current_state`.
     pub untrusted_current_raw_resource: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActiveNameOwnerCoinSourceBinding {
+    TrustedNodeActiveUtxoProjection,
+}
+
+/// Pruning-safe current NameState/owner-Coin projection from the authenticated
+/// node boundary. The source label is deliberately retained because this is
+/// not a cryptographic Coin-to-transaction proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveNameOwnerCoinEvidence {
+    pub projection_version: u8,
+    pub binding: SnapshotBinding,
+    pub current_state: Vec<u8>,
+    pub owner_coin: Coin,
+    pub inclusion: TransactionInclusion,
+    pub source_binding: ActiveNameOwnerCoinSourceBinding,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1046,6 +1128,162 @@ fn validate_canonical_name_state(
         summary,
         owner: validated_owner,
     }))
+}
+
+fn validate_active_name_owner_coin_evidence(
+    evidence: &ActiveNameOwnerCoinEvidence,
+    expected_name_hash: [u8; 32],
+    binding: SnapshotBinding,
+) -> Result<NameState, HnsWalletError> {
+    if evidence.projection_version != 1
+        || evidence.binding != binding
+        || evidence.source_binding
+            != ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection
+        || evidence.inclusion.transaction_index.is_some()
+        || evidence.inclusion.height > binding.tip.height
+        || evidence.inclusion.block_hash == [0; 32]
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let state = NameState::decode(NameHash::new(expected_name_hash), &evidence.current_state)
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    if state.is_null()
+        || state.name_hash.into_bytes() != expected_name_hash
+        || !validate_name(&state.name)
+        || hash_name(&state.name)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?
+            .into_bytes()
+            != expected_name_hash
+        || state
+            .encode()
+            .map_err(|_| HnsWalletError::InvalidEvidence)?
+            != evidence.current_state
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+
+    let coin = &evidence.owner_coin;
+    if coin.outpoint != state.owner
+        || u64::from(coin.height.get()) != evidence.inclusion.height
+        || coin.outpoint.is_null()
+        || (state.registered && coin.value != state.value)
+        || !matches!(
+            coin.covenant.kind,
+            CovenantKind::Claim
+                | CovenantKind::Reveal
+                | CovenantKind::Register
+                | CovenantKind::Update
+                | CovenantKind::Renew
+                | CovenantKind::Transfer
+                | CovenantKind::Finalize
+        )
+        || coin.covenant.item_name_hash(0) != Some(state.name_hash)
+        || covenant_item_u32(&coin.covenant, 1) != Some(state.height.get())
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+
+    let valid = match coin.covenant.kind {
+        CovenantKind::Claim => {
+            coin.coinbase
+                && !state.registered
+                && coin.covenant.items.len() == 6
+                && coin.covenant.items.get(2).map(Vec::as_slice) == Some(state.name.as_slice())
+                && covenant_item_u8(&coin.covenant, 3)
+                    .is_some_and(|flags| flags & 1 == u8::from(state.weak))
+                && covenant_item_32(&coin.covenant, 4).is_some()
+                && covenant_item_u32(&coin.covenant, 5) == Some(state.claimed.get())
+                && state.renewal == coin.height
+        }
+        CovenantKind::Reveal => {
+            !coin.coinbase
+                && !state.registered
+                && coin.covenant.items.len() == 3
+                && covenant_item_32(&coin.covenant, 2).is_some()
+                && coin.value == state.highest
+        }
+        CovenantKind::Register => {
+            !coin.coinbase
+                && coin.covenant.items.len() == 4
+                && coin.covenant.items.get(2).is_some_and(|data| {
+                    data.len() <= MAX_RESOURCE_SIZE
+                        && (data.is_empty() || data == &state.resource_data)
+                })
+                && covenant_item_32(&coin.covenant, 3).is_some()
+                && state.registered
+                && state.transfer.get() == 0
+                && state.renewal == coin.height
+        }
+        CovenantKind::Update => {
+            !coin.coinbase
+                && coin.covenant.items.len() == 3
+                && coin.covenant.items.get(2).is_some_and(|data| {
+                    data.len() <= MAX_RESOURCE_SIZE
+                        && (data.is_empty() || data == &state.resource_data)
+                })
+                && state.registered
+                && state.transfer.get() == 0
+        }
+        CovenantKind::Renew => {
+            !coin.coinbase
+                && coin.covenant.items.len() == 3
+                && covenant_item_32(&coin.covenant, 2).is_some()
+                && state.registered
+                && state.transfer.get() == 0
+                && state.renewal == coin.height
+        }
+        CovenantKind::Transfer => {
+            TransferCovenant::try_from(&coin.covenant).is_ok_and(|transfer| {
+                !coin.coinbase
+                    && state.registered
+                    && transfer.name_hash == state.name_hash
+                    && transfer.start_height == state.height
+                    && state.transfer.get() != 0
+                    && state.transfer == coin.height
+            })
+        }
+        CovenantKind::Finalize => {
+            FinalizeCovenant::try_from(&coin.covenant).is_ok_and(|finalize| {
+                !coin.coinbase
+                    && state.registered
+                    && finalize.name_hash == state.name_hash
+                    && finalize.start_height == state.height
+                    && finalize.name == state.name
+                    && finalize.weak() == state.weak
+                    && finalize.claimed == state.claimed
+                    && finalize
+                        .renewals
+                        .checked_add(1)
+                        .is_some_and(|renewals| renewals == state.renewals)
+                    && state.transfer.get() == 0
+                    && state.renewal == coin.height
+            })
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(state)
+}
+
+fn covenant_item_u8(covenant: &Covenant, index: usize) -> Option<u8> {
+    let item = covenant.items.get(index)?;
+    (item.len() == 1).then_some(item[0])
+}
+
+fn covenant_item_u32(covenant: &Covenant, index: usize) -> Option<u32> {
+    covenant
+        .items
+        .get(index)?
+        .as_slice()
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)
+}
+
+fn covenant_item_32(covenant: &Covenant, index: usize) -> Option<[u8; 32]> {
+    covenant.items.get(index)?.as_slice().try_into().ok()
 }
 
 fn validate_name_owner_transaction(
@@ -1942,13 +2180,14 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             common_ancestor,
             &previous_transactions,
         )?;
-        let names = revalidate_hns_read_names(
+        let coins = reconcile_coins(scan.indexed_coins, &scan.addresses, tip.height)?;
+        let names = reconcile_hns_read_names(
             &self.backend,
             &preparation.names,
             &scan.addresses,
+            &coins,
             scan.binding,
         )?;
-        let coins = reconcile_coins(scan.indexed_coins, &scan.addresses, tip.height)?;
         let balance = coins.iter().try_fold(BaseUnits::ZERO, |total, coin| {
             if is_ordinary_hns_spend_candidate(coin) {
                 total
@@ -2108,6 +2347,12 @@ impl TrackedHnsCoin {
         if self.coin.name_locked != !matches!(covenant.kind, CovenantKind::None) {
             return Err(HnsWalletError::InvalidEvidence);
         }
+        if self.coin.value.is_zero()
+            && (self.derivation.role != KeyRole::HnsName
+                || !is_active_name_owner_covenant(covenant.kind))
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
         canonical_coin_from_evidence(
             self.coin.outpoint,
             self.coin.value,
@@ -2143,6 +2388,10 @@ pub struct HnsInputCoinEvidence {
 
 impl HnsInputCoinEvidence {
     pub fn to_canonical_coin(&self) -> Result<Coin, HnsWalletError> {
+        let covenant = decode_canonical_covenant(&self.covenant)?;
+        if self.value.is_zero() && !is_active_name_owner_covenant(covenant.kind) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
         canonical_coin_from_evidence(
             self.outpoint,
             self.value,
@@ -2150,7 +2399,7 @@ impl HnsInputCoinEvidence {
             self.coinbase,
             self.address_version,
             self.address_hash.clone(),
-            decode_canonical_covenant(&self.covenant)?,
+            covenant,
         )
     }
 
@@ -2175,6 +2424,19 @@ impl HnsInputCoinEvidence {
             covenant,
         })
     }
+}
+
+const fn is_active_name_owner_covenant(kind: CovenantKind) -> bool {
+    matches!(
+        kind,
+        CovenantKind::Claim
+            | CovenantKind::Reveal
+            | CovenantKind::Register
+            | CovenantKind::Update
+            | CovenantKind::Renew
+            | CovenantKind::Transfer
+            | CovenantKind::Finalize
+    )
 }
 
 fn decode_canonical_covenant(encoded: &[u8]) -> Result<Covenant, HnsWalletError> {
@@ -2205,7 +2467,7 @@ fn canonical_coin_from_evidence(
         transaction_hash: CanonicalTransactionHash::new(outpoint.transaction.into_bytes()),
         index: outpoint.output_index,
     };
-    if outpoint.is_null() || value.is_zero() {
+    if outpoint.is_null() {
         return Err(HnsWalletError::InvalidEvidence);
     }
     let value = u64::try_from(value.get()).map_err(|_| HnsWalletError::InvalidEvidence)?;
@@ -5047,6 +5309,16 @@ fn revalidate_hns_read_names<B: HnsBackend>(
     addresses: &[DerivedHnsAddress],
     binding: SnapshotBinding,
 ) -> Result<Vec<KnownName>, HnsWalletError> {
+    reconcile_hns_read_names(backend, stored_names, addresses, &[], binding)
+}
+
+fn reconcile_hns_read_names<B: HnsBackend>(
+    backend: &B,
+    stored_names: &[StoredEntity<KnownName>],
+    addresses: &[DerivedHnsAddress],
+    coins: &[TrackedHnsCoin],
+    binding: SnapshotBinding,
+) -> Result<Vec<KnownName>, HnsWalletError> {
     if stored_names.len() > MAX_HISTORY_RESULTS {
         return Err(HnsWalletError::HistoryLimit);
     }
@@ -5056,21 +5328,127 @@ fn revalidate_hns_read_names<B: HnsBackend>(
         .cloned()
         .collect::<Vec<_>>();
     validate_wallet_name_addresses(&wallet_name_addresses)?;
-    let mut names = Vec::with_capacity(stored_names.len());
+    let mut discovered = BTreeMap::new();
+    for coin in coins {
+        if coin.derivation.role != KeyRole::HnsName {
+            continue;
+        }
+        let canonical_coin = coin.to_canonical_coin()?;
+        if canonical_coin.covenant.kind != CovenantKind::Finalize {
+            continue;
+        }
+        let address = wallet_name_addresses
+            .iter()
+            .find(|address| address.derivation == coin.derivation)
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        if address.program != coin.address_program
+            || canonical_coin.address.version != 0
+            || canonical_coin.address.hash != address.program
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let finalize = FinalizeCovenant::try_from(&canonical_coin.covenant)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        let name_hash = finalize.name_hash.into_bytes();
+        let evidence = backend.get_active_name_owner_coin(name_hash, binding)?;
+        let state = validate_active_name_owner_coin_evidence(&evidence, name_hash, binding)?;
+        if evidence.owner_coin != canonical_coin
+            || state.name != finalize.name
+            || state.height != finalize.start_height
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let current_raw_resource = state.resource_data.clone();
+        let resource_status = if current_raw_resource.is_empty() {
+            NameResourceStatus::Empty
+        } else if state.resource().is_ok() {
+            NameResourceStatus::CanonicalDecoded
+        } else {
+            NameResourceStatus::CanonicalOpaque
+        };
+        let current_owner_outpoint = HnsOutpoint {
+            transaction: TransactionHash::new(
+                canonical_coin.outpoint.transaction_hash.into_bytes(),
+            ),
+            output_index: canonical_coin.outpoint.index,
+        };
+        let known_name = KnownName {
+            name: state.name.clone(),
+            name_hash,
+            proof_height: binding.tip.height,
+            unbound_proof_owner_outpoint: None,
+            unbound_current_owner_outpoint: Some(current_owner_outpoint),
+            proof_state: None,
+            current_state: Some(evidence.current_state),
+            canonical_proof_state: None,
+            canonical_current_state: Some(CanonicalNameStateSummary {
+                owner_outpoint: Some(current_owner_outpoint),
+                value: state.value.get(),
+                highest: state.highest.get(),
+                start_height: state.height.get(),
+                renewal_height: state.renewal.get(),
+                transfer_height: state.transfer.get(),
+                revoked_height: state.revoked.get(),
+                claimed_height: state.claimed.get(),
+                renewals: state.renewals,
+                registered: state.registered,
+                expired: state.expired,
+                weak: state.weak,
+            }),
+            current_raw_resource: Some(current_raw_resource),
+            resource_status,
+            ownership_status: NameOwnershipStatus::WalletOwned {
+                derivation: coin.derivation,
+            },
+        };
+        if discovered.insert(name_hash, known_name).is_some()
+            || discovered.len() > MAX_HISTORY_RESULTS
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+    }
+
+    let stored_hashes = stored_names
+        .iter()
+        .map(|stored| stored.value.name_hash)
+        .collect::<BTreeSet<_>>();
+    if stored_hashes.len() != stored_names.len() {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let novel_names = discovered
+        .keys()
+        .filter(|name_hash| !stored_hashes.contains(*name_hash))
+        .count();
+    let capacity = stored_names
+        .len()
+        .checked_add(novel_names)
+        .ok_or(HnsWalletError::HistoryLimit)?;
+    if capacity > MAX_HISTORY_RESULTS {
+        return Err(HnsWalletError::HistoryLimit);
+    }
+    let mut names = Vec::with_capacity(capacity);
     for stored in stored_names {
-        let current = validated_name_evidence(
-            backend,
-            &stored.value.name,
-            binding,
-            Some(&wallet_name_addresses),
-        )?
-        .known_name;
+        let current = if let Some(discovered) = discovered.remove(&stored.value.name_hash) {
+            if discovered.name != stored.value.name {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            discovered
+        } else {
+            validated_name_evidence(
+                backend,
+                &stored.value.name,
+                binding,
+                Some(&wallet_name_addresses),
+            )?
+            .known_name
+        };
         if current.name_hash != stored.value.name_hash || current.proof_height != binding.tip.height
         {
             return Err(HnsWalletError::InvalidEvidence);
         }
         names.push(current);
     }
+    names.extend(discovered.into_values());
     names.sort_by(|left, right| {
         left.name
             .cmp(&right.name)
@@ -5176,14 +5554,21 @@ fn commit_hns_account_read(
         .iter()
         .map(|stored| (stored.value.name_hash, stored.revision))
         .collect::<BTreeMap<_, _>>();
-    if name_revisions.len() != names.len() {
+    let reconciled_name_hashes = names
+        .iter()
+        .map(|name| name.name_hash)
+        .collect::<BTreeSet<_>>();
+    if reconciled_name_hashes.len() != names.len()
+        || name_revisions
+            .keys()
+            .any(|name_hash| !reconciled_name_hashes.contains(name_hash))
+    {
         return Err(HnsWalletError::StaleAccountRead);
     }
     for name in names {
-        let revision = name_revisions
-            .get(&name.name_hash)
-            .copied()
-            .ok_or(HnsWalletError::StaleAccountRead)?;
+        // A name found from a bound current FINALIZE has no prior entity and
+        // is inserted at revision zero under the existing account/read fence.
+        let revision = name_revisions.get(&name.name_hash).copied().unwrap_or(0);
         store.save_known_name(
             &namespaced_name_id(&account.config, name.name_hash),
             revision,
@@ -5533,6 +5918,21 @@ where
             Some(mempool),
         )?;
         validate_same_restore_snapshot(binding, mempool, name_binding, name_mempool)?;
+        let incoming_name_indices =
+            load_incoming_transfer_derivations(backend, &name_scripts, &name_index_remap, binding)?;
+        let incoming_name_derivations = incoming_name_indices
+            .iter()
+            .map(|index| {
+                let address = name_addresses
+                    .get(*index as usize)
+                    .ok_or(HnsWalletError::InvalidEvidence)?;
+                let key = restore_derivation_key(address.derivation)?;
+                if key.0 != HNS_NAME_DERIVATION_TAG || key.1 != 0 {
+                    return Err(HnsWalletError::InvalidEvidence);
+                }
+                Ok(key)
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
 
         let (shakedex_scripts, shakedex_index_remap) = sorted_restore_scripts(&shakedex_addresses)?;
         let (shakedex_binding, shakedex_mempool, shakedex_history, shakedex_coins) =
@@ -5578,11 +5978,35 @@ where
 
         let mut last_external = None;
         let mut last_internal = None;
-        let mut last_name = None;
+        let mut last_name = incoming_name_derivations
+            .iter()
+            .map(|(_, _, index)| *index)
+            .max();
         let mut last_shakedex = None;
         for entry in &history {
             let derivation = addresses
                 .get(entry.script_index as usize)
+                .ok_or(HnsWalletError::InvalidEvidence)?
+                .derivation;
+            match restore_derivation_key(derivation)? {
+                (HNS_COIN_DERIVATION_TAG, 0, index) => {
+                    last_external = Some(last_external.map_or(index, |last: u32| last.max(index)))
+                }
+                (HNS_COIN_DERIVATION_TAG, 1, index) => {
+                    last_internal = Some(last_internal.map_or(index, |last: u32| last.max(index)))
+                }
+                (HNS_NAME_DERIVATION_TAG, 0, index) => {
+                    last_name = Some(last_name.map_or(index, |last: u32| last.max(index)))
+                }
+                (HNS_SHAKEDEX_DERIVATION_TAG, 0, index) => {
+                    last_shakedex = Some(last_shakedex.map_or(index, |last: u32| last.max(index)))
+                }
+                _ => return Err(HnsWalletError::InvalidEvidence),
+            }
+        }
+        for indexed_coin in &indexed_coins {
+            let derivation = addresses
+                .get(indexed_coin.script_index as usize)
                 .ok_or(HnsWalletError::InvalidEvidence)?
                 .derivation;
             match restore_derivation_key(derivation)? {
@@ -5624,7 +6048,7 @@ where
             continue;
         }
 
-        let used: BTreeSet<(u8, u32, u32)> = history
+        let mut used: BTreeSet<(u8, u32, u32)> = history
             .iter()
             .map(|entry| {
                 let derivation = addresses
@@ -5634,6 +6058,18 @@ where
                 restore_derivation_key(derivation)
             })
             .collect::<Result<_, _>>()?;
+        used.extend(
+            indexed_coins
+                .iter()
+                .map(|coin| {
+                    addresses
+                        .get(coin.script_index as usize)
+                        .ok_or(HnsWalletError::InvalidEvidence)
+                        .and_then(|address| restore_derivation_key(address.derivation))
+                })
+                .collect::<Result<BTreeSet<_>, _>>()?,
+        );
+        used.extend(incoming_name_derivations);
         for address in &mut addresses {
             address.used = used.contains(&restore_derivation_key(address.derivation)?);
         }
@@ -5894,6 +6330,102 @@ fn load_wallet_snapshot_once<B: HnsBackend>(
     ))
 }
 
+fn load_incoming_transfer_derivations<B: HnsBackend>(
+    backend: &B,
+    scripts: &[WalletAddressKey],
+    index_remap: &[u32],
+    binding: SnapshotBinding,
+) -> Result<BTreeSet<u32>, HnsWalletError> {
+    if scripts.is_empty()
+        || scripts.len() != index_remap.len()
+        || scripts.len() > MAX_RESTORE_SCRIPTS_PER_QUERY
+        || !scripts.windows(2).all(|pair| pair[0] < pair[1])
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let limit =
+        u32::try_from(MAX_SCAN_PAGE_RESULTS).map_err(|_| HnsWalletError::ScanCapacityExhausted)?;
+    let mut cursor = None;
+    let mut seen_cursors = BTreeSet::new();
+    let mut outpoints = BTreeSet::new();
+    let mut derivations = BTreeSet::new();
+    let mut row_count = 0usize;
+    for _ in 0..MAX_INCOMING_TRANSFER_PAGES {
+        let page = backend.get_incoming_transfers_page(IncomingTransfersPageRequest {
+            scripts,
+            binding,
+            cursor: cursor.as_deref(),
+            limit,
+        })?;
+        if page.projection_version != 1
+            || page.binding != binding
+            || page.entries.len() > MAX_SCAN_PAGE_RESULTS
+            || !(1..=MAX_SCAN_PAGE_RESULTS).contains(&page.script_examinations)
+            || page.script_examinations > scripts.len()
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        row_count = row_count
+            .checked_add(page.entries.len())
+            .ok_or(HnsWalletError::ScanCapacityExhausted)?;
+        if row_count > MAX_HISTORY_RESULTS {
+            return Err(HnsWalletError::ScanCapacityExhausted);
+        }
+        for entry in page.entries {
+            let request_index = entry.script_index as usize;
+            let expected_script = scripts
+                .get(request_index)
+                .ok_or(HnsWalletError::InvalidEvidence)?;
+            validate_incoming_transfer_candidate(&entry, expected_script, binding)?;
+            let outpoint = HnsOutpoint {
+                transaction: TransactionHash::new(
+                    entry.transfer_coin.outpoint.transaction_hash.into_bytes(),
+                ),
+                output_index: entry.transfer_coin.outpoint.index,
+            };
+            if !outpoints.insert(outpoint) {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            derivations.insert(
+                *index_remap
+                    .get(request_index)
+                    .ok_or(HnsWalletError::InvalidEvidence)?,
+            );
+        }
+        cursor = validated_next_cursor(page.next_cursor, &mut seen_cursors)?;
+        if cursor.is_none() {
+            return Ok(derivations);
+        }
+    }
+    Err(HnsWalletError::ScanCapacityExhausted)
+}
+
+fn validate_incoming_transfer_candidate(
+    candidate: &IncomingTransferCandidate,
+    expected_recipient: &WalletAddressKey,
+    binding: SnapshotBinding,
+) -> Result<(), HnsWalletError> {
+    let transfer = TransferCovenant::try_from(&candidate.transfer_coin.covenant)
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    if &candidate.recipient != expected_recipient
+        || candidate.inclusion.height > binding.tip.height
+        || candidate.inclusion.block_hash == [0; 32]
+        || candidate.inclusion.transaction_index.is_none()
+        || candidate.transfer_coin.outpoint.is_null()
+        || candidate.transfer_coin.coinbase
+        || u64::from(candidate.transfer_coin.height.get()) != candidate.inclusion.height
+        || candidate.source_output_count == 0
+        || candidate.transfer_coin.outpoint.index >= candidate.source_output_count
+        || transfer.name_hash.into_bytes() != candidate.name_hash
+        || transfer.start_height.get() != candidate.start_height
+        || transfer.recipient_version != candidate.recipient.version
+        || transfer.recipient_hash != candidate.recipient.hash
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(())
+}
+
 fn validated_next_cursor(
     cursor: Option<Vec<u8>>,
     seen: &mut BTreeSet<Vec<u8>>,
@@ -6087,8 +6619,7 @@ fn reconcile_coins(
             .and_then(|depth| depth.checked_add(1))
             .and_then(|depth| u32::try_from(depth).ok())
             .ok_or(HnsWalletError::InvalidEvidence)?;
-        if indexed_coin.coin.value.is_zero()
-            || indexed_coin.coin.confirmation_count != expected_confirmations
+        if indexed_coin.coin.confirmation_count != expected_confirmations
             || indexed_coin.output_address.version != 0
             || indexed_coin.output_address.hash.as_slice() != address.program.as_slice()
             || restore_derivation_key(address.derivation).is_err()
@@ -8749,6 +9280,9 @@ mod tests {
         network: HnsNetwork,
         fault: ProductionFollowupReadFault,
         name_history_program: Option<Vec<u8>>,
+        incoming_candidates: Vec<IncomingTransferCandidate>,
+        finalize_coin: Option<(WalletAddressKey, Coin)>,
+        active_owner: Option<([u8; 32], ActiveNameOwnerCoinEvidence)>,
         snapshot_calls: AtomicUsize,
         tip_calls: AtomicUsize,
         confirmed_calls: AtomicUsize,
@@ -8767,6 +9301,9 @@ mod tests {
                 network: config.network,
                 fault,
                 name_history_program: None,
+                incoming_candidates: Vec::new(),
+                finalize_coin: None,
+                active_owner: None,
                 snapshot_calls: AtomicUsize::new(0),
                 tip_calls: AtomicUsize::new(0),
                 confirmed_calls: AtomicUsize::new(0),
@@ -8776,6 +9313,28 @@ mod tests {
 
         fn with_name_history_program(mut self, program: Vec<u8>) -> Self {
             self.name_history_program = Some(program);
+            self
+        }
+
+        fn with_incoming_candidate(mut self, candidate: IncomingTransferCandidate) -> Self {
+            self.incoming_candidates = vec![candidate];
+            self
+        }
+
+        fn with_incoming_candidates(mut self, candidates: Vec<IncomingTransferCandidate>) -> Self {
+            self.incoming_candidates = candidates;
+            self
+        }
+
+        fn with_finalize_owner(
+            mut self,
+            script: WalletAddressKey,
+            coin: Coin,
+            name_hash: [u8; 32],
+            evidence: ActiveNameOwnerCoinEvidence,
+        ) -> Self {
+            self.finalize_coin = Some((script, coin));
+            self.active_owner = Some((name_hash, evidence));
             self
         }
 
@@ -8925,11 +9484,105 @@ mod tests {
                 })
                 .into_iter()
                 .collect();
+            let utxos = self
+                .finalize_coin
+                .as_ref()
+                .and_then(|(expected_script, coin)| {
+                    request
+                        .scripts
+                        .iter()
+                        .position(|script| script == expected_script)
+                        .map(|script_index| IndexedWalletCoin {
+                            coin: WalletCoin {
+                                outpoint: HnsOutpoint {
+                                    transaction: TransactionHash::new(
+                                        coin.outpoint.transaction_hash.into_bytes(),
+                                    ),
+                                    output_index: coin.outpoint.index,
+                                },
+                                value: BaseUnits::new(u128::from(coin.value.get())),
+                                confirmation_count: u32::try_from(
+                                    binding.tip.height - u64::from(coin.height.get()) + 1,
+                                )
+                                .expect("fixture confirmation count"),
+                                confirmed_height: Some(coin.height.get()),
+                                coinbase: coin.coinbase,
+                                covenant: coin.covenant.encode().expect("fixture covenant"),
+                                name_locked: !matches!(coin.covenant.kind, CovenantKind::None),
+                            },
+                            script_index: u32::try_from(script_index)
+                                .expect("bounded fixture script index"),
+                            output_address: expected_script.clone(),
+                        })
+                })
+                .into_iter()
+                .collect();
             Ok(ConfirmedWalletPage {
                 binding,
                 next_cursor: None,
                 history,
-                utxos: Vec::new(),
+                utxos,
+            })
+        }
+
+        fn get_incoming_transfers_page(
+            &self,
+            request: IncomingTransfersPageRequest<'_>,
+        ) -> Result<IncomingTransfersPage, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            if request.binding != Self::binding()
+                || request.scripts.is_empty()
+                || request.limit == 0
+            {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            let start = request.cursor.map_or(Ok(0usize), |cursor| {
+                let raw: [u8; 4] = cursor
+                    .try_into()
+                    .map_err(|_| HnsWalletError::StaleNodeSnapshot)?;
+                usize::try_from(u32::from_le_bytes(raw))
+                    .map_err(|_| HnsWalletError::StaleNodeSnapshot)
+            })?;
+            if start > self.incoming_candidates.len() {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            let selected = self
+                .incoming_candidates
+                .iter()
+                .enumerate()
+                .skip(start)
+                .find_map(|(candidate_index, candidate)| {
+                    request
+                        .scripts
+                        .iter()
+                        .position(|script| script == &candidate.recipient)
+                        .map(|script_index| (candidate_index, script_index, candidate))
+                });
+            let (entries, next_cursor) = selected.map_or_else(
+                || (Vec::new(), None),
+                |(candidate_index, script_index, candidate)| {
+                    let next = candidate_index + 1;
+                    (
+                        vec![IncomingTransferCandidate {
+                            script_index: u32::try_from(script_index)
+                                .expect("bounded fixture script index"),
+                            ..candidate.clone()
+                        }],
+                        (next < self.incoming_candidates.len()).then(|| {
+                            u32::try_from(next)
+                                .expect("bounded fixture continuation")
+                                .to_le_bytes()
+                                .to_vec()
+                        }),
+                    )
+                },
+            );
+            Ok(IncomingTransfersPage {
+                projection_version: 1,
+                binding: request.binding,
+                entries,
+                script_examinations: request.scripts.len().min(MAX_SCAN_PAGE_RESULTS),
+                next_cursor,
             })
         }
 
@@ -8998,6 +9651,22 @@ mod tests {
             _: SnapshotBinding,
         ) -> Result<NameEvidence, HnsWalletError> {
             Err(Self::fail_if_unexpected("get_name_evidence"))
+        }
+
+        fn get_active_name_owner_coin(
+            &self,
+            name_hash: [u8; 32],
+            binding: SnapshotBinding,
+        ) -> Result<ActiveNameOwnerCoinEvidence, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            let (expected_name_hash, evidence) = self
+                .active_owner
+                .as_ref()
+                .ok_or_else(|| Self::fail_if_unexpected("get_active_name_owner_coin"))?;
+            if *expected_name_hash != name_hash || evidence.binding != binding {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            Ok(evidence.clone())
         }
 
         fn get_name_action_context(
@@ -9265,6 +9934,107 @@ mod tests {
             selector,
         )
         .expect("synchronized account read runtime")
+    }
+
+    fn zero_value_incoming_candidate(recipient: &DerivedHnsAddress) -> IncomingTransferCandidate {
+        zero_value_incoming_candidate_at(recipient, 0)
+    }
+
+    fn zero_value_incoming_candidate_at(
+        recipient: &DerivedHnsAddress,
+        candidate_index: u32,
+    ) -> IncomingTransferCandidate {
+        let name = format!("alpha{candidate_index}");
+        let name_hash = hash_name(name.as_bytes()).expect("incoming name hash");
+        let covenant =
+            TransferCovenant::new(name_hash, Height::new(0), 0, recipient.program.clone())
+                .expect("incoming TRANSFER")
+                .to_covenant()
+                .expect("incoming TRANSFER covenant");
+        IncomingTransferCandidate {
+            script_index: 0,
+            recipient: WalletAddressKey {
+                version: 0,
+                hash: recipient.program.clone(),
+            },
+            name_hash: name_hash.into_bytes(),
+            start_height: 0,
+            transfer_coin: Coin {
+                outpoint: CanonicalOutpoint {
+                    transaction_hash: CanonicalTransactionHash::new({
+                        let mut transaction = [0x91; 32];
+                        transaction[..4].copy_from_slice(&candidate_index.to_le_bytes());
+                        transaction
+                    }),
+                    index: 0,
+                },
+                value: Dollarydoos::new(0),
+                height: Height::new(1),
+                coinbase: false,
+                address: Address::new(0, vec![0x92; 20]).expect("old-owner address"),
+                covenant,
+            },
+            inclusion: TransactionInclusion {
+                block_hash: ProductionFollowupReadBackend::binding().tip.block_hash,
+                height: 1,
+                transaction_index: Some(0),
+            },
+            source_output_count: 1,
+            source_binding: IncomingTransferSourceBinding::PrunedTrustedNodeProjection,
+        }
+    }
+
+    fn zero_value_finalize_owner(
+        recipient: &DerivedHnsAddress,
+    ) -> ([u8; 32], Coin, ActiveNameOwnerCoinEvidence) {
+        let name = b"alpha".to_vec();
+        let name_hash = hash_name(&name).expect("FINALIZE name hash");
+        let outpoint = CanonicalOutpoint {
+            transaction_hash: CanonicalTransactionHash::new([0xa1; 32]),
+            index: 0,
+        };
+        let covenant = FinalizeCovenant::new(
+            name.clone(),
+            Height::new(0),
+            false,
+            Height::new(0),
+            0,
+            BlockHash::new([0xa2; 32]),
+        )
+        .expect("zero-value FINALIZE")
+        .to_covenant()
+        .expect("zero-value FINALIZE covenant");
+        let coin = Coin {
+            outpoint,
+            value: Dollarydoos::new(0),
+            height: Height::new(1),
+            coinbase: false,
+            address: Address::new(0, recipient.program.clone()).expect("name address"),
+            covenant,
+        };
+        let mut state = NameState::null(name_hash);
+        state.name = name;
+        state.height = Height::new(0);
+        state.renewal = Height::new(1);
+        state.owner = outpoint;
+        state.value = Dollarydoos::new(0);
+        state.highest = Dollarydoos::new(0);
+        state.renewals = 1;
+        state.registered = true;
+        let binding = ProductionFollowupReadBackend::binding();
+        let evidence = ActiveNameOwnerCoinEvidence {
+            projection_version: 1,
+            binding,
+            current_state: state.encode().expect("zero-value current NameState"),
+            owner_coin: coin.clone(),
+            inclusion: TransactionInclusion {
+                block_hash: binding.tip.block_hash,
+                height: 1,
+                transaction_index: None,
+            },
+            source_binding: ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection,
+        };
+        (name_hash.into_bytes(), coin, evidence)
     }
 
     fn production_followup_recovery_read_runtime(
@@ -10479,6 +11249,42 @@ mod tests {
             mismatched.to_canonical_coin(),
             Err(HnsWalletError::InvalidEvidence)
         ));
+
+        let mut zero_ordinary = mismatched;
+        zero_ordinary.coin.name_locked = false;
+        zero_ordinary.coin.value = BaseUnits::ZERO;
+        assert!(matches!(
+            zero_ordinary.to_canonical_coin(),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+        let mut zero_ordinary_input =
+            HnsInputCoinEvidence::from_canonical_coin(&canonical).expect("ordinary input");
+        zero_ordinary_input.value = BaseUnits::ZERO;
+        assert!(matches!(
+            zero_ordinary_input.to_canonical_coin(),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+        let shakedex_address = test_derived_address(KeyRole::HnsShakedex, 63);
+        let zero_shakedex = TrackedHnsCoin {
+            coin: WalletCoin {
+                outpoint: HnsOutpoint {
+                    transaction: TransactionHash::new([63; 32]),
+                    output_index: 0,
+                },
+                value: BaseUnits::ZERO,
+                confirmation_count: 1,
+                confirmed_height: Some(500),
+                coinbase: false,
+                covenant: Covenant::default().encode().expect("NONE covenant"),
+                name_locked: false,
+            },
+            derivation: shakedex_address.derivation,
+            address_program: shakedex_address.program,
+        };
+        assert!(matches!(
+            zero_shakedex.to_canonical_coin(),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
     }
 
     #[test]
@@ -10786,6 +11592,276 @@ mod tests {
         assert_eq!(target.derivation_index, 1);
         assert_eq!(target.display, post_scan_address.address);
         assert_ne!(target.display, used_name.address);
+    }
+
+    #[test]
+    fn zero_value_incoming_transfer_advances_only_name_key_high_water() {
+        let (store, config) = production_followup_read_store();
+        let account = store
+            .with_store(|wallet| {
+                wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .map(|stored| stored.value)
+                    .ok_or(StoreError::CorruptMetadata)
+            })
+            .expect("incoming account");
+        let recipient = store
+            .try_with_store(|wallet| {
+                derive_restore_addresses(wallet, &account, KeyRole::HnsName)
+                    .map(|addresses| addresses.into_iter().next().expect("name recipient"))
+            })
+            .expect("derive incoming recipient");
+        let candidate = zero_value_incoming_candidate(&recipient);
+        assert_eq!(candidate.transfer_coin.value.get(), 0);
+        assert_ne!(candidate.transfer_coin.address.hash, recipient.program);
+        let selector = HnsExistingAccountSelector::new(store.clone(), config.clone())
+            .expect("incoming selector");
+        let backend = ProductionFollowupReadBackend::new(
+            store.clone(),
+            &config,
+            ProductionFollowupReadFault::Healthy,
+        )
+        .with_incoming_candidate(candidate.clone());
+        let runtime =
+            HnsAccountReadRuntime::new(backend, ProductionFollowupClock, store.clone(), selector)
+                .expect("incoming runtime");
+
+        let snapshot = runtime.synchronize().expect("incoming reconciliation");
+        assert_eq!(snapshot.balance, Amount::new(WalletAsset::Hns, 0));
+        assert!(snapshot.transactions.is_empty());
+        assert!(snapshot.known_names.is_empty());
+        assert_eq!(snapshot.name_receive_target.derivation_index, 1);
+        store
+            .with_store(|wallet| {
+                let account = wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .ok_or(StoreError::CorruptMetadata)?;
+                assert_eq!(account.value.last_used_name, Some(0));
+                assert_eq!(account.value.next_name_index, 1);
+                let coins = wallet.list_entities_by_id_prefix::<TrackedHnsCoin>(
+                    EntityKind::HnsUtxo,
+                    &account_entity_prefix(&config),
+                    MAX_WALLET_COINS,
+                )?;
+                let names = wallet.list_entities_by_id_prefix::<KnownName>(
+                    EntityKind::KnownName,
+                    &account_entity_prefix(&config),
+                    MAX_HISTORY_RESULTS,
+                )?;
+                assert!(coins.is_empty());
+                assert!(names.is_empty());
+                assert!(
+                    wallet
+                        .list_entities_by_id_prefix::<DerivedHnsAddress>(
+                            EntityKind::DerivedAddress,
+                            &account_entity_prefix(&config),
+                            MAX_RESTORE_SCRIPTS_PER_QUERY,
+                        )?
+                        .iter()
+                        .any(|stored| {
+                            stored.value.derivation == recipient.derivation && stored.value.used
+                        })
+                );
+                Ok(())
+            })
+            .expect("incoming high-water commit");
+    }
+
+    #[test]
+    fn incoming_transfer_pagination_supports_more_than_128_nonempty_name_scripts() {
+        let (store, config) = production_followup_read_store();
+        let mut account = store
+            .with_store(|wallet| {
+                wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .map(|stored| stored.value)
+                    .ok_or(StoreError::CorruptMetadata)
+            })
+            .expect("pagination account");
+        account.name_scan_end = 128;
+        let addresses = store
+            .try_with_store(|wallet| derive_restore_addresses(wallet, &account, KeyRole::HnsName))
+            .expect("derive 129 name scripts");
+        assert_eq!(addresses.len(), 129);
+        let candidates = addresses
+            .iter()
+            .enumerate()
+            .map(|(index, address)| {
+                zero_value_incoming_candidate_at(
+                    address,
+                    u32::try_from(index).expect("candidate index"),
+                )
+            })
+            .collect();
+        let (scripts, index_remap) = sorted_restore_scripts(&addresses).expect("sorted scripts");
+        let backend = ProductionFollowupReadBackend::new(
+            store,
+            &config,
+            ProductionFollowupReadFault::Healthy,
+        )
+        .with_incoming_candidates(candidates);
+        let derivations = load_incoming_transfer_derivations(
+            &backend,
+            &scripts,
+            &index_remap,
+            ProductionFollowupReadBackend::binding(),
+        )
+        .expect("129 nonempty incoming pages");
+        assert_eq!(derivations.len(), 129);
+        assert_eq!(derivations.first(), Some(&0));
+        assert_eq!(derivations.last(), Some(&128));
+    }
+
+    #[test]
+    fn zero_value_wallet_finalize_requires_exact_active_coin_before_name_insert() {
+        let (store, config) = production_followup_read_store();
+        let account = store
+            .with_store(|wallet| {
+                wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .map(|stored| stored.value)
+                    .ok_or(StoreError::CorruptMetadata)
+            })
+            .expect("FINALIZE account");
+        let recipient = store
+            .try_with_store(|wallet| {
+                derive_restore_addresses(wallet, &account, KeyRole::HnsName)
+                    .map(|addresses| addresses.into_iter().next().expect("FINALIZE recipient"))
+            })
+            .expect("derive FINALIZE recipient");
+        let (name_hash, coin, evidence) = zero_value_finalize_owner(&recipient);
+        assert_eq!(coin.value.get(), 0);
+        assert_eq!(
+            HnsInputCoinEvidence::from_canonical_coin(&coin)
+                .expect("zero FINALIZE input evidence")
+                .to_canonical_coin()
+                .expect("zero FINALIZE canonical input"),
+            coin
+        );
+        let script = WalletAddressKey {
+            version: 0,
+            hash: recipient.program.clone(),
+        };
+        let selector = HnsExistingAccountSelector::new(store.clone(), config.clone())
+            .expect("FINALIZE selector");
+        let backend = ProductionFollowupReadBackend::new(
+            store.clone(),
+            &config,
+            ProductionFollowupReadFault::Healthy,
+        )
+        .with_finalize_owner(script, coin.clone(), name_hash, evidence);
+        let runtime =
+            HnsAccountReadRuntime::new(backend, ProductionFollowupClock, store.clone(), selector)
+                .expect("FINALIZE runtime");
+
+        let snapshot = runtime.synchronize().expect("FINALIZE reconciliation");
+        assert_eq!(snapshot.balance, Amount::new(WalletAsset::Hns, 0));
+        assert_eq!(snapshot.known_names.len(), 1);
+        assert_eq!(snapshot.known_names[0].name, b"alpha");
+        assert_eq!(snapshot.known_names[0].name_hash, name_hash);
+        assert_eq!(snapshot.known_names[0].proof_state, None);
+        assert!(matches!(
+            snapshot.known_names[0].ownership_status,
+            NameOwnershipStatus::WalletOwned { derivation }
+                if derivation == recipient.derivation
+        ));
+        assert_eq!(snapshot.name_receive_target.derivation_index, 1);
+        let refreshed = runtime
+            .synchronize()
+            .expect("persisted FINALIZE rediscovery");
+        assert_eq!(refreshed.known_names.len(), 1);
+        assert_eq!(refreshed.known_names[0].name_hash, name_hash);
+        store
+            .with_store(|wallet| {
+                let names = wallet.list_entities_by_id_prefix::<KnownName>(
+                    EntityKind::KnownName,
+                    &account_entity_prefix(&config),
+                    MAX_HISTORY_RESULTS,
+                )?;
+                let coins = wallet.list_entities_by_id_prefix::<TrackedHnsCoin>(
+                    EntityKind::HnsUtxo,
+                    &account_entity_prefix(&config),
+                    MAX_WALLET_COINS,
+                )?;
+                assert_eq!(names.len(), 1);
+                assert_eq!(names[0].revision, 2);
+                assert_eq!(coins.len(), 1);
+                assert!(coins[0].value.coin.value.is_zero());
+                assert_eq!(
+                    coins[0].value.to_canonical_coin().expect("zero name Coin"),
+                    coin
+                );
+                Ok(())
+            })
+            .expect("revision-zero name insertion");
+    }
+
+    #[test]
+    fn mismatched_active_finalize_coin_fails_before_name_or_coin_commit() {
+        let (store, config) = production_followup_read_store();
+        let account = store
+            .with_store(|wallet| {
+                wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .map(|stored| stored.value)
+                    .ok_or(StoreError::CorruptMetadata)
+            })
+            .expect("mismatch account");
+        let recipient = store
+            .try_with_store(|wallet| {
+                derive_restore_addresses(wallet, &account, KeyRole::HnsName)
+                    .map(|addresses| addresses.into_iter().next().expect("mismatch recipient"))
+            })
+            .expect("derive mismatch recipient");
+        let (name_hash, coin, mut evidence) = zero_value_finalize_owner(&recipient);
+        evidence.owner_coin.address =
+            Address::new(0, vec![0xb1; 20]).expect("mismatched active address");
+        let selector = HnsExistingAccountSelector::new(store.clone(), config.clone())
+            .expect("mismatch selector");
+        let backend = ProductionFollowupReadBackend::new(
+            store.clone(),
+            &config,
+            ProductionFollowupReadFault::Healthy,
+        )
+        .with_finalize_owner(
+            WalletAddressKey {
+                version: 0,
+                hash: recipient.program,
+            },
+            coin,
+            name_hash,
+            evidence,
+        );
+        let runtime =
+            HnsAccountReadRuntime::new(backend, ProductionFollowupClock, store.clone(), selector)
+                .expect("mismatch runtime");
+        assert!(matches!(
+            runtime.synchronize(),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+        store
+            .with_store(|wallet| {
+                assert!(
+                    wallet
+                        .list_entities_by_id_prefix::<KnownName>(
+                            EntityKind::KnownName,
+                            &account_entity_prefix(&config),
+                            MAX_HISTORY_RESULTS,
+                        )?
+                        .is_empty()
+                );
+                assert!(
+                    wallet
+                        .list_entities_by_id_prefix::<TrackedHnsCoin>(
+                            EntityKind::HnsUtxo,
+                            &account_entity_prefix(&config),
+                            MAX_WALLET_COINS,
+                        )?
+                        .is_empty()
+                );
+                Ok(())
+            })
+            .expect("no mismatched authority commit");
     }
 
     #[test]

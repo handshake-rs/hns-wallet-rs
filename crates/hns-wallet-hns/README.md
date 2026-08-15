@@ -51,6 +51,16 @@ monotonic derivation high-water with the complete trailing gap; watch-only and
 non-wallet evidence persists without advancing. The existing full-runtime raw
 `import_name(&[u8])` API is unchanged.
 
+Fresh synchronization also consumes the node's versioned incoming-TRANSFER
+projection as discovery evidence for derived `HnsName` scripts. Such evidence
+may advance only the name-key high-water: the stale old-owner TRANSFER output
+never enters wallet balance, transaction, coin, or current ownership state. A
+wallet-script FINALIZE becomes a new or refreshed `KnownName` only after the
+node's exact-tip active-owner projection matches the exact name and canonical
+coin byte for byte. This remains a read-only trusted projection, not proof or
+spend authority; consensus-valid zero-valued name owner outputs are handled by
+the same exact-match rule.
+
 Its value and settlement configurations remain fail-closed until the embedding
 product completes the documented adapter and runtime qualification. See the
 [workspace repository](https://github.com/handshake-rs/hns-wallet-rs) for the

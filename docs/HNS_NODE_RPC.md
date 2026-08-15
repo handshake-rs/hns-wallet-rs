@@ -82,6 +82,28 @@ later query is accepted only under the exact chain and mempool bindings learned
 by the coin query, so no branch reduces another's lookahead or combines
 observations from different node views.
 
+The version-1 `incoming_transfers_page` projection is a discovery-only input
+for the `HnsName` branch. The adapter accepts only the two frozen source labels
+(`retained_body_verified` and `pruned_trusted_node_projection`), the exact
+epoch and complete tip, bounded script examinations and rows, canonical typed
+TRANSFER covenants, active-chain inclusion, requested recipient scripts,
+strict ordering, and unique outpoints. A matching candidate can advance only
+the monotonic name derivation high-water; its old-owner TRANSFER coin is never
+inserted into wallet balance, transaction, coin, or current-name ownership
+state. Paging has its own bounded allowance for up to 10,000 nonempty results
+plus the empty script-prefix pages needed to examine the complete 10,000-script
+restore query.
+
+The version-1 `active_name_owner_coin` projection is accepted only from the
+frozen `trusted_node_active_utxo_projection` source under the exact epoch and
+complete tip. The adapter independently checks the canonical NameState,
+active-chain inclusion, current owner outpoint, and complete covenant shape.
+A wallet-script FINALIZE is adopted as a `KnownName` only when its exact name
+and byte-exact canonical coin equal that active projection. The trusted
+projection is neither an ownership proof nor signing authority, and a
+consensus-valid zero-valued name owner output remains eligible for this exact
+comparison.
+
 ScriptId derivation hashes the canonical address bytes
 `[version, hash_length_u8, hash...]` with BLAKE2b-256, sorts the resulting IDs,
 and retains a checked reverse map to wallet derivations. Response hex is

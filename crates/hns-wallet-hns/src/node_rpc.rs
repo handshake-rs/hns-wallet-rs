@@ -18,8 +18,8 @@ use hns_covenants::{
     Covenant, CovenantKind, MAX_COVENANT_ITEM_SIZE, MAX_COVENANT_ITEMS, MAX_NAME_STATE_SIZE,
     NameState,
 };
-use hns_primitives::{Dollarydoos, NameHash};
-use hns_transaction::{Address, MAX_TRANSACTION_RAW_SIZE, Output, Transaction};
+use hns_primitives::{Dollarydoos, Height, NameHash, TransactionHash as CanonicalTransactionHash};
+use hns_transaction::{Address, Coin, MAX_TRANSACTION_RAW_SIZE, Outpoint, Output, Transaction};
 use hns_wallet_types::{BaseUnits, TransactionHash};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -27,9 +27,11 @@ use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    BlockHashEvidence, ChainTip, ConfirmedWalletPage, ConfirmedWalletPageRequest, HistoryEntry,
-    HnsBackend, HnsFeeRateSource, HnsNameAction, HnsNameLifecycle, HnsNetwork, HnsOutpoint,
-    HnsTransactionFeeQuote, HnsWalletError, IndexedWalletCoin, MAX_HISTORY_RESULTS,
+    ActiveNameOwnerCoinEvidence, ActiveNameOwnerCoinSourceBinding, BlockHashEvidence, ChainTip,
+    ConfirmedWalletPage, ConfirmedWalletPageRequest, HistoryEntry, HnsBackend, HnsFeeRateSource,
+    HnsNameAction, HnsNameLifecycle, HnsNetwork, HnsOutpoint, HnsTransactionFeeQuote,
+    HnsWalletError, IncomingTransferCandidate, IncomingTransferSourceBinding,
+    IncomingTransfersPage, IncomingTransfersPageRequest, IndexedWalletCoin, MAX_HISTORY_RESULTS,
     MAX_MEMPOOL_SCAN_RESULTS, MAX_OUTPOINT_SPEND_BATCH, MAX_RESTORE_SCRIPTS_PER_QUERY,
     MAX_SCAN_CURSOR_BYTES, MAX_SCAN_PAGE_RESULTS, MempoolSnapshotBinding, MempoolWalletPage,
     MempoolWalletPageRequest, NameActionContextEvidence, NameActionIneligibility, NameEvidence,
@@ -51,6 +53,8 @@ const MAX_FEE_TARGET_BLOCKS: u16 = 1_008;
 const MAX_FEE_SAMPLES: usize = 4_096;
 const MAX_MEMPOOL_RELATIONS: usize = 4_096;
 const MAX_TIMEOUT: Duration = Duration::from_secs(300);
+const INCOMING_TRANSFER_PROJECTION_VERSION: u8 = 1;
+const ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION: u8 = 1;
 
 /// Trusted local configuration for the authenticated wallet RPC boundary.
 ///
@@ -921,6 +925,39 @@ struct WireConfirmedPage {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WireIncomingTransferInclusion {
+    block_hash: String,
+    height: u32,
+    transaction_index: u32,
+    confirmations: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireIncomingTransfer {
+    script_index: usize,
+    recipient: WireAddress,
+    name_hash: String,
+    start_height: u32,
+    transfer_coin: WireCoin,
+    inclusion: WireIncomingTransferInclusion,
+    source_output_count: u32,
+    source_binding: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireIncomingTransfersPage {
+    projection_version: u8,
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    entries: Vec<WireIncomingTransfer>,
+    script_examinations: usize,
+    continuation: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireMempoolOutput {
     script_index: usize,
     outpoint: WireOutpoint,
@@ -1049,6 +1086,19 @@ struct WireNameState {
     registered: bool,
     expired: bool,
     weak: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireActiveNameOwnerCoin {
+    projection_version: u8,
+    chain_epoch: u64,
+    tip: WireTip,
+    current_state_hex: String,
+    current_state: WireNameState,
+    owner_coin: WireCoin,
+    inclusion: WireInclusion,
+    source_binding: String,
 }
 
 #[derive(Deserialize)]
@@ -1293,6 +1343,56 @@ fn require_binding(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_incoming_page_metadata(
+    projection_version: u8,
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    entry_count: usize,
+    script_examinations: usize,
+    script_count: usize,
+    limit: u32,
+    binding: SnapshotBinding,
+) -> Result<(), HnsWalletError> {
+    require_binding(chain_epoch, tip, binding)?;
+    if projection_version != INCOMING_TRANSFER_PROJECTION_VERSION
+        || entry_count > limit as usize
+        || !(1..=MAX_SCAN_PAGE_RESULTS).contains(&script_examinations)
+        || script_examinations > script_count
+    {
+        return Err(protocol_error());
+    }
+    Ok(())
+}
+
+fn incoming_transfer_source_binding(
+    source: &str,
+) -> Result<IncomingTransferSourceBinding, HnsWalletError> {
+    match source {
+        "retained_body_verified" => Ok(IncomingTransferSourceBinding::RetainedBodyVerified),
+        "pruned_trusted_node_projection" => {
+            Ok(IncomingTransferSourceBinding::PrunedTrustedNodeProjection)
+        }
+        _ => Err(protocol_error()),
+    }
+}
+
+fn validate_active_name_owner_metadata(
+    projection_version: u8,
+    chain_epoch: u64,
+    tip: WireTip,
+    source_binding: &str,
+    binding: SnapshotBinding,
+) -> Result<(), HnsWalletError> {
+    require_binding(chain_epoch, Some(tip), binding)?;
+    if projection_version != ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION
+        || source_binding != "trusted_node_active_utxo_projection"
+    {
+        return Err(protocol_error());
+    }
+    Ok(())
+}
+
 fn hns_outpoint(wire: &WireOutpoint) -> Result<HnsOutpoint, HnsWalletError> {
     Ok(HnsOutpoint {
         transaction: TransactionHash::new(decode_hex_32(&wire.txid)?),
@@ -1340,6 +1440,26 @@ fn wire_output(wire: &WireOutput) -> Result<Output, HnsWalletError> {
     };
     output.encode().map_err(|_| protocol_error())?;
     Ok(output)
+}
+
+fn wire_coin(wire: &WireCoin) -> Result<Coin, HnsWalletError> {
+    let outpoint = hns_outpoint(&wire.outpoint)?;
+    let outpoint = Outpoint {
+        transaction_hash: CanonicalTransactionHash::new(outpoint.transaction.into_bytes()),
+        index: outpoint.output_index,
+    };
+    let coin = Coin {
+        outpoint,
+        value: Dollarydoos::new(wire.value),
+        height: Height::new(wire.height),
+        coinbase: wire.coinbase,
+        address: wire_address(&wire.address)?,
+        covenant: wire_covenant(&wire.covenant)?,
+    };
+    if coin.outpoint.is_null() {
+        return Err(protocol_error());
+    }
+    Ok(coin)
 }
 
 fn canonical_transaction(
@@ -1499,7 +1619,6 @@ impl HnsBackend for HnsNodeRpcBackend {
             let height = u64::from(row.coin.height);
             if &output_address != expected_address
                 || height > binding.tip.height
-                || row.coin.value == 0
                 || !outpoints.insert(outpoint)
             {
                 return Err(protocol_error());
@@ -1528,6 +1647,116 @@ impl HnsBackend for HnsNodeRpcBackend {
             next_cursor,
             history,
             utxos,
+        })
+    }
+
+    fn get_incoming_transfers_page(
+        &self,
+        request: IncomingTransfersPageRequest<'_>,
+    ) -> Result<IncomingTransfersPage, HnsWalletError> {
+        if request.limit == 0 || request.limit as usize > MAX_SCAN_PAGE_RESULTS {
+            return Err(protocol_error());
+        }
+        let query = script_query(request.scripts)?;
+        let response: WireIncomingTransfersPage = self.rpc(serde_json::json!({
+            "method": "incoming_transfers_page",
+            "params": {
+                "script_ids": query.encoded_ids,
+                "expected_chain_epoch": request.binding.chain_epoch,
+                "cursor": encode_cursor(request.cursor)?,
+                "limit": request.limit,
+            },
+        }))?;
+        validate_incoming_page_metadata(
+            response.projection_version,
+            response.chain_epoch,
+            response.tip,
+            response.entries.len(),
+            response.script_examinations,
+            request.scripts.len(),
+            request.limit,
+            request.binding,
+        )?;
+
+        let next_cursor = decode_cursor(response.continuation)?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(response.entries.len())
+            .map_err(|_| protocol_error())?;
+        let mut page_script_index = None;
+        let mut previous_order = None;
+        let mut unique_outpoints = BTreeSet::new();
+        for row in response.entries {
+            let request_index = *query
+                .node_to_request
+                .get(row.script_index)
+                .ok_or_else(protocol_error)?;
+            let expected_recipient = request
+                .scripts
+                .get(request_index as usize)
+                .ok_or_else(protocol_error)?;
+            let recipient = wallet_address(&row.recipient)?;
+            let name_hash = decode_hex_32(&row.name_hash)?;
+            let transfer_coin = wire_coin(&row.transfer_coin)?;
+            let transaction_index = row.inclusion.transaction_index;
+            let inclusion = inclusion(
+                WireInclusion {
+                    block_hash: row.inclusion.block_hash,
+                    height: row.inclusion.height,
+                    transaction_index: Some(transaction_index),
+                    confirmations: row.inclusion.confirmations,
+                },
+                request.binding.tip,
+            )?;
+            let transfer = hns_covenants::TransferCovenant::try_from(&transfer_coin.covenant)
+                .map_err(|_| protocol_error())?;
+            let outpoint = HnsOutpoint {
+                transaction: TransactionHash::new(
+                    transfer_coin.outpoint.transaction_hash.into_bytes(),
+                ),
+                output_index: transfer_coin.outpoint.index,
+            };
+            let order = (
+                inclusion.height,
+                transaction_index,
+                outpoint.transaction,
+                outpoint.output_index,
+            );
+            if &recipient != expected_recipient
+                || transfer.name_hash.into_bytes() != name_hash
+                || transfer.start_height.get() != row.start_height
+                || transfer.recipient_version != recipient.version
+                || transfer.recipient_hash != recipient.hash
+                || transfer_coin.coinbase
+                || u64::from(transfer_coin.height.get()) != inclusion.height
+                || row.source_output_count == 0
+                || transfer_coin.outpoint.index >= row.source_output_count
+                || !unique_outpoints.insert(outpoint)
+                || previous_order.is_some_and(|previous| previous >= order)
+                || page_script_index.is_some_and(|index| index != request_index)
+            {
+                return Err(protocol_error());
+            }
+            previous_order = Some(order);
+            page_script_index = Some(request_index);
+            let source_binding = incoming_transfer_source_binding(&row.source_binding)?;
+            entries.push(IncomingTransferCandidate {
+                script_index: request_index,
+                recipient,
+                name_hash,
+                start_height: row.start_height,
+                transfer_coin,
+                inclusion,
+                source_output_count: row.source_output_count,
+                source_binding,
+            });
+        }
+        Ok(IncomingTransfersPage {
+            projection_version: INCOMING_TRANSFER_PROJECTION_VERSION,
+            binding: request.binding,
+            entries,
+            script_examinations: response.script_examinations,
+            next_cursor,
         })
     }
 
@@ -1960,6 +2189,45 @@ impl HnsBackend for HnsNodeRpcBackend {
         }))?;
         require_binding(response.chain_epoch, response.tip.clone(), binding)?;
         validated_name_response(self, response, name_hash, binding)
+    }
+
+    fn get_active_name_owner_coin(
+        &self,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
+    ) -> Result<ActiveNameOwnerCoinEvidence, HnsWalletError> {
+        let response: WireActiveNameOwnerCoin = self.rpc(serde_json::json!({
+            "method": "active_name_owner_coin",
+            "params": {
+                "name_hash": hex::encode(name_hash),
+                "expected_chain_epoch": binding.chain_epoch,
+            },
+        }))?;
+        validate_active_name_owner_metadata(
+            response.projection_version,
+            response.chain_epoch,
+            response.tip.clone(),
+            &response.source_binding,
+            binding,
+        )?;
+        let (current_state, _) = decode_projected_name_state(
+            &response.current_state_hex,
+            &response.current_state,
+            name_hash,
+        )?;
+        let owner_coin = wire_coin(&response.owner_coin)?;
+        let inclusion = inclusion(response.inclusion, binding.tip)?;
+        let evidence = ActiveNameOwnerCoinEvidence {
+            projection_version: response.projection_version,
+            binding,
+            current_state,
+            owner_coin,
+            inclusion,
+            source_binding: ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection,
+        };
+        super::validate_active_name_owner_coin_evidence(&evidence, name_hash, binding)?;
+        self.require_active_block_hash(inclusion.height, inclusion.block_hash, binding)?;
+        Ok(evidence)
     }
 
     fn get_name_action_context(
@@ -2422,6 +2690,155 @@ mod tests {
         let mut extra_field = response;
         extra_field["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<WireChainSnapshot>(extra_field).is_err());
+    }
+
+    #[test]
+    fn incoming_and_active_projection_metadata_is_strictly_bound_and_closed() {
+        let binding = SnapshotBinding {
+            tip: ChainTip {
+                height: 42,
+                block_hash: [1; 32],
+                tree_root: [2; 32],
+                median_time_past: 1_800_000_000,
+            },
+            chain_epoch: 9,
+        };
+        let wire_tip = || WireTip {
+            hash: hex::encode(binding.tip.block_hash),
+            height: u32::try_from(binding.tip.height).expect("tip height"),
+            tree_root: hex::encode(binding.tip.tree_root),
+            median_time_past: binding.tip.median_time_past,
+        };
+        assert!(
+            validate_incoming_page_metadata(1, 9, Some(wire_tip()), 1, 1, 1, 1, binding).is_ok()
+        );
+        for invalid in [
+            validate_incoming_page_metadata(2, 9, Some(wire_tip()), 1, 1, 1, 1, binding),
+            validate_incoming_page_metadata(1, 10, Some(wire_tip()), 1, 1, 1, 1, binding),
+            validate_incoming_page_metadata(1, 9, Some(wire_tip()), 2, 1, 1, 1, binding),
+            validate_incoming_page_metadata(1, 9, Some(wire_tip()), 0, 0, 1, 1, binding),
+            validate_incoming_page_metadata(1, 9, Some(wire_tip()), 0, 2, 1, 1, binding),
+        ] {
+            assert!(invalid.is_err());
+        }
+        let mut wrong_tip = wire_tip();
+        wrong_tip.hash = hex::encode([3; 32]);
+        assert!(
+            validate_incoming_page_metadata(1, 9, Some(wrong_tip), 0, 1, 1, 1, binding).is_err()
+        );
+        assert_eq!(
+            incoming_transfer_source_binding("retained_body_verified").expect("retained source"),
+            IncomingTransferSourceBinding::RetainedBodyVerified
+        );
+        assert_eq!(
+            incoming_transfer_source_binding("pruned_trusted_node_projection")
+                .expect("pruned source"),
+            IncomingTransferSourceBinding::PrunedTrustedNodeProjection
+        );
+        assert!(incoming_transfer_source_binding("archive_verified").is_err());
+
+        assert!(
+            validate_active_name_owner_metadata(
+                1,
+                9,
+                wire_tip(),
+                "trusted_node_active_utxo_projection",
+                binding,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_active_name_owner_metadata(
+                2,
+                9,
+                wire_tip(),
+                "trusted_node_active_utxo_projection",
+                binding,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_active_name_owner_metadata(
+                1,
+                9,
+                wire_tip(),
+                "retained_body_verified",
+                binding
+            )
+            .is_err()
+        );
+
+        let incoming = serde_json::json!({
+            "projection_version": 1,
+            "chain_epoch": 9,
+            "tip": {
+                "hash": hex::encode(binding.tip.block_hash),
+                "height": 42,
+                "tree_root": hex::encode(binding.tip.tree_root),
+                "median_time_past": binding.tip.median_time_past,
+            },
+            "entries": [],
+            "script_examinations": 1,
+            "continuation": null,
+        });
+        assert!(serde_json::from_value::<WireIncomingTransfersPage>(incoming.clone()).is_ok());
+        let mut extended = incoming;
+        extended
+            .as_object_mut()
+            .expect("incoming object")
+            .insert("unbound_extension".to_owned(), Value::Bool(true));
+        assert!(serde_json::from_value::<WireIncomingTransfersPage>(extended).is_err());
+
+        let active = serde_json::json!({
+            "projection_version": 1,
+            "chain_epoch": 9,
+            "tip": {
+                "hash": hex::encode(binding.tip.block_hash),
+                "height": 42,
+                "tree_root": hex::encode(binding.tip.tree_root),
+                "median_time_past": binding.tip.median_time_past,
+            },
+            "current_state_hex": "00",
+            "current_state": {
+                "name_hash": "11".repeat(32),
+                "name_hex": "616c706861",
+                "height": 0,
+                "renewal": 1,
+                "owner": {"txid": "22".repeat(32), "index": 0},
+                "value": 0,
+                "highest": 0,
+                "data_hex": "",
+                "transfer": 0,
+                "revoked": 0,
+                "claimed": 0,
+                "renewals": 1,
+                "registered": true,
+                "expired": false,
+                "weak": false,
+            },
+            "owner_coin": {
+                "outpoint": {"txid": "22".repeat(32), "index": 0},
+                "value": 0,
+                "height": 1,
+                "coinbase": false,
+                "address": {"version": 0, "hash": "33".repeat(20)},
+                "covenant": {"kind": 10, "items": []},
+            },
+            "inclusion": {
+                "block_hash": "44".repeat(32),
+                "height": 1,
+                "transaction_index": null,
+                "confirmations": 42,
+            },
+            "source_binding": "trusted_node_active_utxo_projection",
+        });
+        assert!(serde_json::from_value::<WireActiveNameOwnerCoin>(active.clone()).is_ok());
+        let mut extended = active;
+        extended
+            .as_object_mut()
+            .expect("active object")
+            .insert("unbound_extension".to_owned(), Value::Bool(true));
+        assert!(serde_json::from_value::<WireActiveNameOwnerCoin>(extended).is_err());
     }
 
     #[test]
