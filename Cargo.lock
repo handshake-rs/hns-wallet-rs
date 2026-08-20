@@ -1022,6 +1022,7 @@ dependencies = [
  "hkdf",
  "hns-marketplace-protocol",
  "hns-primitives",
+ "hns-wallet-bitcoin-kyoto",
  "hns-wallet-chain-api",
  "hns-wallet-store",
  "hns-wallet-types",

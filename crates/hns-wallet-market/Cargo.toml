@@ -15,6 +15,7 @@ publish = ["crates-io"]
 [dependencies]
 hns-wallet-chain-api.workspace = true
 hns-marketplace-protocol.workspace = true
+hns-wallet-bitcoin-kyoto.workspace = true
 hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true
 hex.workspace = true

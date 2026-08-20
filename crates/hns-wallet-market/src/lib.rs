@@ -8,7 +8,8 @@ mod settlement_key;
 
 use std::collections::BTreeMap;
 
-use hns_marketplace_protocol::{AssetId, ChainId, DeadlineKind};
+use hns_marketplace_protocol::{AssetId, ChainId, DeadlineKind, SwapAssetSide, SwapSessionHello};
+use hns_wallet_bitcoin_kyoto::build_denuo_bitcoin_htlc;
 use hns_wallet_store::{StoreError, WalletStore};
 use hns_wallet_types::{
     Amount, BaseUnits, ModuleId, ObjectHash, SessionId, WalletAsset, WorkflowId, WorkflowKind,
@@ -510,6 +511,7 @@ pub fn open_denuo_execution(
     hello
         .verify_agreement(policy.network())
         .map_err(|_| MarketError::CorruptDenuoSwapHandshake)?;
+    verify_canonical_denuo_lock_commitments(hello)?;
     if now_unix < expected_accepted_at {
         return Err(MarketError::InvalidEvidence);
     }
@@ -535,6 +537,53 @@ pub fn open_denuo_execution(
         return Err(MarketError::Invariant);
     }
     Ok(expected)
+}
+
+/// Reconstruct both lock descriptors from the mutually signed terms.  The
+/// HNS protocol owns its descriptor format; the Kyoto adapter owns the
+/// Bitcoin P2WSH format and its domain-separated Denuo commitment.  Keeping
+/// this check at the durable-execution boundary means a board record cannot
+/// turn an opaque or substituted 32-byte lock claim into a fundable swap.
+fn verify_canonical_denuo_lock_commitments(hello: &SwapSessionHello) -> Result<(), MarketError> {
+    verify_canonical_denuo_lock_commitment(hello, SwapAssetSide::Offered)?;
+    verify_canonical_denuo_lock_commitment(hello, SwapAssetSide::Received)
+}
+
+fn verify_canonical_denuo_lock_commitment(
+    hello: &SwapSessionHello,
+    side: SwapAssetSide,
+) -> Result<(), MarketError> {
+    let (asset, commitment) = match side {
+        SwapAssetSide::Offered => (hello.offered_asset, hello.offered_lock_commitment),
+        SwapAssetSide::Received => (hello.received_asset, hello.received_lock_commitment),
+    };
+    let computed = match asset {
+        AssetId::HNS => {
+            hello
+                .build_hns_htlc(
+                    side,
+                    match side {
+                        SwapAssetSide::Offered => hello.taker_settlement_public_key,
+                        SwapAssetSide::Received => hello.maker_settlement_public_key,
+                    },
+                    match side {
+                        SwapAssetSide::Offered => hello.maker_settlement_public_key,
+                        SwapAssetSide::Received => hello.taker_settlement_public_key,
+                    },
+                )
+                .map_err(|_| MarketError::InvalidDenuoSwapHandshake)?
+                .descriptor_hash
+        }
+        AssetId::BTC => build_denuo_bitcoin_htlc(hello, side)
+            .map_err(|_| MarketError::InvalidDenuoSwapHandshake)?
+            .commitment
+            .into_bytes(),
+        _ => return Err(MarketError::InvalidPair),
+    };
+    if computed != commitment {
+        return Err(MarketError::InvalidDenuoSwapHandshake);
+    }
+    Ok(())
 }
 
 fn swap_session_from_accepted_hello(
