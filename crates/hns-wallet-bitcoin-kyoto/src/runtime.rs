@@ -1200,7 +1200,7 @@ fn begin_broadcast_submission(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BitcoinValueRuntimePermit(());
+pub struct BitcoinValueRuntimePermit(pub(crate) ());
 
 pub fn bitcoin_value_runtime_permit() -> Result<BitcoinValueRuntimePermit, BitcoinWalletError> {
     if !BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED {

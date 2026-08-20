@@ -23,7 +23,8 @@ use bdk_wallet::bitcoin::blockdata::opcodes::all::{
 use bdk_wallet::bitcoin::consensus::{deserialize, serialize};
 use bdk_wallet::bitcoin::hashes::{Hash, sha256};
 use bdk_wallet::bitcoin::script::Builder as ScriptBuilder;
-use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey};
+use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
+use bdk_wallet::bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bdk_wallet::bitcoin::{
     Address, Amount as BitcoinAmount, Network, OutPoint, PublicKey, ScriptBuf, Sequence,
     Transaction, TxIn, TxOut, Witness, bip32::Xpriv, psbt::Psbt, transaction,
@@ -457,8 +458,7 @@ pub fn prepare_native_send(
             address.script_pubkey(),
             BitcoinAmount::from_sat(amount_sats),
         )
-        .fee_rate(fee_rate)
-        .only_witness_utxo();
+        .fee_rate(fee_rate);
     let psbt = builder
         .finish()
         .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
@@ -511,6 +511,96 @@ pub struct BitcoinHtlc {
     pub refund_height: u32,
     pub witness_script: Vec<u8>,
     pub script_pubkey: Vec<u8>,
+}
+
+/// A fully signed descriptor-wallet transaction funding one exact native
+/// SegWit HTLC. The raw bytes are redacted from `Debug`; callers must persist
+/// the enclosing descriptor wallet changes and an approval binding before
+/// broadcasting them through Kyoto.
+#[derive(Clone, Eq, PartialEq)]
+pub struct PreparedBitcoinHtlcFunding {
+    pub htlc: BitcoinHtlc,
+    pub value_sats: u64,
+    pub fee_sats: u64,
+    pub txid: TransactionHash,
+    raw_transaction: Vec<u8>,
+}
+
+impl PreparedBitcoinHtlcFunding {
+    pub fn raw_transaction(&self) -> &[u8] {
+        &self.raw_transaction
+    }
+
+    pub fn into_raw_transaction(self) -> Vec<u8> {
+        self.raw_transaction
+    }
+}
+
+impl fmt::Debug for PreparedBitcoinHtlcFunding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedBitcoinHtlcFunding")
+            .field("htlc", &self.htlc)
+            .field("value_sats", &self.value_sats)
+            .field("fee_sats", &self.fee_sats)
+            .field("txid", &self.txid)
+            .field("raw_transaction", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Build and sign the descriptor-wallet funding transaction for one exact
+/// HTLC output. This mutates the BDK wallet's staged change/address state but
+/// performs no persistence or network I/O.
+pub fn prepare_bitcoin_htlc_funding(
+    wallet: &mut Wallet,
+    _permit: &BitcoinValueRuntimePermit,
+    htlc: &BitcoinHtlc,
+    value_sats: u64,
+    fee_rate_sat_vb: u64,
+    maximum_fee_sats: u64,
+) -> Result<PreparedBitcoinHtlcFunding, BitcoinWalletError> {
+    htlc.validate()?;
+    if value_sats < MIN_HTLC_DUST_SATS || fee_rate_sat_vb == 0 || maximum_fee_sats == 0 {
+        return Err(BitcoinWalletError::InvalidAmount);
+    }
+    let fee_rate = bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(fee_rate_sat_vb)
+        .ok_or(BitcoinWalletError::InvalidFee)?;
+    let mut builder = wallet.build_tx();
+    builder
+        .add_recipient(htlc.script_pubkey(), BitcoinAmount::from_sat(value_sats))
+        .fee_rate(fee_rate);
+    let mut psbt = builder
+        .finish()
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
+    let fee_sats = wallet
+        .calculate_fee(&psbt.unsigned_tx)
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?
+        .to_sat();
+    if fee_sats == 0 || fee_sats > maximum_fee_sats {
+        return Err(BitcoinWalletError::FeeLimit);
+    }
+    if !wallet
+        .sign(&mut psbt, SignOptions::default())
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?
+    {
+        return Err(BitcoinWalletError::SigningIncomplete);
+    }
+    let transaction = psbt
+        .extract_tx()
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
+    let raw_transaction = serialize(&transaction);
+    if raw_transaction.len() > MAX_BITCOIN_TRANSACTION_BYTES {
+        return Err(BitcoinWalletError::TransactionTooLarge);
+    }
+    let verified = verify_htlc_funding(&raw_transaction, htlc, value_sats, 0, 0)?;
+    Ok(PreparedBitcoinHtlcFunding {
+        htlc: htlc.clone(),
+        value_sats,
+        fee_sats,
+        txid: verified.funding_txid,
+        raw_transaction,
+    })
 }
 
 impl BitcoinHtlc {
@@ -648,6 +738,15 @@ pub enum HtlcSpendBranch {
     Refund,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitcoinHtlcSpendRequest {
+    pub destination: ScriptBuf,
+    pub fee_sats: u64,
+    pub branch: HtlcSpendBranch,
+    pub preimage: Option<[u8; 32]>,
+    pub current_height: u32,
+}
+
 /// Constructs a policy-correct unsigned spend. A chain-specific signer fills
 /// the first witness item after the approval boundary.
 pub fn prepare_htlc_spend(
@@ -668,7 +767,7 @@ pub fn prepare_htlc_spend(
     if output_value < MIN_HTLC_DUST_SATS {
         return Err(BitcoinWalletError::Dust);
     }
-    let (lock_time, sequence, branch_selector, preimage_item) = match branch {
+    let (lock_time, sequence, witness_items) = match branch {
         HtlcSpendBranch::Redeem => {
             let secret = preimage.ok_or(BitcoinWalletError::MissingPreimage)?;
             if Sha256::digest(secret).as_slice() != lock.htlc.hashlock {
@@ -677,8 +776,12 @@ pub fn prepare_htlc_spend(
             (
                 absolute::LockTime::ZERO,
                 Sequence::MAX,
-                vec![1],
-                secret.to_vec(),
+                vec![
+                    Vec::new(),
+                    secret.to_vec(),
+                    vec![1],
+                    lock.htlc.witness_script.clone(),
+                ],
             )
         }
         HtlcSpendBranch::Refund => {
@@ -689,8 +792,7 @@ pub fn prepare_htlc_spend(
                 absolute::LockTime::from_height(lock.htlc.refund_height)
                     .map_err(|_| BitcoinWalletError::InvalidHtlc)?,
                 Sequence::ENABLE_LOCKTIME_NO_RBF,
-                Vec::new(),
-                Vec::new(),
+                vec![Vec::new(), Vec::new(), lock.htlc.witness_script.clone()],
             )
         }
     };
@@ -698,12 +800,7 @@ pub fn prepare_htlc_spend(
         txid: bdk_wallet::bitcoin::Txid::from_byte_array(lock.funding_txid.into_bytes()),
         vout: lock.output_index,
     };
-    let witness = Witness::from_slice(&[
-        Vec::new(),
-        preimage_item,
-        branch_selector,
-        lock.htlc.witness_script.clone(),
-    ]);
+    let witness = Witness::from_slice(&witness_items);
     Ok(Transaction {
         version: transaction::Version::TWO,
         lock_time,
@@ -718,6 +815,84 @@ pub fn prepare_htlc_spend(
             script_pubkey: destination,
         }],
     })
+}
+
+/// Construct and sign the exact redeem or refund spend with the role-bound,
+/// per-session swap key. The first witness element is a canonical DER ECDSA
+/// signature with `SIGHASH_ALL`; the existing branch selector, preimage, and
+/// witness script remain byte-for-byte unchanged.
+pub fn sign_bitcoin_htlc_spend(
+    lock: &VerifiedBitcoinLock,
+    _permit: &BitcoinValueRuntimePermit,
+    request: BitcoinHtlcSpendRequest,
+    local_key: &DerivedBitcoinSwapKey,
+) -> Result<Vec<u8>, BitcoinWalletError> {
+    lock.htlc.validate()?;
+    let expected_role = match request.branch {
+        HtlcSpendBranch::Redeem => BitcoinSwapKeyRole::Receiver,
+        HtlcSpendBranch::Refund => BitcoinSwapKeyRole::RefundOwner,
+    };
+    if local_key.public_key.reference.role() != expected_role {
+        return Err(BitcoinWalletError::InvalidSwapKeyReference);
+    }
+    let public_key = local_key.public_key.bitcoin_public_key()?;
+    let expected_public_key = match request.branch {
+        HtlcSpendBranch::Redeem => &lock.htlc.receiver_public_key,
+        HtlcSpendBranch::Refund => &lock.htlc.refund_public_key,
+    };
+    if public_key.to_bytes().as_slice() != expected_public_key {
+        return Err(BitcoinWalletError::InvalidSwapKeyReference);
+    }
+
+    let mut transaction = prepare_htlc_spend(
+        lock,
+        request.destination,
+        request.fee_sats,
+        request.branch,
+        request.preimage.as_ref(),
+        request.current_height,
+    )?;
+    let sighash_type = EcdsaSighashType::All;
+    let sighash = SighashCache::new(&transaction)
+        .p2wsh_signature_hash(
+            0,
+            &lock.htlc.witness_script(),
+            BitcoinAmount::from_sat(lock.value_sats),
+            sighash_type,
+        )
+        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    let message = Message::from_digest(sighash.to_byte_array());
+    let mut secret = SecretKey::from_slice(&local_key._secret_key.0)
+        .map_err(|_| BitcoinWalletError::InvalidSwapKeyReference)?;
+    let secp = Secp256k1::new();
+    let signature = secp.sign_ecdsa(&message, &secret);
+    secret.non_secure_erase();
+    secp.verify_ecdsa(&message, &signature, &public_key.inner)
+        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    let mut signature_bytes = signature.serialize_der().to_vec();
+    signature_bytes.push(
+        u8::try_from(sighash_type.to_u32()).map_err(|_| BitcoinWalletError::InvalidEvidence)?,
+    );
+
+    let mut witness = transaction.input[0]
+        .witness
+        .iter()
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let expected_witness_items = match request.branch {
+        HtlcSpendBranch::Redeem => 4,
+        HtlcSpendBranch::Refund => 3,
+    };
+    if witness.len() != expected_witness_items || !witness[0].is_empty() {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    witness[0] = signature_bytes;
+    transaction.input[0].witness = Witness::from_slice(&witness);
+    let raw_transaction = serialize(&transaction);
+    if raw_transaction.len() > MAX_BITCOIN_TRANSACTION_BYTES {
+        return Err(BitcoinWalletError::TransactionTooLarge);
+    }
+    Ok(raw_transaction)
 }
 
 /// Extracts a revealed 32-byte preimage only from a transaction which spends
@@ -1125,6 +1300,49 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_wallet_funds_exact_htlc_with_signed_inputs() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = parse_recovery_phrase(phrase).expect("mnemonic");
+        let mut wallet = create_descriptor_wallet(&mnemonic, Network::Regtest).expect("wallet");
+        let receive = wallet.reveal_next_address(KeychainKind::External).address;
+        let funding_transaction = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bdk_wallet::bitcoin::Txid::from_byte_array([42; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: BitcoinAmount::from_sat(100_000),
+                script_pubkey: receive.script_pubkey(),
+            }],
+        };
+        wallet.apply_unconfirmed_txs([(funding_transaction, 1)]);
+        let htlc = htlc();
+        let permit = BitcoinValueRuntimePermit(());
+        let prepared = prepare_bitcoin_htlc_funding(&mut wallet, &permit, &htlc, 50_000, 2, 5_000)
+            .expect("signed HTLC funding");
+        assert!(prepared.fee_sats > 0);
+        assert!(format!("{prepared:?}").contains("[REDACTED]"));
+        let verified = verify_htlc_funding(prepared.raw_transaction(), &htlc, 50_000, 0, 0)
+            .expect("exact funding output");
+        assert_eq!(verified.funding_txid, prepared.txid);
+        let transaction: Transaction =
+            deserialize(prepared.raw_transaction()).expect("funding transaction");
+        assert!(
+            transaction
+                .input
+                .iter()
+                .all(|input| !input.witness.is_empty())
+        );
+    }
+
+    #[test]
     fn redeem_reveals_preimage_and_refund_enforces_height() {
         let htlc = htlc();
         let tx = funding(&htlc, 50_000);
@@ -1161,6 +1379,98 @@ mod tests {
                 .expect("refund template");
         assert_eq!(
             refund.lock_time,
+            absolute::LockTime::from_height(500).unwrap()
+        );
+    }
+
+    #[test]
+    fn role_bound_swap_keys_sign_redeem_and_refund_witnesses() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = parse_recovery_phrase(phrase).expect("mnemonic");
+        let receiver = derive_bitcoin_swap_key(
+            &mnemonic,
+            BitcoinSwapKeyReference::new(Network::Regtest, BitcoinSwapKeyRole::Receiver, 0, 9)
+                .expect("receiver reference"),
+        )
+        .expect("receiver key");
+        let refund = derive_bitcoin_swap_key(
+            &mnemonic,
+            BitcoinSwapKeyReference::new(Network::Regtest, BitcoinSwapKeyRole::RefundOwner, 0, 10)
+                .expect("refund reference"),
+        )
+        .expect("refund key");
+        let preimage = [9_u8; 32];
+        let htlc = BitcoinHtlc::new(
+            Sha256::digest(preimage).into(),
+            receiver
+                .public_key()
+                .bitcoin_public_key()
+                .expect("receiver public key"),
+            refund
+                .public_key()
+                .bitcoin_public_key()
+                .expect("refund public key"),
+            500,
+        )
+        .expect("HTLC");
+        let lock = verify_htlc_funding(&serialize(&funding(&htlc, 50_000)), &htlc, 50_000, 6, 6)
+            .expect("lock");
+        let destination = ScriptBuf::new_p2wpkh(&key(8).wpubkey_hash().expect("compressed"));
+        let permit = BitcoinValueRuntimePermit(());
+        let redeem = sign_bitcoin_htlc_spend(
+            &lock,
+            &permit,
+            BitcoinHtlcSpendRequest {
+                destination: destination.clone(),
+                fee_sats: 500,
+                branch: HtlcSpendBranch::Redeem,
+                preimage: Some(preimage),
+                current_height: 400,
+            },
+            &receiver,
+        )
+        .expect("signed redeem");
+        let redeem_transaction: Transaction = deserialize(&redeem).expect("redeem transaction");
+        assert!(!redeem_transaction.input[0].witness[0].is_empty());
+        assert_eq!(
+            observe_preimage(&redeem, &lock).expect("redeem evidence"),
+            Some(preimage)
+        );
+        assert!(matches!(
+            sign_bitcoin_htlc_spend(
+                &lock,
+                &permit,
+                BitcoinHtlcSpendRequest {
+                    destination: destination.clone(),
+                    fee_sats: 500,
+                    branch: HtlcSpendBranch::Redeem,
+                    preimage: Some(preimage),
+                    current_height: 400,
+                },
+                &refund,
+            ),
+            Err(BitcoinWalletError::InvalidSwapKeyReference)
+        ));
+
+        let refund_transaction = sign_bitcoin_htlc_spend(
+            &lock,
+            &permit,
+            BitcoinHtlcSpendRequest {
+                destination,
+                fee_sats: 500,
+                branch: HtlcSpendBranch::Refund,
+                preimage: None,
+                current_height: 500,
+            },
+            &refund,
+        )
+        .expect("signed refund");
+        let refund_transaction: Transaction =
+            deserialize(&refund_transaction).expect("refund transaction");
+        assert!(!refund_transaction.input[0].witness[0].is_empty());
+        assert_eq!(refund_transaction.input[0].witness.len(), 3);
+        assert_eq!(
+            refund_transaction.lock_time,
             absolute::LockTime::from_height(500).unwrap()
         );
     }
