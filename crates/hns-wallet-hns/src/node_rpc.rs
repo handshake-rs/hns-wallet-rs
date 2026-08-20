@@ -2740,6 +2740,9 @@ fn finish_validated_name_action_response(
     owner_inclusion: TransactionInclusion,
     owner_kind: CovenantKind,
 ) -> Result<NameActionContextEvidence, HnsWalletError> {
+    let owner_coin_source_binding = owner_coin
+        .as_ref()
+        .map(|_| ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection);
     let transfer_height = (header.canonical_state.transfer.get() != 0)
         .then_some(header.canonical_state.transfer.get());
     let expected_finalize_height = transfer_height
@@ -2851,6 +2854,7 @@ fn finish_validated_name_action_response(
         owner_outpoint,
         owner_transaction,
         owner_coin,
+        owner_coin_source_binding,
         owner_inclusion,
         candidate_inclusion_height: header.candidate_height,
         lifecycle: response.lifecycle,

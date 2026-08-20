@@ -202,11 +202,15 @@ pub struct NameActionContextEvidence {
     /// pruning-safe active owner Coin below instead.
     #[serde(default)]
     pub owner_transaction: Vec<u8>,
-    /// Exact active-owner Coin for the pruning-safe version-2 node context.
-    /// This is trusted-node UTXO evidence, not a cryptographic transaction
-    /// proof or an assertion that this wallet owns the corresponding key.
+    /// Exact active-owner Coin for the pruning-safe version-2 context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_coin: Option<HnsInputCoinEvidence>,
+    /// Explicit authority class for `owner_coin`. Older version-2 records
+    /// omitted this field and are conservatively interpreted as trusted-node
+    /// projections; only the embedded backend may emit the locally verified
+    /// filtered-block class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_coin_source_binding: Option<ActiveNameOwnerCoinSourceBinding>,
     pub owner_inclusion: TransactionInclusion,
     pub candidate_inclusion_height: u64,
     pub lifecycle: HnsNameLifecycle,
@@ -1433,7 +1437,9 @@ fn validate_name_action_context(
             current_state: context.current_state.clone(),
             owner_coin: owner_coin.clone(),
             inclusion: context.owner_inclusion,
-            source_binding: ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection,
+            source_binding: context
+                .owner_coin_source_binding
+                .unwrap_or(ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection),
         };
         let validated_state =
             validate_active_name_owner_coin_evidence(&active, name_hash, binding)?;
@@ -1448,6 +1454,7 @@ fn validate_name_action_context(
     } else {
         if context.context_version != NAME_ACTION_CONTEXT_VERSION
             || context.owner_transaction.is_empty()
+            || context.owner_coin_source_binding.is_some()
         {
             return Err(HnsWalletError::InvalidEvidence);
         }
@@ -3964,6 +3971,7 @@ mod tests {
             owner_outpoint,
             owner_transaction: transfer_transaction.encode().expect("transfer"),
             owner_coin: None,
+            owner_coin_source_binding: None,
             owner_inclusion: TransactionInclusion {
                 block_hash: [81; 32],
                 height: 400,
@@ -4025,6 +4033,8 @@ mod tests {
             HnsInputCoinEvidence::from_canonical_coin(&active_owner_coin)
                 .expect("active owner evidence"),
         );
+        pruning_safe.owner_coin_source_binding =
+            Some(ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection);
         pruning_safe.owner_inclusion.transaction_index = None;
         let pruning_safe_json =
             serde_json::to_value(&pruning_safe).expect("pruning-safe context JSON");

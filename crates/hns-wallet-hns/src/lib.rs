@@ -20,7 +20,7 @@ pub use light_authority::{
 };
 pub use light_index::{
     EncryptedHnsLightIndex, HNS_LIGHT_INDEX_FORMAT_VERSION, HnsLightIndexError, HnsLightScanStatus,
-    HnsLightWatchSet, VerifiedHnsTransactionObservation,
+    HnsLightWatchSet, VerifiedHnsNameProof, VerifiedHnsTransactionObservation,
 };
 pub use name_workflow::{
     AuthorizedNameOperation, CurrentShakedexLockQuery, HnsNameAction, HnsNameLifecycle,
@@ -917,14 +917,18 @@ pub struct NameEvidence {
     pub untrusted_current_raw_resource: Option<Vec<u8>>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ActiveNameOwnerCoinSourceBinding {
     TrustedNodeActiveUtxoProjection,
+    /// Coin reconstructed from a transaction proven in a locally validated
+    /// filtered block under the wallet's own header authority.
+    LocallyVerifiedFilteredBlock,
 }
 
-/// Pruning-safe current NameState/owner-Coin projection from the authenticated
-/// node boundary. The source label is deliberately retained because this is
-/// not a cryptographic Coin-to-transaction proof.
+/// Pruning-safe current NameState/owner-Coin projection. The source label
+/// distinguishes a trusted node UTXO projection from a Coin reconstructed by
+/// the wallet from a Merkle-verified transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActiveNameOwnerCoinEvidence {
     pub projection_version: u8,
@@ -1265,11 +1269,17 @@ fn validate_active_name_owner_coin_evidence(
     expected_name_hash: [u8; 32],
     binding: SnapshotBinding,
 ) -> Result<NameState, HnsWalletError> {
+    let valid_inclusion_shape = match evidence.source_binding {
+        ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection => {
+            evidence.inclusion.transaction_index.is_none()
+        }
+        ActiveNameOwnerCoinSourceBinding::LocallyVerifiedFilteredBlock => {
+            evidence.inclusion.transaction_index.is_some()
+        }
+    };
     if evidence.projection_version != 1
         || evidence.binding != binding
-        || evidence.source_binding
-            != ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection
-        || evidence.inclusion.transaction_index.is_some()
+        || !valid_inclusion_shape
         || evidence.inclusion.height > binding.tip.height
         || evidence.inclusion.block_hash == [0; 32]
     {

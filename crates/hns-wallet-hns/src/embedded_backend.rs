@@ -3,28 +3,31 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use hns_covenants::{CovenantKind, TransferCovenant};
+use hns_covenants::{CovenantKind, MAX_RESOURCE_SIZE, NameState, TransferCovenant};
 use hns_header_consensus::Header;
 use hns_light_sync::{HeaderRoundRequest, PeerId, SyncState};
 use hns_light_wallet::VerifiedWalletBlock;
-use hns_primitives::{Height, Outpoint};
-use hns_transaction::{Coin, Transaction};
+use hns_p2p_wire::{GetProofPacket, ProofPacket};
+use hns_primitives::{Height, NameHash, Outpoint, TreeRoot};
+use hns_transaction::{Coin, Output, Transaction};
 use hns_wallet_types::{BaseUnits, TransactionHash};
 use sha2::{Digest, Sha256};
 
 use crate::light_index::{add_watched_outputs, transaction_relevant};
 use crate::{
-    ActiveNameOwnerCoinEvidence, BlockHashEvidence, ChainTip, ConfirmedWalletPage,
-    ConfirmedWalletPageRequest, DEFAULT_FEE_TARGET_BLOCKS, EncryptedHnsLightAuthority,
-    EncryptedHnsLightIndex, HistoryEntry, HnsBackend, HnsFeeRateSource, HnsLightWatchSet,
-    HnsNameAction, HnsTransactionFeeQuote, HnsWalletError, IncomingTransferCandidate,
+    ActiveNameOwnerCoinEvidence, ActiveNameOwnerCoinSourceBinding, BlockHashEvidence, ChainTip,
+    ConfirmedWalletPage, ConfirmedWalletPageRequest, DEFAULT_FEE_TARGET_BLOCKS,
+    EncryptedHnsLightAuthority, EncryptedHnsLightIndex, HistoryEntry, HnsBackend, HnsFeeRateSource,
+    HnsInputCoinEvidence, HnsLightWatchSet, HnsNameAction, HnsNameLifecycle, HnsNetwork,
+    HnsTransactionFeeQuote, HnsWalletError, IncomingTransferCandidate,
     IncomingTransferSourceBinding, IncomingTransfersPage, IncomingTransfersPageRequest,
     IndexedWalletCoin, MAX_HISTORY_RESULTS, MAX_MEMPOOL_SCAN_RESULTS, MAX_OUTPOINT_SPEND_BATCH,
     MAX_SCAN_PAGE_RESULTS, MempoolSnapshotBinding, MempoolWalletPage, MempoolWalletPageRequest,
-    NameActionContextEvidence, NameEvidence, OutpointSpendEntry, OutpointSpendEvidence,
-    PersistedHeaderRound, SnapshotBinding, SpendingTransactionEvidence, TransactionEvidence,
-    TransactionInclusion, TransactionStatus, VerifiedHnsTransactionObservation, WalletAddressKey,
-    WalletCoin, actual_transaction_fee, local_fee_policy_evidence,
+    NameActionContextEvidence, NameActionIneligibility, NameEvidence, NameProofResponse,
+    OutpointSpendEntry, OutpointSpendEvidence, PersistedHeaderRound, SnapshotBinding,
+    SpendingTransactionEvidence, TransactionEvidence, TransactionInclusion, TransactionStatus,
+    VerifiedHnsNameProof, VerifiedHnsTransactionObservation, WalletAddressKey, WalletCoin,
+    actual_transaction_fee, local_fee_policy_evidence,
 };
 
 const MINIMUM_RELAY_FEE_RATE: u64 = 1_000;
@@ -192,6 +195,45 @@ impl EmbeddedHnsBackend {
             .authority
             .finish_header_round_and_persist(now_unix)
             .map_err(map_authority_error)
+    }
+
+    /// Exact standard `getproof` target for a watched name at the current
+    /// locally agreed header-tree root.
+    pub fn name_proof_request(
+        &self,
+        name_hash: [u8; 32],
+    ) -> Result<GetProofPacket, HnsWalletError> {
+        let state = self.lock()?;
+        let binding = current_binding(&state)?;
+        if state
+            .index
+            .watch_set()
+            .name_hashes
+            .binary_search(&name_hash)
+            .is_err()
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        Ok(GetProofPacket {
+            root: TreeRoot::new(binding.tip.tree_root),
+            key: NameHash::new(name_hash),
+        })
+    }
+
+    /// Admit a strictly decoded peer proof only after binding it to the
+    /// current locally agreed root and installed name watch set.
+    pub fn admit_name_proof(
+        &self,
+        packet: &ProofPacket,
+        now_unix: u64,
+    ) -> Result<VerifiedHnsNameProof, HnsWalletError> {
+        let mut state = self.lock()?;
+        let EmbeddedState {
+            authority, index, ..
+        } = &mut *state;
+        index
+            .admit_name_proof(authority, packet, now_unix)
+            .map_err(map_index_error)
     }
 
     /// Commit one next-height verified filtered block into the encrypted index.
@@ -613,29 +655,105 @@ impl HnsBackend for EmbeddedHnsBackend {
 
     fn get_name_evidence(
         &self,
-        _name_hash: [u8; 32],
-        _binding: SnapshotBinding,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
     ) -> Result<NameEvidence, HnsWalletError> {
-        Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        let state = self.lock()?;
+        require_binding(&state, binding)?;
+        let view = embedded_name_view(&state, name_hash, binding)?;
+        let (proof_owner_outpoint, proof_owner_transaction, proof_owner_inclusion) =
+            optional_name_owner_fields(view.proof_owner.as_ref());
+        let (current_owner_outpoint, current_owner_transaction, current_owner_inclusion) =
+            optional_name_owner_fields(view.current_owner.as_ref());
+        Ok(NameEvidence {
+            binding,
+            proof: NameProofResponse {
+                name_hash,
+                tree_root: view.proof.tree_root,
+                proof: view.proof.proof,
+                proof_height: binding.tip.height,
+            },
+            proof_state: view.proof.state,
+            proof_owner_outpoint,
+            proof_owner_transaction,
+            proof_owner_inclusion,
+            current_state: view.current_raw,
+            current_owner_outpoint,
+            current_owner_transaction,
+            current_owner_inclusion,
+            untrusted_current_raw_resource: view
+                .current
+                .as_ref()
+                .map(|current| current.resource_data.clone()),
+        })
     }
 
     fn get_active_name_owner_coin(
         &self,
-        _name_hash: [u8; 32],
-        _binding: SnapshotBinding,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
     ) -> Result<ActiveNameOwnerCoinEvidence, HnsWalletError> {
-        Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        let state = self.lock()?;
+        require_binding(&state, binding)?;
+        let view = embedded_name_view(&state, name_hash, binding)?;
+        active_name_owner_coin(&view, binding)
     }
 
     fn get_name_action_context(
         &self,
-        _action: HnsNameAction,
-        _name_hash: [u8; 32],
-        _binding: SnapshotBinding,
-        _expected_mempool: MempoolSnapshotBinding,
+        action: HnsNameAction,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
+        expected_mempool: MempoolSnapshotBinding,
     ) -> Result<NameActionContextEvidence, HnsWalletError> {
-        Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        let state = self.lock()?;
+        require_binding(&state, binding)?;
+        embedded_name_action_context(&state, action, name_hash, binding, expected_mempool, false)
     }
+
+    fn get_name_action_context_v2(
+        &self,
+        action: HnsNameAction,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
+        expected_mempool: MempoolSnapshotBinding,
+    ) -> Result<NameActionContextEvidence, HnsWalletError> {
+        let state = self.lock()?;
+        require_binding(&state, binding)?;
+        embedded_name_action_context(&state, action, name_hash, binding, expected_mempool, true)
+    }
+}
+
+struct EmbeddedNameView {
+    proof: VerifiedHnsNameProof,
+    current_raw: Option<Vec<u8>>,
+    current: Option<NameState>,
+    proof_owner: Option<EmbeddedNameOwner>,
+    current_owner: Option<EmbeddedNameOwner>,
+}
+
+#[derive(Clone)]
+struct EmbeddedNameOwner {
+    outpoint: crate::HnsOutpoint,
+    transaction: Vec<u8>,
+    output: Output,
+    inclusion: TransactionInclusion,
+    coinbase: bool,
+}
+
+#[derive(Clone, Copy)]
+struct EmbeddedNameParameters {
+    lockup_period: u32,
+    renewal_window: u32,
+    renewal_period: u32,
+    renewal_maturity: u32,
+    claim_period: u32,
+    bidding_period: u32,
+    reveal_period: u32,
+    tree_interval: u32,
+    transfer_lockup: u32,
+    auction_maturity: u32,
+    no_reserved: bool,
 }
 
 #[derive(Clone)]
@@ -693,6 +811,791 @@ fn validate_page_scripts(scripts: &[WalletAddressKey]) -> Result<(), HnsWalletEr
         return Err(HnsWalletError::InvalidEvidence);
     }
     Ok(())
+}
+
+fn embedded_name_view(
+    state: &EmbeddedState,
+    name_hash: [u8; 32],
+    binding: SnapshotBinding,
+) -> Result<EmbeddedNameView, HnsWalletError> {
+    let proof = state
+        .index
+        .name_proof(name_hash, binding.tip.tree_root)
+        .map_err(map_index_error)?
+        .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)?;
+    let observations = state.index.transactions().map_err(map_index_error)?;
+    let proof_state = proof
+        .state
+        .as_deref()
+        .map(|raw| {
+            NameState::decode(NameHash::new(name_hash), raw)
+                .map_err(|_| HnsWalletError::InvalidEvidence)
+        })
+        .transpose()?;
+    let current = project_current_name_state(
+        proof_state.clone(),
+        name_hash,
+        &observations,
+        state.index.status().birthday_height,
+        state.authority.consensus_network(),
+        u32::try_from(binding.tip.height).map_err(|_| HnsWalletError::InvalidEvidence)?,
+    )?;
+    let current_raw = current
+        .as_ref()
+        .map(|current| {
+            current
+                .encode()
+                .map_err(|_| HnsWalletError::InvalidEvidence)
+        })
+        .transpose()?;
+    let proof_owner = name_owner_observation(proof_state.as_ref(), &observations)?;
+    let current_owner = name_owner_observation(current.as_ref(), &observations)?;
+    Ok(EmbeddedNameView {
+        proof,
+        current_raw,
+        current,
+        proof_owner,
+        current_owner,
+    })
+}
+
+fn name_owner_observation(
+    state: Option<&NameState>,
+    observations: &[VerifiedHnsTransactionObservation],
+) -> Result<Option<EmbeddedNameOwner>, HnsWalletError> {
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let Some(owner) = state.owner_outpoint() else {
+        return Ok(None);
+    };
+    let txid = TransactionHash::new(owner.transaction_hash.into_bytes());
+    let observation = observations
+        .iter()
+        .find(|observation| observation.txid == txid)
+        .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)?;
+    let output = observation
+        .transaction
+        .outputs
+        .get(owner.index as usize)
+        .cloned()
+        .ok_or(HnsWalletError::InvalidEvidence)?;
+    if output.covenant.item_name_hash(0) != Some(state.name_hash) || !output.covenant.kind.is_name()
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(Some(EmbeddedNameOwner {
+        outpoint: crate::HnsOutpoint {
+            transaction: txid,
+            output_index: owner.index,
+        },
+        transaction: observation.raw.clone(),
+        output,
+        inclusion: inclusion(observation),
+        coinbase: observation.coinbase,
+    }))
+}
+
+fn optional_name_owner_fields(
+    owner: Option<&EmbeddedNameOwner>,
+) -> (
+    Option<crate::HnsOutpoint>,
+    Option<Vec<u8>>,
+    Option<TransactionInclusion>,
+) {
+    owner.map_or((None, None, None), |owner| {
+        (
+            Some(owner.outpoint),
+            Some(owner.transaction.clone()),
+            Some(owner.inclusion),
+        )
+    })
+}
+
+fn active_name_owner_coin(
+    view: &EmbeddedNameView,
+    binding: SnapshotBinding,
+) -> Result<ActiveNameOwnerCoinEvidence, HnsWalletError> {
+    let current_state = view
+        .current_raw
+        .clone()
+        .ok_or(HnsWalletError::InvalidEvidence)?;
+    let owner = view
+        .current_owner
+        .as_ref()
+        .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)?;
+    Ok(ActiveNameOwnerCoinEvidence {
+        projection_version: 1,
+        binding,
+        current_state,
+        owner_coin: Coin {
+            outpoint: Outpoint {
+                transaction_hash: hns_primitives::TransactionHash::new(
+                    owner.outpoint.transaction.into_bytes(),
+                ),
+                index: owner.outpoint.output_index,
+            },
+            value: owner.output.value,
+            height: Height::new(
+                u32::try_from(owner.inclusion.height)
+                    .map_err(|_| HnsWalletError::InvalidEvidence)?,
+            ),
+            coinbase: owner.coinbase,
+            address: owner.output.address.clone(),
+            covenant: owner.output.covenant.clone(),
+        },
+        inclusion: owner.inclusion,
+        source_binding: ActiveNameOwnerCoinSourceBinding::LocallyVerifiedFilteredBlock,
+    })
+}
+
+fn project_current_name_state(
+    mut current: Option<NameState>,
+    name_hash: [u8; 32],
+    observations: &[VerifiedHnsTransactionObservation],
+    scan_birthday: u32,
+    network: hns_header_consensus::Network,
+    tip_height: u32,
+) -> Result<Option<NameState>, HnsWalletError> {
+    let parameters = embedded_name_parameters(network);
+    let committed_height = name_tree_committed_height(tip_height, parameters.tree_interval)?;
+    let first_uncommitted = committed_height
+        .checked_add(1)
+        .ok_or(HnsWalletError::Arithmetic)?;
+    if tip_height != 0 && scan_birthday > first_uncommitted {
+        return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+    }
+    for observation in observations
+        .iter()
+        .filter(|observation| observation.height > committed_height)
+    {
+        apply_projected_name_transaction(
+            &mut current,
+            name_hash,
+            &observation.transaction,
+            observation.height,
+            parameters,
+        )?;
+    }
+    if current
+        .as_ref()
+        .is_some_and(|state| state.name_hash.into_bytes() != name_hash || state.is_null())
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(current)
+}
+
+fn name_tree_committed_height(tip_height: u32, interval: u32) -> Result<u32, HnsWalletError> {
+    if interval == 0 {
+        return Err(HnsWalletError::InvalidRuntimeConfiguration);
+    }
+    if tip_height == 0 {
+        return Ok(0);
+    }
+    let parent = tip_height - 1;
+    Ok(parent - parent % interval)
+}
+
+fn apply_projected_name_transaction(
+    current: &mut Option<NameState>,
+    expected_name_hash: [u8; 32],
+    transaction: &Transaction,
+    height: u32,
+    parameters: EmbeddedNameParameters,
+) -> Result<(), HnsWalletError> {
+    let canonical_txid = transaction
+        .transaction_hash()
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    for (output_index, output) in transaction.outputs.iter().enumerate() {
+        if !output.covenant.kind.is_name() {
+            continue;
+        }
+        let Some(name_hash) = output.covenant.item_name_hash(0) else {
+            return Err(HnsWalletError::InvalidEvidence);
+        };
+        if name_hash.into_bytes() != expected_name_hash {
+            continue;
+        }
+        let output_index =
+            u32::try_from(output_index).map_err(|_| HnsWalletError::InvalidEvidence)?;
+        let outpoint = Outpoint {
+            transaction_hash: canonical_txid,
+            index: output_index,
+        };
+        if output.covenant.kind == CovenantKind::Claim {
+            apply_projected_claim(
+                current,
+                expected_name_hash,
+                output,
+                outpoint,
+                height,
+                parameters,
+            )?;
+            continue;
+        }
+
+        let initially_null = current.is_none();
+        if initially_null {
+            if output.covenant.kind != CovenantKind::Open {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            let name = output
+                .covenant
+                .items
+                .get(2)
+                .cloned()
+                .ok_or(HnsWalletError::InvalidEvidence)?;
+            if hns_covenants::hash_name(&name)
+                .map_err(|_| HnsWalletError::InvalidEvidence)?
+                .into_bytes()
+                != expected_name_hash
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            let mut state = NameState::null(NameHash::new(expected_name_hash));
+            initialize_projected_name_state(&mut state, name, height);
+            *current = Some(state);
+        }
+        let state = current.as_mut().ok_or(HnsWalletError::InvalidEvidence)?;
+        if !initially_null {
+            maybe_expire_projected_name(state, height, parameters)?;
+        }
+        let start = embedded_covenant_u32(&output.covenant, 1)?;
+        if !matches!(output.covenant.kind, CovenantKind::Open) && start != state.height.get() {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        match output.covenant.kind {
+            CovenantKind::Open | CovenantKind::Bid | CovenantKind::Redeem => {}
+            CovenantKind::Reveal => {
+                if state.owner.is_null() || output.value > state.highest {
+                    state.value = state.highest;
+                    state.owner = outpoint;
+                    state.highest = output.value;
+                } else if output.value > state.value {
+                    state.value = output.value;
+                }
+            }
+            CovenantKind::Register => {
+                state.registered = true;
+                state.owner = outpoint;
+                if let Some(resource) = output
+                    .covenant
+                    .items
+                    .get(2)
+                    .filter(|resource| !resource.is_empty())
+                {
+                    if resource.len() > MAX_RESOURCE_SIZE {
+                        return Err(HnsWalletError::InvalidEvidence);
+                    }
+                    state.resource_data = resource.clone();
+                }
+                state.renewal = Height::new(height);
+            }
+            CovenantKind::Update => {
+                state.owner = outpoint;
+                if let Some(resource) = output
+                    .covenant
+                    .items
+                    .get(2)
+                    .filter(|resource| !resource.is_empty())
+                {
+                    if resource.len() > MAX_RESOURCE_SIZE {
+                        return Err(HnsWalletError::InvalidEvidence);
+                    }
+                    state.resource_data = resource.clone();
+                }
+                state.transfer = Height::new(0);
+            }
+            CovenantKind::Renew => {
+                state.owner = outpoint;
+                state.transfer = Height::new(0);
+                state.renewal = Height::new(height);
+                state.renewals = state
+                    .renewals
+                    .checked_add(1)
+                    .ok_or(HnsWalletError::Arithmetic)?;
+            }
+            CovenantKind::Transfer => {
+                TransferCovenant::try_from(&output.covenant)
+                    .map_err(|_| HnsWalletError::InvalidEvidence)?;
+                state.owner = outpoint;
+                state.transfer = Height::new(height);
+            }
+            CovenantKind::Finalize => {
+                let finalize = hns_covenants::FinalizeCovenant::try_from(&output.covenant)
+                    .map_err(|_| HnsWalletError::InvalidEvidence)?;
+                if finalize.name_hash != state.name_hash
+                    || finalize.start_height != state.height
+                    || finalize.name != state.name
+                    || finalize.weak() != state.weak
+                    || finalize.claimed != state.claimed
+                    || finalize.renewals != state.renewals
+                {
+                    return Err(HnsWalletError::InvalidEvidence);
+                }
+                state.owner = outpoint;
+                state.transfer = Height::new(0);
+                state.renewal = Height::new(height);
+                state.renewals = state
+                    .renewals
+                    .checked_add(1)
+                    .ok_or(HnsWalletError::Arithmetic)?;
+            }
+            CovenantKind::Revoke => {
+                state.revoked = Height::new(height);
+                state.transfer = Height::new(0);
+                state.resource_data.clear();
+            }
+            CovenantKind::None | CovenantKind::Claim | CovenantKind::Unknown(_) => {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+        }
+        state
+            .encode()
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    }
+    Ok(())
+}
+
+fn apply_projected_claim(
+    current: &mut Option<NameState>,
+    expected_name_hash: [u8; 32],
+    output: &Output,
+    outpoint: Outpoint,
+    height: u32,
+    parameters: EmbeddedNameParameters,
+) -> Result<(), HnsWalletError> {
+    if output.covenant.items.len() != 6 {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let name = output.covenant.items[2].clone();
+    if hns_covenants::hash_name(&name)
+        .map_err(|_| HnsWalletError::InvalidEvidence)?
+        .into_bytes()
+        != expected_name_hash
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let state = current.get_or_insert_with(|| NameState::null(NameHash::new(expected_name_hash)));
+    if state.is_null() {
+        initialize_projected_name_state(state, name.clone(), height);
+    }
+    if state.name != name {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    maybe_expire_projected_name(state, height, parameters)?;
+    state.height = Height::new(height);
+    state.renewal = Height::new(height);
+    state.claimed = Height::new(embedded_covenant_u32(&output.covenant, 5)?);
+    state.value = hns_primitives::Dollarydoos::new(0);
+    state.owner = outpoint;
+    state.highest = hns_primitives::Dollarydoos::new(0);
+    state.weak = embedded_covenant_u8(&output.covenant, 3)? & 1 != 0;
+    state
+        .encode()
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    Ok(())
+}
+
+fn initialize_projected_name_state(state: &mut NameState, name: Vec<u8>, height: u32) {
+    state.name = name;
+    reset_projected_name_state(state, height);
+}
+
+fn reset_projected_name_state(state: &mut NameState, height: u32) {
+    state.height = Height::new(height);
+    state.renewal = Height::new(height);
+    state.owner = Outpoint::NULL;
+    state.value = hns_primitives::Dollarydoos::new(0);
+    state.highest = hns_primitives::Dollarydoos::new(0);
+    state.resource_data.clear();
+    state.transfer = Height::new(0);
+    state.revoked = Height::new(0);
+    state.claimed = Height::new(0);
+    state.renewals = 0;
+    state.registered = false;
+    state.expired = false;
+    state.weak = false;
+}
+
+fn maybe_expire_projected_name(
+    state: &mut NameState,
+    height: u32,
+    parameters: EmbeddedNameParameters,
+) -> Result<bool, HnsWalletError> {
+    if !embedded_name_is_expired(state, height, parameters) {
+        return Ok(false);
+    }
+    let resource = std::mem::take(&mut state.resource_data);
+    reset_projected_name_state(state, height);
+    state.expired = true;
+    state.resource_data = resource;
+    state
+        .encode()
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    Ok(true)
+}
+
+fn embedded_name_lifecycle(
+    state: &NameState,
+    height: u32,
+    parameters: EmbeddedNameParameters,
+) -> HnsNameLifecycle {
+    if state.revoked.get() != 0 {
+        return HnsNameLifecycle::Revoked;
+    }
+    if state.claimed.get() != 0 {
+        if height < state.height.get().saturating_add(parameters.lockup_period) {
+            return HnsNameLifecycle::Locked;
+        }
+        return HnsNameLifecycle::Closed;
+    }
+    let open_period = parameters.tree_interval.saturating_add(1);
+    if height < state.height.get().saturating_add(open_period) {
+        HnsNameLifecycle::Opening
+    } else if height
+        < state
+            .height
+            .get()
+            .saturating_add(open_period)
+            .saturating_add(parameters.bidding_period)
+    {
+        HnsNameLifecycle::Bidding
+    } else if height
+        < state
+            .height
+            .get()
+            .saturating_add(open_period)
+            .saturating_add(parameters.bidding_period)
+            .saturating_add(parameters.reveal_period)
+    {
+        HnsNameLifecycle::Reveal
+    } else {
+        HnsNameLifecycle::Closed
+    }
+}
+
+fn embedded_name_is_expired(
+    state: &NameState,
+    height: u32,
+    parameters: EmbeddedNameParameters,
+) -> bool {
+    if state.revoked.get() != 0 {
+        return height
+            >= state
+                .revoked
+                .get()
+                .saturating_add(parameters.auction_maturity);
+    }
+    if embedded_name_lifecycle(state, height, parameters) != HnsNameLifecycle::Closed {
+        return false;
+    }
+    let claimable =
+        state.claimed.get() != 0 && !parameters.no_reserved && height < parameters.claim_period;
+    if claimable {
+        return false;
+    }
+    height
+        >= state
+            .renewal
+            .get()
+            .saturating_add(parameters.renewal_window)
+        || state.owner.is_null()
+}
+
+fn embedded_covenant_u32(
+    covenant: &hns_covenants::Covenant,
+    index: usize,
+) -> Result<u32, HnsWalletError> {
+    covenant
+        .items
+        .get(index)
+        .and_then(|item| item.as_slice().try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or(HnsWalletError::InvalidEvidence)
+}
+
+fn embedded_covenant_u8(
+    covenant: &hns_covenants::Covenant,
+    index: usize,
+) -> Result<u8, HnsWalletError> {
+    covenant
+        .items
+        .get(index)
+        .and_then(|item| (item.len() == 1).then_some(item[0]))
+        .ok_or(HnsWalletError::InvalidEvidence)
+}
+
+const fn embedded_name_parameters(
+    network: hns_header_consensus::Network,
+) -> EmbeddedNameParameters {
+    match network {
+        hns_header_consensus::Network::Mainnet => EmbeddedNameParameters {
+            lockup_period: 4_320,
+            renewal_window: 105_120,
+            renewal_period: 26_208,
+            renewal_maturity: 4_320,
+            claim_period: 210_240,
+            bidding_period: 720,
+            reveal_period: 1_440,
+            tree_interval: 36,
+            transfer_lockup: 288,
+            auction_maturity: 4_176,
+            no_reserved: false,
+        },
+        hns_header_consensus::Network::Testnet => EmbeddedNameParameters {
+            lockup_period: 36,
+            renewal_window: 4_320,
+            renewal_period: 1_008,
+            renewal_maturity: 144,
+            claim_period: 12_960,
+            bidding_period: 144,
+            reveal_period: 288,
+            tree_interval: 36,
+            transfer_lockup: 288,
+            auction_maturity: 1_008,
+            no_reserved: false,
+        },
+        hns_header_consensus::Network::Regtest => EmbeddedNameParameters {
+            lockup_period: 2,
+            renewal_window: 5_000,
+            renewal_period: 2_500,
+            renewal_maturity: 50,
+            claim_period: 250_000,
+            bidding_period: 5,
+            reveal_period: 10,
+            tree_interval: 5,
+            transfer_lockup: 10,
+            auction_maturity: 65,
+            no_reserved: false,
+        },
+        hns_header_consensus::Network::Simnet => EmbeddedNameParameters {
+            lockup_period: 1,
+            renewal_window: 2_500,
+            renewal_period: 1_250,
+            renewal_maturity: 25,
+            claim_period: 75_000,
+            bidding_period: 25,
+            reveal_period: 50,
+            tree_interval: 2,
+            transfer_lockup: 5,
+            auction_maturity: 100,
+            no_reserved: false,
+        },
+    }
+}
+
+const fn wallet_network(network: hns_header_consensus::Network) -> HnsNetwork {
+    match network {
+        hns_header_consensus::Network::Mainnet => HnsNetwork::Mainnet,
+        hns_header_consensus::Network::Testnet => HnsNetwork::Testnet,
+        hns_header_consensus::Network::Regtest => HnsNetwork::Regtest,
+        hns_header_consensus::Network::Simnet => HnsNetwork::Simnet,
+    }
+}
+
+fn embedded_name_action_context(
+    state: &EmbeddedState,
+    action: HnsNameAction,
+    name_hash: [u8; 32],
+    binding: SnapshotBinding,
+    expected_mempool: MempoolSnapshotBinding,
+    pruning_safe: bool,
+) -> Result<NameActionContextEvidence, HnsWalletError> {
+    let mempool = mempool_binding(&state.mempool);
+    if mempool != expected_mempool {
+        return Err(HnsWalletError::StaleNodeSnapshot);
+    }
+    let view = embedded_name_view(state, name_hash, binding)?;
+    let current = view
+        .current
+        .as_ref()
+        .ok_or(HnsWalletError::InvalidEvidence)?;
+    let current_raw = view
+        .current_raw
+        .clone()
+        .ok_or(HnsWalletError::InvalidEvidence)?;
+    let owner = view
+        .current_owner
+        .as_ref()
+        .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)?;
+    let active_owner = active_name_owner_coin(&view, binding)?;
+    let owner_coin = active_owner.owner_coin;
+    let candidate_height = u32::try_from(
+        binding
+            .tip
+            .height
+            .checked_add(1)
+            .ok_or(HnsWalletError::Arithmetic)?,
+    )
+    .map_err(|_| HnsWalletError::Arithmetic)?;
+    let parameters = embedded_name_parameters(state.authority.consensus_network());
+    let lifecycle = embedded_name_lifecycle(current, candidate_height, parameters);
+    let expired = embedded_name_is_expired(current, candidate_height, parameters);
+    let mempool_spender = embedded_mempool_spender(&state.mempool, owner.outpoint)?;
+    let owner_kind = owner.output.covenant.kind;
+    let mut reasons = Vec::new();
+    if !current.registered {
+        reasons.push(NameActionIneligibility::NameNotRegistered);
+    }
+    if expired {
+        reasons.push(NameActionIneligibility::NameExpiredAtCandidate);
+    }
+    if lifecycle != HnsNameLifecycle::Closed {
+        reasons.push(NameActionIneligibility::LifecycleNotClosed);
+    }
+
+    let mut transfer_height = None;
+    let mut transfer_lockup = None;
+    let mut finalize_eligible_height = None;
+    let mut finalize_mature = None;
+    let mut renewal_maturity = None;
+    let mut renewal_period = None;
+    let mut renewal_block_height = None;
+    let mut renewal_block_hash = None;
+    let mut renewal_valid_at_candidate = None;
+    match action {
+        HnsNameAction::Transfer => {
+            if current.transfer.get() != 0 {
+                reasons.push(NameActionIneligibility::TransferAlreadyPending);
+            }
+            if !matches!(
+                owner_kind,
+                CovenantKind::Register
+                    | CovenantKind::Update
+                    | CovenantKind::Renew
+                    | CovenantKind::Finalize
+            ) {
+                reasons.push(NameActionIneligibility::OwnerCovenantInvalidForAction);
+            }
+        }
+        HnsNameAction::Finalize => {
+            let transfer = current.transfer.get();
+            let eligible = transfer
+                .checked_add(parameters.transfer_lockup)
+                .ok_or(HnsWalletError::Arithmetic)?;
+            let mature = transfer != 0 && candidate_height >= eligible;
+            let selected_height = u32::try_from(binding.tip.height)
+                .map_err(|_| HnsWalletError::Arithmetic)?
+                .saturating_sub(parameters.renewal_maturity.saturating_mul(2));
+            let selected_hash = embedded_block_hash(state, selected_height)?;
+            let renewal_valid = candidate_height < parameters.renewal_maturity
+                || (selected_height
+                    <= candidate_height.saturating_sub(parameters.renewal_maturity)
+                    && selected_height
+                        >= candidate_height.saturating_sub(parameters.renewal_period));
+            transfer_height = Some(u64::from(transfer));
+            transfer_lockup = Some(parameters.transfer_lockup);
+            finalize_eligible_height = Some(u64::from(eligible));
+            finalize_mature = Some(mature);
+            renewal_maturity = Some(parameters.renewal_maturity);
+            renewal_period = Some(parameters.renewal_period);
+            renewal_block_height = Some(u64::from(selected_height));
+            renewal_block_hash = Some(selected_hash);
+            renewal_valid_at_candidate = Some(renewal_valid);
+            if transfer == 0 {
+                reasons.push(NameActionIneligibility::TransferNotPending);
+            } else if !mature {
+                reasons.push(NameActionIneligibility::TransferNotMature);
+            }
+            if owner_kind != CovenantKind::Transfer {
+                reasons.push(NameActionIneligibility::OwnerCovenantInvalidForAction);
+            }
+            if !renewal_valid {
+                reasons.push(NameActionIneligibility::RenewalCommitmentInvalid);
+            }
+        }
+    }
+    if mempool_spender.is_some() {
+        reasons.push(NameActionIneligibility::OwnerSpentInMempool);
+    }
+    let network = wallet_network(state.authority.consensus_network());
+    let (network_id, genesis_hash) = crate::name_workflow::expected_chain_identity(network)?;
+    let (owner_transaction, owner_coin) = if pruning_safe {
+        (
+            Vec::new(),
+            Some(HnsInputCoinEvidence::from_canonical_coin(&owner_coin)?),
+        )
+    } else {
+        (owner.transaction.clone(), None)
+    };
+    Ok(NameActionContextEvidence {
+        binding,
+        mempool,
+        network,
+        network_id,
+        genesis_hash,
+        context_version: if pruning_safe {
+            crate::name_workflow::NAME_ACTION_CONTEXT_V2_VERSION
+        } else {
+            crate::name_workflow::NAME_ACTION_CONTEXT_VERSION
+        },
+        consensus_profile: crate::name_workflow::NAME_ACTION_CONSENSUS_PROFILE.to_owned(),
+        action,
+        name_hash,
+        current_state: current_raw,
+        owner_outpoint: owner.outpoint,
+        owner_transaction,
+        owner_coin,
+        owner_coin_source_binding: pruning_safe
+            .then_some(ActiveNameOwnerCoinSourceBinding::LocallyVerifiedFilteredBlock),
+        owner_inclusion: owner.inclusion,
+        candidate_inclusion_height: u64::from(candidate_height),
+        lifecycle,
+        action_eligible: reasons.is_empty(),
+        ineligibility_reasons: reasons,
+        transfer_height,
+        transfer_lockup,
+        finalize_eligible_height,
+        finalize_mature,
+        renewal_maturity,
+        renewal_period,
+        renewal_block_height,
+        renewal_block_hash,
+        renewal_valid_at_candidate,
+        mempool_spender,
+    })
+}
+
+fn embedded_mempool_spender(
+    mempool: &EmbeddedMempool,
+    owner: crate::HnsOutpoint,
+) -> Result<Option<TransactionHash>, HnsWalletError> {
+    let owner = Outpoint {
+        transaction_hash: hns_primitives::TransactionHash::new(owner.transaction.into_bytes()),
+        index: owner.output_index,
+    };
+    let mut spender = None;
+    for (txid, transaction) in &mempool.transactions {
+        if transaction
+            .transaction
+            .inputs
+            .iter()
+            .any(|input| input.previous_output == owner)
+            && spender.replace(TransactionHash::new(*txid)).is_some()
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+    }
+    Ok(spender)
+}
+
+fn embedded_block_hash(state: &EmbeddedState, height: u32) -> Result<[u8; 32], HnsWalletError> {
+    if height == 0 {
+        return Ok(state
+            .authority
+            .consensus_network()
+            .parameters()
+            .genesis_hash
+            .into_bytes());
+    }
+    state
+        .authority
+        .archived_header(height)
+        .map_err(map_authority_error)?
+        .map(|header| header.block_hash().into_bytes())
+        .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)
 }
 
 fn peer_fee_rate(state: &EmbeddedState) -> (u64, usize) {
@@ -1230,7 +2133,7 @@ fn map_index_error(error: impl std::fmt::Display) -> HnsWalletError {
 mod tests {
     use blake2::Blake2b;
     use blake2::digest::{Digest as BlakeDigest, consts::U32};
-    use hns_covenants::Covenant;
+    use hns_covenants::{Covenant, TransferCovenant, hash_name};
     use hns_header_consensus::Network;
     use hns_light_chain::{ChainLimits, LightChain};
     use hns_light_sync::SyncConfig;
@@ -1312,6 +2215,69 @@ mod tests {
             .unwrap();
         collector.admit(transaction).unwrap();
         (collector.finish().unwrap(), header)
+    }
+
+    fn verified_block_on_chain(
+        chain: &mut LightChain,
+        transaction: Transaction,
+        tree_root: TreeRoot,
+        matched: bool,
+        now: BlockTime,
+    ) -> (VerifiedWalletBlock, Header) {
+        let txid = transaction.transaction_hash().unwrap();
+        let mut leaf = Blake2b::<U32>::new();
+        BlakeDigest::update(&mut leaf, [0]);
+        BlakeDigest::update(&mut leaf, txid.as_bytes());
+        let merkle_root = MerkleRoot::new(leaf.finalize().into());
+        let mut header = Header {
+            time: BlockTime::new(chain.tip().time().get() + 1),
+            previous_block: chain.tip().hash(),
+            tree_root,
+            merkle_root,
+            bits: Network::Regtest.parameters().pow.bits,
+            ..Header::default()
+        };
+        while !header.verify_pow() {
+            header.nonce = header.nonce.checked_add(1).unwrap();
+        }
+        let entry = chain.append(&header, now).unwrap();
+        let mut payload = header.encode().to_vec();
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(1);
+        if matched {
+            payload.extend_from_slice(txid.as_bytes());
+        } else {
+            payload.extend_from_slice(merkle_root.as_bytes());
+        }
+        payload.extend_from_slice(&[1, u8::from(matched)]);
+        let mut collector = WalletBlockEvidence::decode_for_header(&payload, entry)
+            .unwrap()
+            .collect()
+            .unwrap();
+        if matched {
+            collector.admit(transaction).unwrap();
+        }
+        (collector.finish().unwrap(), header)
+    }
+
+    fn inclusion_proof(value: &[u8]) -> hns_urkel_proof::HsdUrkelProof {
+        let mut raw = Vec::with_capacity(value.len() + 6);
+        raw.extend_from_slice(&(3_u16 << 14).to_le_bytes());
+        raw.extend_from_slice(&0_u16.to_le_bytes());
+        raw.extend_from_slice(&u16::try_from(value.len()).unwrap().to_le_bytes());
+        raw.extend_from_slice(value);
+        hns_urkel_proof::HsdUrkelProof::decode_strict(&raw).unwrap()
+    }
+
+    fn inclusion_root(key: &[u8; 32], value: &[u8]) -> TreeRoot {
+        let mut value_hasher = Blake2b::<U32>::new();
+        BlakeDigest::update(&mut value_hasher, value);
+        let value_hash: [u8; 32] = value_hasher.finalize().into();
+        let mut leaf = Blake2b::<U32>::new();
+        BlakeDigest::update(&mut leaf, [0]);
+        BlakeDigest::update(&mut leaf, key);
+        BlakeDigest::update(&mut leaf, value_hash);
+        TreeRoot::new(leaf.finalize().into())
     }
 
     #[test]
@@ -1503,6 +2469,241 @@ mod tests {
                 .estimate_fee_rate(DEFAULT_FEE_TARGET_BLOCKS)
                 .unwrap(),
             BaseUnits::new(9_000)
+        );
+    }
+
+    #[test]
+    fn agreed_urkel_state_and_verified_post_boundary_transfer_drive_name_actions() {
+        let store = store();
+        let account = AccountId::new([22; 16]);
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let authority = EncryptedHnsLightAuthority::open_or_create(
+            store.clone(),
+            account,
+            crate::HnsNetwork::Regtest,
+            1,
+            crate::HnsLightFloor::default(),
+            BlockTime::new(now),
+            ChainLimits::default(),
+            SyncConfig {
+                max_peers: 4,
+                minimum_peer_agreement: 1,
+                round_timeout_seconds: 10,
+                max_peer_failures: 3,
+            },
+        )
+        .unwrap();
+        let index = EncryptedHnsLightIndex::open_or_create(
+            store,
+            account,
+            crate::HnsNetwork::Regtest,
+            1,
+            now,
+        )
+        .unwrap();
+        let backend =
+            EmbeddedHnsBackend::new(authority, index, Arc::new(RecordingNetwork::default()))
+                .unwrap();
+
+        let name = b"wallet-authority".to_vec();
+        let name_hash = hash_name(&name).unwrap();
+        backend
+            .install_watch_set(
+                HnsLightWatchSet::new(Vec::new(), vec![name_hash.into_bytes()]).unwrap(),
+                now,
+            )
+            .unwrap();
+
+        let update = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    transaction_hash: hns_primitives::TransactionHash::new([31; 32]),
+                    index: 0,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: Dollarydoos::new(900_000),
+                address: Address::new(0, vec![32; 20]).unwrap(),
+                covenant: Covenant {
+                    kind: CovenantKind::Update,
+                    items: vec![
+                        name_hash.into_bytes().to_vec(),
+                        1_u32.to_le_bytes().to_vec(),
+                        Vec::new(),
+                    ],
+                },
+            }],
+            locktime: 0,
+        };
+        let update_txid = update.transaction_hash().unwrap();
+        let mut proof_state = NameState {
+            name_hash,
+            name,
+            height: Height::new(1),
+            renewal: Height::new(1),
+            owner: Outpoint {
+                transaction_hash: update_txid,
+                index: 0,
+            },
+            value: Dollarydoos::new(900_000),
+            highest: Dollarydoos::new(900_000),
+            resource_data: Vec::new(),
+            transfer: Height::new(0),
+            revoked: Height::new(0),
+            claimed: Height::new(1),
+            renewals: 0,
+            registered: true,
+            expired: false,
+            weak: false,
+        };
+        let proof_state_raw = proof_state.encode().unwrap();
+        let proof_root = inclusion_root(name_hash.as_bytes(), &proof_state_raw);
+        let transfer = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    transaction_hash: update_txid,
+                    index: 0,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: proof_state.value,
+                address: update.outputs[0].address.clone(),
+                covenant: TransferCovenant::new(name_hash, proof_state.height, 0, vec![33; 20])
+                    .unwrap()
+                    .to_covenant()
+                    .unwrap(),
+            }],
+            locktime: 0,
+        };
+        let transfer_txid = transfer.transaction_hash().unwrap();
+
+        let mut chain = LightChain::from_genesis(
+            Network::Regtest,
+            BlockTime::new(now),
+            ChainLimits::default(),
+        )
+        .unwrap();
+        let dummy = transaction(
+            Outpoint {
+                transaction_hash: hns_primitives::TransactionHash::new([34; 32]),
+                index: 0,
+            },
+            vec![35; 20],
+            1,
+        );
+        let mut blocks = Vec::new();
+        let mut headers = Vec::new();
+        for height in 1_u8..=6 {
+            let (candidate, matched) = match height {
+                3 => (update.clone(), true),
+                6 => (transfer.clone(), true),
+                _ => (dummy.clone(), false),
+            };
+            let tree_root = if height == 6 {
+                proof_root
+            } else {
+                TreeRoot::new([height; 32])
+            };
+            let (block, header) = verified_block_on_chain(
+                &mut chain,
+                candidate,
+                tree_root,
+                matched,
+                BlockTime::new(now),
+            );
+            blocks.push(block);
+            headers.push(header);
+        }
+
+        let peer = PeerId::new([36; 32]);
+        backend.add_header_peer(peer, 1).unwrap();
+        let request = backend.begin_header_round(&[peer], now).unwrap();
+        backend
+            .submit_header_response(request.generation, peer, headers, now)
+            .unwrap();
+        backend.finish_header_round(now).unwrap();
+        let current = backend.begin_header_round(&[peer], now).unwrap();
+        backend
+            .submit_header_response(current.generation, peer, Vec::new(), now)
+            .unwrap();
+        backend.finish_header_round(now).unwrap();
+        for block in &blocks {
+            backend.apply_verified_block(block, now).unwrap();
+        }
+
+        let request = backend.name_proof_request(name_hash.into_bytes()).unwrap();
+        assert_eq!(request.root, proof_root);
+        assert_eq!(request.key, name_hash);
+        let packet = ProofPacket {
+            root: request.root,
+            key: request.key,
+            proof: inclusion_proof(&proof_state_raw),
+        };
+        backend.admit_name_proof(&packet, now).unwrap();
+
+        let binding = backend.get_chain_snapshot().unwrap();
+        let evidence = backend
+            .get_name_evidence(name_hash.into_bytes(), binding)
+            .unwrap();
+        assert_eq!(evidence.proof_state, Some(proof_state_raw));
+        let current_state =
+            NameState::decode(name_hash, evidence.current_state.as_deref().unwrap()).unwrap();
+        proof_state.owner = Outpoint {
+            transaction_hash: transfer_txid,
+            index: 0,
+        };
+        proof_state.transfer = Height::new(6);
+        assert_eq!(current_state, proof_state);
+        assert_eq!(
+            evidence.current_owner_outpoint.unwrap().transaction,
+            TransactionHash::new(transfer_txid.into_bytes())
+        );
+
+        let owner = backend
+            .get_active_name_owner_coin(name_hash.into_bytes(), binding)
+            .unwrap();
+        assert_eq!(
+            owner.source_binding,
+            ActiveNameOwnerCoinSourceBinding::LocallyVerifiedFilteredBlock
+        );
+        assert_eq!(owner.owner_coin.outpoint.transaction_hash, transfer_txid);
+        assert_eq!(owner.inclusion.height, 6);
+        assert_eq!(owner.inclusion.transaction_index, Some(0));
+
+        let mempool = backend
+            .get_transaction_evidence(
+                TransactionHash::new(transfer_txid.into_bytes()),
+                binding,
+                None,
+            )
+            .unwrap()
+            .mempool;
+        let context = backend
+            .get_name_action_context_v2(
+                HnsNameAction::Finalize,
+                name_hash.into_bytes(),
+                binding,
+                mempool,
+            )
+            .unwrap();
+        assert_eq!(context.owner_transaction, Vec::<u8>::new());
+        assert!(context.owner_coin.is_some());
+        assert_eq!(
+            context.owner_coin_source_binding,
+            Some(ActiveNameOwnerCoinSourceBinding::LocallyVerifiedFilteredBlock)
+        );
+        assert_eq!(context.transfer_height, Some(6));
+        assert_eq!(context.finalize_eligible_height, Some(16));
+        assert_eq!(context.finalize_mature, Some(false));
+        assert_eq!(
+            context.ineligibility_reasons,
+            vec![NameActionIneligibility::TransferNotMature]
         );
     }
 }

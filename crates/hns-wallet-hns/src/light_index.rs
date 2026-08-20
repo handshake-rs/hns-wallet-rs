@@ -2,11 +2,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use hns_covenants::{CovenantKind, TransferCovenant};
+use hns_covenants::{CovenantKind, NameState, TransferCovenant};
 use hns_header_consensus::Network;
+use hns_light_sync::SyncState;
 use hns_light_wallet::VerifiedWalletBlock;
-use hns_primitives::{Outpoint, TransactionHash as CanonicalTransactionHash};
+use hns_p2p_wire::ProofPacket;
+use hns_primitives::{NameHash, Outpoint, TransactionHash as CanonicalTransactionHash, TreeRoot};
 use hns_transaction::{Transaction, TransactionError};
+use hns_urkel_proof::HsdUrkelProof;
 use hns_wallet_store::{
     EntityBatchDelete, EntityBatchSave, EntityKind, SharedWalletStore, StoreError, StoredEntity,
 };
@@ -26,6 +29,7 @@ pub const MAX_HNS_LIGHT_WATCH_NAMES: usize = 4_096;
 
 const SCAN_SUFFIX: &[u8] = b"/hns-light-index/scan";
 const TRANSACTION_SUFFIX: &[u8] = b"/hns-light-index/tx/";
+const NAME_PROOF_SUFFIX: &[u8] = b"/hns-light-index/name-proof/";
 const WATCH_DIGEST_DOMAIN: &[u8] = b"hns-wallet-rs/hns-light-watch-set/v1";
 
 /// Complete deterministic bloom-filter input set for one wallet account.
@@ -113,11 +117,24 @@ pub struct VerifiedHnsTransactionObservation {
     pub coinbase: bool,
 }
 
+/// Strict Urkel proof admitted against one locally agreed header-tree root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedHnsNameProof {
+    pub name_hash: [u8; 32],
+    pub tree_root: [u8; 32],
+    pub proof: Vec<u8>,
+    pub state: Option<Vec<u8>>,
+    pub observed_tip_height: u32,
+    pub observed_tip_hash: [u8; 32],
+    pub observed_chain_epoch: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "record", rename_all = "snake_case", deny_unknown_fields)]
 enum StoredHnsLightWalletRecord {
     Scan(StoredHnsLightScan),
     Transaction(StoredHnsLightTransaction),
+    NameProof(StoredHnsLightNameProof),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -144,6 +161,20 @@ struct StoredHnsLightTransaction {
     transaction_index: u32,
     block_time: u64,
     coinbase: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredHnsLightNameProof {
+    format_version: u16,
+    network: u8,
+    name_hash: [u8; 32],
+    tree_root: [u8; 32],
+    proof: Vec<u8>,
+    state: Option<Vec<u8>>,
+    observed_tip_height: u32,
+    observed_tip_hash: [u8; 32],
+    observed_chain_epoch: u64,
 }
 
 impl StoredHnsLightTransaction {
@@ -174,6 +205,46 @@ impl StoredHnsLightTransaction {
             transaction_index: self.transaction_index,
             block_time: self.block_time,
             coinbase: self.coinbase,
+        })
+    }
+}
+
+impl StoredHnsLightNameProof {
+    fn decode(&self, network: Network) -> Result<VerifiedHnsNameProof, HnsLightIndexError> {
+        if self.format_version != HNS_LIGHT_INDEX_FORMAT_VERSION {
+            return Err(HnsLightIndexError::UnsupportedFormat);
+        }
+        if self.network != network.id() {
+            return Err(HnsLightIndexError::NetworkMismatch);
+        }
+        let proof = HsdUrkelProof::decode_strict(&self.proof)
+            .map_err(|_| HnsLightIndexError::InvalidNameProof)?;
+        let state = proof
+            .verify(TreeRoot::new(self.tree_root), NameHash::new(self.name_hash))
+            .map_err(|_| HnsLightIndexError::InvalidNameProof)?;
+        if state != self.state {
+            return Err(HnsLightIndexError::CorruptNameProofRecord);
+        }
+        if let Some(state) = &state {
+            let decoded = NameState::decode(NameHash::new(self.name_hash), state)
+                .map_err(|_| HnsLightIndexError::InvalidNameProof)?;
+            if decoded.is_null()
+                || decoded
+                    .encode()
+                    .map_err(|_| HnsLightIndexError::InvalidNameProof)?
+                    != *state
+            {
+                return Err(HnsLightIndexError::InvalidNameProof);
+            }
+        }
+        Ok(VerifiedHnsNameProof {
+            name_hash: self.name_hash,
+            tree_root: self.tree_root,
+            proof: self.proof.clone(),
+            state,
+            observed_tip_height: self.observed_tip_height,
+            observed_tip_hash: self.observed_tip_hash,
+            observed_chain_epoch: self.observed_chain_epoch,
         })
     }
 }
@@ -253,7 +324,8 @@ impl EncryptedHnsLightIndex {
         if watch_set == self.scan.watch_set {
             return Ok(false);
         }
-        let existing = self.stored_transactions()?;
+        let mut existing = self.stored_transactions()?;
+        existing.extend(self.stored_name_proofs()?);
         let deletes = existing
             .iter()
             .map(|stored| EntityBatchDelete {
@@ -465,6 +537,121 @@ impl EncryptedHnsLightIndex {
         Ok(admitted)
     }
 
+    /// Strictly verify and persist one standard-peer Urkel proof against the
+    /// exact tree root in the wallet's current agreed header tip.
+    pub fn admit_name_proof(
+        &mut self,
+        authority: &EncryptedHnsLightAuthority,
+        packet: &ProofPacket,
+        now_unix: u64,
+    ) -> Result<VerifiedHnsNameProof, HnsLightIndexError> {
+        let status = authority.status();
+        let name_hash = packet.key.into_bytes();
+        if authority.account_id() != self.account_id
+            || authority.consensus_network() != self.network
+            || authority.birthday_height() != self.scan.birthday_height
+            || status.state != SyncState::HeaderCurrent
+            || packet.root != status.tip.tree_root()
+            || self
+                .scan
+                .watch_set
+                .name_hashes
+                .binary_search(&name_hash)
+                .is_err()
+        {
+            return Err(HnsLightIndexError::AuthorityMismatch);
+        }
+        let proof = packet
+            .proof
+            .encode()
+            .map_err(|_| HnsLightIndexError::InvalidNameProof)?;
+        let stored = StoredHnsLightNameProof {
+            format_version: HNS_LIGHT_INDEX_FORMAT_VERSION,
+            network: self.network.id(),
+            name_hash,
+            tree_root: packet.root.into_bytes(),
+            proof,
+            state: packet
+                .proof
+                .verify(packet.root, packet.key)
+                .map_err(|_| HnsLightIndexError::InvalidNameProof)?,
+            observed_tip_height: status.tip.height().get(),
+            observed_tip_hash: status.tip.hash().into_bytes(),
+            observed_chain_epoch: authority.chain_epoch(),
+        };
+        let verified = stored.decode(self.network)?;
+        let id = name_proof_id(self.account_id, name_hash);
+        let existing: Option<StoredEntity<StoredHnsLightWalletRecord>> = self
+            .store
+            .with_store(|wallet| wallet.hns_light_wallet(&id))?;
+        let expected_revision = match existing {
+            Some(existing) => {
+                if !matches!(existing.value, StoredHnsLightWalletRecord::NameProof(_)) {
+                    return Err(HnsLightIndexError::WrongRecordKind);
+                }
+                existing.revision
+            }
+            None => 0,
+        };
+        let saves = [
+            EntityBatchSave {
+                id: scan_id(self.account_id),
+                expected_revision: self.scan_revision,
+                value: StoredHnsLightWalletRecord::Scan(self.scan.clone()),
+                updated_at_unix: now_unix,
+            },
+            EntityBatchSave {
+                id,
+                expected_revision,
+                value: StoredHnsLightWalletRecord::NameProof(stored),
+                updated_at_unix: now_unix,
+            },
+        ];
+        self.store.with_store_mut(|wallet| {
+            wallet.apply_entity_batch(EntityKind::HnsLightWallet, &saves, &[])
+        })?;
+        self.scan_revision = self
+            .scan_revision
+            .checked_add(1)
+            .ok_or(HnsLightIndexError::RevisionOverflow)?;
+        Ok(verified)
+    }
+
+    /// Load the latest authenticated proof for one watched name when it
+    /// belongs to the caller's exact current header-tree root.
+    pub fn name_proof(
+        &self,
+        name_hash: [u8; 32],
+        tree_root: [u8; 32],
+    ) -> Result<Option<VerifiedHnsNameProof>, HnsLightIndexError> {
+        if self
+            .scan
+            .watch_set
+            .name_hashes
+            .binary_search(&name_hash)
+            .is_err()
+        {
+            return Err(HnsLightIndexError::NameNotWatched);
+        }
+        let id = name_proof_id(self.account_id, name_hash);
+        let stored: Option<StoredEntity<StoredHnsLightWalletRecord>> = self
+            .store
+            .with_store(|wallet| wallet.hns_light_wallet(&id))?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let StoredHnsLightWalletRecord::NameProof(proof) = stored.value else {
+            return Err(HnsLightIndexError::WrongRecordKind);
+        };
+        if proof.name_hash != name_hash || stored.id != id {
+            return Err(HnsLightIndexError::CorruptNameProofRecord);
+        }
+        if proof.tree_root != tree_root {
+            return Ok(None);
+        }
+        proof.decode(self.network).map(Some)
+    }
+
     /// Load and authenticate every bounded confirmed observation.
     pub fn transactions(
         &self,
@@ -480,6 +667,18 @@ impl EncryptedHnsLightIndex {
                 EntityKind::HnsLightWallet,
                 &transaction_prefix(self.account_id),
                 crate::MAX_HISTORY_RESULTS,
+            )
+        })?)
+    }
+
+    fn stored_name_proofs(
+        &self,
+    ) -> Result<Vec<StoredEntity<StoredHnsLightWalletRecord>>, HnsLightIndexError> {
+        Ok(self.store.with_store(|wallet| {
+            wallet.list_entities_by_id_prefix(
+                EntityKind::HnsLightWallet,
+                &name_proof_prefix(self.account_id),
+                MAX_HNS_LIGHT_WATCH_NAMES,
             )
         })?)
     }
@@ -610,6 +809,19 @@ fn transaction_id(account_id: AccountId, txid: [u8; 32]) -> Vec<u8> {
     id
 }
 
+fn name_proof_prefix(account_id: AccountId) -> Vec<u8> {
+    let mut id = Vec::with_capacity(AccountId::LENGTH + NAME_PROOF_SUFFIX.len());
+    id.extend_from_slice(account_id.as_bytes());
+    id.extend_from_slice(NAME_PROOF_SUFFIX);
+    id
+}
+
+fn name_proof_id(account_id: AccountId, name_hash: [u8; 32]) -> Vec<u8> {
+    let mut id = name_proof_prefix(account_id);
+    id.extend_from_slice(&name_hash);
+    id
+}
+
 const fn consensus_network(network: HnsNetwork) -> Network {
     match network {
         HnsNetwork::Mainnet => Network::Mainnet,
@@ -641,6 +853,8 @@ pub enum HnsLightIndexError {
     CorruptScanState,
     #[error("HNS light-index transaction record is corrupt")]
     CorruptTransactionRecord,
+    #[error("HNS light-index name-proof record is corrupt")]
+    CorruptNameProofRecord,
     #[error("HNS light-index transaction encoding is noncanonical")]
     NonCanonicalTransaction,
     #[error("HNS light-index watch set is empty")]
@@ -655,6 +869,10 @@ pub enum HnsLightIndexError {
     Authority(#[from] HnsLightError),
     #[error("filtered-block transaction correlation is inconsistent")]
     EvidenceMismatch,
+    #[error("strict Urkel name proof is invalid for the agreed header root")]
+    InvalidNameProof,
+    #[error("name proof was requested outside the exact installed watch set")]
+    NameNotWatched,
     #[error("confirmed transaction was observed twice")]
     DuplicateConfirmedTransaction,
     #[error("HNS light-index history bound exceeded")]
@@ -762,6 +980,11 @@ mod tests {
         let request = authority.begin_header_round(&[peer], now).unwrap();
         authority
             .submit_header_response(request.generation, peer, vec![header], now)
+            .unwrap();
+        authority.finish_header_round_and_persist(now).unwrap();
+        let current = authority.begin_header_round(&[peer], now).unwrap();
+        authority
+            .submit_header_response(current.generation, peer, Vec::new(), now)
             .unwrap();
         authority.finish_header_round_and_persist(now).unwrap();
         authority
@@ -885,5 +1108,50 @@ mod tests {
         );
         assert_eq!(index.status().scanned_height, Some(1));
         assert!(index.transactions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn strict_name_proof_is_persisted_only_for_the_agreed_root_and_watch_set() {
+        let store = store();
+        let account = AccountId::new([6; 16]);
+        let name_hash = [12; 32];
+        let mut index = EncryptedHnsLightIndex::open_or_create(
+            store.clone(),
+            account,
+            HnsNetwork::Regtest,
+            1,
+            1,
+        )
+        .unwrap();
+        index
+            .install_watch_set(
+                HnsLightWatchSet::new(Vec::new(), vec![name_hash]).unwrap(),
+                2,
+            )
+            .unwrap();
+        let (_, mut header) = verified_block(&[13; 20]);
+        header.tree_root = TreeRoot::new([0; 32]);
+        header.nonce = 0;
+        while !header.verify_pow() {
+            header.nonce = header.nonce.checked_add(1).unwrap();
+        }
+        let authority = authority_for_header(store.clone(), account, header);
+        let packet = ProofPacket {
+            root: TreeRoot::new([0; 32]),
+            key: NameHash::new(name_hash),
+            proof: HsdUrkelProof::decode_strict(&[0, 0, 0, 0]).unwrap(),
+        };
+        let admitted = index.admit_name_proof(&authority, &packet, 3).unwrap();
+        assert_eq!(admitted.name_hash, name_hash);
+        assert_eq!(admitted.state, None);
+
+        let reopened =
+            EncryptedHnsLightIndex::open_or_create(store, account, HnsNetwork::Regtest, 1, 4)
+                .unwrap();
+        assert_eq!(
+            reopened.name_proof(name_hash, [0; 32]).unwrap(),
+            Some(admitted)
+        );
+        assert!(reopened.name_proof(name_hash, [1; 32]).unwrap().is_none());
     }
 }
