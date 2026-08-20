@@ -19,6 +19,7 @@ pub use name_workflow::{
 };
 pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
 pub use shakedex_funding::{
+    HnsPreparedShakedexFunding, HnsShakedexChangeReservation,
     HnsShakedexFundingApprovalExpectation, HnsShakedexFundingAuthorization,
     HnsShakedexFundingPurpose, HnsShakedexFundingReservation, HnsShakedexFundingReservationBatch,
     HnsShakedexFundingReservationState, HnsShakedexFundingScope, HnsShakedexTransactionObservation,
@@ -3296,6 +3297,38 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .store_lock()
             .map_err(HnsShakedexKeyAllocationError::Wallet)?;
         shakedex_key::load_hns_shakedex_key_allocation(&store, wallet_id, workflow_id)
+    }
+
+    /// Encode the exact version-zero 32-byte script destination committed by
+    /// an authenticated seller allocation. This is the only address a product
+    /// should pass to the ordinary name TRANSFER workflow for that offer.
+    pub fn shakedex_lock_address(
+        &self,
+        allocation: &HnsShakedexKeyAllocation,
+    ) -> Result<String, HnsShakedexKeyAllocationError> {
+        {
+            let cache = self
+                .cache_read()
+                .map_err(HnsShakedexKeyAllocationError::Wallet)?;
+            shakedex_funding::ensure_shakedex_funding_ready(&cache)
+                .map_err(HnsShakedexKeyAllocationError::Wallet)?;
+            if cache.account.config.wallet_id != allocation.wallet_id()
+                || cache.account.config.account_id != allocation.account_id()
+                || cache.account.config.account_derivation_index
+                    != allocation.account_derivation_index()
+                || cache.account.config.network != allocation.network()
+            {
+                return Err(HnsShakedexKeyAllocationError::BindingConflict);
+            }
+        }
+        let current = self
+            .load_shakedex_key_allocation(allocation.workflow_id())?
+            .ok_or(HnsShakedexKeyAllocationError::AllocationNotFound)?;
+        if current != *allocation {
+            return Err(HnsShakedexKeyAllocationError::BindingConflict);
+        }
+        encode_v0_address(allocation.network(), allocation.lock_script_hash())
+            .map_err(HnsShakedexKeyAllocationError::Wallet)
     }
 
     /// Re-derive a purpose-bound, redacted seller signer after authenticating

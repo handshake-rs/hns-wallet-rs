@@ -51,12 +51,17 @@ const RECOVERY_SEED_COMMITMENT_DOMAIN: &[u8] =
 /// economic terms: a seller may republish or cancel the same presign. The
 /// payment address, price, consensus deadline, and marketplace fee are bound
 /// here and cannot be substituted by any purpose-bound signer method.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HnsShakedexSellerTerms {
+    #[serde(with = "address_serde")]
     pub payment_address: Address,
+    #[serde(with = "dollarydoos_serde")]
     pub price: Dollarydoos,
     pub lock_time_seconds: u64,
+    #[serde(with = "optional_address_serde")]
     pub fee_address: Option<Address>,
+    #[serde(with = "dollarydoos_serde")]
     pub fee: Dollarydoos,
 }
 
@@ -110,6 +115,95 @@ fn hash_address(hasher: &mut Sha256, address: &Address) {
     hasher.update(&address.hash);
 }
 
+mod address_serde {
+    use hns_transaction::Address;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AddressWire {
+        version: u8,
+        hash: Vec<u8>,
+    }
+
+    pub fn serialize<S>(value: &Address, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        AddressWire {
+            version: value.version,
+            hash: value.hash.clone(),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Address, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = AddressWire::deserialize(deserializer)?;
+        Address::new(wire.version, wire.hash)
+            .map_err(|_| <D::Error as serde::de::Error>::custom("invalid Handshake address"))
+    }
+}
+
+mod optional_address_serde {
+    use hns_transaction::Address;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct AddressWire {
+        version: u8,
+        hash: Vec<u8>,
+    }
+
+    pub fn serialize<S>(value: &Option<Address>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value
+            .as_ref()
+            .map(|address| AddressWire {
+                version: address.version,
+                hash: address.hash.clone(),
+            })
+            .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Address>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<AddressWire>::deserialize(deserializer)?
+            .map(|wire| {
+                Address::new(wire.version, wire.hash).map_err(|_| {
+                    <D::Error as serde::de::Error>::custom("invalid Handshake fee address")
+                })
+            })
+            .transpose()
+    }
+}
+
+mod dollarydoos_serde {
+    use hns_primitives::Dollarydoos;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Dollarydoos, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u64(value.get())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Dollarydoos, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(Dollarydoos::new(u64::deserialize(deserializer)?))
+    }
+}
+
 mod compressed_public_key_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -138,7 +232,8 @@ mod compressed_public_key_serde {
 ///
 /// The wallet computes the canonical commitment itself and binds it to the
 /// exact workflow and canonical Handshake name.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HnsShakedexKeyAllocationRequest {
     pub workflow_id: WorkflowId,
     pub name: Vec<u8>,

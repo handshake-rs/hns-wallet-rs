@@ -610,6 +610,7 @@ pub enum WorkflowKind {
     ShakedexBuyer,
     ShakedexSellerPlan,
     ShakedexBuyerPlan,
+    ShakedexSellerOffer,
     ShakedexValue,
     MarketIntent,
     FillReservation,

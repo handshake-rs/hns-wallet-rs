@@ -8,6 +8,8 @@ mod board_runtime;
 mod canonical;
 mod outbox;
 mod plans;
+mod seller_offer;
+mod trade_runtime;
 mod transactions;
 mod value_workflow;
 
@@ -45,15 +47,24 @@ pub use outbox::{
     DenuoOutboxEnqueue, DenuoOutboxMessageKind, DenuoOutboxState, DenuoPreparedHandoff,
     DenuoPublicationOutbox, MAX_DENUO_OUTBOX_ENTRIES, MAX_DENUO_OUTBOX_ENVELOPE_BYTES,
     MAX_DENUO_OUTBOX_RETRY_ATTEMPTS, MAX_DENUO_OUTBOX_SERIALIZED_BYTES,
-    StoredDenuoPublicationOutbox, load_denuo_publication_outbox, load_prepared_denuo_handoff,
-    prepare_next_denuo_handoff, record_denuo_handoff_acceptance, record_denuo_handoff_failure,
-    recover_denuo_handoff_as_retry, save_denuo_publication_outbox,
+    StoredDenuoPublicationOutbox, denuo_outbox_envelope_id, load_denuo_publication_outbox,
+    load_prepared_denuo_handoff, prepare_next_denuo_handoff, record_denuo_handoff_acceptance,
+    record_denuo_handoff_failure, recover_denuo_handoff_as_retry, save_denuo_publication_outbox,
 };
 pub use plans::{
     BuyerLockPlan, BuyerLockPlanState, MAX_SHAKEDEX_TRANSACTION_PLANS, SellerLockPlan,
     SellerLockPlanState, StoredBuyerLockPlan, StoredSellerLockPlan, list_buyer_lock_plans,
     list_seller_lock_plans, load_buyer_lock_plan, load_seller_lock_plan, save_buyer_lock_plan,
     save_seller_lock_plan,
+};
+pub use seller_offer::{
+    MAX_SELLER_LISTING_LIFETIME_SECONDS, MIN_SELLER_LISTING_LIFETIME_SECONDS, PrepareSellerOffer,
+    SellerOfferPreview, SellerOfferStage, ShakedexSellerPolicy, seller_offer_workflow_id,
+};
+pub use trade_runtime::{
+    PrepareBuyerTrade, PrepareScriptFinalize, ShakedexStartupRecoveryEntry,
+    ShakedexStartupRecoveryReport, ShakedexTradePreview, ShakedexTradeRuntime,
+    buyer_trade_workflow_id,
 };
 pub use transactions::{
     CurrentPreparedSellerRecovery, MAX_SHAKEDEX_FUNDING_INPUTS, PreparedBuyerFulfillment,

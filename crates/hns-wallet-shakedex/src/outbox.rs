@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 
 use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketMessage};
-use hns_wallet_store::WalletStore;
-use hns_wallet_types::ObjectHash;
+use hns_wallet_store::{EntityBatchSave, EntityKind, WalletStore};
+use hns_wallet_types::{ObjectHash, WorkflowId, WorkflowKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -25,6 +25,13 @@ pub const MAX_DENUO_OUTBOX_ENTRIES: usize = 1_024;
 pub const MAX_DENUO_OUTBOX_ENVELOPE_BYTES: usize = 16 * 1024;
 pub const MAX_DENUO_OUTBOX_SERIALIZED_BYTES: usize = 512 * 1024;
 pub const MAX_DENUO_OUTBOX_RETRY_ATTEMPTS: u16 = 64;
+
+/// Return the deterministic local outbox identity of one canonical offer or
+/// cancellation envelope. This is not a Denuo content identifier, receipt, or
+/// publication proof.
+pub fn denuo_outbox_envelope_id(envelope_bytes: &[u8]) -> Result<ObjectHash, ShakedexError> {
+    canonical_publication(envelope_bytes).map(|publication| publication.envelope_id)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -922,6 +929,56 @@ pub fn save_denuo_publication_outbox(
             updated_at_unix,
         )
         .map_err(ShakedexError::from)
+}
+
+/// Atomically persist a seller-offer workflow transition and enqueue its exact
+/// canonical offer envelope. A crash can therefore expose neither an
+/// unjournaled publication nor a workflow that claims a publication which was
+/// never durably handed to the outbox.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn enqueue_denuo_offer_and_save_workflow<W: Serialize>(
+    store: &mut WalletStore,
+    workflow_id: WorkflowId,
+    expected_workflow_revision: u64,
+    workflow: &W,
+    envelope_bytes: &[u8],
+    listing: &AuthenticatedFixedPriceListing,
+    updated_at_unix: u64,
+) -> Result<(u64, u64, ObjectHash), ShakedexError> {
+    let mut stored = load_denuo_publication_outbox(store)?;
+    let enqueue = stored
+        .outbox
+        .enqueue_offer(envelope_bytes, listing, updated_at_unix)?;
+    if !enqueue.inserted() {
+        return Err(ShakedexError::DenuoOutboxConflict);
+    }
+    validate_record_time(&stored.outbox, updated_at_unix)?;
+    validate_outbox_save_transition(store, stored.revision, &stored.outbox, updated_at_unix)?;
+    let outbox_revision = stored
+        .revision
+        .checked_add(1)
+        .ok_or(ShakedexError::Invariant)?;
+    let outbox_save = EntityBatchSave {
+        id: DENUO_OUTBOX_RECORD_ID.to_vec(),
+        expected_revision: stored.revision,
+        value: PersistedDenuoPublicationOutboxRef {
+            schema_version: stored.outbox.schema_version,
+            entries: &stored.outbox.entries,
+        },
+        updated_at_unix,
+    };
+    let workflow_revision = store.save_workflow_with_entity_batch(
+        workflow_id,
+        WorkflowKind::ShakedexSellerOffer,
+        expected_workflow_revision,
+        workflow,
+        false,
+        updated_at_unix,
+        EntityKind::DenuoBoardObject,
+        std::slice::from_ref(&outbox_save),
+        &[],
+    )?;
+    Ok((workflow_revision, outbox_revision, enqueue.envelope_id()))
 }
 
 fn validate_outbox_save_transition(

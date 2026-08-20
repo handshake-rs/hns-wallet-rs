@@ -493,6 +493,10 @@ impl BuyerLockPlan {
         self.workflow_id
     }
 
+    pub fn name(&self) -> &[u8] {
+        &self.name
+    }
+
     pub(crate) const fn name_hash(&self) -> ObjectHash {
         self.name_hash
     }

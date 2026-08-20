@@ -50,6 +50,104 @@ pub struct HnsShakedexFundingReservation {
     expires_at_unix: u64,
 }
 
+/// Exact wallet-account mutation required when a funded Shakedex transaction
+/// uses the account's current internal change address. The fields remain
+/// private so another crate cannot substitute a different account row or
+/// derivation after coin selection. The enclosing Shakedex workflow persists
+/// this save in the same immediate transaction as its input reservations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HnsShakedexChangeReservation {
+    derivation: DerivationReference,
+    account_save: EntityBatchSave<HnsAccountRecord>,
+}
+
+impl HnsShakedexChangeReservation {
+    pub const fn derivation(&self) -> DerivationReference {
+        self.derivation
+    }
+
+    pub const fn expected_account_revision(&self) -> u64 {
+        self.account_save.expected_revision
+    }
+
+    pub const fn account_save(&self) -> &EntityBatchSave<HnsAccountRecord> {
+        &self.account_save
+    }
+}
+
+/// Product-owned result of selecting and binding the ordinary HNS funding
+/// suffix for one current Shakedex action. The generic prepared artifact is
+/// retained with the exact scope, reservations, fee, and optional change
+/// mutation that were computed from it; callers cannot independently replace
+/// one component.
+pub struct HnsPreparedShakedexFunding<T> {
+    prepared: T,
+    scope: HnsShakedexFundingScope,
+    funding_reservation: HnsShakedexFundingReservation,
+    change_reservation: Option<HnsShakedexChangeReservation>,
+    fee_rate: BaseUnits,
+    fee: BaseUnits,
+    maximum_fee: BaseUnits,
+    expires_at_unix: u64,
+}
+
+impl<T> HnsPreparedShakedexFunding<T> {
+    pub const fn prepared(&self) -> &T {
+        &self.prepared
+    }
+
+    pub const fn scope(&self) -> &HnsShakedexFundingScope {
+        &self.scope
+    }
+
+    pub const fn funding_reservation(&self) -> &HnsShakedexFundingReservation {
+        &self.funding_reservation
+    }
+
+    pub const fn change_reservation(&self) -> Option<&HnsShakedexChangeReservation> {
+        self.change_reservation.as_ref()
+    }
+
+    pub const fn fee_rate(&self) -> BaseUnits {
+        self.fee_rate
+    }
+
+    pub const fn fee(&self) -> BaseUnits {
+        self.fee
+    }
+
+    pub const fn maximum_fee(&self) -> BaseUnits {
+        self.maximum_fee
+    }
+
+    pub const fn expires_at_unix(&self) -> u64 {
+        self.expires_at_unix
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn into_parts(
+        self,
+    ) -> (
+        T,
+        HnsShakedexFundingScope,
+        HnsShakedexFundingReservation,
+        Option<HnsShakedexChangeReservation>,
+        BaseUnits,
+        BaseUnits,
+        u64,
+    ) {
+        (
+            self.prepared,
+            self.scope,
+            self.funding_reservation,
+            self.change_reservation,
+            self.fee,
+            self.maximum_fee,
+            self.expires_at_unix,
+        )
+    }
+}
+
 impl HnsShakedexFundingReservation {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -445,6 +543,319 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         Ok(HnsShakedexFundingScope {
             config: self.cache_read()?.account.config.clone(),
         })
+    }
+
+    /// Derive the selected account's exact current dedicated name recipient.
+    /// This address is taken from the authenticated restore branch at
+    /// `next_name_index`; a website or market peer never supplies it.
+    pub fn shakedex_name_receive_address(&self) -> Result<Address, HnsWalletError> {
+        let (account, account_revision) = {
+            let cache = self.cache_read()?;
+            ensure_shakedex_funding_ready(&cache)?;
+            (cache.account.clone(), cache.account_revision)
+        };
+        let derivation = DerivationReference {
+            role: KeyRole::HnsName,
+            account: account_number(&account),
+            change: 0,
+            index: account.next_name_index,
+        };
+        let address = {
+            let store = self.store_lock()?;
+            let id = derived_address_record_id(&account.config, derivation)?;
+            let stored = store
+                .derived_address::<DerivedHnsAddress>(&id)?
+                .ok_or(HnsWalletError::InvalidEvidence)?;
+            let public = derive_hns_public_key(&store, account.config.wallet_id, derivation)?;
+            let program = public_key_hash(&public)?.to_vec();
+            let display = encode_v0_address(account.config.network, &program)?;
+            if stored.id != id
+                || stored.value.account_id != account.config.account_id
+                || stored.value.derivation != derivation
+                || stored.value.program != program
+                || stored.value.address != display
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            Address::new(0, program).map_err(|_| HnsWalletError::InvalidAddress)?
+        };
+        let cache = self.cache_read()?;
+        if cache.account_revision != account_revision || cache.account != account {
+            return Err(HnsWalletError::StaleAddressReservation);
+        }
+        Ok(address)
+    }
+
+    /// Derive the exact ordinary receive address used for seller payment.
+    /// Economic terms therefore pay the selected local wallet and cannot be
+    /// redirected by a provider request.
+    pub fn shakedex_payment_receive_address(&self) -> Result<Address, HnsWalletError> {
+        let (account, account_revision) = {
+            let cache = self.cache_read()?;
+            ensure_shakedex_funding_ready(&cache)?;
+            (cache.account.clone(), cache.account_revision)
+        };
+        let derivation = DerivationReference {
+            role: KeyRole::HnsCoin,
+            account: account_number(&account),
+            change: 0,
+            index: account.next_receive_index,
+        };
+        let address = {
+            let store = self.store_lock()?;
+            let id = derived_address_record_id(&account.config, derivation)?;
+            let stored = store
+                .derived_address::<DerivedHnsAddress>(&id)?
+                .ok_or(HnsWalletError::InvalidEvidence)?;
+            let public = derive_hns_public_key(&store, account.config.wallet_id, derivation)?;
+            let program = public_key_hash(&public)?.to_vec();
+            let display = encode_v0_address(account.config.network, &program)?;
+            if stored.id != id
+                || stored.value.account_id != account.config.account_id
+                || stored.value.derivation != derivation
+                || stored.value.program != program
+                || stored.value.address != display
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            Address::new(0, program).map_err(|_| HnsWalletError::InvalidAddress)?
+        };
+        let cache = self.cache_read()?;
+        if cache.account_revision != account_revision || cache.account != account {
+            return Err(HnsWalletError::StaleAddressReservation);
+        }
+        Ok(address)
+    }
+
+    /// Select, fee, and bind the complete ordinary-wallet suffix for a buyer
+    /// fulfillment or seller recovery. The builder is an internal protocol
+    /// adapter: it receives only wallet-selected canonical inputs and optional
+    /// change, and must return the canonical prepared bytes it constructed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_current_shakedex_lock_funding<T, F>(
+        &self,
+        current_lock: &VerifiedCurrentShakedexLock,
+        workflow_id: WorkflowId,
+        purpose: HnsShakedexFundingPurpose,
+        ordinary_value: BaseUnits,
+        maximum_fee: BaseUnits,
+        max_funding_inputs: usize,
+        not_after_unix: Option<u64>,
+        mut build: F,
+    ) -> Result<HnsPreparedShakedexFunding<T>, HnsWalletError>
+    where
+        F: FnMut(Vec<Input>, Vec<Coin>, Vec<Output>, u64) -> Result<(Vec<u8>, T), HnsWalletError>,
+    {
+        require_lock_funding_purpose(purpose)?;
+        match purpose {
+            HnsShakedexFundingPurpose::BuyerFulfillment if ordinary_value.is_zero() => {
+                return Err(HnsWalletError::InvalidAmount);
+            }
+            HnsShakedexFundingPurpose::SellerRecovery if !ordinary_value.is_zero() => {
+                return Err(HnsWalletError::InvalidAmount);
+            }
+            HnsShakedexFundingPurpose::BuyerFulfillment
+            | HnsShakedexFundingPurpose::SellerRecovery => {}
+            HnsShakedexFundingPurpose::SellerScriptFinalize => {
+                return Err(HnsWalletError::InvalidWorkflow);
+            }
+        }
+        let (account, account_revision, cached_coins, change_derivation, change_address, now_unix) =
+            self.prepare_shakedex_funding_selection()?;
+        let fee_rate = self.backend.estimate_fee_rate(DEFAULT_FEE_TARGET_BLOCKS)?;
+        let source_coin = current_lock.locking_coin();
+        let selection = select_shakedex_funding(
+            source_coin,
+            cached_coins,
+            change_address,
+            ordinary_value,
+            fee_rate,
+            maximum_fee,
+            account.config.dust_threshold,
+            account.config.minimum_confirmations,
+            max_funding_inputs,
+            &mut build,
+        )?;
+        let maximum_expiry = now_unix
+            .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
+            .ok_or(HnsWalletError::Arithmetic)?;
+        let expires_at_unix =
+            not_after_unix.map_or(maximum_expiry, |not_after| not_after.min(maximum_expiry));
+        if expires_at_unix <= now_unix {
+            return Err(HnsWalletError::PreparedArtifactExpired);
+        }
+        let funding_coins = selection
+            .selected
+            .iter()
+            .map(TrackedHnsCoin::to_canonical_coin)
+            .collect::<Result<Vec<_>, _>>()?;
+        let (scope, funding_reservation) = self.bind_shakedex_funding_reservation(
+            current_lock,
+            workflow_id,
+            purpose,
+            &funding_coins,
+            expires_at_unix,
+        )?;
+        let change_reservation = selection.uses_change.then(|| {
+            Self::change_account_save(
+                &account,
+                account_revision,
+                change_derivation.index,
+                now_unix,
+            )
+            .map(|account_save| HnsShakedexChangeReservation {
+                derivation: change_derivation,
+                account_save,
+            })
+        });
+        let change_reservation = change_reservation.transpose()?;
+        Ok(HnsPreparedShakedexFunding {
+            prepared: selection.prepared,
+            scope,
+            funding_reservation,
+            change_reservation,
+            fee_rate,
+            fee: selection.fee,
+            maximum_fee,
+            expires_at_unix,
+        })
+    }
+
+    /// Select, fee, and bind the ordinary-wallet suffix for the distinct
+    /// script-controlled FINALIZE path. Current-TRANSFER authority cannot be
+    /// exchanged for a current-lock purpose through this API.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_current_shakedex_finalize_funding<T, F>(
+        &self,
+        current_transfer: &VerifiedCurrentShakedexTransfer,
+        workflow_id: WorkflowId,
+        maximum_fee: BaseUnits,
+        max_funding_inputs: usize,
+        mut build: F,
+    ) -> Result<HnsPreparedShakedexFunding<T>, HnsWalletError>
+    where
+        F: FnMut(Vec<Input>, Vec<Coin>, Vec<Output>, u64) -> Result<(Vec<u8>, T), HnsWalletError>,
+    {
+        let (account, account_revision, cached_coins, change_derivation, change_address, now_unix) =
+            self.prepare_shakedex_funding_selection()?;
+        let fee_rate = self.backend.estimate_fee_rate(DEFAULT_FEE_TARGET_BLOCKS)?;
+        let selection = select_shakedex_funding(
+            current_transfer.transfer_coin(),
+            cached_coins,
+            change_address,
+            BaseUnits::ZERO,
+            fee_rate,
+            maximum_fee,
+            account.config.dust_threshold,
+            account.config.minimum_confirmations,
+            max_funding_inputs,
+            &mut build,
+        )?;
+        let expires_at_unix = now_unix
+            .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
+            .ok_or(HnsWalletError::Arithmetic)?;
+        let funding_coins = selection
+            .selected
+            .iter()
+            .map(TrackedHnsCoin::to_canonical_coin)
+            .collect::<Result<Vec<_>, _>>()?;
+        let (scope, funding_reservation) = self.bind_shakedex_finalize_funding_reservation(
+            current_transfer,
+            workflow_id,
+            &funding_coins,
+            expires_at_unix,
+        )?;
+        let change_reservation = selection.uses_change.then(|| {
+            Self::change_account_save(
+                &account,
+                account_revision,
+                change_derivation.index,
+                now_unix,
+            )
+            .map(|account_save| HnsShakedexChangeReservation {
+                derivation: change_derivation,
+                account_save,
+            })
+        });
+        let change_reservation = change_reservation.transpose()?;
+        Ok(HnsPreparedShakedexFunding {
+            prepared: selection.prepared,
+            scope,
+            funding_reservation,
+            change_reservation,
+            fee_rate,
+            fee: selection.fee,
+            maximum_fee,
+            expires_at_unix,
+        })
+    }
+
+    /// Install the account revision committed atomically by the enclosing
+    /// Shakedex workflow. A stale or substituted reservation poisons no state;
+    /// it returns a fenced address-reservation error instead.
+    pub fn install_committed_shakedex_change(
+        &self,
+        change: &HnsShakedexChangeReservation,
+        committed_account_revision: u64,
+    ) -> Result<(), HnsWalletError> {
+        self.install_committed_account(
+            change.account_save.expected_revision,
+            committed_account_revision,
+            change.account_save.value.clone(),
+        )
+    }
+
+    fn prepare_shakedex_funding_selection(
+        &self,
+    ) -> Result<
+        (
+            HnsAccountRecord,
+            u64,
+            Vec<TrackedHnsCoin>,
+            DerivationReference,
+            Address,
+            u64,
+        ),
+        HnsWalletError,
+    > {
+        let now_unix = self.clock.now_unix()?;
+        let (account, account_revision, cached_coins) = {
+            let cache = self.cache_read()?;
+            ensure_shakedex_funding_ready(&cache)?;
+            (
+                cache.account.clone(),
+                cache.account_revision,
+                cache.coins.clone(),
+            )
+        };
+        let change_derivation = DerivationReference {
+            role: KeyRole::HnsCoin,
+            account: account_number(&account),
+            change: 1,
+            index: account.next_change_index,
+        };
+        let (available, change_address) = {
+            let mut store = self.store_lock()?;
+            let available =
+                available_unreserved_coins(&mut store, &account.config, cached_coins, now_unix)?;
+            let public =
+                derive_hns_public_key(&store, account.config.wallet_id, change_derivation)?;
+            let address = Address::new(0, public_key_hash(&public)?.to_vec())
+                .map_err(|_| HnsWalletError::InvalidAddress)?;
+            (available, address)
+        };
+        let cache = self.cache_read()?;
+        if cache.account_revision != account_revision || cache.account != account {
+            return Err(HnsWalletError::StaleAddressReservation);
+        }
+        Ok((
+            account,
+            account_revision,
+            available,
+            change_derivation,
+            change_address,
+            now_unix,
+        ))
     }
 
     /// Bind canonical funding-coin evidence from a verified Shakedex plan to
@@ -1071,7 +1482,246 @@ pub fn validate_persisted_hns_shakedex_fee_quote_evidence(
     )
 }
 
-fn ensure_shakedex_funding_ready(cache: &HnsRuntimeCache) -> Result<(), HnsWalletError> {
+struct ShakedexFundingSelection<T> {
+    prepared: T,
+    selected: Vec<TrackedHnsCoin>,
+    fee: BaseUnits,
+    uses_change: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_shakedex_funding<T, F>(
+    source_coin: &Coin,
+    mut candidates: Vec<TrackedHnsCoin>,
+    change_address: Address,
+    ordinary_value: BaseUnits,
+    fee_rate: BaseUnits,
+    maximum_fee: BaseUnits,
+    dust_threshold: BaseUnits,
+    minimum_confirmations: u32,
+    max_funding_inputs: usize,
+    build: &mut F,
+) -> Result<ShakedexFundingSelection<T>, HnsWalletError>
+where
+    F: FnMut(Vec<Input>, Vec<Coin>, Vec<Output>, u64) -> Result<(Vec<u8>, T), HnsWalletError>,
+{
+    if source_coin.outpoint.is_null()
+        || source_coin.coinbase
+        || fee_rate.is_zero()
+        || maximum_fee.is_zero()
+        || dust_threshold.is_zero()
+        || minimum_confirmations == 0
+        || max_funding_inputs == 0
+        || max_funding_inputs >= MAX_TRANSACTION_INPUTS
+    {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    u64::try_from(ordinary_value.get()).map_err(|_| HnsWalletError::InvalidAmount)?;
+    let source_outpoint = HnsOutpoint {
+        transaction: TransactionHash::new(source_coin.outpoint.transaction_hash.into_bytes()),
+        output_index: source_coin.outpoint.index,
+    };
+    candidates.retain(|candidate| {
+        is_ordinary_hns_spend_candidate(candidate)
+            && candidate.coin.confirmation_count >= minimum_confirmations
+            && candidate.coin.outpoint != source_outpoint
+    });
+    candidates.sort_by(|left, right| {
+        left.coin
+            .value
+            .cmp(&right.coin.value)
+            .then_with(|| left.coin.outpoint.cmp(&right.coin.outpoint))
+    });
+
+    let mut selected = Vec::new();
+    let mut total = 0_u128;
+    for candidate in candidates.into_iter().take(max_funding_inputs) {
+        total = total
+            .checked_add(candidate.coin.value.get())
+            .ok_or(HnsWalletError::Arithmetic)?;
+        selected.push(candidate);
+        if total <= ordinary_value.get() {
+            continue;
+        }
+
+        let fee_without_change = total - ordinary_value.get();
+        if fee_without_change > 1 {
+            let provisional_fee =
+                u64::try_from(fee_without_change - 1).map_err(|_| HnsWalletError::InvalidAmount)?;
+            let provisional_output = shakedex_change_output(change_address.clone(), 1)?;
+            let (_, transaction, input_coins) = build_shakedex_funding_candidate(
+                source_coin,
+                &selected,
+                vec![provisional_output],
+                provisional_fee,
+                build,
+            )?;
+            let minimum_fee =
+                shakedex_policy_minimum_fee(transaction, &input_coins, selected.len(), fee_rate)?;
+            let required_with_fee = ordinary_value
+                .get()
+                .checked_add(minimum_fee.get())
+                .ok_or(HnsWalletError::Arithmetic)?;
+            if total >= required_with_fee {
+                let change_value = total - required_with_fee;
+                if change_value >= dust_threshold.get() {
+                    if minimum_fee > maximum_fee {
+                        return Err(HnsWalletError::FeeLimit);
+                    }
+                    let change_value =
+                        u64::try_from(change_value).map_err(|_| HnsWalletError::InvalidAmount)?;
+                    let exact_fee = u64::try_from(minimum_fee.get())
+                        .map_err(|_| HnsWalletError::InvalidAmount)?;
+                    let change_output =
+                        shakedex_change_output(change_address.clone(), change_value)?;
+                    let (prepared, transaction, input_coins) = build_shakedex_funding_candidate(
+                        source_coin,
+                        &selected,
+                        vec![change_output],
+                        exact_fee,
+                        build,
+                    )?;
+                    let final_minimum = shakedex_policy_minimum_fee(
+                        transaction,
+                        &input_coins,
+                        selected.len(),
+                        fee_rate,
+                    )?;
+                    if minimum_fee < final_minimum {
+                        return Err(HnsWalletError::InvalidFeeQuote);
+                    }
+                    return Ok(ShakedexFundingSelection {
+                        prepared,
+                        selected,
+                        fee: minimum_fee,
+                        uses_change: true,
+                    });
+                }
+            }
+        }
+
+        let actual_fee = BaseUnits::new(fee_without_change);
+        let actual_fee_u64 =
+            u64::try_from(fee_without_change).map_err(|_| HnsWalletError::InvalidAmount)?;
+        let (prepared, transaction, input_coins) = build_shakedex_funding_candidate(
+            source_coin,
+            &selected,
+            Vec::new(),
+            actual_fee_u64,
+            build,
+        )?;
+        let minimum_fee =
+            shakedex_policy_minimum_fee(transaction, &input_coins, selected.len(), fee_rate)?;
+        if actual_fee >= minimum_fee && actual_fee <= maximum_fee {
+            return Ok(ShakedexFundingSelection {
+                prepared,
+                selected,
+                fee: actual_fee,
+                uses_change: false,
+            });
+        }
+    }
+    Err(HnsWalletError::InsufficientFunds)
+}
+
+fn shakedex_change_output(address: Address, value: u64) -> Result<Output, HnsWalletError> {
+    if value == 0 || address.version != 0 || address.hash.len() != 20 {
+        return Err(HnsWalletError::InvalidAddress);
+    }
+    address
+        .validate()
+        .map_err(|_| HnsWalletError::InvalidAddress)?;
+    Ok(Output {
+        value: Dollarydoos::new(value),
+        address,
+        covenant: Covenant::default(),
+    })
+}
+
+fn build_shakedex_funding_candidate<T, F>(
+    source_coin: &Coin,
+    selected: &[TrackedHnsCoin],
+    funding_outputs: Vec<Output>,
+    expected_fee: u64,
+    build: &mut F,
+) -> Result<(T, Transaction, Vec<Coin>), HnsWalletError>
+where
+    F: FnMut(Vec<Input>, Vec<Coin>, Vec<Output>, u64) -> Result<(Vec<u8>, T), HnsWalletError>,
+{
+    if selected.is_empty() || expected_fee == 0 {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    let funding_coins = selected
+        .iter()
+        .map(TrackedHnsCoin::to_canonical_coin)
+        .collect::<Result<Vec<_>, _>>()?;
+    let funding_inputs = funding_coins
+        .iter()
+        .map(|coin| Input {
+            previous_output: coin.outpoint,
+            sequence: u32::MAX,
+            witness: Witness::default(),
+        })
+        .collect::<Vec<_>>();
+    let (encoded, prepared) = build(
+        funding_inputs,
+        funding_coins.clone(),
+        funding_outputs,
+        expected_fee,
+    )?;
+    let transaction =
+        Transaction::decode(&encoded).map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+    if transaction
+        .encode()
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?
+        != encoded
+        || transaction.is_coinbase()
+        || transaction.inputs.len() != funding_coins.len() + 1
+        || transaction.inputs[0].previous_output != source_coin.outpoint
+        || transaction.inputs[0].witness.items.is_empty()
+        || transaction.inputs[1..]
+            .iter()
+            .zip(&funding_coins)
+            .any(|(input, coin)| {
+                input.previous_output != coin.outpoint
+                    || input.sequence != u32::MAX
+                    || !input.witness.items.is_empty()
+            })
+    {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    let mut input_coins = Vec::with_capacity(funding_coins.len() + 1);
+    input_coins.push(source_coin.clone());
+    input_coins.extend(funding_coins);
+    if actual_transaction_fee(&transaction, &input_coins)?
+        != BaseUnits::new(u128::from(expected_fee))
+    {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    Ok((prepared, transaction, input_coins))
+}
+
+fn shakedex_policy_minimum_fee(
+    mut transaction: Transaction,
+    input_coins: &[Coin],
+    funding_input_count: usize,
+    fee_rate: BaseUnits,
+) -> Result<BaseUnits, HnsWalletError> {
+    if funding_input_count == 0 || transaction.inputs.len() != funding_input_count + 1 {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    for input in &mut transaction.inputs[1..] {
+        if !input.witness.items.is_empty() {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        input.witness = Witness {
+            items: vec![vec![0; 65], vec![0; 33]],
+        };
+    }
+    canonical_policy_minimum_fee(&transaction, input_coins, fee_rate)
+}
+
+pub(super) fn ensure_shakedex_funding_ready(cache: &HnsRuntimeCache) -> Result<(), HnsWalletError> {
     if !HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED
         || !HNS_VALUE_RUNTIME_RELEASE_QUALIFIED
         || !HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED
