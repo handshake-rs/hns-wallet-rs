@@ -71,12 +71,12 @@ use hns_primitives::{
     BlockHash, Dollarydoos, Height, NameHash, TransactionHash as CanonicalTransactionHash, TreeRoot,
 };
 use hns_script::{
-    FeeRate, MAX_POLICY_TRANSACTION_SIGOPS, MAX_POLICY_TRANSACTION_WEIGHT, OP_BLAKE160,
-    OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUALVERIFY, OP_IF,
-    OP_SHA256, SIGHASH_ALL, minimum_policy_fee, signature_hash, transaction_policy_virtual_size,
-    transaction_sigops,
+    FeeRate, LOCKTIME_FLAG, LOCKTIME_MASK, LOCKTIME_MULTIPLIER, MAX_POLICY_TRANSACTION_SIGOPS,
+    MAX_POLICY_TRANSACTION_WEIGHT, OP_BLAKE160, OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_DROP,
+    OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUALVERIFY, OP_IF, OP_SHA256, SIGHASH_ALL, minimum_policy_fee,
+    signature_hash, transaction_policy_virtual_size, transaction_sigops,
 };
-use hns_swap::{NetworkBinding, lock_script_hash};
+use hns_swap::{HnsHtlc, NetworkBinding, lock_script_hash};
 use hns_transaction::{Address, Coin, Input, Outpoint, Output, Transaction, Witness};
 use hns_urkel_proof::{ProofKind, UrkelProof};
 use hns_wallet_chain_api::{
@@ -4002,13 +4002,26 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let now = self.clock.now_unix().map_err(map_chain_error)?;
         let cache = self.cache_read().map_err(map_chain_error)?;
         ensure_settlement_ready(&cache)?;
-        if action == HnsSettlementAction::Refund
-            && (current_height != Some(cache.sync.validated_height)
-                || cache.sync.validated_height < lock.absolute_timelock)
-        {
-            return Err(ChainError::InvalidRequest(
-                "refund height is not current or mature",
-            ));
+        if action == HnsSettlementAction::Refund {
+            let current = current_height.ok_or(ChainError::InvalidRequest(
+                "current Handshake refund authority is required",
+            ))?;
+            let locally_validated_current = if hns_locktime_is_time(lock.absolute_timelock)? {
+                cache
+                    .binding
+                    .ok_or(ChainError::NotSynchronized)?
+                    .tip
+                    .median_time_past
+            } else {
+                cache.sync.validated_height
+            };
+            if current != locally_validated_current
+                || !hns_refund_locktime_mature(lock.absolute_timelock, locally_validated_current)?
+            {
+                return Err(ChainError::InvalidRequest(
+                    "refund locktime is not current or mature",
+                ));
+            }
         }
         let account = cache.account.clone();
         drop(cache);
@@ -4632,6 +4645,110 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         }
     }
 
+    /// Fund the exact native-HNS descriptor committed by a bilateral swap
+    /// session.  This deliberately accepts the descriptor, rather than an
+    /// application-level deadline, so no caller can silently translate HNS's
+    /// encoded median-time lock into a height lock.
+    pub fn prepare_native_htlc_lock(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        maximum_fee: BaseUnits,
+    ) -> Result<PreparedSettlementLock, ChainError> {
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        let network =
+            shakedex_network_binding(cache.account.config.network).map_err(map_chain_error)?;
+        drop(cache);
+        descriptor
+            .verify_for_network(network)
+            .map_err(|_| ChainError::InvalidRequest("invalid native Handshake HTLC descriptor"))?;
+        self.prepare_lock(SettlementLockRequest {
+            session_id,
+            module: ModuleId::Handshake,
+            amount: Amount::new(WalletAsset::Hns, u128::from(descriptor.value.get())),
+            hashlock: ObjectHash::new(descriptor.hashlock),
+            receiver: hex::encode(descriptor.receiver_public_key),
+            refund_target: hex::encode(descriptor.refund_public_key),
+            absolute_timelock: u64::from(descriptor.refund_locktime),
+            maximum_fee,
+        })
+    }
+
+    /// Prepare a refund from the exact descriptor committed by a bilateral
+    /// swap session.  Height locktimes are bound to the validated tip height;
+    /// HNS median-time locktimes are bound to that same tip's validated median
+    /// time past.  Neither value is supplied by the caller.
+    pub fn prepare_native_htlc_refund_with_settlement_signer(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: VerifiedLock,
+        maximum_fee: BaseUnits,
+        signer: &dyn SettlementSigner,
+    ) -> Result<PreparedSettlementRefund, ChainError> {
+        self.verify_native_htlc_network(&descriptor)?;
+        validate_native_htlc_lock(&descriptor, session_id, &lock)?;
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        let current = if hns_locktime_is_time(lock.absolute_timelock)? {
+            cache
+                .binding
+                .ok_or(ChainError::NotSynchronized)?
+                .tip
+                .median_time_past
+        } else {
+            cache.sync.validated_height
+        };
+        drop(cache);
+        self.prepare_settlement_spend(
+            session_id,
+            lock,
+            None,
+            maximum_fee,
+            Some(current),
+            HnsSettlementAction::Refund,
+            Some(signer),
+        )
+        .map(PreparedSettlementRefund)
+    }
+
+    /// Prepare the receiver branch of the exact native-HNS descriptor
+    /// committed by a bilateral swap session.
+    pub fn prepare_native_htlc_redeem_with_settlement_signer(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: VerifiedLock,
+        preimage: Preimage,
+        maximum_fee: BaseUnits,
+        signer: &dyn SettlementSigner,
+    ) -> Result<PreparedSettlementRedeem, ChainError> {
+        self.verify_native_htlc_network(&descriptor)?;
+        validate_native_htlc_lock(&descriptor, session_id, &lock)?;
+        if HnsHtlc::hash_preimage(preimage.expose_for_settlement()) != descriptor.hashlock {
+            return Err(ChainError::InvalidEvidence);
+        }
+        self.prepare_settlement_spend(
+            session_id,
+            lock,
+            Some(preimage),
+            maximum_fee,
+            None,
+            HnsSettlementAction::Redeem,
+            Some(signer),
+        )
+        .map(PreparedSettlementRedeem)
+    }
+
+    fn verify_native_htlc_network(&self, descriptor: &HnsHtlc) -> Result<(), ChainError> {
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        let network =
+            shakedex_network_binding(cache.account.config.network).map_err(map_chain_error)?;
+        drop(cache);
+        descriptor
+            .verify_for_network(network)
+            .map_err(|_| ChainError::InvalidRequest("invalid native Handshake HTLC descriptor"))
+    }
+
     /// Prepare a native-HNS redeem with a chain-neutral per-session signer.
     /// The signer must exactly equal the receiver key frozen in the verified
     /// lock; its scalar never enters this runtime or its persistence layer.
@@ -4665,9 +4782,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         request: SettlementRefundRequest,
         signer: &dyn SettlementSigner,
     ) -> Result<PreparedSettlementRefund, ChainError> {
-        if request.current_chain_time >= HNS_LOCKTIME_THRESHOLD
-            || request.lock.absolute_timelock >= HNS_LOCKTIME_THRESHOLD
-            || request.current_chain_time < request.lock.absolute_timelock
+        if !hns_refund_locktime_mature(request.lock.absolute_timelock, request.current_chain_time)
+            .map_err(|_| ChainError::InvalidRequest("refund timelock is invalid or not mature"))?
         {
             return Err(ChainError::InvalidRequest("refund timelock is not mature"));
         }
@@ -8448,7 +8564,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         if request.expected.module != ModuleId::Handshake
             || request.expected.amount.asset != WalletAsset::Hns
             || request.expected.absolute_timelock == 0
-            || request.expected.absolute_timelock >= HNS_LOCKTIME_THRESHOLD
+            || !hns_locktime_is_valid(request.expected.absolute_timelock)
             || request.expected.minimum_confirmations < configured_minimum
             || request.confirmation_count < request.expected.minimum_confirmations
             || request.confirmation_count < configured_minimum
@@ -8610,9 +8726,8 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         &self,
         request: SettlementRefundRequest,
     ) -> Result<PreparedSettlementRefund, ChainError> {
-        if request.current_chain_time >= HNS_LOCKTIME_THRESHOLD
-            || request.lock.absolute_timelock >= HNS_LOCKTIME_THRESHOLD
-            || request.current_chain_time < request.lock.absolute_timelock
+        if !hns_refund_locktime_mature(request.lock.absolute_timelock, request.current_chain_time)
+            .map_err(|_| ChainError::InvalidRequest("refund timelock is invalid or not mature"))?
         {
             return Err(ChainError::InvalidRequest("refund timelock is not mature"));
         }
@@ -9228,12 +9343,68 @@ fn validate_settlement_request(request: &SettlementLockRequest) -> Result<(), Ch
         || request.amount.asset != WalletAsset::Hns
         || request.amount.base_units.is_zero()
         || request.maximum_fee.is_zero()
-        || request.absolute_timelock == 0
-        || request.absolute_timelock >= HNS_LOCKTIME_THRESHOLD
+        || !hns_locktime_is_valid(request.absolute_timelock)
     {
         return Err(ChainError::InvalidRequest(
             "invalid Handshake settlement terms",
         ));
+    }
+    Ok(())
+}
+
+/// Return whether an HNS absolute locktime is the consensus median-time
+/// encoding rather than a block height.  HNS time locktimes carry the high
+/// bit and express the masked value in 512-second units.
+fn hns_locktime_is_time(locktime: u64) -> Result<bool, ChainError> {
+    let encoded = u32::try_from(locktime)
+        .map_err(|_| ChainError::InvalidRequest("Handshake timelock exceeds u32"))?;
+    Ok(encoded & LOCKTIME_FLAG != 0)
+}
+
+fn hns_locktime_is_valid(locktime: u64) -> bool {
+    u32::try_from(locktime).is_ok_and(|encoded| encoded & LOCKTIME_MASK != 0)
+}
+
+/// Check the exact consensus domain used by the transaction's CLTV branch.
+/// Height locks become usable at their height.  Time locks use the wallet's
+/// validated parent median time, strictly after the represented 512-second
+/// threshold, matching HSD's absolute-lock semantics.
+fn hns_refund_locktime_mature(locktime: u64, local_current: u64) -> Result<bool, ChainError> {
+    let encoded = u32::try_from(locktime)
+        .map_err(|_| ChainError::InvalidRequest("Handshake timelock exceeds u32"))?;
+    let value = u64::from(encoded & LOCKTIME_MASK);
+    if value == 0 {
+        return Err(ChainError::InvalidRequest("Handshake timelock is zero"));
+    }
+    if encoded & LOCKTIME_FLAG == 0 {
+        return Ok(local_current >= value);
+    }
+    let threshold = value
+        .checked_mul(u64::from(LOCKTIME_MULTIPLIER))
+        .ok_or(ChainError::Overflow)?;
+    Ok(local_current > threshold)
+}
+
+/// Confirm that the generic persisted verification record is an exact view of
+/// the protocol descriptor.  This keeps the convenience APIs from ever
+/// spending a same-session lock whose amount, hashlock, participants, or HNS
+/// encoded locktime differs from the signed swap session.
+fn validate_native_htlc_lock(
+    descriptor: &HnsHtlc,
+    session_id: SessionId,
+    lock: &VerifiedLock,
+) -> Result<(), ChainError> {
+    descriptor
+        .validate()
+        .map_err(|_| ChainError::InvalidRequest("invalid native Handshake HTLC descriptor"))?;
+    if lock.module != ModuleId::Handshake
+        || lock.session_id != session_id
+        || lock.amount.asset != WalletAsset::Hns
+        || lock.amount.base_units.get() != u128::from(descriptor.value.get())
+        || lock.hashlock.as_bytes() != &descriptor.hashlock
+        || lock.absolute_timelock != u64::from(descriptor.refund_locktime)
+    {
+        return Err(ChainError::InvalidEvidence);
     }
     Ok(())
 }
@@ -12773,6 +12944,56 @@ mod tests {
             receive_address(HnsNetwork::Regtest, &public)
                 .expect("regtest")
                 .starts_with("rs1")
+        );
+    }
+
+    #[test]
+    fn native_htlc_locktime_preserves_hns_height_and_median_time_domains() {
+        assert!(hns_locktime_is_valid(42));
+        assert!(!hns_locktime_is_time(42).expect("height encoding"));
+        assert!(hns_refund_locktime_mature(42, 42).expect("height maturity"));
+        assert!(!hns_refund_locktime_mature(42, 41).expect("height immaturity"));
+
+        // HNS's high-bit time encoding stores 512-second units.  The local
+        // header authority must use strict parent-MTP maturity, not wall time
+        // and not a translated block height.
+        let encoded_time = u64::from(LOCKTIME_FLAG | 2);
+        assert!(hns_locktime_is_valid(encoded_time));
+        assert!(hns_locktime_is_time(encoded_time).expect("time encoding"));
+        assert!(!hns_refund_locktime_mature(encoded_time, 1_024).expect("time immaturity"));
+        assert!(hns_refund_locktime_mature(encoded_time, 1_025).expect("time maturity"));
+        assert!(!hns_locktime_is_valid(u64::from(LOCKTIME_FLAG)));
+    }
+
+    #[test]
+    fn native_htlc_lock_uses_the_protocol_descriptor_script_without_translation() {
+        let receiver = SigningKey::from_bytes((&[31_u8; 32]).into())
+            .expect("receiver key")
+            .verifying_key()
+            .to_encoded_point(true);
+        let refund = SigningKey::from_bytes((&[32_u8; 32]).into())
+            .expect("refund key")
+            .verifying_key()
+            .to_encoded_point(true);
+        let receiver: [u8; 33] = receiver.as_bytes().try_into().expect("receiver SEC1");
+        let refund: [u8; 33] = refund.as_bytes().try_into().expect("refund SEC1");
+        let descriptor = HnsHtlc {
+            network: shakedex_network_binding(HnsNetwork::Regtest).expect("regtest network"),
+            value: Dollarydoos::new(1_000),
+            hashlock: [7; 32],
+            receiver_public_key: receiver,
+            refund_public_key: refund,
+            refund_locktime: LOCKTIME_FLAG | 2,
+        };
+        assert_eq!(
+            hns_htlc_script(
+                ObjectHash::new(descriptor.hashlock),
+                &descriptor.receiver_public_key,
+                &descriptor.refund_public_key,
+                u64::from(descriptor.refund_locktime),
+            )
+            .expect("wallet HTLC script"),
+            descriptor.script().expect("protocol HTLC script"),
         );
     }
 }
