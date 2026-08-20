@@ -35,7 +35,9 @@ use bdk_wallet::template::Bip84;
 use bdk_wallet::{KeychainKind, SignOptions, Wallet};
 use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
-use hns_marketplace_protocol::{MarketPair, NetworkBinding as DenuoNetworkBinding};
+use hns_marketplace_protocol::{
+    AssetId, MarketPair, NetworkBinding as DenuoNetworkBinding, SwapAssetSide, SwapSessionHello,
+};
 use hns_wallet_chain_api::SettlementSigner;
 use hns_wallet_types::{
     ChainCapabilities, FeeModel, FinalityModel, HashAlgorithm, LocktimeModel, ObjectHash,
@@ -524,6 +526,15 @@ pub struct BitcoinHtlc {
     pub script_pubkey: Vec<u8>,
 }
 
+/// Exact Bitcoin descriptor and commitment implied by one side of an accepted
+/// Denuo HNS/BTC agreement.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenuoBitcoinHtlcBinding {
+    pub htlc: BitcoinHtlc,
+    pub commitment: ObjectHash,
+    pub value_sats: u64,
+}
+
 /// A fully signed descriptor-wallet transaction funding one exact native
 /// SegWit HTLC. The raw bytes are redacted from `Debug`; callers must persist
 /// the enclosing descriptor wallet changes and an approval binding before
@@ -697,6 +708,49 @@ impl BitcoinHtlc {
     pub fn witness_script(&self) -> ScriptBuf {
         ScriptBuf::from_bytes(self.witness_script.clone())
     }
+}
+
+/// Build the Bitcoin HTLC that the signed Denuo terms require for `side`.
+/// The party offering that Bitcoin side owns its refund branch; the other
+/// settlement key owns the redeem branch. The result's commitment must equal
+/// the corresponding lock commitment in the accepted Denuo session before a
+/// caller funds, accepts, or spends it.
+pub fn build_denuo_bitcoin_htlc(
+    hello: &SwapSessionHello,
+    side: SwapAssetSide,
+) -> Result<DenuoBitcoinHtlcBinding, BitcoinWalletError> {
+    let (asset, amount, deadline, receiver_bytes, refund_bytes) = match side {
+        SwapAssetSide::Offered => (
+            hello.offered_asset,
+            hello.offered_amount.get(),
+            hello.offered_refund_deadline.value,
+            hello.taker_settlement_public_key,
+            hello.maker_settlement_public_key,
+        ),
+        SwapAssetSide::Received => (
+            hello.received_asset,
+            hello.received_amount.get(),
+            hello.received_refund_deadline.value,
+            hello.maker_settlement_public_key,
+            hello.taker_settlement_public_key,
+        ),
+    };
+    if asset != AssetId::BTC {
+        return Err(BitcoinWalletError::InvalidHtlc);
+    }
+    let value_sats = u64::try_from(amount).map_err(|_| BitcoinWalletError::InvalidAmount)?;
+    let refund_locktime = u32::try_from(deadline).map_err(|_| BitcoinWalletError::InvalidHtlc)?;
+    let receiver =
+        PublicKey::from_slice(&receiver_bytes).map_err(|_| BitcoinWalletError::InvalidHtlc)?;
+    let refund =
+        PublicKey::from_slice(&refund_bytes).map_err(|_| BitcoinWalletError::InvalidHtlc)?;
+    let htlc = BitcoinHtlc::new(hello.hashlock, receiver, refund, refund_locktime)?;
+    let commitment = denuo_bitcoin_htlc_commitment(hello.header.network, &htlc, value_sats)?;
+    Ok(DenuoBitcoinHtlcBinding {
+        htlc,
+        commitment,
+        value_sats,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1394,7 +1448,9 @@ mod tests {
     use super::*;
     use bdk_wallet::bitcoin::bip32::DerivationPath;
     use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey};
-    use hns_marketplace_protocol::ChainId;
+    use hns_marketplace_protocol::{
+        AssetAmount, ChainId, DeadlineKind, MarketPair, SettlementDeadline, SignedObjectHeader,
+    };
     use hns_primitives::BlockHash;
     use hns_wallet_chain_api::{SettlementSigner, SettlementSigningError};
     use hns_wallet_store::WalletStore;
@@ -1450,6 +1506,67 @@ mod tests {
             counterchain_network,
             counterchain_genesis: [2; 32],
         }
+    }
+
+    fn denuo_hello(bitcoin_side: SwapAssetSide) -> SwapSessionHello {
+        let (offered_asset, received_asset) = match bitcoin_side {
+            SwapAssetSide::Offered => (AssetId::BTC, AssetId::HNS),
+            SwapAssetSide::Received => (AssetId::HNS, AssetId::BTC),
+        };
+        SwapSessionHello {
+            header: SignedObjectHeader {
+                version: hns_marketplace_protocol::MARKETPLACE_PROTOCOL_VERSION,
+                network: denuo_network(1),
+                pair: MarketPair::HNS_BTC,
+                signer_public_key: key(9).to_bytes().try_into().expect("signer SEC1"),
+                sequence: 1,
+                created_at: 10,
+                expires_at: 900,
+            },
+            fill_grant_hash: [1; 32],
+            swap_session_id: [2; 32],
+            maker_settlement_public_key: key(3).to_bytes().try_into().expect("maker SEC1"),
+            taker_settlement_public_key: key(4).to_bytes().try_into().expect("taker SEC1"),
+            offered_asset,
+            offered_amount: AssetAmount::new(50_000),
+            received_asset,
+            received_amount: AssetAmount::new(1_000),
+            price_round_hash: [3; 32],
+            hashlock: [4; 32],
+            first_funding_chain: ChainId::BITCOIN,
+            offered_lock_commitment: [0; 32],
+            offered_refund_deadline: SettlementDeadline {
+                kind: DeadlineKind::UnixTime,
+                value: 1_800_000_000,
+            },
+            offered_minimum_confirmations: 2,
+            received_lock_commitment: [0; 32],
+            received_refund_deadline: SettlementDeadline {
+                kind: DeadlineKind::UnixTime,
+                value: 1_700_000_000,
+            },
+            received_minimum_confirmations: 2,
+            maker_signature: [0; 64],
+            taker_signature: [0; 64],
+        }
+    }
+
+    #[test]
+    fn denuo_bitcoin_descriptor_assigns_redeem_and_refund_to_signed_parties() {
+        let hello = denuo_hello(SwapAssetSide::Received);
+        let binding =
+            build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Received).expect("Bitcoin descriptor");
+        assert_eq!(binding.value_sats, 1_000);
+        assert_eq!(binding.htlc.receiver_public_key, key(3).to_bytes());
+        assert_eq!(binding.htlc.refund_public_key, key(4).to_bytes());
+        verify_denuo_bitcoin_htlc_commitment(
+            binding.commitment,
+            hello.header.network,
+            &binding.htlc,
+            binding.value_sats,
+        )
+        .expect("same Denuo binding");
+        assert!(build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered).is_err());
     }
 
     #[test]
