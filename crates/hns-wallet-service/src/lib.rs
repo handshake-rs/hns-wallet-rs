@@ -3,6 +3,7 @@
 
 mod native_read_bootstrap;
 mod native_read_profile;
+mod native_value_runtime;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -47,6 +48,7 @@ pub use native_read_profile::{
     NativeHnsReadProfileState, StoredNativeHnsReadProfile, load_native_hns_read_profile,
     provision_native_hns_read_profile, revoke_native_hns_read_profile,
 };
+pub use native_value_runtime::{PersistentHnsValueConfig, PersistentHnsValueRuntime};
 
 pub const MAX_SEEN_REQUEST_IDS: usize = 4_096;
 pub const MAX_SERVICE_PENDING_APPROVALS: usize = 128;
@@ -160,6 +162,20 @@ pub trait ServiceRuntime {
     }
 
     fn execute_provider(&mut self, call: ApprovedCall) -> Result<Value, ServiceFailure>;
+
+    /// Execute a call only after the service has consumed the exact
+    /// process-local provider approval. Value runtimes use the nonzero
+    /// approval identifier to atomically consume their separately encrypted
+    /// prepared-artifact approval during signing. Ordinary runtimes retain the
+    /// legacy execution hook.
+    fn execute_approved_provider(
+        &mut self,
+        call: ApprovedCall,
+        _: ApprovalId,
+        _: u64,
+    ) -> Result<Value, ServiceFailure> {
+        self.execute_provider(call)
+    }
 
     fn lock_wallet(&mut self) -> Result<(), ServiceFailure>;
 
@@ -986,6 +1002,7 @@ struct SessionState {
 
 #[derive(Clone)]
 struct PendingState {
+    approval_id: ApprovalId,
     binding: ProviderBinding,
     kind: ApprovalKind,
     expires_at_unix: u64,
@@ -1047,6 +1064,8 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         }
         if !capabilities.contains(&ServiceCapability::ProviderDispatch) {
             capabilities.remove(&ServiceCapability::ValueMovement);
+            capabilities.remove(&ServiceCapability::HnsValueOperationsV1);
+            capabilities.remove(&ServiceCapability::DenuoShakedexV1);
         }
         if !capabilities.contains(&ServiceCapability::WalletOperations) {
             capabilities.remove(&ServiceCapability::HnsReadOperationsV1);
@@ -1055,6 +1074,11 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
             || !capabilities.contains(&ServiceCapability::HnsReadOperationsV1)
         {
             capabilities.remove(&ServiceCapability::HnsWalletAuthorityContextV1);
+            capabilities.remove(&ServiceCapability::HnsValueOperationsV1);
+            capabilities.remove(&ServiceCapability::DenuoShakedexV1);
+        }
+        if !capabilities.contains(&ServiceCapability::HnsValueOperationsV1) {
+            capabilities.remove(&ServiceCapability::DenuoShakedexV1);
         }
         Ok(Self {
             provider: ProviderCore::new(state, wallet_session_id, true),
@@ -1637,6 +1661,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                 self.pending.insert(
                     wire_id,
                     PendingState {
+                        approval_id: approval.id,
                         binding: prompt.binding,
                         kind: approval.kind,
                         expires_at_unix: approval.expires_at_unix,
@@ -1977,7 +2002,14 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     self.runtime.execute_provider(call)
                 }
             }
-            _ => self.runtime.execute_provider(call),
+            _ => match approved_pending {
+                Some(pending) => self.runtime.execute_approved_provider(
+                    call,
+                    pending.approval_id,
+                    now_unix_ms / 1_000,
+                ),
+                None => self.runtime.execute_provider(call),
+            },
         }
     }
 

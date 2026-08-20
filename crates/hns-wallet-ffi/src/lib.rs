@@ -57,6 +57,10 @@ pub enum ServiceCapability {
     WalletOperations,
     HnsReadOperationsV1,
     HnsWalletAuthorityContextV1,
+    /// Exact native/provider HNS send plus TRANSFER/FINALIZE protocol.
+    HnsValueOperationsV1,
+    /// Exact Denuo V2 fixed-price board and Shakedex value protocol.
+    DenuoShakedexV1,
     ProviderDispatch,
     ValueMovement,
     BrowserIntegration,

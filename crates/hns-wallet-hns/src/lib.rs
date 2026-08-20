@@ -2974,6 +2974,15 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         self.store.is_same_authority(store)
     }
 
+    /// Return the account policy retained by this full runtime without
+    /// consulting the node or reopening the encrypted store. Product
+    /// composition uses this cache-only view while the shared store is locked
+    /// to verify that the already-open runtime is the exact requested value
+    /// runtime before exposing any service capability.
+    pub fn configured_runtime_config(&self) -> Result<HnsRuntimeConfig, HnsWalletError> {
+        Ok(self.cache_read()?.account.config.clone())
+    }
+
     /// Reauthenticate the full runtime's cached account against the exact
     /// shared store row before an adjacent product component relies on it.
     /// A store mutation that has not yet been synchronized into the runtime
