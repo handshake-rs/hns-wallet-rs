@@ -85,7 +85,7 @@ impl DenuoPriceRoundPolicy {
         self.fingerprint
     }
 
-    fn verifier(&self) -> Result<PriceRoundVerifier<'_>, MarketError> {
+    pub(crate) fn verifier(&self) -> Result<PriceRoundVerifier<'_>, MarketError> {
         PriceRoundVerifier::new(
             self.network,
             self.round_policy,
@@ -127,6 +127,31 @@ pub struct DenuoPriceRoundSnapshot {
     pub counterchain_anchor_hash: ObjectHash,
     pub accepted_at_unix: u64,
     pub retained_rounds: usize,
+}
+
+/// Re-authenticated canonical round material for a bilateral match or swap
+/// admission. This is intentionally not serializable and does not assert that
+/// either embedded chain anchor is current; the two wallet light clients must
+/// establish that separately before value moves.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenuoVerifiedPriceRound {
+    round: PriceRound,
+    previous_round: Option<PriceRound>,
+    accepted_at_unix: u64,
+}
+
+impl DenuoVerifiedPriceRound {
+    pub const fn round(&self) -> &PriceRound {
+        &self.round
+    }
+
+    pub const fn previous_round(&self) -> Option<&PriceRound> {
+        self.previous_round.as_ref()
+    }
+
+    pub const fn accepted_at_unix(&self) -> u64 {
+        self.accepted_at_unix
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,6 +235,52 @@ pub fn load_denuo_price_round_cache(
     };
     validate_retained_price_round_history(store, policy, &loaded)?;
     Ok(Some(snapshot_from_loaded(policy, &loaded)))
+}
+
+/// Load one exact retained round with the predecessor needed to reverify it.
+/// A pruned predecessor fails closed instead of treating a hash link as price
+/// authority. Active bilateral sessions persist their already-verified terms
+/// separately, so board pruning cannot rewrite a frozen agreement.
+pub fn load_denuo_verified_price_round(
+    store: &WalletStore,
+    policy: &DenuoPriceRoundPolicy,
+    round_hash: [u8; 32],
+) -> Result<Option<DenuoVerifiedPriceRound>, MarketError> {
+    if round_hash == [0; 32] {
+        return Err(MarketError::InvalidDenuoPriceRound);
+    }
+    let Some(loaded) = load_price_round_head_tail(store, policy)? else {
+        return Ok(None);
+    };
+    validate_retained_price_round_history(store, policy, &loaded)?;
+    let Some(index) = loaded
+        .history
+        .iter()
+        .position(|entry| entry.round_hash == ObjectHash::new(round_hash))
+    else {
+        return Ok(None);
+    };
+    let current = load_round_record(store, policy, &loaded.history[index])?;
+    let previous_round = if index > 0 {
+        Some(load_round_record(store, policy, &loaded.history[index - 1])?.round)
+    } else if current.round.previous_round_hash == [0; 32] {
+        None
+    } else {
+        return Err(MarketError::DenuoPriceRoundHistoryUnavailable);
+    };
+    current
+        .round
+        .verify(
+            policy.verifier()?,
+            previous_round.as_ref(),
+            current.accepted_at_unix,
+        )
+        .map_err(|_| MarketError::CorruptDenuoPriceRoundCache)?;
+    Ok(Some(DenuoVerifiedPriceRound {
+        round: current.round,
+        previous_round,
+        accepted_at_unix: current.accepted_at_unix,
+    }))
 }
 
 /// Bootstrap an empty cache from one canonical current Denuo V2 price-round

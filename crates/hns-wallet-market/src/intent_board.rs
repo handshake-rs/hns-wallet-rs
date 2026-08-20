@@ -657,7 +657,7 @@ pub enum DenuoIntentPeerEvent {
     },
 }
 
-fn decode_canonical_envelope(
+pub(crate) fn decode_canonical_envelope(
     envelope_bytes: &[u8],
 ) -> Result<(u64, CrossChainMessage), MarketError> {
     if envelope_bytes.is_empty() {

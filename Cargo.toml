@@ -69,19 +69,19 @@ zeroize = { version = "1.8.1", features = ["derive"] }
 # Reviewed canonical Handshake protocol source. Every protocol crate is pinned
 # to one immutable revision; no mutable branch, tag, or sibling checkout is
 # allowed. This source adoption does not imply downstream release qualification.
-hns-covenants = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-header-consensus = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-marketplace-protocol = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-covenants = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-header-consensus = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-marketplace-protocol = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
 hns-light-chain = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "4cdea838fcac4397ab9fad1b4dd1dbb901a7872d" }
 hns-light-p2p = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "4cdea838fcac4397ab9fad1b4dd1dbb901a7872d" }
 hns-light-sync = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "4cdea838fcac4397ab9fad1b4dd1dbb901a7872d" }
 hns-light-wallet = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "4cdea838fcac4397ab9fad1b4dd1dbb901a7872d" }
-hns-p2p-wire = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-primitives = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-script = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-swap = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-transaction = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-urkel-proof = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-p2p-wire = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-primitives = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-script = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-swap = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-transaction = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-urkel-proof = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
 
 # The only Bitcoin production synchronization implementation. The exact BDK
 # release is part of the encrypted changeset format contract.
@@ -102,10 +102,10 @@ all = "warn"
 # hns-rs revision so canonical headers, transactions, and primitive types have
 # one Cargo source identity across the embedded runtime.
 [patch.crates-io]
-hns-covenants = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-encoding = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-header-consensus = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-p2p-wire = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-primitives = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-transaction = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-urkel-proof = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-covenants = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-encoding = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-header-consensus = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-p2p-wire = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-primitives = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-transaction = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }
+hns-urkel-proof = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "126fee8feb6f9e3e55a753c481ca5c9758870b0c" }

@@ -3,6 +3,7 @@
 
 mod intent_board;
 mod price_board;
+mod session_board;
 
 use std::collections::BTreeMap;
 
@@ -23,8 +24,15 @@ pub use intent_board::{
 };
 pub use price_board::{
     DenuoPriceRoundAdmission, DenuoPriceRoundPolicy, DenuoPriceRoundSnapshot,
-    MAX_DENUO_PRICE_ROUND_HISTORY, admit_denuo_price_round, bootstrap_denuo_price_round_cache,
-    load_denuo_price_round_cache,
+    DenuoVerifiedPriceRound, MAX_DENUO_PRICE_ROUND_HISTORY, admit_denuo_price_round,
+    bootstrap_denuo_price_round_cache, load_denuo_price_round_cache,
+    load_denuo_verified_price_round,
+};
+pub use session_board::{
+    DenuoSwapHandshakeAdmission, DenuoSwapHandshakePolicy, DenuoSwapHandshakeRecord,
+    DenuoSwapHandshakeSnapshot, DenuoSwapHandshakeStage, MAX_DENUO_SWAP_HANDSHAKES,
+    admit_denuo_fill_grant, admit_denuo_match_request, admit_denuo_swap_hello,
+    admit_denuo_swap_proposal, load_denuo_swap_handshake, load_denuo_swap_handshakes,
 };
 
 pub const MAX_ACTIVE_RESERVATIONS: usize = 64;
@@ -544,6 +552,8 @@ pub enum MarketError {
     DenuoPriceRoundReplay,
     #[error("persisted Denuo price-round cache is corrupt or noncanonical")]
     CorruptDenuoPriceRoundCache,
+    #[error("the retained Denuo price round no longer has its required predecessor")]
+    DenuoPriceRoundHistoryUnavailable,
     #[error("invalid Denuo market-intent board policy")]
     InvalidDenuoIntentBoardPolicy,
     #[error("invalid or unexpected canonical Denuo V2 market-intent envelope")]
@@ -556,6 +566,20 @@ pub enum MarketError {
     DenuoMarketIntentCapacity,
     #[error("requested Denuo market intent is unknown")]
     UnknownDenuoMarketIntent,
+    #[error("invalid Denuo bilateral swap-handshake policy")]
+    InvalidDenuoSwapHandshakePolicy,
+    #[error("invalid or unexpected canonical Denuo V2 bilateral swap message")]
+    InvalidDenuoSwapHandshake,
+    #[error("the referenced Denuo price round is not retained locally")]
+    UnknownDenuoPriceRound,
+    #[error("the referenced Denuo bilateral swap handshake is unknown")]
+    UnknownDenuoSwapHandshake,
+    #[error("Denuo bilateral swap handshake conflicts with accepted state")]
+    DenuoSwapHandshakeConflict,
+    #[error("Denuo bilateral swap handshake capacity reached")]
+    DenuoSwapHandshakeCapacity,
+    #[error("persisted Denuo bilateral swap handshake is corrupt or noncanonical")]
+    CorruptDenuoSwapHandshake,
     #[error("invalid, unexpected, or resource-exhausting Denuo peer message")]
     InvalidDenuoPeerMessage,
     #[error("unsupported or inconsistent asset pair")]
