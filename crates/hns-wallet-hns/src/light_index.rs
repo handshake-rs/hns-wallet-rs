@@ -390,6 +390,43 @@ impl EncryptedHnsLightIndex {
         &self.scan.watch_set
     }
 
+    /// Canonical HSD Bloom-filter seeds for the public watch set and all
+    /// locally observed wallet outpoints. Retaining historical outpoints is
+    /// conservative and lets a restarted scan detect spends without relying
+    /// on connection-local BIP37 auto-update state.
+    pub fn bloom_elements(&self) -> Result<Vec<Vec<u8>>, HnsLightIndexError> {
+        let scripts = self
+            .scan
+            .watch_set
+            .scripts
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let observations = self.decoded_transactions()?;
+        let mut elements = self
+            .scan
+            .watch_set
+            .scripts
+            .iter()
+            .map(|script| script.hash.clone())
+            .chain(
+                self.scan
+                    .watch_set
+                    .name_hashes
+                    .iter()
+                    .map(|name| name.to_vec()),
+            )
+            .collect::<Vec<_>>();
+        elements.extend(
+            watched_outputs(&observations, &scripts)?
+                .into_iter()
+                .map(|outpoint| outpoint.encode().to_vec()),
+        );
+        elements.sort_unstable();
+        elements.dedup();
+        Ok(elements)
+    }
+
     /// Commit one next-height verified filtered block and every relevant
     /// transaction atomically with the scan head.
     pub fn apply_verified_block(
@@ -405,7 +442,7 @@ impl EncryptedHnsLightIndex {
         let height = entry.height().get();
         if authority.account_id() != self.account_id
             || authority.consensus_network() != self.network
-            || authority.birthday_height() != self.scan.birthday_height
+            || authority.birthday_height() > self.scan.birthday_height
             || height > authority.validated_chain().tip().height().get()
         {
             return Err(HnsLightIndexError::AuthorityMismatch);
@@ -549,7 +586,7 @@ impl EncryptedHnsLightIndex {
         let name_hash = packet.key.into_bytes();
         if authority.account_id() != self.account_id
             || authority.consensus_network() != self.network
-            || authority.birthday_height() != self.scan.birthday_height
+            || authority.birthday_height() > self.scan.birthday_height
             || status.state != SyncState::HeaderCurrent
             || packet.root != status.tip.tree_root()
             || self

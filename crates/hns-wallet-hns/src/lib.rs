@@ -6,6 +6,7 @@ mod light_authority;
 mod light_index;
 mod name_workflow;
 mod node_rpc;
+mod peer_coordinator;
 mod shakedex_funding;
 mod shakedex_key;
 // The counter boundary stays crate-private until the immutable hns-rs HNSA/HNSR
@@ -30,6 +31,10 @@ pub use name_workflow::{
     VerifiedCurrentShakedexTransfer, VerifiedOutgoingNameTransfer,
 };
 pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
+pub use peer_coordinator::{
+    ConnectedHnsPeer, HnsBlockScanProgress, HnsDirectPeerConfig, HnsDirectPeerCoordinator,
+    HnsDirectPeerError, HnsHeaderRoundProgress, NativeHnsPeerPool,
+};
 pub use shakedex_funding::{
     HnsPreparedShakedexFunding, HnsShakedexChangeReservation,
     HnsShakedexFundingApprovalExpectation, HnsShakedexFundingAuthorization,

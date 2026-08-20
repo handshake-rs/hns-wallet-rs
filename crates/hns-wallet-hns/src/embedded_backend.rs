@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use hns_covenants::{CovenantKind, MAX_RESOURCE_SIZE, NameState, TransferCovenant};
 use hns_header_consensus::Header;
-use hns_light_sync::{HeaderRoundRequest, PeerId, SyncState};
-use hns_light_wallet::VerifiedWalletBlock;
+use hns_light_sync::{HeaderRoundRequest, PeerId, SyncError, SyncState};
+use hns_light_wallet::{VerifiedWalletBlock, WalletHeaderAnchor};
 use hns_p2p_wire::{GetProofPacket, ProofPacket};
 use hns_primitives::{Height, NameHash, Outpoint, TreeRoot};
 use hns_transaction::{Coin, Output, Transaction};
@@ -81,7 +81,7 @@ impl EmbeddedHnsBackend {
     ) -> Result<Self, HnsWalletError> {
         if authority.account_id() != index.account_id()
             || authority.consensus_network() != index.consensus_network()
-            || authority.birthday_height() != index.status().birthday_height
+            || authority.birthday_height() > index.status().birthday_height
         {
             return Err(HnsWalletError::InvalidRuntimeConfiguration);
         }
@@ -123,6 +123,45 @@ impl EmbeddedHnsBackend {
             advance_mempool_generation(&mut state.mempool)?;
         }
         Ok(changed)
+    }
+
+    /// Current authenticated header-sync status owned by this wallet.
+    pub fn header_sync_status(&self) -> Result<hns_light_sync::SyncStatus, HnsWalletError> {
+        Ok(self.lock()?.authority.status())
+    }
+
+    /// Current durable filtered-block coverage for the installed watch set.
+    pub fn light_scan_status(&self) -> Result<crate::HnsLightScanStatus, HnsWalletError> {
+        Ok(self.lock()?.index.status())
+    }
+
+    /// Exact public watch set from which every peer Bloom filter is built.
+    pub fn light_watch_set(&self) -> Result<HnsLightWatchSet, HnsWalletError> {
+        Ok(self.lock()?.index.watch_set().clone())
+    }
+
+    /// Canonical Bloom-filter elements for the current watch set and every
+    /// previously observed wallet outpoint.
+    pub fn light_bloom_elements(&self) -> Result<Vec<Vec<u8>>, HnsWalletError> {
+        self.lock()?.index.bloom_elements().map_err(map_index_error)
+    }
+
+    /// Reconstruct the minimal evidence anchor for one authenticated archived
+    /// header without inventing historical chainwork.
+    pub fn wallet_header_anchor(&self, height: u32) -> Result<WalletHeaderAnchor, HnsWalletError> {
+        let state = self.lock()?;
+        if height > state.authority.validated_chain().tip().height().get() {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let header = state
+            .authority
+            .archived_header(height)
+            .map_err(map_authority_error)?
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        Ok(WalletHeaderAnchor::from_validated_header(
+            Height::new(height),
+            &header,
+        ))
     }
 
     /// Add one ready standard peer to header agreement.
@@ -195,6 +234,23 @@ impl EmbeddedHnsBackend {
             .authority
             .finish_header_round_and_persist(now_unix)
             .map_err(map_authority_error)
+    }
+
+    /// Finish a header round when agreement is already sufficient, preserving
+    /// an incomplete pre-deadline round for later peer responses or expiry.
+    pub fn try_finish_header_round(
+        &self,
+        now_unix: u64,
+    ) -> Result<Option<PersistedHeaderRound>, HnsWalletError> {
+        match self
+            .lock()?
+            .authority
+            .finish_header_round_and_persist(now_unix)
+        {
+            Ok(round) => Ok(Some(round)),
+            Err(crate::HnsLightError::Sync(SyncError::RoundIncomplete)) => Ok(None),
+            Err(error) => Err(map_authority_error(error)),
+        }
     }
 
     /// Exact standard `getproof` target for a watched name at the current
@@ -2289,7 +2345,7 @@ mod tests {
             store.clone(),
             account,
             crate::HnsNetwork::Regtest,
-            1,
+            0,
             crate::HnsLightFloor::default(),
             BlockTime::new(now),
             ChainLimits::default(),
@@ -2337,6 +2393,9 @@ mod tests {
             .submit_header_response(request.generation, peer_one, vec![header], now)
             .unwrap();
         backend.finish_header_round(now).unwrap();
+        let anchor = backend.wallet_header_anchor(1).unwrap();
+        assert_eq!(anchor.height(), Height::new(1));
+        assert_eq!(anchor.hash(), block.evidence().header().hash());
         let current_request = backend.begin_header_round(&[peer_one], now).unwrap();
         backend
             .submit_header_response(current_request.generation, peer_one, Vec::new(), now)
@@ -2348,6 +2407,18 @@ mod tests {
         ));
 
         assert_eq!(backend.apply_verified_block(&block, now).unwrap(), 1);
+        let bloom_elements = backend.light_bloom_elements().unwrap();
+        assert!(bloom_elements.contains(&scripts[0].hash));
+        assert!(
+            bloom_elements.contains(
+                &Outpoint {
+                    transaction_hash: funding_txid,
+                    index: 0,
+                }
+                .encode()
+                .to_vec()
+            )
+        );
         let binding = backend.get_chain_snapshot().unwrap();
         assert_eq!(binding.tip.height, 1);
         assert_eq!(

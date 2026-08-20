@@ -732,7 +732,7 @@ dependencies = [
 [[package]]
 name = "hns-light-chain"
 version = "0.2.1"
-source = "git+https://github.com/handshake-rs/hns-dane-engine.git?rev=aded8e5d829090c1e48be11b52a5bda8cb5de5a0#aded8e5d829090c1e48be11b52a5bda8cb5de5a0"
+source = "git+https://github.com/handshake-rs/hns-dane-engine.git?rev=4cdea838fcac4397ab9fad1b4dd1dbb901a7872d#4cdea838fcac4397ab9fad1b4dd1dbb901a7872d"
 dependencies = [
  "blake2",
  "hns-covenants",
@@ -744,9 +744,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hns-light-p2p"
+version = "0.2.1"
+source = "git+https://github.com/handshake-rs/hns-dane-engine.git?rev=4cdea838fcac4397ab9fad1b4dd1dbb901a7872d#4cdea838fcac4397ab9fad1b4dd1dbb901a7872d"
+dependencies = [
+ "hns-header-consensus",
+ "hns-p2p-wire",
+ "hns-primitives",
+ "hns-transaction",
+ "thiserror",
+]
+
+[[package]]
 name = "hns-light-sync"
 version = "0.2.1"
-source = "git+https://github.com/handshake-rs/hns-dane-engine.git?rev=aded8e5d829090c1e48be11b52a5bda8cb5de5a0#aded8e5d829090c1e48be11b52a5bda8cb5de5a0"
+source = "git+https://github.com/handshake-rs/hns-dane-engine.git?rev=4cdea838fcac4397ab9fad1b4dd1dbb901a7872d#4cdea838fcac4397ab9fad1b4dd1dbb901a7872d"
 dependencies = [
  "hns-header-consensus",
  "hns-light-chain",
@@ -758,7 +770,7 @@ dependencies = [
 [[package]]
 name = "hns-light-wallet"
 version = "0.2.1"
-source = "git+https://github.com/handshake-rs/hns-dane-engine.git?rev=aded8e5d829090c1e48be11b52a5bda8cb5de5a0#aded8e5d829090c1e48be11b52a5bda8cb5de5a0"
+source = "git+https://github.com/handshake-rs/hns-dane-engine.git?rev=4cdea838fcac4397ab9fad1b4dd1dbb901a7872d#4cdea838fcac4397ab9fad1b4dd1dbb901a7872d"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -967,6 +979,7 @@ dependencies = [
  "hns-covenants",
  "hns-header-consensus",
  "hns-light-chain",
+ "hns-light-p2p",
  "hns-light-sync",
  "hns-light-wallet",
  "hns-marketplace-protocol",

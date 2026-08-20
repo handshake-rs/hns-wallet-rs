@@ -22,6 +22,7 @@ hkdf.workspace = true
 hns-covenants.workspace = true
 hns-header-consensus.workspace = true
 hns-light-chain.workspace = true
+hns-light-p2p.workspace = true
 hns-light-sync.workspace = true
 hns-light-wallet.workspace = true
 hns-marketplace-protocol.workspace = true

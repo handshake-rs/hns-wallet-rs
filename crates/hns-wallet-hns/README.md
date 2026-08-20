@@ -1,7 +1,22 @@
 # hns-wallet-hns
 
 `hns-wallet-hns` contains the Handshake-first account, name workflow, recovery,
-and node-backend boundary for `hns-wallet-rs`.
+and locally authoritative light-wallet backend for `hns-wallet-rs`.
+
+The production embedded path does not require a full node, a pruned global
+transaction/name index, or a trusted marketplace relay. The wallet validates
+and persists the standard HNS header chain, retains raw headers from a bounded
+policy-lookback floor, and indexes only transactions, outpoints, names, and
+proofs relevant to its own encrypted account. `HnsDirectPeerCoordinator`
+connects straight to ordinary HSD peers for multi-peer header agreement,
+independently Merkle-verified filtered-block views, exact-root Urkel proofs,
+mempool intake, fee observations, address discovery, and transaction
+broadcast. Peers and DNS seeds supply bytes and addresses only; none can replace
+the wallet's header, Merkle, watch-set, or Urkel verification authority.
+
+`HnsNodeRpcBackend` remains an optional compatibility adapter for existing
+desktop/node deployments. It is not a prerequisite for the mobile, browser,
+extension, Denuo, or Shakedex architecture.
 
 The crate also owns the encrypted publisher-counter boundary required by the
 HNSA/HNSR adapter. Endpoint-delegation and named-route counters are independent,
