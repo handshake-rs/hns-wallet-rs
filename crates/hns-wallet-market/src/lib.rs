@@ -4,6 +4,7 @@
 mod intent_board;
 mod price_board;
 mod session_board;
+mod settlement_key;
 
 use std::collections::BTreeMap;
 
@@ -33,6 +34,11 @@ pub use session_board::{
     DenuoSwapHandshakeSnapshot, DenuoSwapHandshakeStage, MAX_DENUO_SWAP_HANDSHAKES,
     admit_denuo_fill_grant, admit_denuo_match_request, admit_denuo_swap_hello,
     admit_denuo_swap_proposal, load_denuo_swap_handshake, load_denuo_swap_handshakes,
+};
+pub use settlement_key::{
+    CrossChainSwapKey, CrossChainSwapKeyAllocation, CrossChainSwapKeyError,
+    CrossChainSwapKeyRequest, SwapParticipant, allocate_cross_chain_swap_key,
+    derive_cross_chain_swap_key_from_store, load_cross_chain_swap_key_allocation,
 };
 
 pub const MAX_ACTIVE_RESERVATIONS: usize = 64;

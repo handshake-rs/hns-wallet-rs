@@ -371,6 +371,26 @@ pub struct SettlementCapabilities {
     pub maximum_lock_bytes: u32,
 }
 
+/// Non-exportable per-session secp256k1 signing authority shared by the two
+/// native HTLC adapters. Implementations expose only a compressed public key
+/// and a purpose-supplied 32-byte transaction digest; the private scalar never
+/// crosses the wallet boundary.
+pub trait SettlementSigner {
+    fn compressed_public_key(&self) -> [u8; 33];
+
+    /// Return a canonical compact `(r || s)` ECDSA signature. Implementations
+    /// must normalize `s` into the lower half of the curve order.
+    fn sign_digest(&self, digest: [u8; 32]) -> Result<[u8; 64], SettlementSigningError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum SettlementSigningError {
+    #[error("settlement signing key is invalid")]
+    InvalidKey,
+    #[error("settlement digest signing failed")]
+    SigningFailed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HtlcLockRequest {
     pub session_id: SessionId,

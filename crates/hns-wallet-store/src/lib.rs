@@ -75,6 +75,7 @@ pub enum EntityKind {
     BitcoinScanState,
     BitcoinSwapKeyAllocation,
     BitcoinSwapWatch,
+    CrossChainSwapKeyAllocation,
     BitcoinUtxo,
     BitcoinTransaction,
     EthereumAccount,
@@ -114,6 +115,7 @@ impl EntityKind {
             Self::BitcoinScanState => "bitcoin_scan_state",
             Self::BitcoinSwapKeyAllocation => "bitcoin_swap_key_allocation",
             Self::BitcoinSwapWatch => "bitcoin_swap_watch",
+            Self::CrossChainSwapKeyAllocation => "cross_chain_swap_key_allocation",
             Self::BitcoinUtxo => "bitcoin_utxo",
             Self::BitcoinTransaction => "bitcoin_transaction",
             Self::EthereumAccount => "ethereum_account",
@@ -138,6 +140,7 @@ impl EntityKind {
                 | Self::HnsaHnsrPublisherSequence
                 | Self::BitcoinWalletState
                 | Self::BitcoinSwapKeyAllocation
+                | Self::CrossChainSwapKeyAllocation
         )
     }
 }

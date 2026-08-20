@@ -1017,13 +1017,17 @@ name = "hns-wallet-market"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "hkdf",
  "hns-marketplace-protocol",
  "hns-primitives",
+ "hns-wallet-chain-api",
  "hns-wallet-store",
  "hns-wallet-types",
+ "k256",
  "serde",
  "sha2",
  "thiserror",
+ "zeroize",
 ]
 
 [[package]]
