@@ -9,9 +9,13 @@ mod settlement_key;
 use std::collections::BTreeMap;
 
 use hns_marketplace_protocol::{AssetId, ChainId, DeadlineKind, SwapAssetSide, SwapSessionHello};
-use hns_wallet_bitcoin_kyoto::{VerifiedBitcoinLock, build_denuo_bitcoin_htlc};
-use hns_wallet_chain_api::VerifiedLock;
-use hns_wallet_store::{StoreError, WalletStore};
+use hns_wallet_bitcoin_kyoto::{
+    HtlcSpendBranch, VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock,
+    build_denuo_bitcoin_htlc,
+};
+use hns_wallet_chain_api::{Preimage, VerifiedLock};
+use hns_wallet_hns::VerifiedNativeHtlcSpend;
+use hns_wallet_store::{SecretKind, StoreError, WalletStore};
 use hns_wallet_types::{
     Amount, BaseUnits, ModuleId, ObjectHash, SessionId, WalletAsset, WorkflowId, WorkflowKind,
 };
@@ -50,6 +54,7 @@ pub const MAX_ACTIVE_RESERVATIONS: usize = 64;
 pub const MAX_CONCURRENT_SWAP_SESSIONS: usize = 16;
 
 const DENUO_EXECUTION_WORKFLOW_DOMAIN: &[u8] = b"hns-wallet-rs/denuo-execution-workflow/v1";
+const DENUO_OBSERVED_PREIMAGE_DOMAIN: &[u8] = b"hns-wallet-rs/denuo-observed-preimage/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedQuote {
@@ -574,6 +579,67 @@ impl LocallyVerifiedSwapFunding {
     }
 }
 
+/// A redeem or refund proved by one wallet's own chain verifier. HNS evidence
+/// is obtained from the native proof-bound transaction verifier; Bitcoin
+/// evidence is obtained from a compact-filter watch that is bound to the
+/// wallet's current checkpoint. Denuo peer messages are never accepted here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocallyVerifiedSwapSpend {
+    Hns(VerifiedNativeHtlcSpend),
+    Bitcoin(VerifiedBitcoinHtlcSpendObservation),
+}
+
+impl LocallyVerifiedSwapSpend {
+    const fn module(&self) -> ModuleId {
+        match self {
+            Self::Hns(_) => ModuleId::Handshake,
+            Self::Bitcoin(_) => ModuleId::Bitcoin,
+        }
+    }
+
+    fn redeem_preimage(&self) -> Result<Preimage, MarketError> {
+        match self {
+            Self::Hns(VerifiedNativeHtlcSpend::Redeem { preimage, .. }) => Ok(preimage.clone()),
+            Self::Bitcoin(VerifiedBitcoinHtlcSpendObservation {
+                spend:
+                    hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcSpend {
+                        branch: HtlcSpendBranch::Redeem,
+                        revealed_preimage: Some(preimage),
+                        ..
+                    },
+                ..
+            }) => Ok(Preimage::new(*preimage)),
+            _ => Err(MarketError::InvalidEvidence),
+        }
+    }
+
+    fn is_refund(&self) -> bool {
+        matches!(
+            self,
+            Self::Hns(VerifiedNativeHtlcSpend::Refund { .. })
+                | Self::Bitcoin(VerifiedBitcoinHtlcSpendObservation {
+                    spend: hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcSpend {
+                        branch: HtlcSpendBranch::Refund,
+                        ..
+                    },
+                    ..
+                })
+        )
+    }
+
+    const fn confirmation_count(&self) -> u32 {
+        match self {
+            Self::Hns(VerifiedNativeHtlcSpend::Redeem {
+                confirmation_count, ..
+            })
+            | Self::Hns(VerifiedNativeHtlcSpend::Refund {
+                confirmation_count, ..
+            }) => *confirmation_count,
+            Self::Bitcoin(observation) => observation.confirmation_count,
+        }
+    }
+}
+
 /// Advance a durable Denuo execution only with locally verified funding
 /// evidence. The peer's Denuo funding status is intentionally not accepted as
 /// an argument here: it can inform UI/transport state, but cannot cause this
@@ -627,6 +693,241 @@ pub fn apply_locally_verified_denuo_funding(
     };
     session.apply(evidence, now_unix, &mut journal)?;
     Ok(session)
+}
+
+/// Advance a funded Denuo execution through both the first observed redeem
+/// and its secret extraction, using only one wallet's independently verified
+/// chain observation. In the agreed HTLC ordering, the second-funded chain is
+/// redeemed first; that transaction reveals the preimage needed to redeem the
+/// first-funded chain. The preimage is encrypted in the local wallet before
+/// the durable state transition, so an interruption cannot strand recovery.
+pub fn apply_locally_verified_denuo_first_redemption(
+    store: &mut WalletStore,
+    policy: &DenuoSwapHandshakePolicy,
+    session_id: SessionId,
+    spend: LocallyVerifiedSwapSpend,
+    now_unix: u64,
+) -> Result<SwapSession, MarketError> {
+    let workflow_id = denuo_execution_workflow_id(session_id);
+    let stored = load_denuo_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
+    if stored.state.state != SwapState::BothFunded
+        || spend.module() != stored.state.second_module
+        || spend.confirmation_count() == 0
+    {
+        return Err(MarketError::InvalidTransition);
+    }
+    let preimage = spend.redeem_preimage()?;
+    if ObjectHash::new(Sha256::digest(preimage.expose_for_settlement()).into())
+        != stored.state.hashlock
+    {
+        return Err(MarketError::InvalidEvidence);
+    }
+    store.put_secret(
+        &denuo_observed_preimage_id(session_id),
+        SecretKind::HtlcPreimage,
+        preimage.expose_for_settlement(),
+        now_unix,
+    )?;
+    let evidence = spend_evidence_id(&spend);
+    let mut session = stored.state;
+    let mut journal = WalletStoreJournal {
+        store,
+        workflow_id,
+        updated_at_unix: now_unix,
+    };
+    session.apply(
+        VerifiedEvidence::FirstRedemptionConfirmed { evidence },
+        now_unix,
+        &mut journal,
+    )?;
+    session.apply(
+        VerifiedEvidence::SecretExtracted {
+            hashlock: session.hashlock,
+        },
+        now_unix,
+        &mut journal,
+    )?;
+    Ok(session)
+}
+
+/// Advance a Denuo execution after the locally verified redeem of the
+/// first-funded chain. The preceding first redeem must already have persisted
+/// the matching preimage, so this cannot be used to skip the recovery-safe
+/// secret handoff step.
+pub fn apply_locally_verified_denuo_second_redemption(
+    store: &mut WalletStore,
+    policy: &DenuoSwapHandshakePolicy,
+    session_id: SessionId,
+    spend: LocallyVerifiedSwapSpend,
+    now_unix: u64,
+) -> Result<SwapSession, MarketError> {
+    let workflow_id = denuo_execution_workflow_id(session_id);
+    let stored = load_denuo_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
+    if stored.state.state != SwapState::SecretObserved
+        || spend.module() != stored.state.first_module
+        || spend.confirmation_count() == 0
+    {
+        return Err(MarketError::InvalidTransition);
+    }
+    let preimage = spend.redeem_preimage()?;
+    if ObjectHash::new(Sha256::digest(preimage.expose_for_settlement()).into())
+        != stored.state.hashlock
+    {
+        return Err(MarketError::InvalidEvidence);
+    }
+    if store
+        .get_secret(
+            &denuo_observed_preimage_id(session_id),
+            SecretKind::HtlcPreimage,
+        )?
+        .is_none_or(|stored| stored.as_slice() != preimage.expose_for_settlement().as_slice())
+    {
+        return Err(MarketError::InvalidEvidence);
+    }
+    let evidence = spend_evidence_id(&spend);
+    let mut session = stored.state;
+    let mut journal = WalletStoreJournal {
+        store,
+        workflow_id,
+        updated_at_unix: now_unix,
+    };
+    session.apply(
+        VerifiedEvidence::SecondRedemptionConfirmed { evidence },
+        now_unix,
+        &mut journal,
+    )?;
+    session.apply(
+        VerifiedEvidence::CompletionValidated,
+        now_unix,
+        &mut journal,
+    )?;
+    Ok(session)
+}
+
+/// Mark the execution terminal only after a locally verified timeout refund.
+/// Each chain verifier is responsible for consensus maturity and the exact
+/// descriptor/signature branch; the coordinator records the resulting
+/// confirmed observation rather than trusting a peer refund status.
+pub fn apply_locally_verified_denuo_refund(
+    store: &mut WalletStore,
+    policy: &DenuoSwapHandshakePolicy,
+    session_id: SessionId,
+    spend: LocallyVerifiedSwapSpend,
+    now_unix: u64,
+) -> Result<SwapSession, MarketError> {
+    let workflow_id = denuo_execution_workflow_id(session_id);
+    let stored = load_denuo_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
+    if !spend.is_refund()
+        || (spend.module() != stored.state.first_module
+            && spend.module() != stored.state.second_module)
+        || spend.confirmation_count() == 0
+    {
+        return Err(MarketError::InvalidEvidence);
+    }
+    let evidence = spend_evidence_id(&spend);
+    let mut session = stored.state;
+    let mut journal = WalletStoreJournal {
+        store,
+        workflow_id,
+        updated_at_unix: now_unix,
+    };
+    session.apply(
+        VerifiedEvidence::RefundEligibilityValidated,
+        now_unix,
+        &mut journal,
+    )?;
+    session.apply(
+        VerifiedEvidence::RefundBroadcast { evidence },
+        now_unix,
+        &mut journal,
+    )?;
+    session.apply(
+        VerifiedEvidence::RefundConfirmed { evidence },
+        now_unix,
+        &mut journal,
+    )?;
+    Ok(session)
+}
+
+/// Load the locally retained preimage that was authenticated by a first
+/// redemption. This never returns a peer-provided value and requires the
+/// encrypted wallet store to be unlocked.
+pub fn load_locally_verified_denuo_preimage(
+    store: &WalletStore,
+    session_id: SessionId,
+) -> Result<Option<Preimage>, MarketError> {
+    store
+        .get_secret(
+            &denuo_observed_preimage_id(session_id),
+            SecretKind::HtlcPreimage,
+        )?
+        .map(|value| {
+            let bytes = <[u8; Preimage::LENGTH]>::try_from(value.as_slice())
+                .map_err(|_| MarketError::InvalidEvidence)?;
+            Ok(Preimage::new(bytes))
+        })
+        .transpose()
+}
+
+fn load_denuo_execution_for_local_evidence(
+    store: &WalletStore,
+    policy: &DenuoSwapHandshakePolicy,
+    session_id: SessionId,
+    workflow_id: WorkflowId,
+) -> Result<hns_wallet_store::StoredWorkflow<SwapSession>, MarketError> {
+    let stored = store
+        .load_workflow::<SwapSession>(workflow_id)?
+        .ok_or(MarketError::UnknownDenuoSwapHandshake)?;
+    if stored.kind != WorkflowKind::AtomicSwap || stored.state.id != session_id {
+        return Err(MarketError::DenuoSwapHandshakeConflict);
+    }
+    let terms = stored
+        .state
+        .accepted_denuo_terms
+        .as_deref()
+        .ok_or(MarketError::InvalidDenuoSwapHandshake)?;
+    let hello =
+        SwapSessionHello::decode(terms).map_err(|_| MarketError::CorruptDenuoSwapHandshake)?;
+    if hello.encode().ok().as_deref() != Some(terms)
+        || SessionId::new(hello.swap_session_id) != session_id
+        || hello.verify_agreement(policy.network()).is_err()
+    {
+        return Err(MarketError::CorruptDenuoSwapHandshake);
+    }
+    Ok(stored)
+}
+
+fn denuo_observed_preimage_id(session_id: SessionId) -> Vec<u8> {
+    let mut id =
+        Vec::with_capacity(DENUO_OBSERVED_PREIMAGE_DOMAIN.len() + session_id.as_bytes().len());
+    id.extend_from_slice(DENUO_OBSERVED_PREIMAGE_DOMAIN);
+    id.extend_from_slice(session_id.as_bytes());
+    id
+}
+
+fn spend_evidence_id(spend: &LocallyVerifiedSwapSpend) -> ObjectHash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hns-wallet-rs/verified-denuo-spend/v1");
+    match spend {
+        LocallyVerifiedSwapSpend::Hns(VerifiedNativeHtlcSpend::Redeem { transaction, .. }) => {
+            hasher.update([0, 0]);
+            hasher.update(transaction.as_bytes());
+        }
+        LocallyVerifiedSwapSpend::Hns(VerifiedNativeHtlcSpend::Refund { transaction, .. }) => {
+            hasher.update([0, 1]);
+            hasher.update(transaction.as_bytes());
+        }
+        LocallyVerifiedSwapSpend::Bitcoin(observation) => {
+            hasher.update([1]);
+            hasher.update(observation.spend.txid.as_bytes());
+            hasher.update(observation.spend.wtxid);
+            hasher.update(match observation.spend.branch {
+                HtlcSpendBranch::Redeem => [0],
+                HtlcSpendBranch::Refund => [1],
+            });
+        }
+    }
+    ObjectHash::new(hasher.finalize().into())
 }
 
 fn verify_local_funding_against_denuo_terms(

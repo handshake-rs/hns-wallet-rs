@@ -1025,6 +1025,7 @@ dependencies = [
  "hns-swap",
  "hns-wallet-bitcoin-kyoto",
  "hns-wallet-chain-api",
+ "hns-wallet-hns",
  "hns-wallet-store",
  "hns-wallet-types",
  "k256",

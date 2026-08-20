@@ -858,17 +858,23 @@ mod tests {
         SettlementDeadline, SignedObjectHeader,
     };
     use hns_primitives::BlockHash;
-    use hns_wallet_bitcoin_kyoto::VerifiedBitcoinLock;
-    use hns_wallet_chain_api::VerifiedLock;
+    use hns_wallet_bitcoin_kyoto::{
+        HtlcSpendBranch, VerifiedBitcoinHtlcSpend, VerifiedBitcoinHtlcSpendObservation,
+        VerifiedBitcoinLock,
+    };
+    use hns_wallet_chain_api::{Preimage, VerifiedLock};
+    use hns_wallet_hns::VerifiedNativeHtlcSpend;
     use hns_wallet_types::TransactionHash;
     use hns_wallet_types::{Amount, ModuleId, WalletAsset};
 
     use super::*;
     use crate::{
-        DenuoSwapHandshakeStage, LocallyVerifiedSwapFunding, VerifiedEvidence, WalletStoreJournal,
-        admit_denuo_market_intent, apply_locally_verified_denuo_funding,
-        bootstrap_denuo_price_round_cache, canonical_hns_descriptor, denuo_execution_workflow_id,
-        open_denuo_execution,
+        DenuoSwapHandshakeStage, LocallyVerifiedSwapFunding, LocallyVerifiedSwapSpend,
+        VerifiedEvidence, WalletStoreJournal, admit_denuo_market_intent,
+        apply_locally_verified_denuo_first_redemption, apply_locally_verified_denuo_funding,
+        apply_locally_verified_denuo_second_redemption, bootstrap_denuo_price_round_cache,
+        canonical_hns_descriptor, denuo_execution_workflow_id,
+        load_locally_verified_denuo_preimage, open_denuo_execution,
     };
     use hns_wallet_bitcoin_kyoto::build_denuo_bitcoin_htlc;
 
@@ -1039,7 +1045,7 @@ mod tests {
             received_asset: AssetId::BTC,
             received_amount: grant.received_amount,
             price_round_hash: grant.price_round_hash,
-            hashlock: [13; 32],
+            hashlock: Sha256::digest([99_u8; 32]).into(),
             first_funding_chain: ChainId::HANDSHAKE,
             offered_lock_commitment: [0; 32],
             offered_refund_deadline: SettlementDeadline {
@@ -1281,6 +1287,49 @@ mod tests {
         )
         .expect("locally verified second Bitcoin funding");
         assert_eq!(both_funded.state, crate::SwapState::BothFunded);
+
+        // The second-funded Bitcoin HTLC is redeemed first. Its locally
+        // re-authenticated compact-filter observation persists the preimage
+        // before the execution journal is advanced, then the first-funded
+        // HNS lock can be redeemed with the same verified secret.
+        let first_redeemed = apply_locally_verified_denuo_first_redemption(
+            &mut maker_store,
+            &policy,
+            session_id,
+            LocallyVerifiedSwapSpend::Bitcoin(VerifiedBitcoinHtlcSpendObservation {
+                spend: VerifiedBitcoinHtlcSpend {
+                    txid: TransactionHash::new([46; 32]),
+                    wtxid: [47; 32],
+                    fee_sats: 500,
+                    branch: HtlcSpendBranch::Redeem,
+                    revealed_preimage: Some([99; 32]),
+                },
+                confirmation_count: 1,
+            }),
+            135,
+        )
+        .expect("locally verified first Bitcoin redemption");
+        assert_eq!(first_redeemed.state, crate::SwapState::SecretObserved);
+        assert_eq!(
+            load_locally_verified_denuo_preimage(&maker_store, session_id)
+                .expect("load encrypted observed preimage")
+                .expect("preimage is retained")
+                .expose_for_settlement(),
+            &[99; 32]
+        );
+        let completed = apply_locally_verified_denuo_second_redemption(
+            &mut maker_store,
+            &policy,
+            session_id,
+            LocallyVerifiedSwapSpend::Hns(VerifiedNativeHtlcSpend::Redeem {
+                transaction: TransactionHash::new([48; 32]),
+                confirmation_count: 1,
+                preimage: Preimage::new([99; 32]),
+            }),
+            136,
+        )
+        .expect("locally verified second HNS redemption");
+        assert_eq!(completed.state, crate::SwapState::Completed);
 
         let wrong_correlation = envelope(CrossChainMessage::SwapSessionHello(hello), 78);
         assert_eq!(
