@@ -21,14 +21,22 @@ The bounded supervisor now owns these transitions:
   wallet does not guess a height from wall-clock time;
 - the encrypted scan record uses CAS revisions and explicit starting,
   synchronizing, reconciling, ready, and recovery-required phases;
-- each Kyoto update is applied and committed as a strict, versioned BDK
-  changeset snapshot in the authenticated encrypted wallet store before
-  bounded transaction/output mirrors are reconciled in encrypted 512-record
-  chunks; the ready checkpoint is committed last. A crash in a chunk leaves
-  the state reconciling, so restart replays reconciliation from the
-  already-durable BDK view without another network scan. A crash after the BDK
-  commit but before `reconciling` leaves a tip mismatch and forces a recovery
-  scan rather than accepting the older journal checkpoint;
+- one filter subscriber checks both BDK descriptor scripts and every active
+  native HTLC script. A matching block is downloaded once, applied to the BDK
+  graph when relevant, and separately admitted to the swap watcher only when
+  its merkle root and exact block hash match Kyoto's locally validated header
+  chain;
+- encrypted per-session HTLC watches discover exact funding outpoints and
+  exact signed redeem/refund spends directly from those blocks. Funding and
+  spend confirmations follow the canonical checkpoint and roll back on a
+  reorganization. A revealed preimage is retained monotonically because an
+  orphaned publication cannot make a disclosed secret private again;
+- matched swap evidence is committed before the BDK checkpoint advances, then
+  each Kyoto update is applied and committed as a strict BDK changeset
+  snapshot before bounded transaction/output mirrors are reconciled in
+  encrypted 512-record chunks; the ready checkpoint is committed last. This
+  ordering makes a crash during a long offline catch-up rescan from the older
+  wallet checkpoint instead of skipping a matched HTLC block;
 - exact block-hash membership queries locate a retained common ancestor. A
   reorg deeper than the bounded 32-checkpoint recovery window fails closed and
   requires a recovery-anchor scan;
@@ -61,8 +69,9 @@ record. The same
 `SharedWalletStore` authority owns birthday, supervisor sequence/phase, last
 consistent checkpoint, the distinct recovery checkpoint, bounded recent
 checkpoints, transaction/output reconciliation records, and broadcast intents.
-The BDK snapshot commit and scan-journal commit are deliberately ordered
-transactions, not one falsely atomic transaction.
+It also owns the bounded, account-bound HTLC watch set. Swap evidence, the BDK
+snapshot, and the scan journal are deliberately ordered transactions, not one
+falsely atomic transaction.
 
 This first backend stores one aggregate changeset and therefore inherits the
 encrypted entity cleartext limit of 1 MiB. BDK's persistent script cache is
@@ -78,22 +87,24 @@ which has such a database must retain it and stop for an explicit future import
 instead of treating `WalletNotFound` as permission to create replacement state.
 
 `bip157` 0.6.3 accepts `data_dir`, but this pinned release discards the field in
-`Node::new`; it does not persist headers, compact-filter headers/filters, or its
-address book. `bdk_kyoto` also exposes a completed wallet update, not the exact
-filter-header chain or durable peer database. The source therefore does not
-claim those objects are persisted. A reviewed Kyoto release/API which exposes
-and durably restores that validated state is a release blocker. BDK's wallet
-checkpoint permits bounded restart recovery in the meantime, but is not a
-substitute for the missing Kyoto database.
+`Node::new`; it does not persist a full header/filter database or its address
+book. The wallet does not require a pruned or indexed Bitcoin node: its
+encrypted BDK checkpoint and recovery journal are the durable authority, and
+Kyoto re-fetches and revalidates the required headers and compact filters from
+ordinary untrusted Bitcoin peers after restart. Full header/filter persistence
+would improve startup cost, but is not a separate product authority or a
+prerequisite for the light-wallet model.
 
 ## Broadcast boundary and release gate
 
-A signed transaction is accepted for journaling only when the BDK wallet can
-resolve every input as owned and unspent, calculate its exact fee, and prove the
-fee does not exceed the approved maximum. The approval commitment is
-domain-separated and binds network magic, txid, wtxid, exact fee, fee maximum,
-and expiry. The complete raw transaction and approval are persisted before the
-state advances to `submission_started`.
+A signed descriptor-wallet transaction is accepted for journaling only when
+BDK can resolve every input as owned and unspent, calculate its exact fee, and
+prove the fee does not exceed the approved maximum. A native HTLC spend has a
+separate admission path which re-verifies the exact funding outpoint, branch,
+preimage or timelock, fee, witness script, signer key, signature, and
+`SIGHASH_ALL`. Both paths bind network magic, txid, wtxid, exact fee, fee
+maximum, and expiry, and persist the complete raw transaction and approval
+before `submission_started`.
 
 Only a durable ready checkpoint, a running Kyoto node, and the configured peer
 quorum can reach `submit_package`. Expiry is exclusive: a request at the expiry
@@ -202,10 +213,10 @@ database snapshot rollback. Session IDs must never be recycled, and recovering
 an already active allocation requires its current encrypted database records.
 
 This source addition does not expose a signing or value permit and does not
-advertise atomic settlement. The allocator is not yet wired into the settlement
-supervisor. Signed-spend supervision plus complete restart, reorg,
-multi-connection concurrency, snapshot-rollback, and corruption qualification
-remain missing.
+advertise atomic settlement. The allocator, exact signed-spend verifier,
+durable broadcast journal, and canonical compact-filter HTLC watcher are not
+yet wired together by the cross-chain product coordinator. Complete product
+restart, multi-connection, snapshot-rollback, and network qualification remain.
 
 ## HTLC profile
 
@@ -220,9 +231,10 @@ Funding verification reconstructs the exact script, checks value, a unique
 matching output, transaction bounds, and confirmation minimum. Redeem/refund
 templates enforce the branch, hashlock, dust, fee, and refund height. Preimage
 observation requires the expected outpoint and exact witness script. The
-domain-separated local public key can now be bound to its HTLC script position;
-signed spend integration and the cross-chain settlement supervisor remain
-unavailable.
+domain-separated local key is bound to its HTLC script position and signs an
+exact spend template. The combined Kyoto subscriber watches the script itself,
+so neither a Denuo peer nor the counterparty supplies chain authority or block
+locations. The cross-chain settlement coordinator remains to be connected.
 
 ## Qualification and benchmarks
 
@@ -243,8 +255,8 @@ Neither source result qualifies the Bitcoin value runtime.
 | Five-year restore | not measured | not measured | not measured | not measured | not measured |
 | Genesis restore | not measured | not measured | not measured | not measured | not measured |
 
-Bitcoin send and settlement remain unavailable until the pinned persistence
-gap is resolved and invalid-PoW/filter/peer tests, regtest restart/reorg/
-broadcast/HTLC product suites, mobile resource benchmarks, and independent
-review are recorded. Exact source CI has passed and is not a substitute for
-those network and product gates.
+Bitcoin send and settlement remain unavailable until the complete cross-chain
+coordinator and installed product flow are connected and the final direct-peer
+restart/reorg/broadcast/HTLC qualification is recorded. Full header/filter
+database persistence is an optimization, not a requirement for wallet-owned
+light-client authority.

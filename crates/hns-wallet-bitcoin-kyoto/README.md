@@ -8,12 +8,16 @@ the HNS/BTC swap path:
 - encrypted, compare-and-swap persisted wallet and synchronization state;
 - session- and role-bound native Bitcoin HTLC keys; and
 - exact HTLC funding, redeem, refund, evidence, and prepared-broadcast
-  primitives.
+  primitives; and
+- one Kyoto compact-filter stream that watches both descriptor scripts and all
+  active swap HTLC scripts, persists canonical funding/spend observations, and
+  learns a redeem preimage without trusting the counterparty to reveal it.
 
 Peers supply chain data and transactions, but no explorer, hosted API, relay,
 or third-party node is a wallet authority. Denuo owns peer-to-peer offer and
 swap-session exchange; Kyoto independently verifies and settles the Bitcoin
-side.
+side. A reorganization can roll back funding or spend confirmations, but it
+cannot erase a preimage that has already become public.
 
 The public Bitcoin value permit remains unavailable until these primitives are
 connected to the durable product-level swap coordinator and qualified as one

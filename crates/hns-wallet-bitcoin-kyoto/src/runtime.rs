@@ -1,23 +1,28 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use bdk_kyoto::bip157::{ChainState, Client, Event};
+use bdk_kyoto::bip157::chain::BlockHeaderChanges;
+use bdk_kyoto::bip157::{self, ChainState, Client, Event, SyncUpdate};
 use bdk_kyoto::builder::Builder;
-use bdk_kyoto::{
-    HashCheckpoint, LoggingSubscribers, Requester, ScanType, UpdateSubscriber, wallets,
-};
+use bdk_kyoto::{HashCheckpoint, LoggingSubscribers, Requester, ScanType};
 use bdk_wallet::bitcoin::consensus::{deserialize, serialize};
 use bdk_wallet::bitcoin::hashes::Hash;
-use bdk_wallet::bitcoin::{BlockHash, Network, Transaction};
-use bdk_wallet::chain::{ChainPosition, ConfirmationBlockTime};
-use bdk_wallet::{KeychainKind, Wallet};
+use bdk_wallet::bitcoin::{BlockHash, Network, ScriptBuf, Transaction};
+use bdk_wallet::chain::keychain_txout::KeychainTxOutIndex;
+use bdk_wallet::chain::{
+    BlockId, ChainPosition, CheckPoint, ConfirmationBlockTime, IndexedTxGraph, TxUpdate,
+};
+use bdk_wallet::{KeychainKind, Update, Wallet};
 use hns_wallet_store::{EntityBatchSave, SharedWalletStore, WalletStore};
+use hns_wallet_types::SessionId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED, BitcoinWalletError, EncryptedPersistedBitcoinWallet,
-    HtlcSpendBranch, KyotoRuntimeConfig, MAX_RECOVERY_SCRIPT_INDEX, VerifiedBitcoinLock,
-    build_kyoto_client, verify_signed_bitcoin_htlc_spend,
+    BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED, BitcoinHtlcWatchAdmission, BitcoinHtlcWatchRequest,
+    BitcoinWalletError, EncryptedPersistedBitcoinWallet, HtlcSpendBranch, KyotoRuntimeConfig,
+    MAX_RECOVERY_SCRIPT_INDEX, MatchedBitcoinBlock, VerifiedBitcoinLock, load_bitcoin_htlc_watches,
+    reconcile_bitcoin_htlc_watches, register_bitcoin_htlc_watch, verify_signed_bitcoin_htlc_spend,
+    watched_scripts,
 };
 
 pub const KYOTO_WALLET_STATE_VERSION: u16 = 1;
@@ -727,9 +732,217 @@ impl StoredKyotoWalletState {
     }
 }
 
+fn wallet_scripts_for_scan(
+    index: &KeychainTxOutIndex<KeychainKind>,
+    scan_type: ScanType,
+) -> HashSet<ScriptBuf> {
+    match scan_type {
+        ScanType::Sync => wallet_scripts_to_lookahead(index),
+        ScanType::Recovery {
+            used_script_index, ..
+        } => wallet_scripts(index, used_script_index),
+    }
+}
+
+fn wallet_scripts_to_lookahead(index: &KeychainTxOutIndex<KeychainKind>) -> HashSet<ScriptBuf> {
+    wallet_scripts(index, index.lookahead())
+}
+
+fn wallet_scripts(index: &KeychainTxOutIndex<KeychainKind>, to_index: u32) -> HashSet<ScriptBuf> {
+    let mut scripts = HashSet::new();
+    let last_revealed = index.last_revealed_indices();
+    for keychain in [KeychainKind::External, KeychainKind::Internal] {
+        let Some(unbounded) = index.unbounded_spk_iter(keychain) else {
+            continue;
+        };
+        let revealed = last_revealed.get(&keychain).copied().unwrap_or(0);
+        let bound = usize::try_from(revealed.saturating_add(to_index)).unwrap_or(usize::MAX);
+        scripts.extend(unbounded.take(bound).map(|(_, script)| script));
+    }
+    scripts
+}
+
+fn walk_back_wallet_checkpoint(checkpoint: CheckPoint) -> HashCheckpoint {
+    const REORG_SAFETY_DEPTH: usize = 7;
+    let mut start = HashCheckpoint::new(checkpoint.height(), checkpoint.hash());
+    for (index, ancestor) in checkpoint.iter().enumerate() {
+        if index > REORG_SAFETY_DEPTH {
+            break;
+        }
+        start = HashCheckpoint::new(ancestor.height(), ancestor.hash());
+    }
+    start
+}
+
+fn build_wallet_swap_client(
+    wallet: &Wallet,
+    config: KyotoRuntimeConfig,
+    scan_type: ScanType,
+    swap_scripts: Vec<(SessionId, ScriptBuf)>,
+) -> Result<(Requester, LoggingSubscribers, KyotoWalletSwapSubscriber), BitcoinWalletError> {
+    config.validate()?;
+    if wallet.network() != config.network {
+        return Err(BitcoinWalletError::NetworkMismatch);
+    }
+    let start = match scan_type {
+        ScanType::Sync => walk_back_wallet_checkpoint(wallet.latest_checkpoint()),
+        ScanType::Recovery { checkpoint, .. } => checkpoint,
+    };
+    let mut builder = Builder::new(config.network)
+        .data_dir(config.data_dir)
+        .required_peers(config.required_peers)
+        .response_timeout(config.response_timeout)
+        .chain_state(ChainState::Checkpoint(start));
+    if !config.trusted_peers.is_empty() {
+        builder = builder.add_peers(config.trusted_peers);
+    }
+    let (node, client) = builder.build();
+    let Client {
+        requester,
+        info_rx,
+        warn_rx,
+        event_rx,
+    } = client;
+    let updates = KyotoWalletSwapSubscriber::new(
+        requester.clone(),
+        event_rx,
+        wallet,
+        scan_type,
+        swap_scripts,
+    );
+    bip157::tokio::task::spawn(async move { node.run().await });
+    Ok((
+        requester,
+        LoggingSubscribers {
+            info_subscriber: info_rx,
+            warning_subscriber: warn_rx,
+        },
+        updates,
+    ))
+}
+
+struct KyotoWalletSwapUpdate {
+    wallet_update: Update,
+    canonical_chain: CheckPoint,
+    swap_blocks: Vec<MatchedBitcoinBlock>,
+}
+
+/// One compact-filter consumer for both the descriptor wallet and every
+/// active native HTLC. Keeping the script sets in one subscriber avoids a
+/// second node, a second peer pool, or counterparty-provided chain authority.
+struct KyotoWalletSwapSubscriber {
+    requester: Requester,
+    receiver: bip157::tokio::sync::mpsc::UnboundedReceiver<Event>,
+    queued_blocks: BTreeMap<BlockHash, bool>,
+    wallet_scripts: HashSet<ScriptBuf>,
+    swap_scripts: BTreeMap<SessionId, ScriptBuf>,
+    chain: CheckPoint,
+    graph: IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
+}
+
+impl KyotoWalletSwapSubscriber {
+    fn new(
+        requester: Requester,
+        receiver: bip157::tokio::sync::mpsc::UnboundedReceiver<Event>,
+        wallet: &Wallet,
+        scan_type: ScanType,
+        swap_scripts: Vec<(SessionId, ScriptBuf)>,
+    ) -> Self {
+        let graph = IndexedTxGraph::new(wallet.spk_index().clone());
+        let wallet_scripts = wallet_scripts_for_scan(&graph.index, scan_type);
+        Self {
+            requester,
+            receiver,
+            queued_blocks: BTreeMap::new(),
+            wallet_scripts,
+            swap_scripts: swap_scripts.into_iter().collect(),
+            chain: wallet.latest_checkpoint(),
+            graph,
+        }
+    }
+
+    fn register_swap_script(&mut self, session_id: SessionId, script: ScriptBuf) {
+        self.swap_scripts.insert(session_id, script);
+    }
+
+    async fn update(&mut self) -> Result<KyotoWalletSwapUpdate, BitcoinWalletError> {
+        let mut swap_blocks = Vec::new();
+        while let Some(event) = self.receiver.recv().await {
+            match event {
+                Event::IndexedFilter(filter) => {
+                    let wallet_match = filter.contains_any(self.wallet_scripts.iter());
+                    let swap_match = filter.contains_any(self.swap_scripts.values());
+                    if wallet_match || swap_match {
+                        self.queued_blocks
+                            .entry(filter.block_hash())
+                            .and_modify(|queued_for_swap| *queued_for_swap |= swap_match)
+                            .or_insert(swap_match);
+                    }
+                }
+                Event::ChainUpdate(changes) => self.apply_chain_event(&changes),
+                Event::FiltersSynced(SyncUpdate { .. }) => {
+                    for (hash, swap_match) in core::mem::take(&mut self.queued_blocks) {
+                        let indexed = self
+                            .requester
+                            .get_block(hash)
+                            .await
+                            .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
+                        let _ = self
+                            .graph
+                            .apply_block_relevant(&indexed.block, indexed.height);
+                        if swap_match {
+                            swap_blocks.push(MatchedBitcoinBlock {
+                                height: indexed.height,
+                                block: indexed.block,
+                            });
+                        }
+                    }
+                    self.wallet_scripts
+                        .extend(wallet_scripts_to_lookahead(&self.graph.index));
+                    let tx_update = TxUpdate::from(self.graph.graph().clone());
+                    let graph = core::mem::take(&mut self.graph);
+                    let last_active_indices = graph.index.last_used_indices();
+                    self.graph = IndexedTxGraph::new(graph.index);
+                    let canonical_chain = self.chain.clone();
+                    return Ok(KyotoWalletSwapUpdate {
+                        wallet_update: Update {
+                            tx_update,
+                            last_active_indices,
+                            chain: Some(canonical_chain.clone()),
+                        },
+                        canonical_chain,
+                        swap_blocks,
+                    });
+                }
+            }
+        }
+        Err(BitcoinWalletError::KyotoNodeStopped)
+    }
+
+    fn apply_chain_event(&mut self, event: &BlockHeaderChanges) {
+        match event {
+            BlockHeaderChanges::Connected(header) => {
+                self.chain = self.chain.clone().insert(BlockId {
+                    hash: header.block_hash(),
+                    height: header.height,
+                });
+            }
+            BlockHeaderChanges::Reorganized { accepted, .. } => {
+                for header in accepted {
+                    self.chain = self.chain.clone().insert(BlockId {
+                        hash: header.block_hash(),
+                        height: header.height,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub struct KyotoSupervisor {
     requester: Requester,
-    updates: UpdateSubscriber<wallets::Single>,
+    updates: KyotoWalletSwapSubscriber,
     required_peers: u8,
     request_timeout: std::time::Duration,
     sync_timeout: std::time::Duration,
@@ -775,9 +988,11 @@ impl KyotoSupervisor {
         let required_peers = config.required_peers;
         let request_timeout = config.supervisor_request_timeout;
         let sync_timeout = config.supervisor_sync_timeout;
-        let client = build_kyoto_client(wallet, config, scan_type)?;
-        let (client, logging, updates) = client.subscribe();
-        let requester = client.start().requester();
+        let watches = store.try_with_store(|store| {
+            load_bitcoin_htlc_watches(store, wallet.network(), wallet.account_id())
+        })?;
+        let (requester, logging, updates) =
+            build_wallet_swap_client(wallet, config, scan_type, watched_scripts(&watches))?;
         Ok((
             Self {
                 requester,
@@ -802,10 +1017,11 @@ impl KyotoSupervisor {
         self.durable.revision()
     }
 
-    /// Drives one Kyoto update, persists the BDK changes first, reconciles
-    /// bounded encrypted transaction/output mirrors, and only then commits a
-    /// ready scan checkpoint. A configured timeout poisons this supervisor and
-    /// requires reconstruction because Kyoto's update future is not cancel safe.
+    /// Drives one Kyoto update, durably records matched swap evidence before
+    /// advancing the BDK checkpoint, reconciles bounded encrypted
+    /// transaction/output mirrors, and only then commits a ready scan
+    /// checkpoint. A configured timeout poisons this supervisor and requires
+    /// reconstruction because Kyoto's update future is not cancel safe.
     pub async fn synchronize_once(
         &mut self,
         wallet: &mut EncryptedPersistedBitcoinWallet,
@@ -881,6 +1097,7 @@ impl KyotoSupervisor {
             }
         };
         let announced_tip = update
+            .wallet_update
             .chain
             .as_ref()
             .map(|checkpoint| BitcoinCheckpoint {
@@ -889,8 +1106,19 @@ impl KyotoSupervisor {
             })
             .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
         announced_tip.validate(self.durable.state.network)?;
+        self.store.try_with_store_mut(|store| {
+            reconcile_bitcoin_htlc_watches(
+                store,
+                wallet.network(),
+                wallet.account_id(),
+                &update.canonical_chain,
+                announced_tip,
+                &update.swap_blocks,
+                now_unix,
+            )
+        })?;
         wallet
-            .apply_update(update)
+            .apply_update(update.wallet_update)
             .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
         wallet.persist(now_unix)?;
 
@@ -1015,6 +1243,45 @@ impl KyotoSupervisor {
             connected_peer_count: peer_count,
             required_peer_count: self.required_peers,
         })
+    }
+
+    /// Persist and activate one exact HTLC compact-filter watch before either
+    /// party can fund it. Registration is bound to this wallet's current
+    /// locally validated checkpoint and immediately joins the existing Kyoto
+    /// filter stream.
+    pub fn register_htlc_watch(
+        &mut self,
+        wallet: &EncryptedPersistedBitcoinWallet,
+        request: BitcoinHtlcWatchRequest,
+        now_unix: u64,
+    ) -> Result<BitcoinHtlcWatchAdmission, BitcoinWalletError> {
+        if self.poisoned
+            || !matches!(self.durable.state.phase, KyotoSyncPhase::Ready)
+            || wallet.network() != self.durable.state.network
+            || wallet.account_id() != self.durable.account_id.as_slice()
+            || !wallet.shared_store().is_same_authority(&self.store)
+        {
+            return Err(BitcoinWalletError::RuntimeNotReady);
+        }
+        let checkpoint = BitcoinCheckpoint::from_wallet(wallet);
+        if checkpoint != self.durable.state.last_consistent_checkpoint
+            || checkpoint != self.durable.state.scanned_checkpoint
+        {
+            return Err(BitcoinWalletError::CheckpointMismatch);
+        }
+        let admission = self.store.try_with_store_mut(|store| {
+            register_bitcoin_htlc_watch(
+                store,
+                wallet.network(),
+                wallet.account_id(),
+                &request,
+                checkpoint,
+                now_unix,
+            )
+        })?;
+        self.updates
+            .register_swap_script(request.session_id, request.htlc.script_pubkey());
+        Ok(admission)
     }
 
     pub async fn minimum_broadcast_fee_rate_sat_vb(&self) -> Result<u64, BitcoinWalletError> {

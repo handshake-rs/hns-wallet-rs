@@ -4,10 +4,12 @@
 mod persistence;
 mod runtime;
 mod swap_key_store;
+mod swap_watch;
 
 pub use persistence::*;
 pub use runtime::*;
 pub use swap_key_store::*;
+pub use swap_watch::*;
 
 use core::fmt;
 use std::path::PathBuf;
@@ -732,7 +734,8 @@ pub fn verify_htlc_funding(
     })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum HtlcSpendBranch {
     Redeem,
     Refund,
@@ -1178,6 +1181,14 @@ pub enum BitcoinWalletError {
     InvalidBroadcastApproval,
     #[error("prepared Bitcoin broadcast conflicts with durable state")]
     BroadcastConflict,
+    #[error("Bitcoin HTLC compact-filter watch request is invalid")]
+    InvalidSwapWatch,
+    #[error("Bitcoin HTLC compact-filter watch conflicts with durable state")]
+    SwapWatchConflict,
+    #[error("Bitcoin HTLC compact-filter watch capacity reached")]
+    SwapWatchCapacity,
+    #[error("persisted Bitcoin HTLC compact-filter watch is corrupt")]
+    CorruptSwapWatch,
     #[error("prepared Bitcoin broadcast was not found")]
     BroadcastIntentNotFound,
     #[error("Bitcoin transaction is not durably prepared for broadcast")]

@@ -74,6 +74,7 @@ pub enum EntityKind {
     BitcoinWalletState,
     BitcoinScanState,
     BitcoinSwapKeyAllocation,
+    BitcoinSwapWatch,
     BitcoinUtxo,
     BitcoinTransaction,
     EthereumAccount,
@@ -112,6 +113,7 @@ impl EntityKind {
             Self::BitcoinWalletState => "bitcoin_wallet_state",
             Self::BitcoinScanState => "bitcoin_scan_state",
             Self::BitcoinSwapKeyAllocation => "bitcoin_swap_key_allocation",
+            Self::BitcoinSwapWatch => "bitcoin_swap_watch",
             Self::BitcoinUtxo => "bitcoin_utxo",
             Self::BitcoinTransaction => "bitcoin_transaction",
             Self::EthereumAccount => "ethereum_account",
@@ -1482,6 +1484,13 @@ impl WalletStore {
             bitcoin_scan_states,
             delete_bitcoin_scan_state,
             BitcoinScanState
+        ),
+        (
+            save_bitcoin_swap_watch,
+            bitcoin_swap_watch,
+            bitcoin_swap_watches,
+            delete_bitcoin_swap_watch,
+            BitcoinSwapWatch
         ),
         (
             save_bitcoin_utxo,

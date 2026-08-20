@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_source_commits_bdk_before_reconciling_and_ready() {
+    fn sync_source_commits_swap_evidence_before_bdk_and_ready() {
         let source = include_str!("runtime.rs");
         let cycle = source
             .split_once("let announced_tip = update")
@@ -543,12 +543,16 @@ mod tests {
         let bdk_commit = cycle
             .find("wallet.persist(now_unix)?;")
             .expect("BDK commit");
+        let swap_reconciliation = cycle
+            .find("reconcile_bitcoin_htlc_watches")
+            .expect("swap evidence reconciliation");
         let reconciling = cycle
             .find("self.durable.state.phase = KyotoSyncPhase::Reconciling")
             .expect("reconciling journal transition");
         let reconciliation = cycle
             .find("self.finish_reconciliation")
             .expect("mirror reconciliation");
+        assert!(swap_reconciliation < bdk_commit);
         assert!(bdk_commit < reconciling);
         assert!(reconciling < reconciliation);
 

@@ -646,8 +646,10 @@ changeset. It is account-ID authenticated, deletion-protected, and updated by
 CAS. Separate encrypted records contain the authenticated birthday, distinct
 non-genesis new-wallet recovery anchor, bounded recent checkpoints, supervisor
 sequence and phase, transaction/output reconciliation mirrors, and signed
-broadcast intents. These commits are ordered but are not claimed as one atomic
-transaction.
+broadcast intents. Bounded account/session-bound HTLC watch records add exact
+funding and spend transactions, canonical block positions, confirmations, and
+monotonic learned preimages. These commits are ordered but are not claimed as
+one atomic transaction.
 
 Bitcoin swap keys add an encrypted entity namespace without a plaintext schema
 table or seed copy. Each role allocation atomically writes an immutable
@@ -671,15 +673,18 @@ a different numeric reference. Session IDs must never be recycled, and a
 current encrypted database backup is required to recover already active swaps;
 the mnemonic alone is not an allocation journal.
 
-A sync records `synchronizing`, applies the Kyoto update, commits the encrypted
-BDK snapshot, records `reconciling`, applies encrypted mirror changes in bounded
-chunks, and commits `ready` last. Consumers must ignore an incomplete mirror
-unless the scan record is ready at its completed sequence. Restart from
-`reconciling` compares the BDK tip to the pending checkpoint and resumes the
-chunks without another network update. If the BDK commit landed but the
-`reconciling` commit did not, the unequal tip forces a recovery scan. A sync
-timeout discards the non-cancel-safe subscriber, shuts down the node, and
-persists `recovery_required`; the poisoned supervisor cannot be reused.
+A sync records `synchronizing`, authenticates matched HTLC blocks against the
+same locally validated Kyoto checkpoint, commits swap observations, applies
+the Kyoto update, commits the encrypted BDK snapshot, records `reconciling`,
+applies encrypted mirror changes in bounded chunks, and commits `ready` last.
+Committing swap observations before the BDK checkpoint ensures that a crash
+during a long catch-up cannot skip an older match: restart still scans from the
+older BDK checkpoint. Consumers must ignore an incomplete mirror unless the
+scan record is ready at its completed sequence. Restart from `reconciling`
+compares the BDK tip to the pending checkpoint and resumes the chunks without
+another network update. A sync timeout discards the non-cancel-safe subscriber,
+shuts down the node, and persists `recovery_required`; the poisoned supervisor
+cannot be reused.
 
 The aggregate BDK snapshot has the same 1 MiB cleartext limit as every generic
 encrypted entity, and its persistent script cache is disabled. Oversize state
@@ -702,10 +707,12 @@ attempt timestamp. A production release still requires a reviewed source of
 trusted or monotonic time across process and device restart.
 
 The pinned `bip157` 0.6.3 implementation ignores its configured `data_dir` and
-does not expose durable headers, filter headers/filters, or peer address-book
-state. Those databases cannot be truthfully restored by this source and remain
-a release blocker. Canonically absent transaction/output records are retained;
-safe archival is also pending, so the fixed lifetime caps fail closed.
+does not expose a durable full header/filter database or peer address book.
+Those are therefore re-fetched from untrusted peers after restart. The
+encrypted wallet checkpoint and recovery journal remain the durable local
+authority; no pruned/full indexed node or hosted relay is required. Canonically
+absent transaction/output records are retained; safe archival is still needed
+before the fixed lifetime caps are production-scale.
 
 ## Migrations and backups
 
