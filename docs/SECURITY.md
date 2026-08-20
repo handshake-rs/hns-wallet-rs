@@ -519,7 +519,16 @@ for expired, revoked, unregistered, or pending-transfer state.
 TRANSFER and FINALIZE additionally require the exact action/mempool snapshot,
 network and genesis identity, current owner inclusion, candidate height,
 ordered eligibility reasons, lockup, renewal window/hash, and absence of an
-owner spender. Persisted action context is audit/recovery evidence only.
+owner spender. Wallet-owned TRANSFER and direct FINALIZE obtain those fields
+through pruning-safe context version 2: the active owner Coin must be canonical,
+must exactly match the NameState owner/value/name covenant and inclusion, and
+its address must match one exact persisted `HnsName` derivation. The trusted
+node projection is not a transaction proof or wallet-ownership assertion.
+Legacy version-1 prepared sources cannot inherit a version-2 reacquisition and
+must be replaced through reapproval. Descriptor-linked Shakedex verification
+continues to require version 1 because the owner transaction's previous input
+is part of that authority and is absent from v2. Persisted action context is
+audit/recovery evidence only.
 
 Shakedex fulfillment, explicit-recipient recovery, and script-controlled
 FINALIZE adapters enforce canonical transaction shape. Encrypted parent-plan

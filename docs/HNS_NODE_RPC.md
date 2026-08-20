@@ -2,14 +2,16 @@
 
 `HnsNodeRpcBackend` is the concrete synchronous wallet-side adapter for the
 authenticated `hns-node-rs` wallet RPC v1 contract, including its additive
-script-free chain-snapshot call. It implements `HnsBackend`; the node supplies
+script-free chain-snapshot and pruning-safe name-action-context-v2 calls. It
+implements `HnsBackend`; the node supplies
 canonical chain evidence and broadcast admission while the wallet alone derives
 keys, signs, approves, and persists workflows. The node never signs. Exact
 wallet/node commit pairing remains required qualification evidence. The
 script-free call was introduced at node source
 `2b267ffe7fc6f9929063a18986a83b566d02ae6d`; selected qualified node main
-`2712d1dbb74934038188637dccf27d58fbc39a48` contains that unchanged API. This
-records compatibility evidence and does not make the node a wallet dependency.
+`4275b4e06a07ae3a4afe2db72bdd7c58d2fb1661` contains that unchanged API plus
+the additive pruning-safe action context. This records compatibility evidence
+and does not make the node a wallet dependency.
 
 ## Trusted configuration and transport
 
@@ -195,6 +197,28 @@ including preparation, authorization, and broadcast or rebroadcast. A bound
 owner mempool spender denies fresh action authority. No consensus name-policy
 constant is copied into the wallet; contextual policy originates in the pinned
 node consensus profile and is independently checked from returned evidence.
+
+The adapter also implements the additive `name_action_context_v2` method. Its
+closed response must carry context version 2, projection version 1, the exact
+`trusted_node_active_utxo_projection` source label, canonical current
+NameState bytes, an exact active owner Coin, and an inclusion whose transaction
+position is `null`. The wallet reconstructs and canonically re-encodes the Coin
+and covenant, checks the NameState/owner/value/name-covenant/inclusion linkage,
+checks the inclusion block against the same epoch, and then applies the same
+chain identity, candidate-height, mempool, policy-reason, transfer-maturity,
+and renewal-window validation as version 1. Unknown fields, mixed v1/v2 owner
+sources, an invented transaction position, or a zero process nonce fail closed.
+
+Wallet-owned TRANSFER and direct-FINALIZE preparation and every later authority
+reacquisition select version 2. The Coin address must match exactly one
+persisted `HnsName` derivation before the ephemeral result can feed a dormant
+signing workflow. New persisted plans retain canonical serializable Coin
+evidence; legacy v1 plans remain decodable, but a later v2 reacquisition does
+not silently upgrade their approval and instead requires replacement through
+the existing reapproval path. Shakedex descriptor-linked verification retains
+version 1 because it also proves that the TRANSFER transaction spent a specific
+locking outpoint; v2 does not return that previous input and the wallet does not
+invent it.
 
 ## Release policy
 

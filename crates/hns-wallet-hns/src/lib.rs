@@ -537,6 +537,21 @@ pub trait HnsBackend {
         binding: SnapshotBinding,
         expected_mempool: MempoolSnapshotBinding,
     ) -> Result<NameActionContextEvidence, HnsWalletError>;
+
+    /// Returns the pruning-safe version-2 action context whose active owner
+    /// is represented by exact current UTXO evidence rather than retained raw
+    /// transaction bytes. The default keeps older backend implementations
+    /// source-compatible while failing closed if they are selected for a v2
+    /// operation.
+    fn get_name_action_context_v2(
+        &self,
+        _action: HnsNameAction,
+        _name_hash: [u8; 32],
+        _binding: SnapshotBinding,
+        _expected_mempool: MempoolSnapshotBinding,
+    ) -> Result<NameActionContextEvidence, HnsWalletError> {
+        Err(HnsWalletError::RuntimeIntegrationUnavailable)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

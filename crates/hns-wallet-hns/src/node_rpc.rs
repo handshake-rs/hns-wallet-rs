@@ -29,15 +29,15 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     ActiveNameOwnerCoinEvidence, ActiveNameOwnerCoinSourceBinding, BlockHashEvidence, ChainTip,
     ConfirmedWalletPage, ConfirmedWalletPageRequest, HistoryEntry, HnsBackend, HnsFeeRateSource,
-    HnsNameAction, HnsNameLifecycle, HnsNetwork, HnsOutpoint, HnsTransactionFeeQuote,
-    HnsWalletError, IncomingTransferCandidate, IncomingTransferSourceBinding,
-    IncomingTransfersPage, IncomingTransfersPageRequest, IndexedWalletCoin, MAX_HISTORY_RESULTS,
-    MAX_MEMPOOL_SCAN_RESULTS, MAX_OUTPOINT_SPEND_BATCH, MAX_RESTORE_SCRIPTS_PER_QUERY,
-    MAX_SCAN_CURSOR_BYTES, MAX_SCAN_PAGE_RESULTS, MempoolSnapshotBinding, MempoolWalletPage,
-    MempoolWalletPageRequest, NameActionContextEvidence, NameActionIneligibility, NameEvidence,
-    NameProofResponse, OutpointSpendEntry, OutpointSpendEvidence, SnapshotBinding,
-    SpendingTransactionEvidence, TransactionEvidence, TransactionInclusion, TransactionStatus,
-    WalletAddressKey, WalletCoin,
+    HnsInputCoinEvidence, HnsNameAction, HnsNameLifecycle, HnsNetwork, HnsOutpoint,
+    HnsTransactionFeeQuote, HnsWalletError, IncomingTransferCandidate,
+    IncomingTransferSourceBinding, IncomingTransfersPage, IncomingTransfersPageRequest,
+    IndexedWalletCoin, MAX_HISTORY_RESULTS, MAX_MEMPOOL_SCAN_RESULTS, MAX_OUTPOINT_SPEND_BATCH,
+    MAX_RESTORE_SCRIPTS_PER_QUERY, MAX_SCAN_CURSOR_BYTES, MAX_SCAN_PAGE_RESULTS,
+    MempoolSnapshotBinding, MempoolWalletPage, MempoolWalletPageRequest, NameActionContextEvidence,
+    NameActionIneligibility, NameEvidence, NameProofResponse, OutpointSpendEntry,
+    OutpointSpendEvidence, SnapshotBinding, SpendingTransactionEvidence, TransactionEvidence,
+    TransactionInclusion, TransactionStatus, WalletAddressKey, WalletCoin,
 };
 
 const WALLET_RPC_API_VERSION: u16 = 1;
@@ -1205,6 +1205,35 @@ struct WireNameActionContext {
     eligibility: WireNameActionEligibility,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireNameActionActiveOwnerCoin {
+    projection_version: u8,
+    owner_coin: WireCoin,
+    inclusion: WireInclusion,
+    source_binding: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireNameActionContextV2 {
+    context_version: u8,
+    action: HnsNameAction,
+    chain_identity: WireNameActionChainIdentity,
+    chain_epoch: u64,
+    tip: WireTip,
+    candidate_inclusion_height: u32,
+    mempool: WireNameActionMempool,
+    name_hash: String,
+    current_state_hex: String,
+    current_state: WireNameState,
+    active_owner: WireNameActionActiveOwnerCoin,
+    lifecycle: HnsNameLifecycle,
+    transfer: WireNameActionTransfer,
+    renewal: WireNameActionRenewal,
+    eligibility: WireNameActionEligibility,
+}
+
 struct ScriptQuery {
     encoded_ids: Vec<String>,
     node_to_request: Vec<u32>,
@@ -2248,23 +2277,123 @@ impl HnsBackend for HnsNodeRpcBackend {
         }))?;
         validated_name_action_response(self, response, action, name_hash, binding, expected_mempool)
     }
+
+    fn get_name_action_context_v2(
+        &self,
+        action: HnsNameAction,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
+        expected_mempool: MempoolSnapshotBinding,
+    ) -> Result<NameActionContextEvidence, HnsWalletError> {
+        let response: WireNameActionContextV2 = self.rpc(serde_json::json!({
+            "method": "name_action_context_v2",
+            "params": {
+                "action": action,
+                "name_hash": hex::encode(name_hash),
+                "expected_chain_epoch": binding.chain_epoch,
+                "expected_mempool": expected_mempool_json(expected_mempool),
+            },
+        }))?;
+        validated_name_action_v2_response(
+            self,
+            response,
+            action,
+            name_hash,
+            binding,
+            expected_mempool,
+        )
+    }
 }
 
-fn validated_name_action_response(
-    backend: &HnsNodeRpcBackend,
-    response: WireNameActionContext,
+struct WireNameActionCommon {
+    context_version: u8,
+    action: HnsNameAction,
+    chain_identity: WireNameActionChainIdentity,
+    chain_epoch: u64,
+    tip: WireTip,
+    candidate_inclusion_height: u32,
+    mempool: WireNameActionMempool,
+    name_hash: String,
+    current_state_hex: String,
+    current_state: WireNameState,
+    lifecycle: HnsNameLifecycle,
+    transfer: WireNameActionTransfer,
+    renewal: WireNameActionRenewal,
+    eligibility: WireNameActionEligibility,
+}
+
+impl WireNameActionContext {
+    fn into_parts(self) -> (WireNameActionCommon, WireNameOwner) {
+        (
+            WireNameActionCommon {
+                context_version: self.context_version,
+                action: self.action,
+                chain_identity: self.chain_identity,
+                chain_epoch: self.chain_epoch,
+                tip: self.tip,
+                candidate_inclusion_height: self.candidate_inclusion_height,
+                mempool: self.mempool,
+                name_hash: self.name_hash,
+                current_state_hex: self.current_state_hex,
+                current_state: self.current_state,
+                lifecycle: self.lifecycle,
+                transfer: self.transfer,
+                renewal: self.renewal,
+                eligibility: self.eligibility,
+            },
+            self.owner,
+        )
+    }
+}
+
+impl WireNameActionContextV2 {
+    fn into_parts(self) -> (WireNameActionCommon, WireNameActionActiveOwnerCoin) {
+        (
+            WireNameActionCommon {
+                context_version: self.context_version,
+                action: self.action,
+                chain_identity: self.chain_identity,
+                chain_epoch: self.chain_epoch,
+                tip: self.tip,
+                candidate_inclusion_height: self.candidate_inclusion_height,
+                mempool: self.mempool,
+                name_hash: self.name_hash,
+                current_state_hex: self.current_state_hex,
+                current_state: self.current_state,
+                lifecycle: self.lifecycle,
+                transfer: self.transfer,
+                renewal: self.renewal,
+                eligibility: self.eligibility,
+            },
+            self.active_owner,
+        )
+    }
+}
+
+struct ValidatedWireNameActionHeader {
+    candidate_height: u64,
+    mempool: MempoolSnapshotBinding,
+    mempool_spender: Option<TransactionHash>,
+    current_state: Vec<u8>,
+    canonical_state: NameState,
+}
+
+fn validate_wire_name_action_header(
+    response: &WireNameActionCommon,
+    expected_context_version: u8,
     expected_action: HnsNameAction,
     expected_name_hash: [u8; 32],
     binding: SnapshotBinding,
     expected_mempool: MempoolSnapshotBinding,
-) -> Result<NameActionContextEvidence, HnsWalletError> {
+) -> Result<ValidatedWireNameActionHeader, HnsWalletError> {
     require_binding(response.chain_epoch, Some(response.tip.clone()), binding)?;
     let candidate_height = binding
         .tip
         .height
         .checked_add(1)
         .ok_or_else(protocol_error)?;
-    if response.action != expected_action
+    if response.context_version != expected_context_version
+        || response.action != expected_action
         || decode_hex_32(&response.name_hash)? != expected_name_hash
         || u64::from(response.candidate_inclusion_height) != candidate_height
     {
@@ -2275,7 +2404,7 @@ fn validated_name_action_response(
         instance_nonce: decode_hex_32(&response.mempool.instance_nonce)?,
         generation: response.mempool.generation,
     };
-    if mempool != expected_mempool {
+    if mempool.instance_nonce == [0; 32] || mempool != expected_mempool {
         return Err(HnsWalletError::StaleNodeSnapshot);
     }
     let mempool_spender = response
@@ -2285,22 +2414,35 @@ fn validated_name_action_response(
         .map(decode_hex_32)
         .transpose()?
         .map(TransactionHash::new);
-
     let (current_state, canonical_state) = decode_projected_name_state(
         &response.current_state_hex,
         &response.current_state,
         expected_name_hash,
     )?;
-    let owner = validate_name_owner(
-        backend,
-        response.owner,
-        &response.current_state,
-        &canonical_state,
-        binding,
-    )?;
+    Ok(ValidatedWireNameActionHeader {
+        candidate_height,
+        mempool,
+        mempool_spender,
+        current_state,
+        canonical_state,
+    })
+}
 
-    let transfer_height =
-        (canonical_state.transfer.get() != 0).then_some(canonical_state.transfer.get());
+#[allow(clippy::too_many_arguments)]
+fn finish_validated_name_action_response(
+    response: WireNameActionCommon,
+    header: ValidatedWireNameActionHeader,
+    expected_action: HnsNameAction,
+    expected_name_hash: [u8; 32],
+    binding: SnapshotBinding,
+    owner_outpoint: HnsOutpoint,
+    owner_transaction: Vec<u8>,
+    owner_coin: Option<HnsInputCoinEvidence>,
+    owner_inclusion: TransactionInclusion,
+    owner_kind: CovenantKind,
+) -> Result<NameActionContextEvidence, HnsWalletError> {
+    let transfer_height = (header.canonical_state.transfer.get() != 0)
+        .then_some(header.canonical_state.transfer.get());
     let expected_finalize_height = transfer_height
         .map(|height| {
             height
@@ -2348,10 +2490,9 @@ fn validated_name_action_response(
     {
         return Err(protocol_error());
     }
-    let has = |reason| reasons.contains(&reason);
-    let expired_at_candidate = has(NameActionIneligibility::NameExpiredAtCandidate);
+    let expired_at_candidate = reasons.contains(&NameActionIneligibility::NameExpiredAtCandidate);
     let mut expected_reasons = Vec::new();
-    if !canonical_state.registered {
+    if !header.canonical_state.registered {
         expected_reasons.push(NameActionIneligibility::NameNotRegistered);
     }
     if expired_at_candidate {
@@ -2366,7 +2507,7 @@ fn validated_name_action_response(
                 expected_reasons.push(NameActionIneligibility::TransferAlreadyPending);
             }
             if !matches!(
-                owner.output.covenant.kind,
+                owner_kind,
                 CovenantKind::Register
                     | CovenantKind::Update
                     | CovenantKind::Renew
@@ -2381,7 +2522,7 @@ fn validated_name_action_response(
             } else if !expected_finalize_eligible {
                 expected_reasons.push(NameActionIneligibility::TransferNotMature);
             }
-            if owner.output.covenant.kind != CovenantKind::Transfer {
+            if owner_kind != CovenantKind::Transfer {
                 expected_reasons.push(NameActionIneligibility::OwnerCovenantInvalidForAction);
             }
             if !renewal_valid {
@@ -2389,7 +2530,7 @@ fn validated_name_action_response(
             }
         }
     }
-    if mempool_spender.is_some() {
+    if header.mempool_spender.is_some() {
         expected_reasons.push(NameActionIneligibility::OwnerSpentInMempool);
     }
     if reasons != &expected_reasons {
@@ -2399,7 +2540,7 @@ fn validated_name_action_response(
     let genesis_hash = decode_hex_32(&response.chain_identity.genesis_hash)?;
     let common = NameActionContextEvidence {
         binding,
-        mempool,
+        mempool: header.mempool,
         network: response.chain_identity.network,
         network_id: response.chain_identity.network_id,
         genesis_hash,
@@ -2407,11 +2548,12 @@ fn validated_name_action_response(
         consensus_profile: response.chain_identity.consensus_profile,
         action: response.action,
         name_hash: expected_name_hash,
-        current_state,
-        owner_outpoint: owner.outpoint,
-        owner_transaction: owner.raw_transaction,
-        owner_inclusion: owner.inclusion,
-        candidate_inclusion_height: candidate_height,
+        current_state: header.current_state,
+        owner_outpoint,
+        owner_transaction,
+        owner_coin,
+        owner_inclusion,
+        candidate_inclusion_height: header.candidate_height,
         lifecycle: response.lifecycle,
         action_eligible: response.eligibility.eligible,
         ineligibility_reasons: response.eligibility.reasons,
@@ -2424,7 +2566,7 @@ fn validated_name_action_response(
         renewal_block_height: None,
         renewal_block_hash: None,
         renewal_valid_at_candidate: None,
-        mempool_spender,
+        mempool_spender: header.mempool_spender,
     };
     Ok(match expected_action {
         HnsNameAction::Transfer => common,
@@ -2441,6 +2583,139 @@ fn validated_name_action_response(
             ..common
         },
     })
+}
+
+fn validated_name_action_response(
+    backend: &HnsNodeRpcBackend,
+    response: WireNameActionContext,
+    expected_action: HnsNameAction,
+    expected_name_hash: [u8; 32],
+    binding: SnapshotBinding,
+    expected_mempool: MempoolSnapshotBinding,
+) -> Result<NameActionContextEvidence, HnsWalletError> {
+    let (response, owner) = response.into_parts();
+    let header = validate_wire_name_action_header(
+        &response,
+        1,
+        expected_action,
+        expected_name_hash,
+        binding,
+        expected_mempool,
+    )?;
+    let owner = validate_name_owner(
+        backend,
+        owner,
+        &response.current_state,
+        &header.canonical_state,
+        binding,
+    )?;
+    let owner_kind = owner.output.covenant.kind;
+    finish_validated_name_action_response(
+        response,
+        header,
+        expected_action,
+        expected_name_hash,
+        binding,
+        owner.outpoint,
+        owner.raw_transaction,
+        None,
+        owner.inclusion,
+        owner_kind,
+    )
+}
+
+struct ValidatedWireNameActionOwnerV2 {
+    outpoint: HnsOutpoint,
+    coin: HnsInputCoinEvidence,
+    inclusion: TransactionInclusion,
+    kind: CovenantKind,
+}
+
+fn validate_wire_name_action_owner_v2(
+    active_owner: WireNameActionActiveOwnerCoin,
+    current_state: &[u8],
+    canonical_state: &NameState,
+    expected_name_hash: [u8; 32],
+    binding: SnapshotBinding,
+) -> Result<ValidatedWireNameActionOwnerV2, HnsWalletError> {
+    if active_owner.projection_version != ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION
+        || active_owner.source_binding != "trusted_node_active_utxo_projection"
+    {
+        return Err(protocol_error());
+    }
+    let owner_coin = wire_coin(&active_owner.owner_coin)?;
+    let owner_inclusion = inclusion(active_owner.inclusion, binding.tip)?;
+    let active_evidence = ActiveNameOwnerCoinEvidence {
+        projection_version: active_owner.projection_version,
+        binding,
+        current_state: current_state.to_vec(),
+        owner_coin: owner_coin.clone(),
+        inclusion: owner_inclusion,
+        source_binding: ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection,
+    };
+    let validated_state = super::validate_active_name_owner_coin_evidence(
+        &active_evidence,
+        expected_name_hash,
+        binding,
+    )?;
+    if &validated_state != canonical_state {
+        return Err(protocol_error());
+    }
+    let outpoint = HnsOutpoint {
+        transaction: TransactionHash::new(owner_coin.outpoint.transaction_hash.into_bytes()),
+        output_index: owner_coin.outpoint.index,
+    };
+    let kind = owner_coin.covenant.kind;
+    let coin = HnsInputCoinEvidence::from_canonical_coin(&owner_coin)?;
+    Ok(ValidatedWireNameActionOwnerV2 {
+        outpoint,
+        coin,
+        inclusion: owner_inclusion,
+        kind,
+    })
+}
+
+fn validated_name_action_v2_response(
+    backend: &HnsNodeRpcBackend,
+    response: WireNameActionContextV2,
+    expected_action: HnsNameAction,
+    expected_name_hash: [u8; 32],
+    binding: SnapshotBinding,
+    expected_mempool: MempoolSnapshotBinding,
+) -> Result<NameActionContextEvidence, HnsWalletError> {
+    let (response, active_owner) = response.into_parts();
+    let header = validate_wire_name_action_header(
+        &response,
+        2,
+        expected_action,
+        expected_name_hash,
+        binding,
+        expected_mempool,
+    )?;
+    let owner = validate_wire_name_action_owner_v2(
+        active_owner,
+        &header.current_state,
+        &header.canonical_state,
+        expected_name_hash,
+        binding,
+    )?;
+    backend.require_active_block_hash(
+        owner.inclusion.height,
+        owner.inclusion.block_hash,
+        binding,
+    )?;
+    finish_validated_name_action_response(
+        response,
+        header,
+        expected_action,
+        expected_name_hash,
+        binding,
+        owner.outpoint,
+        Vec::new(),
+        Some(owner.coin),
+        owner.inclusion,
+        owner.kind,
+    )
 }
 
 fn validated_name_response(
@@ -2924,6 +3199,121 @@ mod tests {
     }
 
     #[test]
+    fn name_action_v2_owner_projection_is_canonical_and_pruning_safe() {
+        let name = b"alpha".to_vec();
+        let name_hash = hash_name(&name).expect("name hash");
+        let owner_txid = CanonicalTransactionHash::new([2; 32]);
+        let state = NameState {
+            name_hash,
+            name,
+            height: Height::new(100),
+            renewal: Height::new(120),
+            owner: Outpoint {
+                transaction_hash: owner_txid,
+                index: 0,
+            },
+            value: Dollarydoos::new(50_000),
+            highest: Dollarydoos::new(60_000),
+            resource_data: Vec::new(),
+            transfer: Height::new(400),
+            revoked: Height::new(0),
+            claimed: Height::new(0),
+            renewals: 1,
+            registered: true,
+            expired: false,
+            weak: false,
+        };
+        let current_state = state.encode().expect("canonical state");
+        let transfer =
+            hns_covenants::TransferCovenant::new(name_hash, state.height, 0, vec![9; 20])
+                .expect("transfer")
+                .to_covenant()
+                .expect("transfer covenant");
+        let binding = SnapshotBinding {
+            chain_epoch: 9,
+            tip: ChainTip {
+                height: 409,
+                block_hash: [4; 32],
+                tree_root: [5; 32],
+                median_time_past: 1_700_000_000,
+            },
+        };
+        let active = serde_json::json!({
+            "projection_version": 1,
+            "owner_coin": {
+                "outpoint": {"txid": hex::encode(owner_txid.as_bytes()), "index": 0},
+                "value": 50_000,
+                "height": 400,
+                "coinbase": false,
+                "address": {"version": 0, "hash": hex::encode([7; 20])},
+                "covenant": {
+                    "kind": transfer.kind.as_u8(),
+                    "items": transfer.items.iter().map(hex::encode).collect::<Vec<_>>()
+                }
+            },
+            "inclusion": {
+                "block_hash": hex::encode([8; 32]),
+                "height": 400,
+                "transaction_index": null,
+                "confirmations": 10
+            },
+            "source_binding": "trusted_node_active_utxo_projection"
+        });
+        let validated = validate_wire_name_action_owner_v2(
+            serde_json::from_value(active.clone()).expect("wire owner"),
+            &current_state,
+            &state,
+            name_hash.into_bytes(),
+            binding,
+        )
+        .expect("valid v2 owner");
+        assert_eq!(validated.outpoint.output_index, 0);
+        assert_eq!(validated.inclusion.transaction_index, None);
+        assert_eq!(validated.kind, CovenantKind::Transfer);
+        assert_eq!(
+            validated.coin.to_canonical_coin().expect("coin").height,
+            Height::new(400)
+        );
+
+        let mut invented_position = active.clone();
+        invented_position["inclusion"]["transaction_index"] = serde_json::json!(0);
+        assert!(
+            validate_wire_name_action_owner_v2(
+                serde_json::from_value(invented_position).expect("wire owner"),
+                &current_state,
+                &state,
+                name_hash.into_bytes(),
+                binding,
+            )
+            .is_err()
+        );
+        let mut wrong_source = active.clone();
+        wrong_source["source_binding"] = serde_json::json!("retained_body_verified");
+        assert!(
+            validate_wire_name_action_owner_v2(
+                serde_json::from_value(wrong_source).expect("wire owner"),
+                &current_state,
+                &state,
+                name_hash.into_bytes(),
+                binding,
+            )
+            .is_err()
+        );
+        let mut wrong_value = active;
+        wrong_value["owner_coin"]["value"] = serde_json::json!(50_001);
+        assert!(
+            validate_wire_name_action_owner_v2(
+                serde_json::from_value(wrong_value).expect("wire owner"),
+                &current_state,
+                &state,
+                name_hash.into_bytes(),
+                binding,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn canonical_hns_v3_name_action_wire_schema_is_closed() {
         let projected_state = serde_json::json!({
             "name_hash": hex::encode([1; 32]),
@@ -3011,6 +3401,43 @@ mod tests {
             parsed.eligibility.reasons,
             vec![NameActionIneligibility::TransferNotMature]
         );
+
+        let mut response_v2 = response.clone();
+        response_v2["context_version"] = serde_json::json!(2);
+        response_v2
+            .as_object_mut()
+            .expect("context object")
+            .remove("owner");
+        response_v2["active_owner"] = serde_json::json!({
+            "projection_version": 1,
+            "owner_coin": {
+                "outpoint": {"txid": hex::encode([2; 32]), "index": 0},
+                "value": 50_000,
+                "height": 400,
+                "coinbase": false,
+                "address": {"version": 0, "hash": hex::encode([7; 20])},
+                "covenant": {"kind": 9, "items": []}
+            },
+            "inclusion": {
+                "block_hash": hex::encode([8; 32]),
+                "height": 400,
+                "transaction_index": null,
+                "confirmations": 10
+            },
+            "source_binding": "trusted_node_active_utxo_projection"
+        });
+        let parsed_v2: WireNameActionContextV2 =
+            serde_json::from_value(response_v2.clone()).expect("closed v2 response schema");
+        assert_eq!(parsed_v2.context_version, 2);
+        assert_eq!(parsed_v2.active_owner.projection_version, 1);
+        assert!(parsed_v2.active_owner.inclusion.transaction_index.is_none());
+
+        let mut v2_with_legacy_owner = response_v2.clone();
+        v2_with_legacy_owner["owner"] = serde_json::json!({});
+        assert!(serde_json::from_value::<WireNameActionContextV2>(v2_with_legacy_owner).is_err());
+        let mut v2_extended_owner = response_v2;
+        v2_extended_owner["active_owner"]["unbound_extension"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WireNameActionContextV2>(v2_extended_owner).is_err());
 
         let mut missing_median_time = response.clone();
         missing_median_time["tip"]

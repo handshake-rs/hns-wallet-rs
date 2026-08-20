@@ -61,6 +61,17 @@ coin byte for byte. This remains a read-only trusted projection, not proof or
 spend authority; consensus-valid zero-valued name owner outputs are handled by
 the same exact-match rule.
 
+Wallet-owned TRANSFER and direct-FINALIZE workflows use the node's additive
+pruning-safe `name_action_context_v2` boundary. The wallet independently
+decodes the canonical NameState, reconstructs the exact active owner Coin,
+checks its covenant/outpoint/value/inclusion and fixed policy result, and then
+requires its address to match one exact persisted `HnsName` derivation. The
+Coin projection and node eligibility result confer no signing authority by
+themselves. New encrypted plans retain canonical Coin evidence; a legacy v1
+plan must be reapproved rather than silently upgraded. Shakedex's
+descriptor-linked TRANSFER path remains on v1 because it needs the previous
+input from the retained transaction, which v2 intentionally omits.
+
 Its value and settlement configurations remain fail-closed until the embedding
 product completes the documented adapter and runtime qualification. See the
 [workspace repository](https://github.com/handshake-rs/hns-wallet-rs) for the

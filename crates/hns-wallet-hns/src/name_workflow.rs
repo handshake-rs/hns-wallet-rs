@@ -197,7 +197,16 @@ pub struct NameActionContextEvidence {
     pub name_hash: [u8; 32],
     pub current_state: Vec<u8>,
     pub owner_outpoint: HnsOutpoint,
+    /// Retained canonical owner transaction for the legacy version-1 node
+    /// context. Version 2 deliberately leaves this empty and carries the
+    /// pruning-safe active owner Coin below instead.
+    #[serde(default)]
     pub owner_transaction: Vec<u8>,
+    /// Exact active-owner Coin for the pruning-safe version-2 node context.
+    /// This is trusted-node UTXO evidence, not a cryptographic transaction
+    /// proof or an assertion that this wallet owns the corresponding key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_coin: Option<HnsInputCoinEvidence>,
     pub owner_inclusion: TransactionInclusion,
     pub candidate_inclusion_height: u64,
     pub lifecycle: HnsNameLifecycle,
@@ -527,10 +536,7 @@ pub struct VerifiedOutgoingNameTransfer {
     pub(super) mempool: MempoolSnapshotBinding,
     pub(super) name: Vec<u8>,
     pub(super) name_hash: [u8; 32],
-    pub(super) current_state: Vec<u8>,
     pub(super) owner_outpoint: HnsOutpoint,
-    pub(super) owner_transaction: Vec<u8>,
-    pub(super) owner_output: Output,
     pub(super) owner_inclusion: TransactionInclusion,
     pub(super) owner_derivation: DerivationReference,
     pub(super) recipient: WalletAddressKey,
@@ -588,6 +594,40 @@ impl VerifiedOutgoingNameTransfer {
 
     pub const fn finalize_eligible_height(&self) -> Option<u64> {
         self.context.finalize_eligible_height
+    }
+}
+
+/// Pruning-safe, non-serializable authority used only by the wallet-owned
+/// TRANSFER/direct-FINALIZE workflow. It is rebuilt from a version-2 node
+/// context for every preparation or pre-submit fence and never escapes as a
+/// generic signing capability.
+struct VerifiedWalletNameActionV2 {
+    binding: SnapshotBinding,
+    mempool: MempoolSnapshotBinding,
+    name: Vec<u8>,
+    name_hash: [u8; 32],
+    current_state: Vec<u8>,
+    owner_outpoint: HnsOutpoint,
+    owner_coin: Coin,
+    owner_inclusion: TransactionInclusion,
+    owner_derivation: DerivationReference,
+    recipient: Option<WalletAddressKey>,
+    context: NameActionContextEvidence,
+}
+
+impl fmt::Debug for VerifiedWalletNameActionV2 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedWalletNameActionV2")
+            .field("binding", &self.binding)
+            .field("mempool", &self.mempool)
+            .field("name", &String::from_utf8_lossy(&self.name))
+            .field("name_hash", &hex::encode(self.name_hash))
+            .field("owner_outpoint", &self.owner_outpoint)
+            .field("owner_inclusion", &self.owner_inclusion)
+            .field("owner_derivation", &self.owner_derivation)
+            .field("recipient", &self.recipient)
+            .finish_non_exhaustive()
     }
 }
 
@@ -722,6 +762,7 @@ impl HnsInputReservationKind {
 }
 
 pub(super) const NAME_ACTION_CONTEXT_VERSION: u32 = 1;
+pub(super) const NAME_ACTION_CONTEXT_V2_VERSION: u32 = 2;
 pub(super) const NAME_ACTION_CONSENSUS_PROFILE: &str = "hns-consensus/name-policy-v1";
 
 fn ensure_name_value_ready(cache: &HnsRuntimeCache) -> Result<(), HnsWalletError> {
@@ -964,7 +1005,67 @@ fn tracked_name_source(
     })
 }
 
+fn tracked_name_source_from_coin(
+    binding: SnapshotBinding,
+    owner_coin: &Coin,
+    owner_inclusion: TransactionInclusion,
+    derivation: DerivationReference,
+) -> Result<TrackedHnsCoin, HnsWalletError> {
+    let owner_outpoint = HnsOutpoint {
+        transaction: TransactionHash::new(owner_coin.outpoint.transaction_hash.into_bytes()),
+        output_index: owner_coin.outpoint.index,
+    };
+    if owner_coin.coinbase
+        || u64::from(owner_coin.height.get()) != owner_inclusion.height
+        || owner_inclusion.transaction_index.is_some()
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    let owner_output = Output {
+        value: owner_coin.value,
+        address: owner_coin.address.clone(),
+        covenant: owner_coin.covenant.clone(),
+    };
+    tracked_name_source(
+        binding,
+        owner_outpoint,
+        &owner_output,
+        owner_inclusion,
+        derivation,
+    )
+}
+
 fn name_source_from_plan(plan: &HnsNamePlan) -> Result<TrackedHnsCoin, HnsWalletError> {
+    if let Some(owner_coin) = plan.source.action_context.owner_coin.as_ref() {
+        if plan.source.action_context.context_version != NAME_ACTION_CONTEXT_V2_VERSION
+            || !plan.source.owner_transaction.is_empty()
+            || !plan.source.action_context.owner_transaction.is_empty()
+            || plan.source.current_name_state != plan.source.action_context.current_state
+            || plan.source.owner_outpoint != plan.source.action_context.owner_outpoint
+            || plan.source.owner_inclusion != plan.source.action_context.owner_inclusion
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let owner_coin = owner_coin.to_canonical_coin()?;
+        let canonical_outpoint = HnsOutpoint {
+            transaction: TransactionHash::new(owner_coin.outpoint.transaction_hash.into_bytes()),
+            output_index: owner_coin.outpoint.index,
+        };
+        if canonical_outpoint != plan.source.owner_outpoint {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        return tracked_name_source_from_coin(
+            plan.source.preparation_binding,
+            &owner_coin,
+            plan.source.owner_inclusion,
+            plan.source.owner_derivation,
+        );
+    }
+    if plan.source.action_context.context_version != NAME_ACTION_CONTEXT_VERSION
+        || plan.source.action_context.owner_transaction != plan.source.owner_transaction
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
     let transaction = decode_transaction_for_id(
         &plan.source.owner_transaction,
         plan.source.owner_outpoint.transaction,
@@ -1317,22 +1418,51 @@ fn validate_name_action_context(
     let canonical_state = state
         .encode()
         .map_err(|_| HnsWalletError::InvalidEvidence)?;
-    let validated_context = validate_canonical_name_state(
-        &state.name,
-        name_hash,
-        Some(&context.current_state),
-        Some(context.owner_outpoint),
-        Some(&context.owner_transaction),
-        Some(context.owner_inclusion),
-    )?
-    .ok_or(HnsWalletError::InvalidEvidence)?;
-    let owner_kind = validated_context
-        .owner
-        .as_ref()
+    let owner_kind = if let Some(owner_coin) = context.owner_coin.as_ref() {
+        if context.context_version != NAME_ACTION_CONTEXT_V2_VERSION
+            || !context.owner_transaction.is_empty()
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let owner_coin = owner_coin.to_canonical_coin()?;
+        let active = ActiveNameOwnerCoinEvidence {
+            projection_version: 1,
+            binding,
+            current_state: context.current_state.clone(),
+            owner_coin: owner_coin.clone(),
+            inclusion: context.owner_inclusion,
+            source_binding: ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection,
+        };
+        let validated_state =
+            validate_active_name_owner_coin_evidence(&active, name_hash, binding)?;
+        if validated_state != *state
+            || owner_coin.outpoint.transaction_hash.as_bytes()
+                != context.owner_outpoint.transaction.as_bytes()
+            || owner_coin.outpoint.index != context.owner_outpoint.output_index
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        owner_coin.covenant.kind
+    } else {
+        if context.context_version != NAME_ACTION_CONTEXT_VERSION
+            || context.owner_transaction.is_empty()
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        validate_canonical_name_state(
+            &state.name,
+            name_hash,
+            Some(&context.current_state),
+            Some(context.owner_outpoint),
+            Some(&context.owner_transaction),
+            Some(context.owner_inclusion),
+        )?
+        .and_then(|validated| validated.owner)
         .ok_or(HnsWalletError::InvalidEvidence)?
         .output
         .covenant
-        .kind;
+        .kind
+    };
     let reasons = &context.ineligibility_reasons;
     if reasons.len() > 9
         || !reasons
@@ -1353,7 +1483,6 @@ fn validate_name_action_context(
         || context.network != config.network
         || context.network_id != expected_network_id
         || context.genesis_hash != expected_genesis_hash
-        || context.context_version != NAME_ACTION_CONTEXT_VERSION
         || context.consensus_profile != NAME_ACTION_CONSENSUS_PROFILE
         || context.action != action
         || context.name_hash != name_hash
@@ -1903,46 +2032,35 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 return Err(HnsWalletError::StaleNodeSnapshot);
             }
         }
-        let source = match plan.action {
+        let authority = self.verify_wallet_name_action_v2(&plan.name, plan.action)?;
+        match plan.action {
             HnsNameAction::Transfer => {
-                let authority = self.verify_name_ownership(&plan.name)?;
-                let context = self.transfer_action_context(&authority)?;
-                if plan.recipient_display
-                    != encode_hns_address(
-                        self.cache_read()?.account.config.network,
-                        &plan.recipient,
-                    )?
+                if authority.recipient.is_some()
+                    || plan.recipient_display
+                        != encode_hns_address(
+                            self.cache_read()?.account.config.network,
+                            &plan.recipient,
+                        )?
                 {
                     return Err(HnsWalletError::InvalidPreparedArtifact);
                 }
-                HnsNameSourceEvidence {
-                    preparation_binding: authority.binding,
-                    preparation_mempool: authority.mempool,
-                    current_name_state: authority.current_state,
-                    owner_outpoint: authority.owner_outpoint,
-                    owner_transaction: authority.owner_transaction,
-                    owner_inclusion: authority.owner_inclusion,
-                    owner_derivation: authority.derivation,
-                    action_context: context,
-                }
             }
             HnsNameAction::Finalize => {
-                let authority = self.verify_outgoing_name_transfer(&plan.name)?;
-                if authority.recipient != plan.recipient {
+                if authority.recipient.as_ref() != Some(&plan.recipient) {
                     self.mark_name_operation_reapproval_required(plan)?;
                     return Err(HnsWalletError::ApprovalRequired);
                 }
-                HnsNameSourceEvidence {
-                    preparation_binding: authority.binding,
-                    preparation_mempool: authority.mempool,
-                    current_name_state: authority.current_state,
-                    owner_outpoint: authority.owner_outpoint,
-                    owner_transaction: authority.owner_transaction,
-                    owner_inclusion: authority.owner_inclusion,
-                    owner_derivation: authority.owner_derivation,
-                    action_context: authority.context,
-                }
             }
+        }
+        let source = HnsNameSourceEvidence {
+            preparation_binding: authority.binding,
+            preparation_mempool: authority.mempool,
+            current_name_state: authority.current_state,
+            owner_outpoint: authority.owner_outpoint,
+            owner_transaction: Vec::new(),
+            owner_inclusion: authority.owner_inclusion,
+            owner_derivation: authority.owner_derivation,
+            action_context: authority.context,
         };
 
         if let Some((binding, mempool)) = required_snapshot
@@ -1963,7 +2081,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             && source.owner_outpoint == plan.source.owner_outpoint
             && source.owner_transaction == plan.source.owner_transaction
             && source.owner_inclusion == plan.source.owner_inclusion
-            && source.owner_derivation == plan.source.owner_derivation;
+            && source.owner_derivation == plan.source.owner_derivation
+            && source.action_context.owner_coin == plan.source.action_context.owner_coin;
         let action_terms_match = match plan.action {
             HnsNameAction::Transfer => plan.finalize.is_none(),
             HnsNameAction::Finalize => {
@@ -2400,45 +2519,39 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                                     }
                                     Some(_) => return Err(HnsWalletError::InvalidEvidence),
                                     None => {
-                                        let context = self.backend.get_name_action_context(
-                                            HnsNameAction::Finalize,
-                                            workflow.plan.name_hash,
-                                            binding,
-                                            mempool,
-                                        )?;
-                                        let state = NameState::decode(
-                                            NameHash::new(workflow.plan.name_hash),
-                                            &context.current_state,
-                                        )
-                                        .map_err(|_| HnsWalletError::InvalidEvidence)?;
-                                        validate_name_action_context(
-                                            &config,
-                                            HnsNameAction::Finalize,
-                                            workflow.plan.name_hash,
-                                            HnsOutpoint {
-                                                transaction: transaction_id,
-                                                output_index: 0,
-                                            },
-                                            inclusion,
-                                            binding,
-                                            mempool,
-                                            &state,
-                                            &context,
-                                            false,
-                                            false,
-                                        )?;
-                                        if let (Some(height), Some(hash)) = (
-                                            context.renewal_block_height,
-                                            context.renewal_block_hash,
-                                        ) {
-                                            let block =
-                                                self.backend.get_block_hash(height, binding)?;
-                                            if block.binding != binding
-                                                || block.height != height
-                                                || block.block_hash != Some(hash)
-                                            {
-                                                return Err(HnsWalletError::InvalidEvidence);
-                                            }
+                                        let (context, _, owner_coin) = self
+                                            .require_action_context_v2(
+                                                &config,
+                                                HnsNameAction::Finalize,
+                                                workflow.plan.name_hash,
+                                                binding,
+                                                mempool,
+                                                false,
+                                                false,
+                                            )?;
+                                        let owner_output = transaction
+                                            .outputs
+                                            .first()
+                                            .ok_or(HnsWalletError::InvalidEvidence)?;
+                                        let owner_height = u32::try_from(inclusion.height)
+                                            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+                                        let expected_owner_outpoint = Outpoint {
+                                            transaction_hash: CanonicalTransactionHash::new(
+                                                transaction_id.into_bytes(),
+                                            ),
+                                            index: 0,
+                                        };
+                                        if owner_coin.outpoint != expected_owner_outpoint
+                                            || owner_coin.value != owner_output.value
+                                            || owner_coin.height.get() != owner_height
+                                            || owner_coin.coinbase
+                                            || owner_coin.address != owner_output.address
+                                            || owner_coin.covenant != owner_output.covenant
+                                            || context.owner_inclusion.height != inclusion.height
+                                            || context.owner_inclusion.block_hash
+                                                != inclusion.block_hash
+                                        {
+                                            return Err(HnsWalletError::InvalidEvidence);
                                         }
                                         action_already_in_mempool =
                                             context.mempool_spender.is_some();
@@ -2735,29 +2848,28 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         if recipient_display != request.recipient {
             return Err(HnsWalletError::InvalidAddress);
         }
-        let authority = self.verify_name_ownership(&request.name)?;
-        let context = self.transfer_action_context(&authority)?;
-        let state = NameState::decode(
-            NameHash::new(authority.name_hash),
-            authority.current_state(),
-        )
-        .map_err(|_| HnsWalletError::InvalidEvidence)?;
-        let source = tracked_name_source(
+        let authority =
+            self.verify_wallet_name_action_v2(&request.name, HnsNameAction::Transfer)?;
+        if authority.recipient.is_some() {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let state = NameState::decode(NameHash::new(authority.name_hash), &authority.current_state)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        let source = tracked_name_source_from_coin(
             authority.binding,
-            authority.owner_outpoint,
-            &authority.owner_output,
+            &authority.owner_coin,
             authority.owner_inclusion,
-            authority.derivation,
+            authority.owner_derivation,
         )?;
         let source_evidence = HnsNameSourceEvidence {
             preparation_binding: authority.binding,
             preparation_mempool: authority.mempool,
-            current_name_state: authority.current_state,
+            current_name_state: authority.current_state.clone(),
             owner_outpoint: authority.owner_outpoint,
-            owner_transaction: authority.owner_transaction,
+            owner_transaction: Vec::new(),
             owner_inclusion: authority.owner_inclusion,
-            owner_derivation: authority.derivation,
-            action_context: context,
+            owner_derivation: authority.owner_derivation,
+            action_context: authority.context,
         };
         self.persist_prepared_name_operation(
             account,
@@ -2798,25 +2910,29 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let account_revision = cache.account_revision;
         let cached_coins = cache.coins.clone();
         drop(cache);
-        let authority = self.verify_outgoing_name_transfer(&request.name)?;
-        let recipient_display = encode_hns_address(account.config.network, &authority.recipient)?;
+        let authority =
+            self.verify_wallet_name_action_v2(&request.name, HnsNameAction::Finalize)?;
+        let recipient = authority
+            .recipient
+            .clone()
+            .ok_or(HnsWalletError::InvalidEvidence)?;
+        let recipient_display = encode_hns_address(account.config.network, &recipient)?;
         if let Some(expected) = request.expected_recipient {
             let decoded = decode_hns_address(account.config.network, &expected)?;
             let expected_key = WalletAddressKey {
                 version: decoded.version,
                 hash: decoded.hash,
             };
-            if expected != recipient_display || expected_key != authority.recipient {
+            if expected != recipient_display || expected_key != recipient {
                 return Err(HnsWalletError::InvalidPreparedArtifact);
             }
         }
         let current_state =
             NameState::decode(NameHash::new(authority.name_hash), &authority.current_state)
                 .map_err(|_| HnsWalletError::InvalidEvidence)?;
-        let source = tracked_name_source(
+        let source = tracked_name_source_from_coin(
             authority.binding,
-            authority.owner_outpoint,
-            &authority.owner_output,
+            &authority.owner_coin,
             authority.owner_inclusion,
             authority.owner_derivation,
         )?;
@@ -2849,9 +2965,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let source_evidence = HnsNameSourceEvidence {
             preparation_binding: authority.binding,
             preparation_mempool: authority.mempool,
-            current_name_state: authority.current_state,
+            current_name_state: authority.current_state.clone(),
             owner_outpoint: authority.owner_outpoint,
-            owner_transaction: authority.owner_transaction,
+            owner_transaction: Vec::new(),
             owner_inclusion: authority.owner_inclusion,
             owner_derivation: authority.owner_derivation,
             action_context: authority.context,
@@ -2867,7 +2983,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             source_evidence,
             source,
             current_state,
-            authority.recipient,
+            recipient,
             recipient_display,
             Some(finalize),
             request.maximum_fee,
@@ -2877,6 +2993,155 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
 
     // Each value is separately checked against node evidence and cached
     // bindings, so this domain validation boundary intentionally stays flat.
+    #[allow(clippy::too_many_arguments)]
+    fn require_action_context_v2(
+        &self,
+        config: &HnsRuntimeConfig,
+        action: HnsNameAction,
+        name_hash: [u8; 32],
+        binding: SnapshotBinding,
+        mempool: MempoolSnapshotBinding,
+        require_eligible: bool,
+        reject_mempool_spender: bool,
+    ) -> Result<(NameActionContextEvidence, NameState, Coin), HnsWalletError> {
+        let context = self
+            .backend
+            .get_name_action_context_v2(action, name_hash, binding, mempool)?;
+        if context.context_version != NAME_ACTION_CONTEXT_V2_VERSION
+            || !context.owner_transaction.is_empty()
+        {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let owner_coin = context
+            .owner_coin
+            .as_ref()
+            .ok_or(HnsWalletError::InvalidEvidence)?
+            .to_canonical_coin()?;
+        let state = NameState::decode(NameHash::new(name_hash), &context.current_state)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        validate_name_action_context(
+            config,
+            action,
+            name_hash,
+            context.owner_outpoint,
+            context.owner_inclusion,
+            binding,
+            mempool,
+            &state,
+            &context,
+            require_eligible,
+            reject_mempool_spender,
+        )?;
+        if let (Some(height), Some(expected_hash)) =
+            (context.renewal_block_height, context.renewal_block_hash)
+        {
+            let block = self.backend.get_block_hash(height, binding)?;
+            if block.binding != binding
+                || block.height != height
+                || block.block_hash != Some(expected_hash)
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+        }
+        let cache = self.cache_read()?;
+        if cache.binding != Some(binding) || cache.mempool_binding != Some(mempool) {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        Ok((context, state, owner_coin))
+    }
+
+    fn verify_wallet_name_action_v2(
+        &self,
+        name: &[u8],
+        action: HnsNameAction,
+    ) -> Result<VerifiedWalletNameActionV2, HnsWalletError> {
+        if !validate_name(name) {
+            return Err(HnsWalletError::InvalidName);
+        }
+        let name_hash = hash_name(name)
+            .map_err(|_| HnsWalletError::InvalidName)?
+            .into_bytes();
+        let cache = self.cache_read()?;
+        let binding = cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?;
+        let mempool = cache
+            .mempool_binding
+            .ok_or(HnsWalletError::StaleNodeSnapshot)?;
+        let config = cache.account.config.clone();
+        drop(cache);
+        let wallet_name_addresses = {
+            let store = self.store_lock()?;
+            persisted_name_addresses(&store, &config)?
+        };
+        validate_wallet_name_addresses(&wallet_name_addresses)?;
+        let (context, state, owner_coin) = self
+            .require_action_context_v2(&config, action, name_hash, binding, mempool, true, true)?;
+        if state.name.as_slice() != name
+            || !state.registered
+            || state.expired
+            || state.revoked.get() != 0
+            || owner_coin.address.version != 0
+            || owner_coin.address.hash.len() != 20
+        {
+            return Err(HnsWalletError::NameNotOwned);
+        }
+        match action {
+            HnsNameAction::Transfer if state.transfer.get() != 0 => {
+                return Err(HnsWalletError::NameNotOwned);
+            }
+            HnsNameAction::Finalize if state.transfer.get() == 0 => {
+                return Err(HnsWalletError::NameNotOwned);
+            }
+            _ => {}
+        }
+        let mut matches = wallet_name_addresses.iter().filter(|address| {
+            address.derivation.role == KeyRole::HnsName
+                && address.derivation.change == 0
+                && address.program == owner_coin.address.hash
+        });
+        let owner_derivation = matches
+            .next()
+            .map(|address| address.derivation)
+            .ok_or(HnsWalletError::NameNotOwned)?;
+        if matches.next().is_some() {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let recipient = match action {
+            HnsNameAction::Transfer => None,
+            HnsNameAction::Finalize => {
+                let transfer = TransferCovenant::try_from(&owner_coin.covenant)
+                    .map_err(|_| HnsWalletError::InvalidEvidence)?;
+                Some(WalletAddressKey {
+                    version: transfer.recipient_version,
+                    hash: transfer.recipient_hash,
+                })
+            }
+        };
+        let owner_outpoint = HnsOutpoint {
+            transaction: TransactionHash::new(owner_coin.outpoint.transaction_hash.into_bytes()),
+            output_index: owner_coin.outpoint.index,
+        };
+        if owner_outpoint != context.owner_outpoint {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let cache = self.cache_read()?;
+        if cache.binding != Some(binding) || cache.mempool_binding != Some(mempool) {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        Ok(VerifiedWalletNameActionV2 {
+            binding,
+            mempool,
+            name: state.name.clone(),
+            name_hash,
+            current_state: context.current_state.clone(),
+            owner_outpoint,
+            owner_coin,
+            owner_inclusion: context.owner_inclusion,
+            owner_derivation,
+            recipient,
+            context,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn require_action_context(
         &self,
@@ -2922,29 +3187,6 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
         Ok(context)
-    }
-
-    fn transfer_action_context(
-        &self,
-        authority: &VerifiedNameOwnership,
-    ) -> Result<NameActionContextEvidence, HnsWalletError> {
-        let config = self.cache_read()?.account.config.clone();
-        let state = NameState::decode(
-            NameHash::new(authority.name_hash),
-            authority.current_state(),
-        )
-        .map_err(|_| HnsWalletError::InvalidEvidence)?;
-        self.require_action_context(
-            &config,
-            HnsNameAction::Transfer,
-            authority.name_hash,
-            authority.owner_outpoint,
-            authority.owner_inclusion,
-            authority.binding,
-            authority.mempool,
-            &state,
-            true,
-        )
     }
 
     /// Reacquire current, unspent chain authority for one exact Shakedex lock.
@@ -3098,74 +3340,18 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         &self,
         name: &[u8],
     ) -> Result<VerifiedOutgoingNameTransfer, HnsWalletError> {
-        let cache = self.cache_read()?;
-        let binding = cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?;
-        let mempool = cache
-            .mempool_binding
-            .ok_or(HnsWalletError::StaleNodeSnapshot)?;
-        let config = cache.account.config.clone();
-        drop(cache);
-        let wallet_name_addresses = {
-            let store = self.store_lock()?;
-            persisted_name_addresses(&store, &config)?
-        };
-        let validated =
-            validated_name_evidence(&self.backend, name, binding, Some(&wallet_name_addresses))?;
-        let current = validated.current.ok_or(HnsWalletError::NameNotOwned)?;
-        if !current.state.registered
-            || current.state.expired
-            || current.state.revoked.get() != 0
-            || current.state.transfer.get() == 0
-        {
-            return Err(HnsWalletError::NameNotOwned);
-        }
-        let (owner_derivation, recipient) = match &validated.known_name.ownership_status {
-            NameOwnershipStatus::OutgoingTransfer {
-                owner_derivation,
-                recipient,
-            } => (*owner_derivation, recipient.clone()),
-            _ => return Err(HnsWalletError::NameNotOwned),
-        };
-        let owner = current.owner.ok_or(HnsWalletError::NameNotOwned)?;
-        let owner_inclusion = owner.inclusion;
-        let transfer = TransferCovenant::try_from(&owner.output.covenant)
-            .map_err(|_| HnsWalletError::InvalidEvidence)?;
-        if transfer.recipient_version != recipient.version
-            || transfer.recipient_hash != recipient.hash
-            || u64::from(current.state.transfer.get()) != owner_inclusion.height
-        {
-            return Err(HnsWalletError::InvalidEvidence);
-        }
-        let context = self.require_action_context(
-            &config,
-            HnsNameAction::Finalize,
-            validated.known_name.name_hash,
-            owner.outpoint,
-            owner_inclusion,
-            binding,
-            mempool,
-            &current.state,
-            true,
-        )?;
-        if self.cache_read()?.binding != Some(binding) {
-            return Err(HnsWalletError::StaleNodeSnapshot);
-        }
+        let authority = self.verify_wallet_name_action_v2(name, HnsNameAction::Finalize)?;
+        let recipient = authority.recipient.ok_or(HnsWalletError::InvalidEvidence)?;
         Ok(VerifiedOutgoingNameTransfer {
-            binding,
-            mempool,
-            name: validated.known_name.name,
-            name_hash: validated.known_name.name_hash,
-            current_state: validated
-                .known_name
-                .current_state
-                .ok_or(HnsWalletError::InvalidEvidence)?,
-            owner_outpoint: owner.outpoint,
-            owner_transaction: owner.raw_transaction,
-            owner_output: owner.output,
-            owner_inclusion,
-            owner_derivation,
+            binding: authority.binding,
+            mempool: authority.mempool,
+            name: authority.name,
+            name_hash: authority.name_hash,
+            owner_outpoint: authority.owner_outpoint,
+            owner_inclusion: authority.owner_inclusion,
+            owner_derivation: authority.owner_derivation,
             recipient,
-            context,
+            context: authority.context,
         })
     }
 
@@ -3690,6 +3876,7 @@ mod tests {
             current_state: state.encode().expect("state"),
             owner_outpoint,
             owner_transaction: transfer_transaction.encode().expect("transfer"),
+            owner_coin: None,
             owner_inclusion: TransactionInclusion {
                 block_hash: [81; 32],
                 height: 400,
@@ -3724,6 +3911,94 @@ mod tests {
             true,
         )
         .expect("eligible context");
+        let legacy_json = serde_json::to_value(&context).expect("legacy context JSON");
+        assert!(legacy_json.get("owner_coin").is_none());
+        assert_eq!(
+            serde_json::from_value::<NameActionContextEvidence>(legacy_json)
+                .expect("legacy context remains decodable"),
+            context
+        );
+
+        let owner_output = &transfer_transaction.outputs[0];
+        let active_owner_coin = Coin {
+            outpoint: CanonicalOutpoint {
+                transaction_hash: transfer_hash,
+                index: 0,
+            },
+            value: owner_output.value,
+            height: Height::new(400),
+            coinbase: false,
+            address: owner_output.address.clone(),
+            covenant: owner_output.covenant.clone(),
+        };
+        let mut pruning_safe = context.clone();
+        pruning_safe.context_version = NAME_ACTION_CONTEXT_V2_VERSION;
+        pruning_safe.owner_transaction.clear();
+        pruning_safe.owner_coin = Some(
+            HnsInputCoinEvidence::from_canonical_coin(&active_owner_coin)
+                .expect("active owner evidence"),
+        );
+        pruning_safe.owner_inclusion.transaction_index = None;
+        let pruning_safe_json =
+            serde_json::to_value(&pruning_safe).expect("pruning-safe context JSON");
+        assert!(pruning_safe_json.get("owner_coin").is_some());
+        assert_eq!(
+            serde_json::from_value::<NameActionContextEvidence>(pruning_safe_json)
+                .expect("pruning-safe context remains decodable"),
+            pruning_safe
+        );
+        validate_name_action_context(
+            &account.config,
+            HnsNameAction::Finalize,
+            state.name_hash.into_bytes(),
+            owner_outpoint,
+            pruning_safe.owner_inclusion,
+            binding,
+            mempool,
+            &state,
+            &pruning_safe,
+            true,
+            true,
+        )
+        .expect("eligible pruning-safe context");
+
+        let mut mixed_sources = pruning_safe.clone();
+        mixed_sources.owner_transaction = transfer_transaction.encode().expect("transfer");
+        assert!(
+            validate_name_action_context(
+                &account.config,
+                HnsNameAction::Finalize,
+                state.name_hash.into_bytes(),
+                owner_outpoint,
+                mixed_sources.owner_inclusion,
+                binding,
+                mempool,
+                &state,
+                &mixed_sources,
+                true,
+                true,
+            )
+            .is_err()
+        );
+
+        let mut invented_position = pruning_safe;
+        invented_position.owner_inclusion.transaction_index = Some(0);
+        assert!(
+            validate_name_action_context(
+                &account.config,
+                HnsNameAction::Finalize,
+                state.name_hash.into_bytes(),
+                owner_outpoint,
+                invented_position.owner_inclusion,
+                binding,
+                mempool,
+                &state,
+                &invented_position,
+                true,
+                true,
+            )
+            .is_err()
+        );
 
         let mut mismatch = context.clone();
         mismatch.finalize_eligible_height = Some(411);

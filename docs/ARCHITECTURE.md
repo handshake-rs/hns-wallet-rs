@@ -291,16 +291,23 @@ restart/reorg/regtest qualification remain pending. All Shakedex and dependent
 HNS Shakedex-funding/value/fee release gates remain `false`, so preparation,
 authorization, and submission cannot execute in a released product.
 
-Wallet-owned name actions additionally consume the node's versioned
-`name_action_context` for the exact chain epoch, tip, mempool instance and
+Wallet-owned name actions consume the node's pruning-safe version-2
+`name_action_context_v2` for the exact chain epoch, tip, mempool instance and
 generation. The wallet independently binds chain identity, candidate height,
-canonical state, owner transaction and active-chain inclusion, fixed ordered
-ineligibility reasons, owner mempool spender, transfer lockup, FINALIZE
-maturity, and the HSD-selected active-chain renewal block. TRANSFER preserves
-the name value at canonical input/output zero. Direct FINALIZE derives its
-destination from the authenticated TRANSFER covenant and is signed by the
-outgoing owner's `HnsName` key; incoming-recipient classification is not
-signing authority.
+canonical NameState bytes, the exact active-owner Coin and active-chain
+inclusion, fixed ordered ineligibility reasons, owner mempool spender, transfer
+lockup, FINALIZE maturity, and the HSD-selected active-chain renewal block. It
+then matches the Coin address to one exact persisted `HnsName` derivation;
+neither the trusted-node UTXO projection nor contextual eligibility asserts
+wallet ownership. TRANSFER preserves the name value at canonical input/output
+zero. Direct FINALIZE derives its destination from the authenticated TRANSFER
+covenant and is signed by the outgoing owner's `HnsName` key;
+incoming-recipient classification is not signing authority. Legacy persisted
+version-1 plans remain decodable but cannot silently inherit version-2
+authority and require reapproval. Shakedex descriptor-linked TRANSFER
+verification retains version 1 because it separately binds the owner
+transaction's previous input; the Coin-only v2 projection must not invent that
+linkage.
 
 Name workflow IDs deterministically bind account, action, and request nonce.
 Preparation atomically saves the encrypted workflow plus separately typed name
@@ -320,7 +327,8 @@ The concrete synchronous HNS adapter speaks the authenticated loopback
 `hns-node-rs` wallet RPC v1 boundary whose script-free `chain_snapshot` source
 was introduced at exact node commit
 `2b267ffe7fc6f9929063a18986a83b566d02ae6d`. Selected qualified node main
-`2712d1dbb74934038188637dccf27d58fbc39a48` contains that unchanged API. This is
+`4275b4e06a07ae3a4afe2db72bdd7c58d2fb1661` contains that unchanged API plus
+the additive pruning-safe `name_action_context_v2` method. This is
 an exact compatibility pairing, not a Cargo dependency or claim that a node is
 embedded in the wallet. The adapter derives canonical ScriptIds, enforces full
 chain/mempool bindings, and validates HTTP, JSON, transaction, spender, name,

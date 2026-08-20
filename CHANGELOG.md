@@ -40,6 +40,16 @@ boundary:
   monotonic wallet-bearing `HnsName` derivation rotation, non-wallet
   non-advancement, and minimized service/mobile output. Provider/browser import
   and all value gates remain unavailable;
+- strict additive consumption of the node wallet RPC
+  `name_action_context_v2` response. Wallet-owned TRANSFER and direct-FINALIZE
+  preparation/reacquisition now retain exact active-owner Coin evidence rather
+  than requiring a pruned owner transaction, independently revalidate the
+  canonical NameState, Coin, covenant, inclusion, chain/mempool identity,
+  ordered policy reasons, and wallet derivation, and force legacy version-1
+  prepared sources through reapproval instead of silently upgrading their
+  authority. Descriptor-linked Shakedex paths deliberately retain version 1
+  until a separate pruning-safe previous-input linkage exists. This wiring
+  changes neither fixed HNS value gate;
 - persistence-first Shakedex and chain-neutral market state machines whose live
   product and value gates remain disabled, including a bounded encrypted/CAS
   offline Denuo V2 offer/cancellation outbox with exact-envelope restart

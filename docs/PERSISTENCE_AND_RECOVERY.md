@@ -392,6 +392,16 @@ cancellation, or conflict releases them atomically. A formerly confirmed action
 that disappears becomes `ReapprovalRequired`; replacing an explicitly
 abandoned record requires a fresh request nonce and approval.
 
+New wallet-owned name plans persist context-version-2 active owner Coin
+evidence in a canonical serializable form and leave the legacy retained-owner-
+transaction field empty. Reload reconstructs the exact consensus Coin and
+rejects mixed v1/v2 sources, a non-null invented transaction position,
+outpoint/state/inclusion disagreement, or a noncanonical covenant. Historical
+v1 JSON remains decodable because the new Coin field is optional and omitted
+from v1 serialization, but a subsequent v2 reacquisition does not match that
+historical source and therefore requires explicit reapproval. This is a safe
+authority transition, not a migration that reuses an old approval.
+
 ## HNS change derivations
 
 Send preparation and settlement-lock preparation commit account change-index
