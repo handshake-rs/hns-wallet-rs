@@ -58,13 +58,14 @@ pub use plans::{
     save_seller_lock_plan,
 };
 pub use seller_offer::{
-    MAX_SELLER_LISTING_LIFETIME_SECONDS, MIN_SELLER_LISTING_LIFETIME_SECONDS, PrepareSellerOffer,
-    SellerOfferPreview, SellerOfferStage, ShakedexSellerPolicy, seller_offer_workflow_id,
+    MAX_SELLER_LISTING_LIFETIME_SECONDS, MAX_SELLER_OFFER_WORKFLOWS,
+    MIN_SELLER_LISTING_LIFETIME_SECONDS, PrepareSellerOffer, SellerOfferPreview, SellerOfferStage,
+    ShakedexSellerPolicy, seller_offer_workflow_id,
 };
 pub use trade_runtime::{
-    PrepareBuyerTrade, PrepareScriptFinalize, ShakedexStartupRecoveryEntry,
-    ShakedexStartupRecoveryReport, ShakedexTradePreview, ShakedexTradeRuntime,
-    buyer_trade_workflow_id,
+    MAX_SHAKEDEX_OFFER_PAGE_SIZE, PrepareBuyerTrade, PrepareScriptFinalize, ShakedexOfferPage,
+    ShakedexOfferPreview, ShakedexStartupRecoveryEntry, ShakedexStartupRecoveryReport,
+    ShakedexTradePreview, ShakedexTradeRuntime, buyer_trade_workflow_id,
 };
 pub use transactions::{
     CurrentPreparedSellerRecovery, MAX_SHAKEDEX_FUNDING_INPUTS, PreparedBuyerFulfillment,

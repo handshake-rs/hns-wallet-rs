@@ -811,7 +811,7 @@ pub(super) fn expected_chain_identity(
     Ok((network_id, genesis_hash))
 }
 
-fn encode_hns_address(
+pub(super) fn encode_hns_address(
     network: HnsNetwork,
     address: &WalletAddressKey,
 ) -> Result<String, HnsWalletError> {

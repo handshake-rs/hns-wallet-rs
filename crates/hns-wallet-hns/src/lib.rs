@@ -3331,6 +3331,24 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .map_err(HnsShakedexKeyAllocationError::Wallet)
     }
 
+    /// Project a canonical public address from authenticated Shakedex terms
+    /// onto the selected Handshake network. This exposes only the ordinary
+    /// bech32 display string; it does not expose a derivation, key, coin, or
+    /// signing capability.
+    pub fn shakedex_address_display(&self, address: &Address) -> Result<String, HnsWalletError> {
+        address
+            .validate()
+            .map_err(|_| HnsWalletError::InvalidAddress)?;
+        let network = self.cache_read()?.account.config.network;
+        name_workflow::encode_hns_address(
+            network,
+            &WalletAddressKey {
+                version: address.version,
+                hash: address.hash.clone(),
+            },
+        )
+    }
+
     /// Re-derive a purpose-bound, redacted seller signer after authenticating
     /// the complete protected allocation topology and recovery-seed binding.
     pub fn load_shakedex_signer(

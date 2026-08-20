@@ -263,6 +263,13 @@ impl ProviderMethod {
                 | Self::HnsTransferName
                 | Self::HnsFinalizeName
                 | Self::HnsSignTypedMessage
+                | Self::NameMarketListOffers
+                | Self::NameMarketCreateFixedPriceOffer
+                | Self::NameMarketCancelOffer
+                | Self::NameMarketAcceptOffer
+                | Self::NameMarketGetSession
+                | Self::NameMarketFinalizePurchase
+                | Self::NameMarketRecoverName
         )
     }
 
@@ -1447,7 +1454,7 @@ mod tests {
             .into_iter()
             .filter(|method| method.requires_hns_namespace())
             .collect::<Vec<_>>();
-        assert_eq!(hns_methods.len(), 12);
+        assert_eq!(hns_methods.len(), 19);
         for (index, method) in hns_methods.into_iter().enumerate() {
             let request = serde_json::to_vec(&serde_json::json!({
                 "method": method.wire_name(),

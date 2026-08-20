@@ -1,7 +1,7 @@
 use hns_covenants::{hash_name, validate_name};
 use hns_marketplace_protocol::DenuoRegistryVersion;
 use hns_primitives::Dollarydoos;
-use hns_swap::{FixedPriceListing, SwapProof};
+use hns_swap::{FixedPriceListing, ListingCancellation, SwapProof};
 use hns_transaction::Address;
 use hns_wallet_hns::{
     HnsBackend, HnsClock, HnsShakedexKeyAllocationRequest, HnsShakedexSellerTerms, HnsWalletRuntime,
@@ -11,14 +11,19 @@ use hns_wallet_types::{AccountId, BaseUnits, ObjectHash, WalletId, WorkflowId, W
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::outbox::enqueue_denuo_offer_and_save_workflow;
+use crate::outbox::{
+    enqueue_denuo_cancellation_and_save_workflow, enqueue_denuo_offer_and_save_workflow,
+};
 use crate::{
     DenuoOutboxState, ShakedexError, authenticate_fixed_price_listing,
-    decode_denuo_authenticated_offer, denuo_outbox_envelope_id, encode_denuo_offer,
-    load_denuo_publication_outbox, verify_fixed_price_listing,
+    authenticate_listing_cancellation, decode_denuo_authenticated_cancellation,
+    decode_denuo_authenticated_offer, denuo_outbox_envelope_id, encode_denuo_cancellation,
+    encode_denuo_offer, load_denuo_publication_outbox, verify_fixed_price_listing,
+    verify_listing_cancellation,
 };
 
 const SELLER_OFFER_SCHEMA_VERSION: u16 = 1;
+pub const MAX_SELLER_OFFER_WORKFLOWS: usize = 10_000;
 pub const MIN_SELLER_LISTING_LIFETIME_SECONDS: u64 = 10 * 60;
 pub const MAX_SELLER_LISTING_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
 const LOCKTIME_SAFETY_SECONDS: u64 = 1_024;
@@ -61,6 +66,7 @@ pub struct PrepareSellerOffer {
 pub enum SellerOfferStage {
     NameLockRequired,
     PublicationQueued,
+    CancellationQueued,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -68,6 +74,17 @@ pub enum SellerOfferStage {
 struct QueuedSellerListing {
     listing_hash: ObjectHash,
     listing_bytes: Vec<u8>,
+    request_id: u64,
+    envelope_id: ObjectHash,
+    envelope_bytes: Vec<u8>,
+    queued_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueuedSellerCancellation {
+    cancellation_hash: ObjectHash,
+    cancellation_bytes: Vec<u8>,
     request_id: u64,
     envelope_id: ObjectHash,
     envelope_bytes: Vec<u8>,
@@ -88,6 +105,8 @@ struct SellerOfferWorkflow {
     created_at_unix: u64,
     stage: SellerOfferStage,
     queued_listing: Option<QueuedSellerListing>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queued_cancellation: Option<QueuedSellerCancellation>,
 }
 
 impl SellerOfferWorkflow {
@@ -120,37 +139,37 @@ impl SellerOfferWorkflow {
         {
             return Err(ShakedexError::InvalidEvidence);
         }
-        match (&self.stage, &self.queued_listing) {
-            (SellerOfferStage::NameLockRequired, None) => Ok(()),
-            (SellerOfferStage::PublicationQueued, Some(queued)) => {
-                let listing =
-                    authenticate_fixed_price_listing(&queued.listing_bytes, queued.listing_hash)?;
-                let (request_id, envelope_listing) = decode_denuo_authenticated_offer(
-                    &queued.envelope_bytes,
-                    DenuoRegistryVersion::V2,
-                    queued.listing_hash,
+        match (self.stage, &self.queued_listing, &self.queued_cancellation) {
+            (SellerOfferStage::NameLockRequired, None, None) => Ok(()),
+            (SellerOfferStage::PublicationQueued, Some(queued), None) => {
+                validate_queued_listing(self, queued).map(|_| ())
+            }
+            (
+                SellerOfferStage::CancellationQueued,
+                Some(queued_listing),
+                Some(queued_cancellation),
+            ) => {
+                let listing = validate_queued_listing(self, queued_listing)?;
+                let cancellation = authenticate_listing_cancellation(
+                    &queued_cancellation.cancellation_bytes,
+                    queued_listing.listing_hash,
+                    queued_cancellation.cancellation_hash,
                 )?;
-                if request_id != queued.request_id
-                    || envelope_listing.encoded() != listing.encoded()
-                    || listing.name() != self.allocation_request.name
-                    || listing.price_base_units()
-                        != u64::try_from(self.allocation_request.seller_terms.price.get())
-                            .map_err(|_| ShakedexError::InvalidEvidence)?
-                    || listing.proof().payment_address
-                        != self.allocation_request.seller_terms.payment_address
-                    || listing.proof().lock_time_seconds
-                        != self.allocation_request.seller_terms.lock_time_seconds
-                    || listing.proof().fee_address
-                        != self.allocation_request.seller_terms.fee_address
-                    || listing.proof().fee != self.allocation_request.seller_terms.fee
-                    || listing.expires_at_unix()
-                        != listing
-                            .created_at_unix()
-                            .checked_add(self.listing_lifetime_seconds)
-                            .ok_or(ShakedexError::Invariant)?
-                    || listing.sequence() != 1
-                    || queued.queued_at_unix != listing.created_at_unix()
-                    || denuo_outbox_envelope_id(&queued.envelope_bytes)? != queued.envelope_id
+                let (request_id, envelope_cancellation) = decode_denuo_authenticated_cancellation(
+                    &queued_cancellation.envelope_bytes,
+                    DenuoRegistryVersion::V2,
+                    queued_listing.listing_hash,
+                    queued_cancellation.cancellation_hash,
+                )?;
+                if request_id != queued_cancellation.request_id
+                    || envelope_cancellation.encoded() != cancellation.encoded()
+                    || cancellation.seller_public_key() != listing.seller_public_key()
+                    || cancellation.sequence() != listing.sequence().saturating_add(1)
+                    || cancellation.created_at_unix() < listing.created_at_unix()
+                    || cancellation.expires_at_unix() < listing.expires_at_unix()
+                    || queued_cancellation.queued_at_unix != cancellation.created_at_unix()
+                    || denuo_outbox_envelope_id(&queued_cancellation.envelope_bytes)?
+                        != queued_cancellation.envelope_id
                 {
                     return Err(ShakedexError::InvalidEvidence);
                 }
@@ -161,16 +180,53 @@ impl SellerOfferWorkflow {
     }
 }
 
+fn validate_queued_listing(
+    workflow: &SellerOfferWorkflow,
+    queued: &QueuedSellerListing,
+) -> Result<crate::AuthenticatedFixedPriceListing, ShakedexError> {
+    let listing = authenticate_fixed_price_listing(&queued.listing_bytes, queued.listing_hash)?;
+    let (request_id, envelope_listing) = decode_denuo_authenticated_offer(
+        &queued.envelope_bytes,
+        DenuoRegistryVersion::V2,
+        queued.listing_hash,
+    )?;
+    if request_id != queued.request_id
+        || envelope_listing.encoded() != listing.encoded()
+        || listing.name() != workflow.allocation_request.name
+        || listing.price_base_units() != workflow.allocation_request.seller_terms.price.get()
+        || listing.proof().payment_address
+            != workflow.allocation_request.seller_terms.payment_address
+        || listing.proof().lock_time_seconds
+            != workflow.allocation_request.seller_terms.lock_time_seconds
+        || listing.proof().fee_address != workflow.allocation_request.seller_terms.fee_address
+        || listing.proof().fee != workflow.allocation_request.seller_terms.fee
+        || listing.expires_at_unix()
+            != listing
+                .created_at_unix()
+                .checked_add(workflow.listing_lifetime_seconds)
+                .ok_or(ShakedexError::Invariant)?
+        || listing.sequence() != 1
+        || queued.queued_at_unix != listing.created_at_unix()
+        || denuo_outbox_envelope_id(&queued.envelope_bytes)? != queued.envelope_id
+    {
+        return Err(ShakedexError::InvalidEvidence);
+    }
+    Ok(listing)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SellerOfferPreview {
     pub revision: u64,
     pub workflow_id: WorkflowId,
+    pub request_nonce: u64,
     pub stage: SellerOfferStage,
     pub name: Vec<u8>,
     pub price: BaseUnits,
     pub lock_address: String,
+    pub listing_lifetime_seconds: u64,
     pub listing_hash: Option<ObjectHash>,
+    pub cancellation_hash: Option<ObjectHash>,
     pub publication_state: Option<DenuoOutboxState>,
 }
 
@@ -254,6 +310,7 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
             created_at_unix: now_unix,
             stage: SellerOfferStage::NameLockRequired,
             queued_listing: None,
+            queued_cancellation: None,
         };
         workflow.validate()?;
         let revision = self.store.try_with_store_mut(|store| {
@@ -281,7 +338,7 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
         let stored = self
             .load(workflow_id)?
             .ok_or(ShakedexError::InvalidTransition)?;
-        if stored.state.stage == SellerOfferStage::PublicationQueued {
+        if stored.state.stage != SellerOfferStage::NameLockRequired {
             return self.preview(stored);
         }
         let current_lock = self
@@ -380,6 +437,103 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
         })
     }
 
+    pub(crate) fn queue_cancellation(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<SellerOfferPreview, ShakedexError> {
+        let stored = self
+            .load(workflow_id)?
+            .ok_or(ShakedexError::InvalidTransition)?;
+        if stored.state.stage == SellerOfferStage::CancellationQueued {
+            return self.preview(stored);
+        }
+        if stored.state.stage != SellerOfferStage::PublicationQueued {
+            return Err(ShakedexError::InvalidTransition);
+        }
+        let queued_listing = stored
+            .state
+            .queued_listing
+            .as_ref()
+            .ok_or(ShakedexError::InvalidEvidence)?;
+        let listing = validate_queued_listing(&stored.state, queued_listing)?;
+        let current_lock = self
+            .hns
+            .verify_allocated_current_shakedex_lock(&stored.state.allocation_request)
+            .map_err(|_| ShakedexError::InvalidEvidence)?;
+        let signer = self
+            .hns
+            .load_shakedex_signer(&stored.state.allocation_request)
+            .map_err(|_| ShakedexError::InvalidEvidence)?;
+        let now_unix = self.hns.shakedex_now_unix()?;
+        let sequence = listing
+            .sequence()
+            .checked_add(1)
+            .ok_or(ShakedexError::Invariant)?;
+        let mut cancellation = ListingCancellation::for_listing(
+            listing.canonical(),
+            now_unix,
+            listing.expires_at_unix(),
+            sequence,
+        )
+        .map_err(|_| ShakedexError::InvalidCancellation)?;
+        signer
+            .sign_listing_cancellation(
+                &mut cancellation,
+                listing.canonical(),
+                current_lock.locking_coin(),
+                now_unix,
+            )
+            .map_err(|_| ShakedexError::InvalidEvidence)?;
+        let cancellation_bytes = cancellation
+            .encode()
+            .map_err(|_| ShakedexError::InvalidCancellation)?;
+        let verified = verify_listing_cancellation(
+            &cancellation_bytes,
+            &listing,
+            current_lock.descriptor().network,
+            now_unix,
+        )?;
+        let cancellation_hash = verified.cancellation_hash();
+        let request_id = seller_cancellation_request_id(workflow_id, cancellation_hash);
+        let envelope_bytes =
+            encode_denuo_cancellation(DenuoRegistryVersion::V2, request_id, &verified)?;
+        let envelope_id = denuo_outbox_envelope_id(&envelope_bytes)?;
+        let mut next = stored.state.clone();
+        next.stage = SellerOfferStage::CancellationQueued;
+        next.queued_cancellation = Some(QueuedSellerCancellation {
+            cancellation_hash,
+            cancellation_bytes,
+            request_id,
+            envelope_id,
+            envelope_bytes: envelope_bytes.clone(),
+            queued_at_unix: now_unix,
+        });
+        next.validate()?;
+        let (revision, _, committed_envelope_id) = self.store.try_with_store_mut(|store| {
+            let current =
+                load_seller_offer(store, workflow_id)?.ok_or(ShakedexError::InvalidTransition)?;
+            if current.revision != stored.revision || current.state != stored.state {
+                return Err(ShakedexError::StaleRevision);
+            }
+            enqueue_denuo_cancellation_and_save_workflow(
+                store,
+                workflow_id,
+                stored.revision,
+                &next,
+                &envelope_bytes,
+                &verified,
+                now_unix,
+            )
+        })?;
+        if committed_envelope_id != envelope_id {
+            return Err(ShakedexError::Invariant);
+        }
+        self.preview(StoredSellerOffer {
+            revision,
+            state: next,
+        })
+    }
+
     pub(crate) fn load_preview(
         &self,
         workflow_id: WorkflowId,
@@ -389,6 +543,31 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
             .transpose()
     }
 
+    pub(crate) fn allocation_request(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<HnsShakedexKeyAllocationRequest, ShakedexError> {
+        self.load(workflow_id)?
+            .map(|stored| stored.state.allocation_request)
+            .ok_or(ShakedexError::InvalidTransition)
+    }
+
+    pub(crate) fn list_previews(&self) -> Result<Vec<SellerOfferPreview>, ShakedexError> {
+        let stored = self.store.try_with_store(|store| {
+            store
+                .list_workflows_complete::<SellerOfferWorkflow>(
+                    WorkflowKind::ShakedexSellerOffer,
+                    MAX_SELLER_OFFER_WORKFLOWS,
+                )
+                .map_err(ShakedexError::from)
+        })?;
+        stored
+            .into_iter()
+            .map(validate_stored_seller_offer)
+            .map(|stored| stored.and_then(|stored| self.preview(stored)))
+            .collect()
+    }
+
     fn load(&self, workflow_id: WorkflowId) -> Result<Option<StoredSellerOffer>, ShakedexError> {
         self.store
             .try_with_store(|store| load_seller_offer(store, workflow_id))
@@ -396,26 +575,38 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
 
     fn preview(&self, stored: StoredSellerOffer) -> Result<SellerOfferPreview, ShakedexError> {
         stored.state.validate()?;
-        let (listing_hash, publication_state) = match &stored.state.queued_listing {
-            Some(queued) => {
-                let outbox = self.store.try_with_store(load_denuo_publication_outbox)?;
-                (
-                    Some(queued.listing_hash),
-                    outbox.outbox.state(queued.envelope_id),
-                )
-            }
-            None => (None, None),
+        let outbox = self.store.try_with_store(load_denuo_publication_outbox)?;
+        let listing_hash = stored
+            .state
+            .queued_listing
+            .as_ref()
+            .map(|queued| queued.listing_hash);
+        let cancellation_hash = stored
+            .state
+            .queued_cancellation
+            .as_ref()
+            .map(|queued| queued.cancellation_hash);
+        let publication_state = match &stored.state.queued_cancellation {
+            Some(queued) => outbox.outbox.state(queued.envelope_id),
+            None => stored
+                .state
+                .queued_listing
+                .as_ref()
+                .and_then(|queued| outbox.outbox.state(queued.envelope_id)),
         };
         Ok(SellerOfferPreview {
             revision: stored.revision,
             workflow_id: stored.state.workflow_id,
+            request_nonce: stored.state.request_nonce,
             stage: stored.state.stage,
             name: stored.state.allocation_request.name,
             price: BaseUnits::new(u128::from(
                 stored.state.allocation_request.seller_terms.price.get(),
             )),
             lock_address: stored.state.lock_address,
+            listing_lifetime_seconds: stored.state.listing_lifetime_seconds,
             listing_hash,
+            cancellation_hash,
             publication_state,
         })
     }
@@ -499,6 +690,20 @@ fn seller_offer_request_id(workflow_id: WorkflowId, listing_hash: ObjectHash) ->
     hasher.update(workflow_id.as_bytes());
     hasher.update(listing_hash.as_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
-    let request_id = u64::from_be_bytes(digest[..8].try_into().expect("fixed digest prefix"));
+    let mut request_bytes = [0_u8; 8];
+    request_bytes.copy_from_slice(&digest[..8]);
+    let request_id = u64::from_be_bytes(request_bytes);
+    request_id.max(1)
+}
+
+fn seller_cancellation_request_id(workflow_id: WorkflowId, cancellation_hash: ObjectHash) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hns-wallet-rs/shakedex-seller-cancellation-request/v1");
+    hasher.update(workflow_id.as_bytes());
+    hasher.update(cancellation_hash.as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut request_bytes = [0_u8; 8];
+    request_bytes.copy_from_slice(&digest[..8]);
+    let request_id = u64::from_be_bytes(request_bytes);
     request_id.max(1)
 }

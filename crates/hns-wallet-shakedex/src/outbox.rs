@@ -981,6 +981,56 @@ pub(crate) fn enqueue_denuo_offer_and_save_workflow<W: Serialize>(
     Ok((workflow_revision, outbox_revision, enqueue.envelope_id()))
 }
 
+/// Atomically persist a seller-offer cancellation transition and enqueue the
+/// exact authenticated Denuo cancellation. This preserves the same crash
+/// boundary as offer publication: neither half can become durable alone.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn enqueue_denuo_cancellation_and_save_workflow<W: Serialize>(
+    store: &mut WalletStore,
+    workflow_id: WorkflowId,
+    expected_workflow_revision: u64,
+    workflow: &W,
+    envelope_bytes: &[u8],
+    cancellation: &VerifiedListingCancellation,
+    updated_at_unix: u64,
+) -> Result<(u64, u64, ObjectHash), ShakedexError> {
+    let mut stored = load_denuo_publication_outbox(store)?;
+    let enqueue =
+        stored
+            .outbox
+            .enqueue_cancellation(envelope_bytes, cancellation, updated_at_unix)?;
+    if !enqueue.inserted() {
+        return Err(ShakedexError::DenuoOutboxConflict);
+    }
+    validate_record_time(&stored.outbox, updated_at_unix)?;
+    validate_outbox_save_transition(store, stored.revision, &stored.outbox, updated_at_unix)?;
+    let outbox_revision = stored
+        .revision
+        .checked_add(1)
+        .ok_or(ShakedexError::Invariant)?;
+    let outbox_save = EntityBatchSave {
+        id: DENUO_OUTBOX_RECORD_ID.to_vec(),
+        expected_revision: stored.revision,
+        value: PersistedDenuoPublicationOutboxRef {
+            schema_version: stored.outbox.schema_version,
+            entries: &stored.outbox.entries,
+        },
+        updated_at_unix,
+    };
+    let workflow_revision = store.save_workflow_with_entity_batch(
+        workflow_id,
+        WorkflowKind::ShakedexSellerOffer,
+        expected_workflow_revision,
+        workflow,
+        false,
+        updated_at_unix,
+        EntityKind::DenuoBoardObject,
+        std::slice::from_ref(&outbox_save),
+        &[],
+    )?;
+    Ok((workflow_revision, outbox_revision, enqueue.envelope_id()))
+}
+
 fn validate_outbox_save_transition(
     store: &WalletStore,
     expected_revision: u64,

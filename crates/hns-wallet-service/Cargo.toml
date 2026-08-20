@@ -18,10 +18,12 @@ hns-wallet-chain-api.workspace = true
 hns-wallet-ffi.workspace = true
 hns-wallet-hns.workspace = true
 hns-wallet-provider.workspace = true
+hns-wallet-shakedex.workspace = true
 hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 

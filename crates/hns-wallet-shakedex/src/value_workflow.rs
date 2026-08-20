@@ -970,6 +970,30 @@ impl ShakedexValueWorkflow {
         self.recipient.to_address()
     }
 
+    /// Public seller payment destination committed by the authenticated
+    /// listing for buyer-originated workflows. Seller recovery has no buyer
+    /// payment destination and therefore returns `None`.
+    pub fn seller_payment_address(&self) -> Result<Option<Address>, ShakedexError> {
+        match &self.structural_plan {
+            StructuralPlan::Buyer { plan } => Ok(Some(
+                plan.authenticated_listing()?
+                    .proof()
+                    .payment_address
+                    .clone(),
+            )),
+            StructuralPlan::ScriptFinalize { parent, .. } => match parent.as_ref() {
+                ShakedexScriptFinalizeParent::BuyerFulfillment { plan } => Ok(Some(
+                    plan.authenticated_listing()?
+                        .proof()
+                        .payment_address
+                        .clone(),
+                )),
+                ShakedexScriptFinalizeParent::SellerRecovery { .. } => Ok(None),
+            },
+            StructuralPlan::Seller { .. } => Ok(None),
+        }
+    }
+
     pub fn name(&self) -> &[u8] {
         match &self.structural_plan {
             StructuralPlan::Buyer { plan } => plan.name(),
@@ -1002,6 +1026,21 @@ impl ShakedexValueWorkflow {
             StructuralPlan::Seller { .. } | StructuralPlan::ScriptFinalize { .. } => {
                 Ok(BaseUnits::ZERO)
             }
+        }
+    }
+
+    pub fn purchase_price_base_units(&self) -> Result<Option<BaseUnits>, ShakedexError> {
+        match &self.structural_plan {
+            StructuralPlan::Buyer { plan } => Ok(Some(BaseUnits::new(u128::from(
+                plan.authenticated_listing()?.price_base_units(),
+            )))),
+            StructuralPlan::ScriptFinalize { parent, .. } => match parent.as_ref() {
+                ShakedexScriptFinalizeParent::BuyerFulfillment { plan } => Ok(Some(
+                    BaseUnits::new(u128::from(plan.authenticated_listing()?.price_base_units())),
+                )),
+                ShakedexScriptFinalizeParent::SellerRecovery { .. } => Ok(None),
+            },
+            StructuralPlan::Seller { .. } => Ok(None),
         }
     }
 

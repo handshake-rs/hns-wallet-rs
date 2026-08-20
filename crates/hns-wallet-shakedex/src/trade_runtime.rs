@@ -7,6 +7,7 @@ use hns_wallet_types::{ApprovalId, BaseUnits, ObjectHash, WorkflowId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::board_runtime::CurrentDenuoBoardOffersResolution;
 use crate::seller_offer::SellerOfferRuntime;
 use crate::{
     BuyerLockPlan, DenuoBoardRuntime, MAX_SHAKEDEX_FUNDING_INPUTS, PrepareSellerOffer,
@@ -17,6 +18,8 @@ use crate::{
     prepare_current_script_finalize, prepare_current_seller_recovery, shakedex_value_workflow_id,
     verify_signed_buyer_fulfillment, verify_signed_seller_recovery,
 };
+
+pub const MAX_SHAKEDEX_OFFER_PAGE_SIZE: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PrepareBuyerTrade {
@@ -45,16 +48,29 @@ pub struct ShakedexTradePreview {
     pub name: Vec<u8>,
     pub listing_hash: Option<ObjectHash>,
     pub trade_value: BaseUnits,
+    pub purchase_price: Option<BaseUnits>,
     pub marketplace_fee: BaseUnits,
     pub network_fee: BaseUnits,
     pub maximum_network_fee: BaseUnits,
     pub expires_at_unix: u64,
+    pub recipient: String,
+    pub seller_payment_address: Option<String>,
     pub transaction: Option<hns_wallet_types::TransactionHash>,
 }
 
 impl ShakedexTradePreview {
-    fn from_stored(stored: &StoredShakedexValueWorkflow) -> Result<Self, ShakedexError> {
+    fn from_stored<B: HnsBackend, C: HnsClock>(
+        hns: &HnsWalletRuntime<B, C>,
+        stored: &StoredShakedexValueWorkflow,
+    ) -> Result<Self, ShakedexError> {
         stored.workflow.validate()?;
+        let recipient = hns.shakedex_address_display(&stored.workflow.recipient()?)?;
+        let seller_payment_address = stored
+            .workflow
+            .seller_payment_address()?
+            .as_ref()
+            .map(|address| hns.shakedex_address_display(address))
+            .transpose()?;
         Ok(Self {
             revision: stored.revision,
             workflow_id: stored.workflow.workflow_id(),
@@ -64,13 +80,39 @@ impl ShakedexTradePreview {
             name: stored.workflow.name().to_vec(),
             listing_hash: stored.workflow.listing_hash(),
             trade_value: stored.workflow.value_base_units(),
+            purchase_price: stored.workflow.purchase_price_base_units()?,
             marketplace_fee: stored.workflow.marketplace_fee_base_units()?,
             network_fee: stored.workflow.fee_base_units(),
             maximum_network_fee: stored.workflow.maximum_fee(),
             expires_at_unix: stored.workflow.expires_at_unix(),
+            recipient,
+            seller_payment_address,
             transaction: stored.workflow.transaction(),
         })
     }
+}
+
+/// Current, chain-revalidated marketplace discovery projection. Raw listing
+/// bytes, locking coins, outpoints, public keys, and transaction material are
+/// retained inside the runtime.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShakedexOfferPreview {
+    pub listing_hash: ObjectHash,
+    pub name: Vec<u8>,
+    pub price: BaseUnits,
+    pub marketplace_fee: BaseUnits,
+    pub seller_payment_address: String,
+    pub created_at_unix: u64,
+    pub expires_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShakedexOfferPage {
+    pub board_revision: u64,
+    pub offers: Vec<ShakedexOfferPreview>,
+    pub next_cursor: Option<ObjectHash>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -107,7 +149,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         }
         let board = DenuoBoardRuntime::new_value(hns, store.clone())?;
         let seller = SellerOfferRuntime::new(hns, store.clone())?;
-        let value = ShakedexValueRuntime::new(store, hns)?;
+        let value = ShakedexValueRuntime::new(store.clone(), hns)?;
         Ok(Self {
             hns,
             board,
@@ -131,11 +173,125 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         self.seller.queue_listing(workflow_id)
     }
 
+    pub fn cancel_seller_offer(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<SellerOfferPreview, ShakedexError> {
+        self.seller.queue_cancellation(workflow_id)
+    }
+
     pub fn load_seller_offer(
         &self,
         workflow_id: WorkflowId,
     ) -> Result<Option<SellerOfferPreview>, ShakedexError> {
         self.seller.load_preview(workflow_id)
+    }
+
+    pub fn list_seller_offers(&self) -> Result<Vec<SellerOfferPreview>, ShakedexError> {
+        self.seller.list_previews()
+    }
+
+    /// Advance a seller workflow once its exact script lock becomes current.
+    /// `InvalidEvidence` is left as a non-mutating waiting state because the
+    /// ordinary name TRANSFER may still be confirming; every successful
+    /// transition signs and queues the exact listing atomically.
+    pub fn advance_seller_offer(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<SellerOfferPreview, ShakedexError> {
+        let preview = self
+            .seller
+            .load_preview(workflow_id)?
+            .ok_or(ShakedexError::InvalidTransition)?;
+        if preview.stage != crate::SellerOfferStage::NameLockRequired {
+            return Ok(preview);
+        }
+        match self.seller.queue_listing(workflow_id) {
+            Ok(advanced) => Ok(advanced),
+            Err(ShakedexError::InvalidEvidence) => Ok(preview),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn recover_seller_publications(&self) -> Result<Vec<SellerOfferPreview>, ShakedexError> {
+        self.seller
+            .list_previews()?
+            .into_iter()
+            .map(|preview| self.advance_seller_offer(preview.workflow_id))
+            .collect()
+    }
+
+    pub fn list_current_offers(
+        &self,
+        cursor: Option<ObjectHash>,
+        limit: usize,
+    ) -> Result<ShakedexOfferPage, ShakedexError> {
+        if limit == 0 || limit > MAX_SHAKEDEX_OFFER_PAGE_SIZE {
+            return Err(ShakedexError::InvalidTransition);
+        }
+        let inventory = self.board.current_inventory()?;
+        let hashes = inventory.listing_hashes();
+        if hashes.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ShakedexError::CorruptNameMarketBoard);
+        }
+        let start = cursor.map_or(0, |cursor| hashes.partition_point(|hash| *hash <= cursor));
+        let selected = hashes
+            .get(start..)
+            .ok_or(ShakedexError::Invariant)?
+            .iter()
+            .take(limit)
+            .copied()
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Ok(ShakedexOfferPage {
+                board_revision: inventory.board_revision(),
+                offers: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let current = match self.board.current_offers(&selected)? {
+            CurrentDenuoBoardOffersResolution::Absent { board_revision } => {
+                if board_revision != inventory.board_revision() {
+                    return Err(ShakedexError::StaleRevision);
+                }
+                return Ok(ShakedexOfferPage {
+                    board_revision,
+                    offers: Vec::new(),
+                    next_cursor: None,
+                });
+            }
+            CurrentDenuoBoardOffersResolution::Current(current) => current,
+        };
+        if current.board_revision() != inventory.board_revision()
+            || current.listings().len() != selected.len()
+        {
+            return Err(ShakedexError::StaleRevision);
+        }
+        let offers = current
+            .listings()
+            .iter()
+            .map(|listing| {
+                Ok(ShakedexOfferPreview {
+                    listing_hash: listing.listing_hash(),
+                    name: listing.name().to_vec(),
+                    price: BaseUnits::new(u128::from(listing.price_base_units())),
+                    marketplace_fee: BaseUnits::new(u128::from(listing.proof().fee.get())),
+                    seller_payment_address: self
+                        .hns
+                        .shakedex_address_display(&listing.proof().payment_address)?,
+                    created_at_unix: listing.created_at_unix(),
+                    expires_at_unix: listing.expires_at_unix(),
+                })
+            })
+            .collect::<Result<Vec<_>, ShakedexError>>()?;
+        let next_cursor = (start + selected.len() < hashes.len())
+            .then(|| selected.last().copied())
+            .flatten();
+        Ok(ShakedexOfferPage {
+            board_revision: current.board_revision(),
+            offers,
+            next_cursor,
+        })
     }
 
     pub fn load_preview(
@@ -145,8 +301,25 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         self.value
             .load(workflow_id)?
             .as_ref()
-            .map(ShakedexTradePreview::from_stored)
+            .map(|stored| ShakedexTradePreview::from_stored(self.hns, stored))
             .transpose()
+    }
+
+    pub fn refresh_preview(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Option<ShakedexTradePreview>, ShakedexError> {
+        let Some(stored) = self.value.load(workflow_id)? else {
+            return Ok(None);
+        };
+        match stored.workflow.stage() {
+            ShakedexValueStage::Broadcast
+            | ShakedexValueStage::Mempool
+            | ShakedexValueStage::Confirming
+            | ShakedexValueStage::Confirmed
+            | ShakedexValueStage::Conflicted => self.reconcile(workflow_id).map(Some),
+            _ => ShakedexTradePreview::from_stored(self.hns, &stored).map(Some),
+        }
     }
 
     pub fn prepare_buyer_fulfillment(
@@ -180,7 +353,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
                 request.maximum_fee,
                 Some(request.listing_hash),
             )?;
-            return ShakedexTradePreview::from_stored(&existing);
+            return ShakedexTradePreview::from_stored(self.hns, &existing);
         }
 
         let offer = self
@@ -235,10 +408,19 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         let stored = self
             .value
             .save_prepared_with_change(&scope, &workflow, change.as_ref())?;
-        ShakedexTradePreview::from_stored(&stored)
+        ShakedexTradePreview::from_stored(self.hns, &stored)
     }
 
-    pub fn prepare_seller_recovery(
+    pub fn prepare_seller_offer_recovery(
+        &self,
+        seller_offer_workflow_id: WorkflowId,
+        maximum_fee: BaseUnits,
+    ) -> Result<ShakedexTradePreview, ShakedexError> {
+        let allocation_request = self.seller.allocation_request(seller_offer_workflow_id)?;
+        self.prepare_seller_recovery(&allocation_request, maximum_fee)
+    }
+
+    fn prepare_seller_recovery(
         &self,
         allocation_request: &HnsShakedexKeyAllocationRequest,
         maximum_fee: BaseUnits,
@@ -258,7 +440,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
                 maximum_fee,
                 None,
             )?;
-            return ShakedexTradePreview::from_stored(&existing);
+            return ShakedexTradePreview::from_stored(self.hns, &existing);
         }
         let current_lock = self
             .hns
@@ -314,7 +496,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         let stored = self
             .value
             .save_prepared_with_change(&scope, &workflow, change.as_ref())?;
-        ShakedexTradePreview::from_stored(&stored)
+        ShakedexTradePreview::from_stored(self.hns, &stored)
     }
 
     pub fn prepare_script_finalize(
@@ -341,7 +523,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
                 request.maximum_fee,
                 parent_value.workflow.listing_hash(),
             )?;
-            return ShakedexTradePreview::from_stored(&existing);
+            return ShakedexTradePreview::from_stored(self.hns, &existing);
         }
         let parent = parent_value.workflow.script_finalize_parent()?;
         let verified_parent = OwnedVerifiedParent::from_parent(&parent)?;
@@ -389,7 +571,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         let stored = self
             .value
             .save_prepared_with_change(&scope, &workflow, change.as_ref())?;
-        ShakedexTradePreview::from_stored(&stored)
+        ShakedexTradePreview::from_stored(self.hns, &stored)
     }
 
     pub fn register_approval(
@@ -418,7 +600,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
             .load(workflow_id)?
             .ok_or(ShakedexError::InvalidTransition)?;
         let authorized = self.value.authorize_current(&stored, approval_id, origin)?;
-        ShakedexTradePreview::from_stored(&authorized)
+        ShakedexTradePreview::from_stored(self.hns, &authorized)
     }
 
     pub fn submit(&self, workflow_id: WorkflowId) -> Result<ShakedexTradePreview, ShakedexError> {
@@ -432,7 +614,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
             ShakedexValueStage::RequiresRebroadcast => self.value.rebroadcast(&scope, &stored)?,
             _ => return Err(ShakedexError::InvalidTransition),
         };
-        ShakedexTradePreview::from_stored(&submitted)
+        ShakedexTradePreview::from_stored(self.hns, &submitted)
     }
 
     pub fn reconcile(
@@ -445,7 +627,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
             .load(workflow_id)?
             .ok_or(ShakedexError::InvalidTransition)?;
         let reconciled = self.value.reconcile(&scope, &stored)?;
-        ShakedexTradePreview::from_stored(&reconciled)
+        ShakedexTradePreview::from_stored(self.hns, &reconciled)
     }
 
     /// Resolve every durable value workflow before the installed service
