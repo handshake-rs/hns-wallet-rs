@@ -8,11 +8,13 @@ mod settlement_key;
 
 use std::collections::BTreeMap;
 
+use hns_marketplace_protocol::{AssetId, ChainId, DeadlineKind};
 use hns_wallet_store::{StoreError, WalletStore};
 use hns_wallet_types::{
     Amount, BaseUnits, ModuleId, ObjectHash, SessionId, WalletAsset, WorkflowId, WorkflowKind,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use intent_board::{
@@ -43,6 +45,8 @@ pub use settlement_key::{
 
 pub const MAX_ACTIVE_RESERVATIONS: usize = 64;
 pub const MAX_CONCURRENT_SWAP_SESSIONS: usize = 16;
+
+const DENUO_EXECUTION_WORKFLOW_DOMAIN: &[u8] = b"hns-wallet-rs/denuo-execution-workflow/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedQuote {
@@ -328,8 +332,8 @@ impl SwapSession {
         quote.validate(now_unix)?;
         timeouts.validate(now_unix)?;
         if first_module == second_module
-            || first_module.asset() != quote.offered.asset
-            || second_module.asset() != quote.received.asset
+            || !matches!(first_module.asset(), asset if asset == quote.offered.asset || asset == quote.received.asset)
+            || !matches!(second_module.asset(), asset if asset == quote.offered.asset || asset == quote.received.asset)
         {
             return Err(MarketError::InvalidPair);
         }
@@ -460,6 +464,167 @@ impl SwapSession {
         self.state = next;
         self.last_verified_at_unix = now_unix;
         Ok(())
+    }
+}
+
+/// Return the deterministic workflow identity for the executable side of one
+/// accepted Denuo session. The bilateral session ID is already a 256-bit
+/// signed protocol identity; hashing it again domain-separates its local
+/// durable execution record from every other workflow namespace.
+pub fn denuo_execution_workflow_id(session_id: SessionId) -> WorkflowId {
+    let mut hasher = Sha256::new();
+    hasher.update(DENUO_EXECUTION_WORKFLOW_DOMAIN);
+    hasher.update(session_id.as_bytes());
+    let digest: [u8; 32] = hasher.finalize().into();
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    WorkflowId::new(id)
+}
+
+/// Promote one already admitted, fully countersigned Denuo HNS/BTC session
+/// into the durable execution journal.  This is deliberately a local-store
+/// operation: the board and the counterparty are not consulted, and no
+/// transaction is funded or broadcast here.
+///
+/// The returned session is at `TermsFrozen`, so the next permitted action is
+/// local refund preparation. A restart can call this function again: the
+/// exact existing journal is returned, while any mismatch fails closed.
+pub fn open_denuo_execution(
+    store: &mut WalletStore,
+    policy: &DenuoSwapHandshakePolicy,
+    session_id: SessionId,
+    now_unix: u64,
+) -> Result<SwapSession, MarketError> {
+    let record = load_denuo_swap_handshake(store, policy, session_id)?
+        .ok_or(MarketError::UnknownDenuoSwapHandshake)?;
+    let hello = record
+        .hello
+        .as_ref()
+        .ok_or(MarketError::InvalidDenuoSwapHandshake)?;
+    let expected_accepted_at = record
+        .hello_accepted_at_unix
+        .ok_or(MarketError::CorruptDenuoSwapHandshake)?;
+    // Re-authenticate the retained record at its original admission moment.
+    // This permits recovery after a funding deadline, but does not let this
+    // constructor authorize new funding after that deadline.
+    hello
+        .verify_agreement(policy.network())
+        .map_err(|_| MarketError::CorruptDenuoSwapHandshake)?;
+    if now_unix < expected_accepted_at {
+        return Err(MarketError::InvalidEvidence);
+    }
+    let workflow_id = denuo_execution_workflow_id(session_id);
+    if let Some(existing) = store.load_workflow::<SwapSession>(workflow_id)? {
+        if existing.kind != WorkflowKind::AtomicSwap || existing.state.id != session_id {
+            return Err(MarketError::DenuoSwapHandshakeConflict);
+        }
+        return Ok(existing.state);
+    }
+    // A new execution must still be inside the signed new-funding window.
+    // Existing execution journals deliberately remain recoverable afterwards.
+    let expected = swap_session_from_accepted_hello(hello, now_unix)?;
+    let saved_revision = store.save_workflow(
+        workflow_id,
+        WorkflowKind::AtomicSwap,
+        0,
+        &expected,
+        false,
+        now_unix,
+    )?;
+    if saved_revision != expected.revision {
+        return Err(MarketError::Invariant);
+    }
+    Ok(expected)
+}
+
+fn swap_session_from_accepted_hello(
+    hello: &hns_marketplace_protocol::SwapSessionHello,
+    now_unix: u64,
+) -> Result<SwapSession, MarketError> {
+    if hello.offered_asset != AssetId::HNS && hello.offered_asset != AssetId::BTC
+        || hello.received_asset != AssetId::HNS && hello.received_asset != AssetId::BTC
+        || hello.offered_asset == hello.received_asset
+        || hello.offered_refund_deadline.kind != DeadlineKind::UnixTime
+        || hello.received_refund_deadline.kind != DeadlineKind::UnixTime
+    {
+        return Err(MarketError::InvalidPair);
+    }
+    let offered = Amount::new(
+        wallet_asset_for_protocol_asset(hello.offered_asset)?,
+        hello.offered_amount.get(),
+    );
+    let received = Amount::new(
+        wallet_asset_for_protocol_asset(hello.received_asset)?,
+        hello.received_amount.get(),
+    );
+    let first_module = module_for_chain(hello.first_funding_chain)?;
+    let second_module = module_for_chain(other_chain(hello.first_funding_chain)?)?;
+    let (first_refund_at, second_refund_at) =
+        if hello.first_funding_chain == hello.offered_asset.chain() {
+            (
+                hello.offered_refund_deadline.value,
+                hello.received_refund_deadline.value,
+            )
+        } else if hello.first_funding_chain == hello.received_asset.chain() {
+            (
+                hello.received_refund_deadline.value,
+                hello.offered_refund_deadline.value,
+            )
+        } else {
+            return Err(MarketError::InvalidPair);
+        };
+    let safety_margin = first_refund_at
+        .checked_sub(second_refund_at)
+        .ok_or(MarketError::UnsafeTimeouts)?;
+    let mut session = SwapSession::new(
+        SessionId::new(hello.swap_session_id),
+        first_module,
+        second_module,
+        VerifiedQuote {
+            price_round_hash: ObjectHash::new(hello.price_round_hash),
+            offered,
+            received,
+            // The signed session itself is the source of execution terms;
+            // its received refund deadline is the latest new-funding gate.
+            valid_until_unix: hello.received_refund_deadline.value,
+        },
+        ObjectHash::new(hello.hashlock),
+        TimeoutPlan {
+            first_chain_refund_at: first_refund_at,
+            second_chain_refund_at: second_refund_at,
+            minimum_safety_margin: safety_margin,
+        },
+        now_unix,
+    )?;
+    // The Denuo board has already admitted MatchRequest, FillGrant and the
+    // exact double-signed terms. Persist one execution baseline instead of
+    // replaying those historic state transitions after a restart.
+    session.state = SwapState::TermsFrozen;
+    session.revision = 1;
+    Ok(session)
+}
+
+fn wallet_asset_for_protocol_asset(asset: AssetId) -> Result<WalletAsset, MarketError> {
+    match asset {
+        AssetId::HNS => Ok(WalletAsset::Hns),
+        AssetId::BTC => Ok(WalletAsset::Btc),
+        _ => Err(MarketError::InvalidPair),
+    }
+}
+
+fn module_for_chain(chain: ChainId) -> Result<ModuleId, MarketError> {
+    match chain {
+        ChainId::HANDSHAKE => Ok(ModuleId::Handshake),
+        ChainId::BITCOIN => Ok(ModuleId::Bitcoin),
+        _ => Err(MarketError::InvalidPair),
+    }
+}
+
+fn other_chain(chain: ChainId) -> Result<ChainId, MarketError> {
+    match chain {
+        ChainId::HANDSHAKE => Ok(ChainId::BITCOIN),
+        ChainId::BITCOIN => Ok(ChainId::HANDSHAKE),
+        _ => Err(MarketError::InvalidPair),
     }
 }
 
@@ -622,6 +787,12 @@ impl From<StoreError> for MarketError {
 
 #[cfg(test)]
 mod tests {
+    use hns_marketplace_protocol::{
+        AssetAmount, MARKETPLACE_PROTOCOL_VERSION, MarketPair, NetworkBinding, SettlementDeadline,
+        SignedObjectHeader, SwapSessionHello,
+    };
+    use hns_primitives::BlockHash;
+
     use super::*;
 
     fn quote() -> VerifiedQuote {
@@ -755,5 +926,77 @@ mod tests {
                 .expect("transition");
         }
         assert_eq!(session.state, SwapState::Refunded);
+    }
+
+    fn accepted_terms(first_funding_chain: ChainId) -> SwapSessionHello {
+        SwapSessionHello {
+            header: SignedObjectHeader {
+                version: MARKETPLACE_PROTOCOL_VERSION,
+                network: NetworkBinding {
+                    hns_magic: 0x5b6e_c393,
+                    hns_genesis: BlockHash::new([1; 32]),
+                    counterchain: ChainId::BITCOIN,
+                    counterchain_network: 1,
+                    counterchain_genesis: [2; 32],
+                },
+                pair: MarketPair::HNS_BTC,
+                signer_public_key: [2; 33],
+                sequence: 1,
+                created_at: 10,
+                expires_at: 900,
+            },
+            fill_grant_hash: [3; 32],
+            swap_session_id: [4; 32],
+            maker_settlement_public_key: [2; 33],
+            taker_settlement_public_key: [3; 33],
+            offered_asset: AssetId::HNS,
+            offered_amount: AssetAmount::new(1_000),
+            received_asset: AssetId::BTC,
+            received_amount: AssetAmount::new(25),
+            price_round_hash: [5; 32],
+            hashlock: [6; 32],
+            first_funding_chain,
+            offered_lock_commitment: [7; 32],
+            offered_refund_deadline: SettlementDeadline {
+                kind: DeadlineKind::UnixTime,
+                value: 800,
+            },
+            offered_minimum_confirmations: 2,
+            received_lock_commitment: [8; 32],
+            received_refund_deadline: SettlementDeadline {
+                kind: DeadlineKind::UnixTime,
+                value: 500,
+            },
+            received_minimum_confirmations: 2,
+            maker_signature: [0; 64],
+            taker_signature: [0; 64],
+        }
+    }
+
+    #[test]
+    fn accepted_denuo_terms_open_a_resumable_execution_in_signed_chain_order() {
+        let hns_first = swap_session_from_accepted_hello(&accepted_terms(ChainId::HANDSHAKE), 100)
+            .expect("HNS first terms");
+        assert_eq!(hns_first.state, SwapState::TermsFrozen);
+        assert_eq!(hns_first.revision, 1);
+        assert_eq!(hns_first.first_module, ModuleId::Handshake);
+        assert_eq!(hns_first.second_module, ModuleId::Bitcoin);
+        assert_eq!(hns_first.timeouts.first_chain_refund_at, 800);
+        assert_eq!(hns_first.timeouts.second_chain_refund_at, 500);
+
+        let mut btc_first_terms = accepted_terms(ChainId::BITCOIN);
+        btc_first_terms.offered_refund_deadline.value = 500;
+        btc_first_terms.received_refund_deadline.value = 800;
+        let btc_first =
+            swap_session_from_accepted_hello(&btc_first_terms, 100).expect("Bitcoin first terms");
+        assert_eq!(btc_first.first_module, ModuleId::Bitcoin);
+        assert_eq!(btc_first.second_module, ModuleId::Handshake);
+        assert_eq!(btc_first.timeouts.first_chain_refund_at, 800);
+        assert_eq!(btc_first.timeouts.second_chain_refund_at, 500);
+        assert_eq!(
+            denuo_execution_workflow_id(hns_first.id),
+            denuo_execution_workflow_id(btc_first.id),
+            "workflow identity is session-bound, not chain-order-bound"
+        );
     }
 }
