@@ -76,7 +76,7 @@ use hns_script::{
     OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUALVERIFY, OP_IF, OP_SHA256, SIGHASH_ALL, minimum_policy_fee,
     signature_hash, transaction_policy_virtual_size, transaction_sigops,
 };
-use hns_swap::{HnsHtlc, NetworkBinding, lock_script_hash};
+use hns_swap::{HnsHtlc, HnsHtlcSpend, NetworkBinding, lock_script_hash};
 use hns_transaction::{Address, Coin, Input, Outpoint, Output, Transaction, Witness};
 use hns_urkel_proof::{ProofKind, UrkelProof};
 use hns_wallet_chain_api::{
@@ -2928,6 +2928,23 @@ struct HnsVerifiedSettlementRecord {
     funding_coin: Option<HnsInputCoinEvidence>,
 }
 
+/// A native-HNS HTLC spend authenticated against the wallet's locally
+/// verified funding coin and the current proof-bound transaction evidence.
+/// Peer notices never construct this value: the runtime re-executes the HNS
+/// witness program and reports the branch it observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifiedNativeHtlcSpend {
+    Redeem {
+        transaction: TransactionHash,
+        confirmation_count: u32,
+        preimage: Preimage,
+    },
+    Refund {
+        transaction: TransactionHash,
+        confirmation_count: u32,
+    },
+}
+
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 struct HnsPreparedSettlement {
     wallet_id: WalletId,
@@ -4737,6 +4754,90 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             Some(signer),
         )
         .map(PreparedSettlementRedeem)
+    }
+
+    /// Observe and fully verify one spend of the exact native-HNS HTLC
+    /// descriptor committed by a bilateral session. The transaction bytes and
+    /// status are fetched through this wallet's current local chain authority;
+    /// the witness program is then executed against the retained verified
+    /// funding coin before a redeem preimage is returned.
+    pub fn verify_native_htlc_spend(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: VerifiedLock,
+        spending_transaction: TransactionHash,
+    ) -> Result<Option<VerifiedNativeHtlcSpend>, ChainError> {
+        self.verify_native_htlc_network(&descriptor)?;
+        validate_native_htlc_lock(&descriptor, session_id, &lock)?;
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_settlement_ready(&cache)?;
+        let binding = cache.binding.ok_or(ChainError::NotSynchronized)?;
+        let mempool_binding = cache.mempool_binding.ok_or(ChainError::NotSynchronized)?;
+        let config = cache.account.config.clone();
+        drop(cache);
+        let record = self
+            .store_lock()
+            .map_err(map_chain_error)?
+            .hns_verified_settlement::<HnsVerifiedSettlementRecord>(&settlement_entity_id(
+                &config, session_id,
+            ))
+            .map_err(map_chain_error)?
+            .ok_or(ChainError::InvalidEvidence)?
+            .value;
+        if record.verified != lock {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let funding_coin = record
+            .funding_coin
+            .ok_or(ChainError::InvalidEvidence)?
+            .to_canonical_coin()
+            .map_err(map_chain_error)?;
+        let evidence = self
+            .backend
+            .get_transaction_evidence(spending_transaction, binding, Some(mempool_binding))
+            .map_err(map_chain_error)?;
+        if evidence.binding != binding || evidence.mempool != mempool_binding {
+            return Err(ChainError::InvalidEvidence);
+        }
+        if evidence.status.conflicted
+            || (!evidence.status.in_mempool && evidence.status.confirmation_count == 0)
+        {
+            return Ok(None);
+        }
+        let raw = evidence.raw.ok_or(ChainError::InvalidEvidence)?;
+        let transaction =
+            decode_transaction_for_id(&raw, spending_transaction).map_err(map_chain_error)?;
+        let expected_outpoint = Outpoint {
+            transaction_hash: CanonicalTransactionHash::new(lock.funding_id.into_bytes()),
+            index: record.output_index,
+        };
+        let matching_input = transaction
+            .inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, input)| input.previous_output == expected_outpoint)
+            .collect::<Vec<_>>();
+        let [(input_index, _)] = matching_input.as_slice() else {
+            return Err(ChainError::InvalidEvidence);
+        };
+        let spend = descriptor
+            .verify_spend(&transaction, *input_index, &funding_coin)
+            .map_err(|_| ChainError::InvalidEvidence)?;
+        match spend {
+            HnsHtlcSpend::Redeem { preimage } => {
+                let preimage = Preimage::new(*preimage.expose_for_settlement());
+                Ok(Some(VerifiedNativeHtlcSpend::Redeem {
+                    transaction: spending_transaction,
+                    confirmation_count: evidence.status.confirmation_count,
+                    preimage,
+                }))
+            }
+            HnsHtlcSpend::Refund => Ok(Some(VerifiedNativeHtlcSpend::Refund {
+                transaction: spending_transaction,
+                confirmation_count: evidence.status.confirmation_count,
+            })),
+        }
     }
 
     fn verify_native_htlc_network(&self, descriptor: &HnsHtlc) -> Result<(), ChainError> {
