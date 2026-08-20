@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED, BitcoinWalletError, EncryptedPersistedBitcoinWallet,
-    KyotoRuntimeConfig, MAX_RECOVERY_SCRIPT_INDEX, build_kyoto_client,
+    HtlcSpendBranch, KyotoRuntimeConfig, MAX_RECOVERY_SCRIPT_INDEX, VerifiedBitcoinLock,
+    build_kyoto_client, verify_signed_bitcoin_htlc_spend,
 };
 
 pub const KYOTO_WALLET_STATE_VERSION: u16 = 1;
@@ -1293,6 +1294,9 @@ impl BitcoinTransactionRecord {
                 deserialize(raw).map_err(|_| BitcoinWalletError::CorruptRuntimeState)?;
             if transaction.compute_txid().to_byte_array() != self.txid
                 || transaction.compute_wtxid().to_byte_array() != self.wtxid
+                || u32::try_from(transaction.input.len()).ok() != Some(self.input_count)
+                || u32::try_from(transaction.output.len()).ok() != Some(self.output_count)
+                || input_outpoint_commitment(&transaction) != self.input_outpoint_commitment
                 || serialize(&transaction) != *raw
             {
                 return Err(BitcoinWalletError::CorruptRuntimeState);
@@ -1476,6 +1480,47 @@ pub fn derive_bitcoin_broadcast_approval(
     })
 }
 
+/// Derive an exact broadcast approval for a signed native HTLC redeem or
+/// refund. Unlike an ordinary wallet spend, the input is the previously
+/// verified swap output rather than a descriptor-wallet UTXO.
+pub fn derive_bitcoin_htlc_spend_broadcast_approval(
+    wallet: &Wallet,
+    raw_transaction: &[u8],
+    lock: &VerifiedBitcoinLock,
+    branch: HtlcSpendBranch,
+    maximum_fee_sats: u64,
+    expires_at_unix: u64,
+) -> Result<BitcoinBroadcastApprovalBinding, BitcoinWalletError> {
+    if raw_transaction.len() > MAX_PERSISTED_BROADCAST_TRANSACTION_BYTES {
+        return Err(BitcoinWalletError::TransactionTooLarge);
+    }
+    if maximum_fee_sats == 0 || expires_at_unix == 0 {
+        return Err(BitcoinWalletError::InvalidBroadcastApproval);
+    }
+    let verified = verify_signed_bitcoin_htlc_spend(raw_transaction, lock, branch)?;
+    if verified.fee_sats > maximum_fee_sats {
+        return Err(BitcoinWalletError::FeeLimit);
+    }
+    let network = wallet.network();
+    let txid = verified.txid.into_bytes();
+    Ok(BitcoinBroadcastApprovalBinding {
+        network,
+        txid,
+        wtxid: verified.wtxid,
+        fee_sats: verified.fee_sats,
+        maximum_fee_sats,
+        expires_at_unix,
+        commitment: bitcoin_broadcast_approval_commitment(
+            network,
+            txid,
+            verified.wtxid,
+            verified.fee_sats,
+            maximum_fee_sats,
+            expires_at_unix,
+        ),
+    })
+}
+
 pub fn bitcoin_broadcast_approval_commitment(
     network: Network,
     txid: [u8; 32],
@@ -1512,21 +1557,75 @@ pub fn persist_prepared_bitcoin_broadcast(
     now_unix: u64,
     expires_at_unix: u64,
 ) -> Result<PreparedBitcoinBroadcast, BitcoinWalletError> {
-    if approval_commitment == [0; 32]
-        || expires_at_unix <= now_unix
-        || expires_at_unix
-            .checked_sub(now_unix)
-            .is_none_or(|lifetime| lifetime > MAX_BROADCAST_APPROVAL_LIFETIME_SECONDS)
-    {
-        return Err(BitcoinWalletError::InvalidBroadcastApproval);
-    }
     let approval = derive_bitcoin_broadcast_approval(
         wallet,
         raw_transaction,
         maximum_fee_sats,
         expires_at_unix,
     )?;
-    if approval.commitment != approval_commitment {
+    persist_approved_bitcoin_broadcast(
+        store,
+        raw_transaction,
+        approval,
+        approval_commitment,
+        expected_revision,
+        now_unix,
+    )
+}
+
+/// Persist a signed native HTLC spend for the same Kyoto submission path used
+/// by ordinary wallet transactions. The exact lock and branch are verified
+/// again here before any signed bytes become broadcastable.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the persistence boundary keeps the verified lock, branch, approval, fee cap, revision, and validity window explicit"
+)]
+pub fn persist_prepared_bitcoin_htlc_spend_broadcast(
+    wallet: &Wallet,
+    store: &mut WalletStore,
+    raw_transaction: &[u8],
+    lock: &VerifiedBitcoinLock,
+    branch: HtlcSpendBranch,
+    approval_commitment: [u8; 32],
+    maximum_fee_sats: u64,
+    expected_revision: u64,
+    now_unix: u64,
+    expires_at_unix: u64,
+) -> Result<PreparedBitcoinBroadcast, BitcoinWalletError> {
+    let approval = derive_bitcoin_htlc_spend_broadcast_approval(
+        wallet,
+        raw_transaction,
+        lock,
+        branch,
+        maximum_fee_sats,
+        expires_at_unix,
+    )?;
+    persist_approved_bitcoin_broadcast(
+        store,
+        raw_transaction,
+        approval,
+        approval_commitment,
+        expected_revision,
+        now_unix,
+    )
+}
+
+fn persist_approved_bitcoin_broadcast(
+    store: &mut WalletStore,
+    raw_transaction: &[u8],
+    approval: BitcoinBroadcastApprovalBinding,
+    approval_commitment: [u8; 32],
+    expected_revision: u64,
+    now_unix: u64,
+) -> Result<PreparedBitcoinBroadcast, BitcoinWalletError> {
+    if approval_commitment == [0; 32]
+        || approval.commitment != approval_commitment
+        || approval.expires_at_unix <= now_unix
+        || approval
+            .expires_at_unix
+            .checked_sub(now_unix)
+            .is_none_or(|lifetime| lifetime > MAX_BROADCAST_APPROVAL_LIFETIME_SECONDS)
+    {
         return Err(BitcoinWalletError::InvalidBroadcastApproval);
     }
     let transaction: Transaction =
@@ -1579,8 +1678,8 @@ pub fn persist_prepared_bitcoin_broadcast(
             && intent.network == approval.network
             && intent.approval_commitment == approval_commitment
             && intent.fee_sats == approval.fee_sats
-            && intent.maximum_fee_sats == maximum_fee_sats
-            && intent.expires_at_unix == expires_at_unix;
+            && intent.maximum_fee_sats == approval.maximum_fee_sats
+            && intent.expires_at_unix == approval.expires_at_unix;
         if !same_terms {
             return Err(BitcoinWalletError::BroadcastConflict);
         }
@@ -1598,9 +1697,9 @@ pub fn persist_prepared_bitcoin_broadcast(
         network: approval.network,
         approval_commitment,
         fee_sats: approval.fee_sats,
-        maximum_fee_sats,
+        maximum_fee_sats: approval.maximum_fee_sats,
         prepared_at_unix: now_unix,
-        expires_at_unix,
+        expires_at_unix: approval.expires_at_unix,
         phase: BitcoinBroadcastPhase::Prepared,
         attempt_count: 0,
         last_submission_started_at_unix: None,
@@ -1734,11 +1833,21 @@ fn reconcile_transaction_records(
         let raw = transaction.tx_node.tx.as_ref();
         let (sent, received) = wallet.sent_and_received(raw);
         let observation = chain_observation(transaction.chain_position);
+        let fee_sats = wallet
+            .calculate_fee(raw)
+            .ok()
+            .map(|fee| fee.to_sat())
+            .or_else(|| {
+                prior
+                    .as_ref()
+                    .and_then(|stored| stored.value.broadcast.as_ref())
+                    .map(|intent| intent.fee_sats)
+            });
         let changed = prior.as_ref().is_none_or(|stored| {
             stored.value.observation != observation
                 || stored.value.sent_sats != sent.to_sat()
                 || stored.value.received_sats != received.to_sat()
-                || stored.value.fee_sats != wallet.calculate_fee(raw).ok().map(|fee| fee.to_sat())
+                || stored.value.fee_sats != fee_sats
         });
         let first_observed = prior
             .as_ref()
@@ -1755,7 +1864,7 @@ fn reconcile_transaction_records(
             input_outpoint_commitment: input_outpoint_commitment(raw),
             sent_sats: sent.to_sat(),
             received_sats: received.to_sat(),
-            fee_sats: wallet.calculate_fee(raw).ok().map(|fee| fee.to_sat()),
+            fee_sats,
             observation,
             raw_transaction: prior
                 .as_ref()
