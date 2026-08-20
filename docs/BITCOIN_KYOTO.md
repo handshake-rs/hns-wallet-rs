@@ -224,17 +224,24 @@ The native settlement template is P2WSH:
 
 ```text
 IF SHA256 <hashlock> EQUALVERIFY <receiver-key> CHECKSIG
-ELSE <refund-height> CLTV DROP <refund-key> CHECKSIG ENDIF
+ELSE <refund-absolute-locktime> CLTV DROP <refund-key> CHECKSIG ENDIF
 ```
 
 Funding verification reconstructs the exact script, checks value, a unique
-matching output, transaction bounds, and confirmation minimum. Redeem/refund
-templates enforce the branch, hashlock, dust, fee, and refund height. Preimage
-observation requires the expected outpoint and exact witness script. The
-domain-separated local key is bound to its HTLC script position and signs an
-exact spend template. The combined Kyoto subscriber watches the script itself,
-so neither a Denuo peer nor the counterparty supplies chain authority or block
-locations. The cross-chain settlement coordinator remains to be connected.
+matching output, transaction bounds, and confirmation minimum. The refund
+locktime is the Bitcoin consensus `nLockTime` value: a height below
+500,000,000 or a Unix timestamp at/above that threshold. Redeem/refund
+templates enforce the branch, hashlock, dust, fee, and exact locktime. Refund
+eligibility comes from the wallet's Kyoto-validated next-block height and
+median-time-past over the canonical header chain; it never estimates a height
+from wall time or accepts a Denuo peer's timing claim. Preimage observation
+requires the expected outpoint and exact witness script. The local signer is
+bound to its HTLC script position and signs an exact spend template; the
+chain-neutral session signer can be used by both native adapters without
+exporting a private scalar. The combined Kyoto subscriber watches the script
+itself, so neither a Denuo peer nor the counterparty supplies chain authority
+or block locations. The cross-chain settlement coordinator remains to be
+connected.
 
 ## Qualification and benchmarks
 

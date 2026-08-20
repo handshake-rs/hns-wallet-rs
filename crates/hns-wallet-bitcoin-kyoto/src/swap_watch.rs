@@ -970,7 +970,10 @@ mod tests {
                 fee_sats: 500,
                 branch: HtlcSpendBranch::Redeem,
                 preimage: Some(PREIMAGE),
-                current_height: 400,
+                chain_context: crate::BitcoinChainLockContext {
+                    next_block_height: 400,
+                    median_time_past: 500_000_000,
+                },
             },
             &receiver,
         )

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use bdk_kyoto::bip157::chain::BlockHeaderChanges;
+use bdk_kyoto::bip157::chain::{BlockHeaderChanges, IndexedHeader};
 use bdk_kyoto::bip157::{self, ChainState, Client, Event, SyncUpdate};
 use bdk_kyoto::builder::Builder;
 use bdk_kyoto::{HashCheckpoint, LoggingSubscribers, Requester, ScanType};
@@ -18,11 +18,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED, BitcoinHtlcWatchAdmission, BitcoinHtlcWatchRequest,
-    BitcoinWalletError, EncryptedPersistedBitcoinWallet, HtlcSpendBranch, KyotoRuntimeConfig,
-    MAX_RECOVERY_SCRIPT_INDEX, MatchedBitcoinBlock, VerifiedBitcoinLock, load_bitcoin_htlc_watches,
-    reconcile_bitcoin_htlc_watches, register_bitcoin_htlc_watch, verify_signed_bitcoin_htlc_spend,
-    watched_scripts,
+    BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED, BitcoinChainLockContext, BitcoinHtlcWatchAdmission,
+    BitcoinHtlcWatchRequest, BitcoinWalletError, EncryptedPersistedBitcoinWallet, HtlcSpendBranch,
+    KyotoRuntimeConfig, MAX_RECOVERY_SCRIPT_INDEX, MatchedBitcoinBlock, VerifiedBitcoinLock,
+    load_bitcoin_htlc_watches, reconcile_bitcoin_htlc_watches, register_bitcoin_htlc_watch,
+    verify_signed_bitcoin_htlc_spend, watched_scripts,
 };
 
 pub const KYOTO_WALLET_STATE_VERSION: u16 = 1;
@@ -36,6 +36,7 @@ pub const MAX_BROADCAST_APPROVAL_LIFETIME_SECONDS: u64 = 3_600;
 pub const MIN_REBROADCAST_INTERVAL_SECONDS: u64 = 60;
 pub const MAX_PERSISTED_BROADCAST_TRANSACTION_BYTES: usize = 200_000;
 pub const MAX_RECONCILIATION_BATCH_SAVES: usize = 512;
+pub const MEDIAN_TIME_PAST_HEADERS: usize = 11;
 pub const MIN_DATE_BIRTHDAY_SAFETY_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const MAX_DATE_BIRTHDAY_SAFETY_SECONDS: u64 = 366 * 24 * 60 * 60;
 
@@ -1292,6 +1293,76 @@ impl KyotoSupervisor {
             .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))
     }
 
+    /// Return the exact local consensus context for a new absolute-locktime
+    /// transaction. The tip must be the supervisor's durable ready checkpoint;
+    /// headers are read from Kyoto's locally validated most-work chain, linked
+    /// backwards to that tip, and their median is used for BIP113 timestamp
+    /// locks. No wall clock, relay, or remote full node supplies this value.
+    pub async fn validated_chain_lock_context(
+        &self,
+    ) -> Result<BitcoinChainLockContext, BitcoinWalletError> {
+        if self.poisoned
+            || !matches!(self.durable.state.phase, KyotoSyncPhase::Ready)
+            || self.durable.state.scanned_checkpoint
+                != self.durable.state.last_consistent_checkpoint
+        {
+            return Err(BitcoinWalletError::RuntimeNotReady);
+        }
+        let expected_tip = self.durable.state.last_consistent_checkpoint;
+        let observed_tip = tokio::time::timeout(self.request_timeout, self.requester.chain_tip())
+            .await
+            .map_err(|_| BitcoinWalletError::OperationTimedOut)?
+            .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
+        if observed_tip.height != expected_tip.height
+            || observed_tip.hash.to_byte_array() != expected_tip.block_hash
+        {
+            return Err(BitcoinWalletError::CheckpointMismatch);
+        }
+        let count = usize::try_from(expected_tip.height)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1)
+            .min(MEDIAN_TIME_PAST_HEADERS);
+        let start = expected_tip
+            .height
+            .checked_add(1)
+            .and_then(|height| height.checked_sub(u32::try_from(count).ok()?))
+            .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
+        let mut headers: Vec<IndexedHeader> = Vec::with_capacity(count);
+        for height in start..=expected_tip.height {
+            let indexed =
+                tokio::time::timeout(self.request_timeout, self.requester.get_header(height))
+                    .await
+                    .map_err(|_| BitcoinWalletError::OperationTimedOut)?
+                    .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?
+                    .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
+            if indexed.height != height {
+                return Err(BitcoinWalletError::InvalidCheckpoint);
+            }
+            if let Some(prior) = headers.last()
+                && indexed.header.prev_blockhash != prior.header.block_hash()
+            {
+                return Err(BitcoinWalletError::InvalidCheckpoint);
+            }
+            headers.push(indexed);
+        }
+        if headers.last().is_none_or(|header| {
+            header.header.block_hash().to_byte_array() != expected_tip.block_hash
+        }) {
+            return Err(BitcoinWalletError::CheckpointMismatch);
+        }
+        let median_time_past = median_time_past(headers.iter().map(|header| header.header.time))?;
+        let next_block_height = expected_tip
+            .height
+            .checked_add(1)
+            .ok_or(BitcoinWalletError::InvalidChainLockContext)?;
+        let context = BitcoinChainLockContext {
+            next_block_height,
+            median_time_past,
+        };
+        context.validate()?;
+        Ok(context)
+    }
+
     pub fn add_trusted_peer(&self, peer: bdk_kyoto::TrustedPeer) -> Result<(), BitcoinWalletError> {
         self.requester
             .add_peer(peer)
@@ -1376,6 +1447,17 @@ impl KyotoSupervisor {
             submitted_at_unix,
         })
     }
+}
+
+fn median_time_past(
+    header_times: impl IntoIterator<Item = u32>,
+) -> Result<u32, BitcoinWalletError> {
+    let mut times = header_times.into_iter().collect::<Vec<_>>();
+    if times.is_empty() || times.len() > MEDIAN_TIME_PAST_HEADERS {
+        return Err(BitcoinWalletError::InvalidChainLockContext);
+    }
+    times.sort_unstable();
+    Ok(times[times.len() / 2])
 }
 
 enum BroadcastStart {
@@ -2379,6 +2461,16 @@ mod restart_tests {
             &KyotoSyncPhase::Ready,
             committed,
             committed,
+        ));
+    }
+
+    #[test]
+    fn median_time_past_is_the_canonical_middle_header_time() {
+        assert_eq!(median_time_past([11, 9, 10]).expect("median"), 10);
+        assert_eq!(median_time_past([1, 9, 2, 8, 3]).expect("median"), 3);
+        assert!(matches!(
+            median_time_past([]),
+            Err(BitcoinWalletError::InvalidChainLockContext)
         ));
     }
 }
