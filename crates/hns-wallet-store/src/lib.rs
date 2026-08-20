@@ -60,6 +60,7 @@ pub enum EntityKind {
     HnsUtxo,
     HnsTransaction,
     HnsLightChain,
+    HnsLightWallet,
     KnownName,
     NameOwnerOutpoint,
     NameTransfer,
@@ -97,6 +98,7 @@ impl EntityKind {
             Self::HnsUtxo => "hns_utxo",
             Self::HnsTransaction => "hns_transaction",
             Self::HnsLightChain => "hns_light_chain",
+            Self::HnsLightWallet => "hns_light_wallet",
             Self::KnownName => "known_name",
             Self::NameOwnerOutpoint => "name_owner_outpoint",
             Self::NameTransfer => "name_transfer",
@@ -1403,6 +1405,13 @@ impl WalletStore {
             hns_light_chain_records,
             delete_hns_light_chain,
             HnsLightChain
+        ),
+        (
+            save_hns_light_wallet,
+            hns_light_wallet,
+            hns_light_wallet_records,
+            delete_hns_light_wallet,
+            HnsLightWallet
         ),
         (
             save_known_name,

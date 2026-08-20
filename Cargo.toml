@@ -72,9 +72,9 @@ zeroize = { version = "1.8.1", features = ["derive"] }
 hns-covenants = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
 hns-header-consensus = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
 hns-marketplace-protocol = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
-hns-light-chain = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "23bb433952a86e22e01f5c5d95123d8f7c2a6355" }
-hns-light-sync = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "23bb433952a86e22e01f5c5d95123d8f7c2a6355" }
-hns-light-wallet = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "23bb433952a86e22e01f5c5d95123d8f7c2a6355" }
+hns-light-chain = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "aded8e5d829090c1e48be11b52a5bda8cb5de5a0" }
+hns-light-sync = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "aded8e5d829090c1e48be11b52a5bda8cb5de5a0" }
+hns-light-wallet = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "aded8e5d829090c1e48be11b52a5bda8cb5de5a0" }
 hns-p2p-wire = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
 hns-primitives = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
 hns-script = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }

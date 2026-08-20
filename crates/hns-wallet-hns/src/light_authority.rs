@@ -313,6 +313,18 @@ impl EncryptedHnsLightAuthority {
         HnsLightFloor::from_entry(self.sync.chain().tip())
     }
 
+    /// Monotonic authenticated chain revision used to bind wallet-index reads.
+    #[must_use]
+    pub const fn chain_epoch(&self) -> u64 {
+        self.checkpoint_revision
+    }
+
+    /// Read-only access to the locally validated chain window.
+    #[must_use]
+    pub const fn validated_chain(&self) -> &LightChain {
+        self.sync.chain()
+    }
+
     /// Add one newly handshaken peer. The peer identity is connection-scoped
     /// and is not chain authority.
     pub fn add_peer(&mut self, id: PeerId, advertised_height: u32) -> Result<(), HnsLightError> {
