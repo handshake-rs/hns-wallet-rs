@@ -49,6 +49,9 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const MIN_HTLC_DUST_SATS: u64 = 330;
+/// Bitcoin's consensus boundary between height and Unix-time absolute
+/// locktimes. Denuo `UnixTime` deadlines must never silently become heights.
+pub const BITCOIN_TIMESTAMP_LOCKTIME_THRESHOLD: u64 = 500_000_000;
 pub const MAX_HTLC_SCRIPT_BYTES: usize = 256;
 pub const MAX_BITCOIN_TRANSACTION_BYTES: usize = 400_000;
 pub const MAX_REQUIRED_PEERS: u8 = 8;
@@ -740,6 +743,9 @@ pub fn build_denuo_bitcoin_htlc(
     }
     let value_sats = u64::try_from(amount).map_err(|_| BitcoinWalletError::InvalidAmount)?;
     let refund_locktime = u32::try_from(deadline).map_err(|_| BitcoinWalletError::InvalidHtlc)?;
+    if deadline < BITCOIN_TIMESTAMP_LOCKTIME_THRESHOLD {
+        return Err(BitcoinWalletError::InvalidHtlc);
+    }
     let receiver =
         PublicKey::from_slice(&receiver_bytes).map_err(|_| BitcoinWalletError::InvalidHtlc)?;
     let refund =
@@ -1567,6 +1573,9 @@ mod tests {
         )
         .expect("same Denuo binding");
         assert!(build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered).is_err());
+        let mut height_like_deadline = hello;
+        height_like_deadline.received_refund_deadline.value = 500;
+        assert!(build_denuo_bitcoin_htlc(&height_like_deadline, SwapAssetSide::Received).is_err());
     }
 
     #[test]

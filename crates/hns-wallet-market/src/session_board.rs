@@ -802,7 +802,9 @@ mod tests {
     use super::*;
     use crate::{
         DenuoSwapHandshakeStage, admit_denuo_market_intent, bootstrap_denuo_price_round_cache,
+        open_denuo_execution,
     };
+    use hns_wallet_bitcoin_kyoto::build_denuo_bitcoin_htlc;
 
     const MAKER_IDENTITY_SECRET: [u8; 32] = [7; 32];
     const TAKER_IDENTITY_SECRET: [u8; 32] = [6; 32];
@@ -960,7 +962,7 @@ mod tests {
     fn maker_proposal(intent: &MarketIntent, grant: &FillGrant) -> SwapSessionProposal {
         let mut session_header = header(3, 126, 150);
         session_header.signer_public_key = intent.header.signer_public_key;
-        SwapSessionHello {
+        let mut hello = SwapSessionHello {
             header: session_header,
             fill_grant_hash: grant.grant_hash,
             swap_session_id: grant.swap_session_id,
@@ -973,23 +975,36 @@ mod tests {
             price_round_hash: grant.price_round_hash,
             hashlock: [13; 32],
             first_funding_chain: ChainId::HANDSHAKE,
-            offered_lock_commitment: [14; 32],
+            offered_lock_commitment: [0; 32],
             offered_refund_deadline: SettlementDeadline {
                 kind: DeadlineKind::UnixTime,
-                value: 500,
+                value: 1_800_000_000,
             },
             offered_minimum_confirmations: 2,
-            received_lock_commitment: [15; 32],
+            received_lock_commitment: [0; 32],
             received_refund_deadline: SettlementDeadline {
                 kind: DeadlineKind::UnixTime,
-                value: 300,
+                value: 1_700_000_000,
             },
             received_minimum_confirmations: 2,
             maker_signature: [0; 64],
             taker_signature: [0; 64],
-        }
-        .into_maker_proposal(&MAKER_SETTLEMENT_SECRET)
-        .expect("sign maker proposal")
+        };
+        hello
+            .build_and_bind_hns_htlc(
+                hns_marketplace_protocol::SwapAssetSide::Offered,
+                grant.counterparty_settlement_key,
+                grant.maker_settlement_key,
+            )
+            .expect("canonical HNS lock");
+        hello.received_lock_commitment =
+            build_denuo_bitcoin_htlc(&hello, hns_marketplace_protocol::SwapAssetSide::Received)
+                .expect("canonical Bitcoin lock")
+                .commitment
+                .into_bytes();
+        hello
+            .into_maker_proposal(&MAKER_SETTLEMENT_SECRET)
+            .expect("sign maker proposal")
     }
 
     fn envelope(message: CrossChainMessage, request_id: u64) -> Vec<u8> {
@@ -1083,6 +1098,19 @@ mod tests {
         assert_eq!(maker, taker);
         assert_eq!(maker.hello, Some(hello.clone()));
         assert_eq!(maker.store_revision, 4);
+
+        let maker_execution = open_denuo_execution(&mut maker_store, &policy, session_id, 129)
+            .expect("open maker execution");
+        let taker_execution = open_denuo_execution(&mut taker_store, &policy, session_id, 129)
+            .expect("open taker execution");
+        assert_eq!(maker_execution, taker_execution);
+        assert_eq!(maker_execution.state, crate::SwapState::TermsFrozen);
+        assert!(maker_execution.accepted_denuo_terms.is_some());
+        assert_eq!(
+            open_denuo_execution(&mut maker_store, &policy, session_id, 1_900_000_000)
+                .expect("reopen existing execution"),
+            maker_execution,
+        );
 
         let wrong_correlation = envelope(CrossChainMessage::SwapSessionHello(hello), 78);
         assert_eq!(
