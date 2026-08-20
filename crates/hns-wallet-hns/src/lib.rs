@@ -6463,6 +6463,63 @@ fn derive_restore_addresses(
     Ok(addresses)
 }
 
+/// Derive the complete public watch set required by the wallet-owned direct
+/// HNS light client. The encrypted recovery seed remains inside `store`; this
+/// function returns only version-zero script identifiers and already-known
+/// name hashes, never private keys, derivation secrets, or transaction data.
+///
+/// A mobile or extension host must install this exact result into its local
+/// filtered-block authority before asking direct peers to scan. It is tied to
+/// the persisted account record rather than accepting a caller-assembled list
+/// of scripts, so a replacement or stale account cannot redirect wallet
+/// discovery to another authority.
+pub fn derive_hns_light_watch_set(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+) -> Result<HnsLightWatchSet, HnsWalletError> {
+    if store.is_locked() {
+        return Err(HnsWalletError::StoreLocked);
+    }
+    config.validate_structure()?;
+    let account_id = account_entity_id(config);
+    let account = store
+        .wallet_account::<HnsAccountRecord>(&account_id)?
+        .ok_or(HnsWalletError::AccountConfigurationMismatch)?;
+    if account.id.as_slice() != account_id.as_slice() || account.value.config != *config {
+        return Err(HnsWalletError::AccountConfigurationMismatch);
+    }
+    let coin_addresses = derive_restore_addresses(store, &account.value, KeyRole::HnsCoin)?;
+    let name_addresses = derive_restore_addresses(store, &account.value, KeyRole::HnsName)?;
+    let shakedex_addresses = derive_restore_addresses(store, &account.value, KeyRole::HnsShakedex)?;
+    validate_disjoint_restore_programs(&coin_addresses, &name_addresses, &shakedex_addresses)?;
+    let scripts = coin_addresses
+        .iter()
+        .chain(&name_addresses)
+        .chain(&shakedex_addresses)
+        .map(|address| WalletAddressKey {
+            version: 0,
+            hash: address.program.clone(),
+        })
+        .collect::<Vec<_>>();
+    let known_names = store.list_entities_by_id_prefix::<KnownName>(
+        EntityKind::KnownName,
+        &account_entity_prefix(config),
+        MAX_HISTORY_RESULTS,
+    )?;
+    let mut name_hashes = Vec::with_capacity(known_names.len());
+    for stored in known_names {
+        let expected_id = namespaced_name_id(config, stored.value.name_hash);
+        let actual_hash = hash_name(&stored.value.name)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?
+            .into_bytes();
+        if stored.id != expected_id || stored.value.name_hash != actual_hash {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        name_hashes.push(stored.value.name_hash);
+    }
+    HnsLightWatchSet::new(scripts, name_hashes).map_err(|_| HnsWalletError::InvalidEvidence)
+}
+
 fn validate_disjoint_restore_programs(
     coin_addresses: &[DerivedHnsAddress],
     name_addresses: &[DerivedHnsAddress],
@@ -12365,6 +12422,31 @@ mod tests {
                 Ok(())
             })
             .expect("authenticated read commit");
+    }
+
+    #[test]
+    fn direct_light_watch_set_is_complete_public_and_bound_to_the_selected_account() {
+        let (store, config) = production_followup_read_store();
+        let watch_set = store
+            .try_with_store(|wallet| derive_hns_light_watch_set(wallet, &config))
+            .expect("derive local direct-light watch set");
+        // One external and one internal payment branch plus the independent
+        // name and Shakedex branches are all installed before a peer scan.
+        assert_eq!(watch_set.scripts.len(), 4);
+        assert!(watch_set.name_hashes.is_empty());
+        assert!(
+            watch_set
+                .scripts
+                .iter()
+                .all(|script| script.version == 0 && matches!(script.hash.len(), 20 | 32))
+        );
+
+        let mut other = config.clone();
+        other.account_id = AccountId::new([77; 16]);
+        assert!(matches!(
+            store.try_with_store(|wallet| derive_hns_light_watch_set(wallet, &other)),
+            Err(HnsWalletError::AccountConfigurationMismatch)
+        ));
     }
 
     #[test]
