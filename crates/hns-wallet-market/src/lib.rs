@@ -1,6 +1,7 @@
 #![doc = "Chain-neutral, evidence-driven market and atomic-swap workflow state."]
 #![forbid(unsafe_code)]
 
+mod intent_board;
 mod price_board;
 
 use std::collections::BTreeMap;
@@ -12,6 +13,14 @@ use hns_wallet_types::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use intent_board::{
+    DenuoIntentBoardPolicy, DenuoIntentPeerEvent, DenuoIntentPeerSession, DenuoIntentPeerStep,
+    DenuoMarketIntentAdmission, DenuoMarketIntentCancellationAdmission, DenuoMarketIntentRecord,
+    DenuoMarketIntentSnapshot, MAX_DENUO_MARKET_INTENTS, MAX_PENDING_DENUO_INTENT_REQUESTS,
+    admit_denuo_market_intent, admit_denuo_market_intent_cancellation,
+    denuo_market_intent_inventory, load_denuo_market_intent, load_denuo_market_intents,
+    prune_denuo_market_intents,
+};
 pub use price_board::{
     DenuoPriceRoundAdmission, DenuoPriceRoundPolicy, DenuoPriceRoundSnapshot,
     MAX_DENUO_PRICE_ROUND_HISTORY, admit_denuo_price_round, bootstrap_denuo_price_round_cache,
@@ -535,6 +544,20 @@ pub enum MarketError {
     DenuoPriceRoundReplay,
     #[error("persisted Denuo price-round cache is corrupt or noncanonical")]
     CorruptDenuoPriceRoundCache,
+    #[error("invalid Denuo market-intent board policy")]
+    InvalidDenuoIntentBoardPolicy,
+    #[error("invalid or unexpected canonical Denuo V2 market-intent envelope")]
+    InvalidDenuoMarketIntent,
+    #[error("Denuo market-intent replay, resurrection, or conflict was rejected")]
+    DenuoMarketIntentReplay,
+    #[error("persisted Denuo market-intent board is corrupt or noncanonical")]
+    CorruptDenuoMarketIntentBoard,
+    #[error("Denuo market-intent board reached its bounded capacity")]
+    DenuoMarketIntentCapacity,
+    #[error("requested Denuo market intent is unknown")]
+    UnknownDenuoMarketIntent,
+    #[error("invalid, unexpected, or resource-exhausting Denuo peer message")]
+    InvalidDenuoPeerMessage,
     #[error("unsupported or inconsistent asset pair")]
     InvalidPair,
     #[error("quantity reservation rejected")]
