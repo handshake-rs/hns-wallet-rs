@@ -86,8 +86,8 @@ use hns_wallet_chain_api::{
     PreparedHtlcRedeem, PreparedHtlcRefund, PreparedSend, PreparedSettlementLock,
     PreparedSettlementRedeem, PreparedSettlementRefund, RegistryError, SendRequest,
     SettlementCapabilities, SettlementLockExpectation, SettlementLockRequest,
-    SettlementRedeemRequest, SettlementRefundRequest, Utxo, UtxoChainModule, UtxoFeePolicy,
-    VerifiedHtlcLock, VerifiedLock, VerifiedSettlementLock, VerifyHtlcLockRequest,
+    SettlementRedeemRequest, SettlementRefundRequest, SettlementSigner, Utxo, UtxoChainModule,
+    UtxoFeePolicy, VerifiedHtlcLock, VerifiedLock, VerifiedSettlementLock, VerifyHtlcLockRequest,
     VerifySettlementLockRequest,
 };
 use hns_wallet_store::{
@@ -102,7 +102,7 @@ use hns_wallet_types::{
     SyncStatus, TransactionHash, TransactionSummary, WalletAsset, WalletId, WorkflowId,
     WorkflowKind,
 };
-use k256::ecdsa::signature::hazmat::PrehashSigner;
+use k256::ecdsa::signature::hazmat::{PrehashSigner, PrehashVerifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -3980,6 +3980,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         Ok(artifact)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_settlement_spend(
         &self,
         session_id: SessionId,
@@ -3988,6 +3989,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         maximum_fee: BaseUnits,
         current_height: Option<u64>,
         action: HnsSettlementAction,
+        external_signer: Option<&dyn SettlementSigner>,
     ) -> Result<PreparedArtifact, ChainError> {
         if lock.module != ModuleId::Handshake
             || lock.session_id != session_id
@@ -4023,8 +4025,13 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             return Err(ChainError::InvalidEvidence);
         }
         let refund = action == HnsSettlementAction::Refund;
-        let public = derive_settlement_public_key(&store, &account, session_id, refund)
-            .map_err(map_chain_error)?;
+        let public = external_signer.map_or_else(
+            || {
+                derive_settlement_public_key(&store, &account, session_id, refund)
+                    .map_err(map_chain_error)
+            },
+            |signer| Ok(signer.compressed_public_key()),
+        )?;
         let expected_key = if refund {
             decode_compressed_key(&record.expected.refund_target)?
         } else {
@@ -4115,16 +4122,26 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             previous_value - u64::try_from(fee.get()).map_err(|_| ChainError::Overflow)?,
         );
         let unsigned_transaction = transaction.clone();
-        let signed = sign_htlc_spend(
-            &store,
-            &account,
-            transaction,
-            session_id,
-            &record.script,
-            previous_value,
-            preimage.as_ref(),
-            refund,
-        )
+        let signed = match external_signer {
+            Some(signer) => sign_htlc_spend_with_settlement_signer(
+                transaction,
+                &record.script,
+                previous_value,
+                preimage.as_ref(),
+                refund,
+                signer,
+            ),
+            None => sign_htlc_spend(
+                &store,
+                &account,
+                transaction,
+                session_id,
+                &record.script,
+                previous_value,
+                preimage.as_ref(),
+                refund,
+            ),
+        }
         .map_err(map_chain_error)?;
         validate_witness_only_change(&unsigned_transaction, &signed).map_err(map_chain_error)?;
         drop(store);
@@ -4613,6 +4630,57 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             }
             result => result,
         }
+    }
+
+    /// Prepare a native-HNS redeem with a chain-neutral per-session signer.
+    /// The signer must exactly equal the receiver key frozen in the verified
+    /// lock; its scalar never enters this runtime or its persistence layer.
+    pub fn prepare_redeem_with_settlement_signer(
+        &self,
+        request: SettlementRedeemRequest,
+        signer: &dyn SettlementSigner,
+    ) -> Result<PreparedSettlementRedeem, ChainError> {
+        let expected_hash: [u8; 32] =
+            Sha256::digest(request.preimage.expose_for_settlement()).into();
+        if expected_hash != *request.lock.hashlock.as_bytes() {
+            return Err(ChainError::InvalidEvidence);
+        }
+        self.prepare_settlement_spend(
+            request.session_id,
+            request.lock,
+            Some(request.preimage),
+            request.maximum_fee,
+            None,
+            HnsSettlementAction::Redeem,
+            Some(signer),
+        )
+        .map(PreparedSettlementRedeem)
+    }
+
+    /// Prepare a native-HNS refund with a chain-neutral per-session signer.
+    /// The caller supplies the exact local validated HNS height and the signer
+    /// must equal the refund key frozen in the verified lock.
+    pub fn prepare_refund_with_settlement_signer(
+        &self,
+        request: SettlementRefundRequest,
+        signer: &dyn SettlementSigner,
+    ) -> Result<PreparedSettlementRefund, ChainError> {
+        if request.current_chain_time >= HNS_LOCKTIME_THRESHOLD
+            || request.lock.absolute_timelock >= HNS_LOCKTIME_THRESHOLD
+            || request.current_chain_time < request.lock.absolute_timelock
+        {
+            return Err(ChainError::InvalidRequest("refund timelock is not mature"));
+        }
+        self.prepare_settlement_spend(
+            request.session_id,
+            request.lock,
+            None,
+            request.maximum_fee,
+            Some(request.current_chain_time),
+            HnsSettlementAction::Refund,
+            Some(signer),
+        )
+        .map(PreparedSettlementRefund)
     }
 }
 
@@ -8533,6 +8601,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
             request.maximum_fee,
             None,
             HnsSettlementAction::Redeem,
+            None,
         )
         .map(PreparedSettlementRedeem)
     }
@@ -8554,6 +8623,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
             request.maximum_fee,
             Some(request.current_chain_time),
             HnsSettlementAction::Refund,
+            None,
         )
         .map(PreparedSettlementRefund)
     }
@@ -9363,6 +9433,50 @@ fn sign_htlc_spend(
         .sign_prehash(&digest)
         .map_err(|_| HnsWalletError::Signing)?;
     let signature = signature.normalize_s().unwrap_or(signature);
+    let mut encoded = signature.to_bytes().to_vec();
+    encoded.push(SIGHASH_ALL as u8);
+    transaction.inputs[0].witness = if refund {
+        Witness {
+            items: vec![encoded, Vec::new(), script.to_vec()],
+        }
+    } else {
+        let preimage = preimage.ok_or(HnsWalletError::InvalidPreparedArtifact)?;
+        Witness {
+            items: vec![
+                encoded,
+                preimage.expose_for_settlement().to_vec(),
+                vec![1],
+                script.to_vec(),
+            ],
+        }
+    };
+    transaction
+        .encode()
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)
+}
+
+fn sign_htlc_spend_with_settlement_signer(
+    mut transaction: Transaction,
+    script: &[u8],
+    previous_value: u64,
+    preimage: Option<&Preimage>,
+    refund: bool,
+    signer: &dyn SettlementSigner,
+) -> Result<Vec<u8>, HnsWalletError> {
+    let digest = signature_hash(&transaction, 0, script, previous_value, SIGHASH_ALL)
+        .map_err(|_| HnsWalletError::Signing)?;
+    let signature = signer
+        .sign_digest(digest)
+        .map_err(|_| HnsWalletError::Signing)?;
+    let signature = Signature::from_slice(&signature).map_err(|_| HnsWalletError::Signing)?;
+    if signature.normalize_s().is_some() {
+        return Err(HnsWalletError::Signing);
+    }
+    let verifying = VerifyingKey::from_sec1_bytes(&signer.compressed_public_key())
+        .map_err(|_| HnsWalletError::Signing)?;
+    verifying
+        .verify_prehash(&digest, &signature)
+        .map_err(|_| HnsWalletError::Signing)?;
     let mut encoded = signature.to_bytes().to_vec();
     encoded.push(SIGHASH_ALL as u8);
     transaction.inputs[0].witness = if refund {
