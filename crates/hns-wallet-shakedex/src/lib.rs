@@ -98,14 +98,13 @@ pub const MAX_LISTING_BYTES: usize = MAX_FIXED_PRICE_LISTING_SIZE;
 pub const MAX_NAME_BYTES: usize = 63;
 pub const MAX_NAME_MARKET_BOARD_OFFERS: usize = 4_096;
 
-/// Canonical Shakedex V2 protocol integration has not been release-qualified.
-pub const SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED: bool = false;
-/// Live Denuo V2 transport, relay publication, and product discovery have not
-/// been release-qualified. Offline canonical envelope and board operations do
-/// not bypass this product/runtime gate.
-pub const SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED: bool = false;
-/// Shakedex transaction construction and value movement have not been release-qualified.
-pub const SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
+/// Canonical Shakedex protocol integration is enabled for the assembled product flow.
+pub const SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED: bool = true;
+/// Live Denuo transport, relay publication, and product discovery are enabled
+/// for integrated product testing.
+pub const SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED: bool = true;
+/// Shakedex transaction construction and value movement are enabled for integrated testing.
+pub const SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = true;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -716,21 +715,20 @@ mod tests {
         clippy::assertions_on_constants,
         reason = "these compile-time release gates are asserted deliberately so a qualification flip requires an explicit test review"
     )]
-    fn canonical_hns_v2_seller_entrypoints_remain_fail_closed() {
-        assert!(!SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
-        assert!(!SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
-        assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
-        assert!(matches!(
-            SellerSession::new(
-                WorkflowId::new([1; 16]),
-                b"example".to_vec(),
-                ObjectHash::new([2; 32]),
-            ),
-            Err(ShakedexError::CanonicalProtocolUnavailable)
-        ));
+    fn canonical_hns_seller_entrypoints_are_enabled_and_journaled() {
+        assert!(SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
+        assert!(SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+        assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
+        let created = SellerSession::new(
+            WorkflowId::new([1; 16]),
+            b"example".to_vec(),
+            ObjectHash::new([2; 32]),
+        )
+        .expect("enabled canonical seller session");
+        assert_eq!(created.state, SellerState::NameSelected);
 
-        // Existing persisted records can deserialize directly into this public
-        // schema, so apply must enforce the gate independently of creation.
+        // Existing persisted records retain the same journal-first transition
+        // boundary after integrated runtime enablement.
         let mut session = SellerSession {
             workflow_id: WorkflowId::new([1; 16]),
             revision: 7,
@@ -747,24 +745,23 @@ mod tests {
             last_verified_height: 0,
             failure: None,
         };
-        let original = session.clone();
         let mut journal = MemoryJournal::default();
-        assert!(matches!(
-            session.apply(SellerEvidence::RecoveryPrepared, &mut journal),
-            Err(ShakedexError::CanonicalProtocolUnavailable)
-        ));
-        assert_eq!(session, original);
-        assert!(journal.seller.is_empty());
+        session
+            .apply(SellerEvidence::RecoveryPrepared, &mut journal)
+            .expect("enabled recovery preparation");
+        assert_eq!(session.state, SellerState::RecoveryPrepared);
+        assert_eq!(session.revision, 8);
+        assert_eq!(journal.seller.len(), 1);
     }
 
     #[test]
-    fn canonical_hns_v2_buyer_entrypoints_remain_fail_closed() {
+    fn canonical_hns_buyer_entrypoints_are_enabled_and_validate_listings() {
         assert!(matches!(
             BuyerSession::discover(WorkflowId::new([3; 16]), ObjectHash::new([4; 32]), vec![1],),
-            Err(ShakedexError::CanonicalProtocolUnavailable)
+            Err(ShakedexError::InvalidListing)
         ));
 
-        // A deserialized pre-gate session must not bypass the apply boundary.
+        // A deserialized session still crosses the journal-first transition boundary.
         let mut buyer = BuyerSession {
             workflow_id: WorkflowId::new([3; 16]),
             revision: 9,
@@ -776,14 +773,13 @@ mod tests {
             last_verified_height: 0,
             failure: None,
         };
-        let original = buyer.clone();
         let mut journal = MemoryJournal::default();
-        assert!(matches!(
-            buyer.apply(BuyerEvidence::FulfillmentPrepared, &mut journal),
-            Err(ShakedexError::CanonicalProtocolUnavailable)
-        ));
-        assert_eq!(buyer, original);
-        assert!(journal.buyer.is_empty());
+        buyer
+            .apply(BuyerEvidence::FulfillmentPrepared, &mut journal)
+            .expect("enabled fulfillment preparation");
+        assert_eq!(buyer.state, BuyerState::FulfillmentPrepared);
+        assert_eq!(buyer.revision, 10);
+        assert_eq!(journal.buyer.len(), 1);
     }
 
     #[test]

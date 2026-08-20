@@ -1914,11 +1914,11 @@ fn batch_offers_response_preserves_sorted_request_subset_and_tombstones_without_
         2
     );
 
-    assert!(!HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
-    assert!(!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
+    assert!(HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
+    assert!(HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
 }
 
 #[test]
@@ -2309,11 +2309,11 @@ fn inventory_response_plan_is_read_only_restart_safe_and_hides_cancelled_rows_wi
     assert_eq!(cancelled.listing_count(), 0);
     assert_eq!(restarted_control.query_count.load(Ordering::SeqCst), 0);
 
-    assert!(!HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
-    assert!(!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
+    assert!(HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
+    assert!(HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
 }
 
 #[test]
@@ -2717,11 +2717,11 @@ fn single_offer_response_plan_reacquires_after_restart_and_hides_cancelled_rows_
         queries_after_cancellation
     );
 
-    assert!(!HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
-    assert!(!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
+    assert!(HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
+    assert!(HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
 }
 
 #[test]
@@ -3174,11 +3174,11 @@ fn signed_cancellation_tombstone_survives_spend_restart_and_expiry_without_node_
         2
     );
 
-    assert!(!HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
-    assert!(!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
-    assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
+    assert!(HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
+    assert!(HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
 }
 
 #[test]

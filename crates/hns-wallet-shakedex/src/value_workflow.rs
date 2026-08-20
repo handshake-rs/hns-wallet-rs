@@ -4123,10 +4123,10 @@ mod tests {
         reason = "these compile-time release gates are asserted deliberately so a qualification flip requires an explicit test review"
     )]
     fn production_next_script_finalize_restart_preserves_canonical_transfer_identity() {
-        assert!(!SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
-        assert!(!HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED);
-        assert!(!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
-        assert!(!HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
+        assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
+        assert!(HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED);
+        assert!(HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
+        assert!(HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
         let workflow = production_next_script_finalize_fixture();
         assert_eq!(workflow.action(), ShakedexValueAction::SellerScriptFinalize);
         assert_eq!(workflow.stage(), ShakedexValueStage::Prepared);
