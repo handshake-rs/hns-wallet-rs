@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use hns_wallet_ffi::{
     ApprovalSummary, ServiceCapability, ServiceErrorCode, ServiceFailure, ServiceRequest,
-    WalletRequest, WalletResponse,
+    WalletAuthorityContextRequest, WalletHnsAuthorityContext, WalletRequest, WalletResponse,
 };
 use hns_wallet_provider::{ApprovedCall, PendingApproval, ProviderMethod};
 use hns_wallet_store::{SharedWalletStore, StoreError};
@@ -96,8 +96,10 @@ impl NativeHnsReadProfileFence {
 }
 
 /// Closed post-bootstrap runtime. Its wallet-operation implementation admits
-/// exactly the six reads frozen by `hnsReadOperationsV1`; lifecycle, recovery,
-/// workflow, value, provider, and non-HNS module operations remain rejected.
+/// exactly the six reads frozen by `hnsReadOperationsV1`; mainnet/testnet/
+/// regtest instances additionally admit the separate native-only authority-
+/// context request. Lifecycle, recovery, workflow, value, provider, and non-HNS
+/// module operations remain rejected.
 pub struct ProfileBackedNativeHnsReadRuntime {
     inner: PersistentNativeHnsReadRuntime,
     profile_fence: NativeHnsReadProfileFence,
@@ -108,6 +110,15 @@ impl ProfileBackedNativeHnsReadRuntime {
     pub(crate) fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
         self.inner.store.is_same_authority(store)
             && self.inner.runtime.shares_store_authority(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_account_revision(&self) -> Result<u64, ServiceFailure> {
+        self.inner
+            .runtime
+            .selected_account_with_revision()
+            .map(|selected| selected.revision)
+            .map_err(crate::hns_read_failure)
     }
 
     pub(crate) fn admits_wallet_request(request: &WalletRequest) -> bool {
@@ -129,6 +140,10 @@ impl ProfileBackedNativeHnsReadRuntime {
                 Err(profile_fence_changed())
             }
         }
+    }
+
+    fn authority_context_available(&self) -> bool {
+        self.inner.authority_network().is_some()
     }
 }
 
@@ -188,6 +203,9 @@ impl ServiceRuntime for RecoveryProfileBackedNativeHnsReadRuntime {
             ServiceRequest::Wallet { request } if Self::admits_wallet_request(request) => Ok(()),
             ServiceRequest::Wallet { .. } => Err(ServiceFailure::unsupported(
                 ServiceCapability::WalletOperations,
+            )),
+            ServiceRequest::WalletAuthority { .. } => Err(ServiceFailure::unsupported(
+                ServiceCapability::HnsWalletAuthorityContextV1,
             )),
             _ => Err(ServiceFailure::unsupported(
                 ServiceCapability::ProviderDispatch,
@@ -259,10 +277,14 @@ impl Drop for ProfileBackedNativeHnsReadRuntime {
 
 impl ServiceRuntime for ProfileBackedNativeHnsReadRuntime {
     fn capabilities(&self) -> BTreeSet<ServiceCapability> {
-        BTreeSet::from([
+        let mut capabilities = BTreeSet::from([
             ServiceCapability::WalletOperations,
             ServiceCapability::HnsReadOperationsV1,
-        ])
+        ]);
+        if self.authority_context_available() {
+            capabilities.insert(ServiceCapability::HnsWalletAuthorityContextV1);
+        }
+        capabilities
     }
 
     fn admit_service_request(&self, request: &ServiceRequest) -> Result<(), ServiceFailure> {
@@ -270,6 +292,10 @@ impl ServiceRuntime for ProfileBackedNativeHnsReadRuntime {
             ServiceRequest::Wallet { request } if Self::admits_wallet_request(request) => Ok(()),
             ServiceRequest::Wallet { .. } => Err(ServiceFailure::unsupported(
                 ServiceCapability::WalletOperations,
+            )),
+            ServiceRequest::WalletAuthority { .. } if self.authority_context_available() => Ok(()),
+            ServiceRequest::WalletAuthority { .. } => Err(ServiceFailure::unsupported(
+                ServiceCapability::HnsWalletAuthorityContextV1,
             )),
             _ => Err(ServiceFailure::unsupported(
                 ServiceCapability::ProviderDispatch,
@@ -307,6 +333,30 @@ impl ServiceRuntime for ProfileBackedNativeHnsReadRuntime {
         let response = self.inner.execute_wallet(request);
         self.revalidate_profile_fence()?;
         response
+    }
+
+    fn execute_wallet_authority_context(
+        &mut self,
+        request: WalletAuthorityContextRequest,
+    ) -> Result<WalletHnsAuthorityContext, ServiceFailure> {
+        if !self.authority_context_available() {
+            return Err(ServiceFailure::unsupported(
+                ServiceCapability::HnsWalletAuthorityContextV1,
+            ));
+        }
+        self.revalidate_profile_fence()?;
+        let before = self
+            .inner
+            .wallet_hns_authority_context(request, self.profile_fence.revision)?;
+        self.revalidate_profile_fence()?;
+        let after = self
+            .inner
+            .wallet_hns_authority_context(request, self.profile_fence.revision)?;
+        if before != after {
+            let _ = self.inner.store.lock();
+            return Err(authority_context_changed());
+        }
+        Ok(after)
     }
 }
 
@@ -430,6 +480,11 @@ impl WalletService<SharedWalletStore, ProfileBackedNativeHnsReadRuntime> {
             pending,
             event_sequences,
         } = base;
+        if runtime.authority_network().is_some() {
+            capabilities.insert(ServiceCapability::HnsWalletAuthorityContextV1);
+        } else {
+            capabilities.remove(&ServiceCapability::HnsWalletAuthorityContextV1);
+        }
         capabilities.remove(&ServiceCapability::ProviderDispatch);
         capabilities.remove(&ServiceCapability::ValueMovement);
         capabilities.remove(&ServiceCapability::BrowserIntegration);
@@ -558,6 +613,14 @@ fn profile_fence_changed() -> ServiceFailure {
     ServiceFailure {
         code: ServiceErrorCode::PersistenceFailure,
         message: "native HNS read profile is unavailable or changed".to_owned(),
+        unsupported_capability: None,
+    }
+}
+
+fn authority_context_changed() -> ServiceFailure {
+    ServiceFailure {
+        code: ServiceErrorCode::PersistenceFailure,
+        message: "wallet HNS authority context changed during observation".to_owned(),
         unsupported_capability: None,
     }
 }

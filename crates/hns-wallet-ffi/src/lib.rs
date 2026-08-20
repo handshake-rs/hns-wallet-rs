@@ -56,9 +56,33 @@ pub enum ServiceCapability {
     TypedEvents,
     WalletOperations,
     HnsReadOperationsV1,
+    HnsWalletAuthorityContextV1,
     ProviderDispatch,
     ValueMovement,
     BrowserIntegration,
+}
+
+/// Canonical Handshake network identity used by the native-only wallet
+/// authority-context operation. Simnet is intentionally absent because the
+/// browser authority broker admits only production, public test, and local
+/// regression networks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WalletHandshakeNetwork {
+    Mainnet,
+    Testnet,
+    Regtest,
+}
+
+impl WalletHandshakeNetwork {
+    /// Return the canonical Handshake wire magic for this network.
+    pub const fn magic(self) -> u32 {
+        match self {
+            Self::Mainnet => 0x5b6e_f2d3,
+            Self::Testnet => 0xb152_0dd2,
+            Self::Regtest => 0xae38_95cf,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -187,6 +211,43 @@ pub enum ServiceRequest {
     Wallet {
         request: WalletRequest,
     },
+    WalletAuthority {
+        request: WalletAuthorityContextRequest,
+    },
+}
+
+/// Additive native-only request kept outside [`WalletRequest`] so the exact
+/// six-operation `hnsReadOperationsV1` subset remains unchanged.
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "operation",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum WalletAuthorityContextRequest {
+    CurrentHnsContext {
+        network: WalletHandshakeNetwork,
+        network_magic: u32,
+        namespace_id: [u8; 16],
+        namespace_lease_generation: u64,
+        module: ModuleId,
+    },
+}
+
+impl std::fmt::Debug for WalletAuthorityContextRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CurrentHnsContext { module, .. } => formatter
+                .debug_struct("CurrentHnsContext")
+                .field("network", &"<bound>")
+                .field("network_magic", &"<bound>")
+                .field("namespace_id", &"<opaque>")
+                .field("namespace_lease_generation", &"<bound>")
+                .field("module", module)
+                .finish(),
+        }
+    }
 }
 
 /// An owned ABI secret that zeroizes its allocation on drop and never prints
@@ -412,9 +473,51 @@ pub enum ServiceResponse {
     Wallet {
         response: WalletResponse,
     },
+    WalletAuthority {
+        context: WalletHnsAuthorityContext,
+    },
     Failure {
         failure: ServiceFailure,
     },
+}
+
+/// Wallet-service evidence joined to a trusted native broker lease by the
+/// browser host. This value is not independently an authority and is never a
+/// website/provider projection.
+#[derive(Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WalletHnsAuthorityContext {
+    pub network: WalletHandshakeNetwork,
+    pub network_magic: u32,
+    pub namespace_id: [u8; 16],
+    pub namespace_lease_generation: u64,
+    pub active_wallet: WalletId,
+    pub account: AccountId,
+    pub wallet_authority_revision: u64,
+    pub account_authority_revision: u64,
+    pub locked: bool,
+    pub module: ModuleId,
+    pub persistent_wallet_confirmed: bool,
+    pub recovery_pending: bool,
+    pub retirement_pending: bool,
+    pub hns_reads_ready: bool,
+}
+
+impl std::fmt::Debug for WalletHnsAuthorityContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WalletHnsAuthorityContext")
+            .field("network", &"<bound>")
+            .field("network_magic", &"<bound>")
+            .field("namespace_id", &"<opaque>")
+            .field("namespace_lease_generation", &"<bound>")
+            .field("active_wallet", &"<opaque>")
+            .field("account", &"<opaque>")
+            .field("wallet_authority_revision", &"<bound>")
+            .field("account_authority_revision", &"<bound>")
+            .field("lifecycle", &"<positive evidence>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1235,6 +1338,9 @@ fn validate_service_request(request: &ServiceRequest) -> Result<(), AbiError> {
             Ok(())
         }
         ServiceRequest::Wallet { request } => validate_wallet_request(request),
+        ServiceRequest::WalletAuthority { request } => {
+            validate_wallet_authority_context_request(request)
+        }
     }
 }
 
@@ -1268,6 +1374,27 @@ fn validate_wallet_request(request: &WalletRequest) -> Result<(), AbiError> {
     }
 }
 
+fn validate_wallet_authority_context_request(
+    request: &WalletAuthorityContextRequest,
+) -> Result<(), AbiError> {
+    match request {
+        WalletAuthorityContextRequest::CurrentHnsContext {
+            network,
+            network_magic,
+            namespace_id,
+            namespace_lease_generation,
+            module,
+        } if *network_magic == network.magic()
+            && namespace_id.iter().any(|byte| *byte != 0)
+            && *namespace_lease_generation != 0
+            && *module == ModuleId::Handshake =>
+        {
+            Ok(())
+        }
+        WalletAuthorityContextRequest::CurrentHnsContext { .. } => Err(AbiError::InvalidAuthority),
+    }
+}
+
 fn validate_service_frame(frame: &ServiceFrame) -> Result<(), AbiError> {
     match frame {
         ServiceFrame::Hello { hello } => {
@@ -1281,6 +1408,15 @@ fn validate_service_frame(frame: &ServiceFrame) -> Result<(), AbiError> {
                     && !hello
                         .capabilities
                         .contains(&ServiceCapability::WalletOperations))
+                || (hello
+                    .capabilities
+                    .contains(&ServiceCapability::HnsWalletAuthorityContextV1)
+                    && (!hello
+                        .capabilities
+                        .contains(&ServiceCapability::WalletOperations)
+                        || !hello
+                            .capabilities
+                            .contains(&ServiceCapability::HnsReadOperationsV1)))
             {
                 return Err(AbiError::InvalidEnvelope);
             }
@@ -1379,9 +1515,38 @@ fn validate_service_response(response: &ServiceResponse) -> Result<(), AbiError>
             Ok(())
         }
         ServiceResponse::Wallet { response } => validate_wallet_response(response),
+        ServiceResponse::WalletAuthority { context } => {
+            validate_wallet_hns_authority_context(context)
+        }
         ServiceResponse::Failure { failure } => failure.validate(),
         _ => Ok(()),
     }
+}
+
+fn validate_wallet_hns_authority_context(
+    context: &WalletHnsAuthorityContext,
+) -> Result<(), AbiError> {
+    if context.network_magic != context.network.magic()
+        || context.namespace_id.iter().all(|byte| *byte == 0)
+        || context.namespace_lease_generation == 0
+        || context
+            .active_wallet
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        || context.account.as_bytes().iter().all(|byte| *byte == 0)
+        || context.wallet_authority_revision == 0
+        || context.account_authority_revision == 0
+        || context.locked
+        || context.module != ModuleId::Handshake
+        || !context.persistent_wallet_confirmed
+        || context.recovery_pending
+        || context.retirement_pending
+        || !context.hns_reads_ready
+    {
+        return Err(AbiError::InvalidAuthority);
+    }
+    Ok(())
 }
 
 fn validate_wallet_response(response: &WalletResponse) -> Result<(), AbiError> {
@@ -1666,6 +1831,185 @@ mod tests {
                 ServiceCapability::WalletOperations,
                 ServiceCapability::HnsReadOperationsV1,
             ]))
+        );
+    }
+
+    #[test]
+    fn hns_wallet_authority_context_v1_is_additive_exact_and_positive_only() {
+        assert_json_round_trip(
+            &ServiceCapability::HnsWalletAuthorityContextV1,
+            serde_json::json!("hnsWalletAuthorityContextV1"),
+        );
+        let namespace_id = [7_u8; 16];
+        let authority_request = WalletAuthorityContextRequest::CurrentHnsContext {
+            network: WalletHandshakeNetwork::Regtest,
+            network_magic: 0xae38_95cf,
+            namespace_id,
+            namespace_lease_generation: 9_007_199_254_740_997,
+            module: ModuleId::Handshake,
+        };
+        let request_debug = format!("{authority_request:?}");
+        assert!(!request_debug.contains("9007199254740997"));
+        assert!(!request_debug.contains("[7, 7"));
+        assert_json_round_trip(
+            &ServiceRequest::WalletAuthority {
+                request: authority_request,
+            },
+            serde_json::json!({
+                "operation": "walletAuthority",
+                "request": {
+                    "operation": "currentHnsContext",
+                    "network": "regtest",
+                    "networkMagic": 2_922_943_951_u32,
+                    "namespaceId": namespace_id,
+                    "namespaceLeaseGeneration": 9_007_199_254_740_997_u64,
+                    "module": "handshake",
+                },
+            }),
+        );
+
+        let context = WalletHnsAuthorityContext {
+            network: WalletHandshakeNetwork::Regtest,
+            network_magic: 0xae38_95cf,
+            namespace_id,
+            namespace_lease_generation: 9_007_199_254_740_997,
+            active_wallet: wallet_id(),
+            account: AccountId::new([9_u8; 16]),
+            wallet_authority_revision: 9_007_199_254_740_993,
+            account_authority_revision: 9_007_199_254_740_995,
+            locked: false,
+            module: ModuleId::Handshake,
+            persistent_wallet_confirmed: true,
+            recovery_pending: false,
+            retirement_pending: false,
+            hns_reads_ready: true,
+        };
+        let context_debug = format!("{context:?}");
+        for private_value in [
+            "9007199254740993",
+            "9007199254740995",
+            "9007199254740997",
+            "[7, 7",
+            "[8, 8",
+            "[9, 9",
+        ] {
+            assert!(!context_debug.contains(private_value));
+        }
+        assert_json_round_trip(
+            &ServiceResponse::WalletAuthority { context },
+            serde_json::json!({
+                "result": "walletAuthority",
+                "context": {
+                    "network": "regtest",
+                    "networkMagic": 2_922_943_951_u32,
+                    "namespaceId": namespace_id,
+                    "namespaceLeaseGeneration": 9_007_199_254_740_997_u64,
+                    "activeWallet": [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+                    "account": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9],
+                    "walletAuthorityRevision": 9_007_199_254_740_993_u64,
+                    "accountAuthorityRevision": 9_007_199_254_740_995_u64,
+                    "locked": false,
+                    "module": "handshake",
+                    "persistentWalletConfirmed": true,
+                    "recoveryPending": false,
+                    "retirementPending": false,
+                    "hnsReadsReady": true,
+                },
+            }),
+        );
+
+        for invalid in [
+            WalletAuthorityContextRequest::CurrentHnsContext {
+                network: WalletHandshakeNetwork::Regtest,
+                network_magic: 1,
+                namespace_id,
+                namespace_lease_generation: 1,
+                module: ModuleId::Handshake,
+            },
+            WalletAuthorityContextRequest::CurrentHnsContext {
+                network: WalletHandshakeNetwork::Regtest,
+                network_magic: 0xae38_95cf,
+                namespace_id: [0_u8; 16],
+                namespace_lease_generation: 1,
+                module: ModuleId::Handshake,
+            },
+            WalletAuthorityContextRequest::CurrentHnsContext {
+                network: WalletHandshakeNetwork::Regtest,
+                network_magic: 0xae38_95cf,
+                namespace_id,
+                namespace_lease_generation: 0,
+                module: ModuleId::Handshake,
+            },
+            WalletAuthorityContextRequest::CurrentHnsContext {
+                network: WalletHandshakeNetwork::Regtest,
+                network_magic: 0xae38_95cf,
+                namespace_id,
+                namespace_lease_generation: 1,
+                module: ModuleId::Bitcoin,
+            },
+        ] {
+            assert_eq!(
+                encode_host_frame(&request(ServiceRequest::WalletAuthority {
+                    request: invalid,
+                })),
+                Err(AbiError::InvalidAuthority)
+            );
+        }
+
+        let service_hello = |capabilities| ServiceFrame::Hello {
+            hello: ServiceHello {
+                protocol_version: WALLET_ABI_VERSION,
+                platform: HostPlatform::ChromiumNativeHost,
+                host_session_id: host_session(),
+                service_session_id: service_session(),
+                restart_generation: 7,
+                capabilities,
+                limits: ServiceLimits::default(),
+            },
+        };
+        for capabilities in [
+            BTreeSet::from([ServiceCapability::HnsWalletAuthorityContextV1]),
+            BTreeSet::from([
+                ServiceCapability::WalletOperations,
+                ServiceCapability::HnsWalletAuthorityContextV1,
+            ]),
+            BTreeSet::from([
+                ServiceCapability::HnsReadOperationsV1,
+                ServiceCapability::HnsWalletAuthorityContextV1,
+            ]),
+        ] {
+            assert_eq!(
+                encode_service_frame(&service_hello(capabilities)),
+                Err(AbiError::InvalidEnvelope)
+            );
+        }
+        encode_service_frame(&service_hello(BTreeSet::from([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::HnsReadOperationsV1,
+            ServiceCapability::HnsWalletAuthorityContextV1,
+        ])))
+        .expect("complete HNS authority capability prerequisites");
+
+        let invalid_context = WalletHnsAuthorityContext {
+            locked: true,
+            ..context
+        };
+        let invalid_response = ServiceFrame::Response {
+            envelope: SessionEnvelope {
+                protocol_version: WALLET_ABI_VERSION,
+                host_session_id: host_session(),
+                service_session_id: service_session(),
+                restart_generation: 7,
+                channel_sequence: 1,
+                request_id: request_id(),
+                body: ServiceResponse::WalletAuthority {
+                    context: invalid_context,
+                },
+            },
+        };
+        assert_eq!(
+            encode_service_frame(&invalid_response),
+            Err(AbiError::InvalidAuthority)
         );
     }
 

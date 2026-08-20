@@ -80,6 +80,17 @@ a bounded label. Persisted Authorization rejects JSON escape bytes so parsing
 cannot create an unowned plaintext scratch copy. Provisioning and every load
 require unlock, re-authenticate that sole account, and require its complete
 singleton recovery-seed bootstrap.
+The ordinary profile-backed read service now also implements the exact
+native-only `hnsWalletAuthorityContextV1` contract already consumed by the
+Chromium host candidate. It keeps that request outside the frozen six-read
+enum, validates the account's canonical network/magic, and returns the active
+wallet/account with authenticated profile and account-row revisions. Opaque
+namespace and lease-generation fields are only echoed evidence for a native
+caller that already holds the matching HRM/HNSA broker guard; they confer no
+authority by themselves and never enter provider/page JSON. Generic, simnet,
+recovery-only, and checked-in executable compositions do not advertise the
+marker. A real exclusive namespace/database broker and supervised launch path
+are still required.
 Revocation replaces the secret-bearing record with a persistent tombstone, so
 later re-provisioning continues the revision/update-time high-water. The
 checked-in executable does not consume the profile, and rotation/revocation

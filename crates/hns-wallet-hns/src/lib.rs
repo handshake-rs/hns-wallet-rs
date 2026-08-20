@@ -1716,6 +1716,17 @@ pub struct HnsExistingAccountSelector {
     mode: HnsAccountReadMode,
 }
 
+/// Exact authenticated account row and its monotonic entity revision.
+///
+/// The revision is local wallet evidence only: it proves neither chain state
+/// nor a broker lease. Native compositions can join it to their independently
+/// held authority and re-read it around dependent use.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedHnsAccountRevision {
+    pub account: HnsAccountRecord,
+    pub revision: u64,
+}
+
 impl HnsExistingAccountSelector {
     pub fn new(
         store: SharedWalletStore,
@@ -1753,6 +1764,14 @@ impl HnsExistingAccountSelector {
     /// a restarted service fail closed if product configuration selects a
     /// different account than a persisted provider permission.
     pub fn selected_account(&self) -> Result<HnsAccountRecord, HnsWalletError> {
+        Ok(self.selected_account_with_revision()?.account)
+    }
+
+    /// Re-read the same exact account selection while retaining the
+    /// authenticated entity revision for a native authority-context join.
+    pub fn selected_account_with_revision(
+        &self,
+    ) -> Result<SelectedHnsAccountRevision, HnsWalletError> {
         let expected_id = account_entity_id(&self.expected);
         let (accounts, selected) = self
             .store
@@ -1787,10 +1806,16 @@ impl HnsExistingAccountSelector {
             }
         }
         let selected = selected.ok_or(HnsWalletError::AccountConfigurationMismatch)?;
-        if selected.id != expected_id || selected.value.config != self.expected {
+        if selected.id != expected_id
+            || selected.value.config != self.expected
+            || selected.revision == 0
+        {
             return Err(HnsWalletError::AccountConfigurationMismatch);
         }
-        Ok(selected.value)
+        Ok(SelectedHnsAccountRevision {
+            account: selected.value,
+            revision: selected.revision,
+        })
     }
 }
 
@@ -2017,6 +2042,19 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
 
     pub fn selected_account(&self) -> Result<HnsAccountRecord, HnsWalletError> {
         self.selector.selected_account()
+    }
+
+    /// Return the exact authenticated account row and its monotonic entity
+    /// revision without contacting the node.
+    pub fn selected_account_with_revision(
+        &self,
+    ) -> Result<SelectedHnsAccountRevision, HnsWalletError> {
+        self.selector.selected_account_with_revision()
+    }
+
+    /// Return the configured account network without consulting caller input.
+    pub const fn configured_network(&self) -> HnsNetwork {
+        self.selector.expected.network
     }
 
     /// Import one canonical Handshake name from exact native text.

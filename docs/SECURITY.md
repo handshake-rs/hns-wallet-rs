@@ -235,19 +235,26 @@ and module status is an error-free ready snapshot with one equal
 validated/scanned/target height. Any mismatch poisons the session. The marker
 grants no browser/provider authority and changes no availability or value gate.
 
-The profile-backed native-read constructor narrows this further without adding
-wire vocabulary. It accepts the literal locked shared authority, an owned
+The profile-backed native-read constructor narrows this further while adding
+one closed native-only authority-evidence operation outside the frozen six-read
+enum. It accepts the literal locked shared authority, an owned
 zeroizing/redacted/non-cloneable/non-serializable passphrase, and exact active
 profile revision/update time. It unlocks only to authenticate and consume the
 encrypted singleton, relocks before ordinary native-read construction,
 performs a private internal unlock, and authenticates the same fence again
 before returning. Its runtime-level request admission executes at the start of
 request-specific dispatch, after framed session sequence/replay bookkeeping,
-so every authority, provider, approval, ABI unlock/lock, create/restore,
-workflow, and non-HNS module request is rejected;
-only the six marker reads remain. The active profile fence is loaded before and
-after each admitted read. A mismatch, tombstone, absence, malformed profile, or
-store failure suppresses the read result and clears the key. Drop also
+so every provider, approval, ABI unlock/lock, create/restore, workflow, and
+non-HNS module request is rejected. Only the six marker reads and
+`walletAuthority/currentHnsContext` remain. The latter is advertised only for
+mainnet/testnet/regtest and requires canonical network/magic, a nonzero broker
+namespace claim, and a nonzero lease generation. It returns only positive
+unlocked/persistent/nonrecovering/nonretiring/read-ready evidence plus the
+authenticated profile and selected-account row revisions. The namespace fields
+are echoed for equality under a separately held native broker guard and confer
+no authority themselves. The active profile and account revision are read
+around the observation. A mismatch, tombstone, absence, malformed profile,
+account change, or store failure suppresses the result and clears the key. Drop also
 best-effort clears the same shared key. This is process-local containment, not
 a cross-process database lease or secret-delivery mechanism; installed
 products still need both and must terminate the process on lease invalidation.
@@ -259,7 +266,8 @@ there is no typed flagged-profile provisioning surface, and privileged generic
 low-level store mutation is out-of-band state construction rather than recovery
 authority. Its exact service capability
 set omits `providerDispatch`, `persistentPermissions`, `valueMovement`, and
-`browserIntegration`, every provider method is unsupported, and only the six
+`browserIntegration`, as well as `hnsWalletAuthorityContextV1`; every provider
+method and wallet-authority request is unsupported, and only the six
 non-signing `hnsReadOperationsV1` wallet reads are admitted. Structural config
 validation in this path is explicitly inert: it never authorizes current
 Shakedex-lock/Denuo access, allocation, signing, import/export, workflows,

@@ -51,7 +51,7 @@ release-gate authority.
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
 | `hns-wallet-ffi` | strict ABI v2 framing, canonical service IDs, typed approvals/events, and the closed exact HNS read-operations-v1 marker | raw keys/native commands or engine authority objects |
-| `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition, locked existing-database control runtime, same-Arc exact-account and synchronized non-value HNS read library runtimes, encrypted-profile bootstrap with private internal unlock, exact-six complete-request admission, per-read profile-fence invalidation and failure/drop locking, runtime-scoped HNS read-marker advertisement, atomic account grant, singleton persisted-account recheck, scoped public read projections | cross-process database leasing or secret transport, browser engine policy, value enablement, or product availability claims |
+| `hns-wallet-service` | random service/wallet sessions, exact sequences, private host control, permission-backed provider composition, locked existing-database control runtime, same-Arc exact-account and synchronized non-value HNS read library runtimes, encrypted-profile bootstrap with private internal unlock, exact-six read admission plus one native-only HNS authority-evidence operation, profile/account revision revalidation and failure/drop locking, runtime-scoped HNS read/authority-marker advertisement, atomic account grant, singleton persisted-account recheck, scoped public read projections | cross-process database or HRM/HNSA namespace brokerage, one-shot secret transport, browser engine policy, value enablement, or product availability claims |
 | `hns-wallet-host` | host-owned negotiation, identifiers/nonces, bounded request correlation, authority revisions, approval ownership, private provider bindings, event replay cursors, and exact six-operation HNS read admission/correlation | platform process launch, engine policy, page injection, artifact trust, or availability claims |
 | `hns-wallet-testkit` | deterministic non-mainnet fixtures | production configuration |
 
@@ -130,8 +130,9 @@ ordinary authority validation, but the bits remain authenticated identity and
 never become capability. The public core wrapper exposes only exact account
 selection and the synchronized projection. At the service boundary a distinct
 profile-backed recovery runtime admits the same six wallet reads and advertises
-no provider dispatch, persistent permissions, value, browser, Shakedex-lock,
-Denuo, signing, workflow, import/export, or lifecycle authority. It cannot
+no wallet-authority-context marker, provider dispatch, persistent permissions,
+value, browser, Shakedex-lock, Denuo, signing, workflow, import/export, or
+lifecycle authority. It cannot
 provision missing state; exact account/profile/revision fences and the ordinary
 chain/mempool checks still apply. Ordinary and full constructors continue to
 use the unchanged production gates. Like the ordinary synchronized scanner, a

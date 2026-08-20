@@ -13,11 +13,13 @@ use hns_wallet_ffi::{
     PROVIDER_SCHEMA_VERSION, ProviderBinding, ProviderCapabilitySnapshot, ProviderEventEnvelope,
     ProviderEventPayload, ProviderNamespace, ServiceCapability, ServiceErrorCode, ServiceFailure,
     ServiceFrame, ServiceHello, ServiceLimits, ServiceRequest, ServiceResponse, SessionEnvelope,
-    WALLET_ABI_VERSION, WalletRequest, WalletResponse, WalletRuntimeStatus, encode_service_frame,
+    WALLET_ABI_VERSION, WalletAuthorityContextRequest, WalletHandshakeNetwork,
+    WalletHnsAuthorityContext, WalletRequest, WalletResponse, WalletRuntimeStatus,
+    encode_service_frame,
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountReadSnapshot, HnsBackend, HnsClock,
-    HnsExistingAccountSelector, HnsNodeRpcBackend, HnsNodeRpcConfig,
+    HnsExistingAccountSelector, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
     HnsPersistedRecoveryReadOnlyRuntime, HnsRuntimeConfig, HnsWalletError, KnownName,
     NameOwnershipStatus, NameResourceStatus, SystemClock as HnsSystemClock,
 };
@@ -162,6 +164,18 @@ pub trait ServiceRuntime {
     fn lock_wallet(&mut self) -> Result<(), ServiceFailure>;
 
     fn execute_wallet(&mut self, request: WalletRequest) -> Result<WalletResponse, ServiceFailure>;
+
+    /// Return positive native-only HNS authority evidence. Ordinary runtimes
+    /// fail closed; only the exact profile-backed composition implements this
+    /// additive operation.
+    fn execute_wallet_authority_context(
+        &mut self,
+        _: WalletAuthorityContextRequest,
+    ) -> Result<WalletHnsAuthorityContext, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::HnsWalletAuthorityContextV1,
+        ))
+    }
 }
 
 #[derive(Default)]
@@ -553,6 +567,61 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsReadRuntime<B, C> {
             return Err(error);
         }
         Ok(())
+    }
+
+    fn authority_network(&self) -> Option<WalletHandshakeNetwork> {
+        match self.runtime.configured_network() {
+            HnsNetwork::Mainnet => Some(WalletHandshakeNetwork::Mainnet),
+            HnsNetwork::Testnet => Some(WalletHandshakeNetwork::Testnet),
+            HnsNetwork::Regtest => Some(WalletHandshakeNetwork::Regtest),
+            HnsNetwork::Simnet => None,
+        }
+    }
+
+    fn wallet_hns_authority_context(
+        &self,
+        request: WalletAuthorityContextRequest,
+        wallet_authority_revision: u64,
+    ) -> Result<WalletHnsAuthorityContext, ServiceFailure> {
+        let WalletAuthorityContextRequest::CurrentHnsContext {
+            network,
+            network_magic,
+            namespace_id,
+            namespace_lease_generation,
+            module,
+        } = request;
+        if self.authority_network() != Some(network)
+            || network_magic != network.magic()
+            || namespace_id.iter().all(|byte| *byte == 0)
+            || namespace_lease_generation == 0
+            || module != ModuleId::Handshake
+            || wallet_authority_revision == 0
+            || self.store.is_locked().map_err(persistent_store_failure)?
+        {
+            return Err(invalid_request(
+                "wallet HNS authority claim does not match the active profile",
+            ));
+        }
+        let selected = self
+            .runtime
+            .selected_account_with_revision()
+            .map_err(hns_read_failure)?;
+        Ok(WalletHnsAuthorityContext {
+            network,
+            network_magic,
+            namespace_id,
+            namespace_lease_generation,
+            active_wallet: selected.account.config.wallet_id,
+            account: selected.account.config.account_id,
+            wallet_authority_revision,
+            account_authority_revision: selected.revision,
+            locked: false,
+            module: ModuleId::Handshake,
+            persistent_wallet_confirmed: true,
+            recovery_pending: false,
+            retirement_pending: false,
+            hns_reads_ready: true,
+        })
     }
 }
 
@@ -982,6 +1051,11 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         if !capabilities.contains(&ServiceCapability::WalletOperations) {
             capabilities.remove(&ServiceCapability::HnsReadOperationsV1);
         }
+        if !capabilities.contains(&ServiceCapability::WalletOperations)
+            || !capabilities.contains(&ServiceCapability::HnsReadOperationsV1)
+        {
+            capabilities.remove(&ServiceCapability::HnsWalletAuthorityContextV1);
+        }
         Ok(Self {
             provider: ProviderCore::new(state, wallet_session_id, true),
             runtime,
@@ -1303,6 +1377,18 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
                     _ => {}
                 }
                 Ok(ServiceResponse::Wallet { response })
+            }
+            ServiceRequest::WalletAuthority { request } => {
+                if !self
+                    .capabilities
+                    .contains(&ServiceCapability::HnsWalletAuthorityContextV1)
+                {
+                    return Err(ServiceFailure::unsupported(
+                        ServiceCapability::HnsWalletAuthorityContextV1,
+                    ));
+                }
+                let context = self.runtime.execute_wallet_authority_context(request)?;
+                Ok(ServiceResponse::WalletAuthority { context })
             }
         }
     }
@@ -5050,12 +5136,18 @@ mod tests {
             BTreeSet::from([
                 ServiceCapability::WalletOperations,
                 ServiceCapability::HnsReadOperationsV1,
+                ServiceCapability::HnsWalletAuthorityContextV1,
             ])
         );
         assert!(
             service
                 .capabilities
                 .contains(&ServiceCapability::HnsReadOperationsV1)
+        );
+        assert!(
+            service
+                .capabilities
+                .contains(&ServiceCapability::HnsWalletAuthorityContextV1)
         );
         for capability in [
             ServiceCapability::ProviderDispatch,
@@ -5122,6 +5214,107 @@ mod tests {
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].account_id, account.account_id);
 
+        let namespace_id = [41_u8; 16];
+        let authority_request = WalletAuthorityContextRequest::CurrentHnsContext {
+            network: WalletHandshakeNetwork::Regtest,
+            network_magic: WalletHandshakeNetwork::Regtest.magic(),
+            namespace_id,
+            namespace_lease_generation: 7,
+            module: ModuleId::Handshake,
+        };
+        let expected_account_revision = service
+            .runtime
+            .selected_account_revision()
+            .expect("selected account revision");
+        let ServiceResponse::WalletAuthority { context } = service
+            .dispatch(
+                ServiceRequest::WalletAuthority {
+                    request: authority_request,
+                },
+                NOW_MS + 2,
+            )
+            .expect("profile-backed HNS authority context")
+        else {
+            panic!("wallet authority response")
+        };
+        assert_eq!(
+            context,
+            WalletHnsAuthorityContext {
+                network: WalletHandshakeNetwork::Regtest,
+                network_magic: WalletHandshakeNetwork::Regtest.magic(),
+                namespace_id,
+                namespace_lease_generation: 7,
+                active_wallet: account.wallet_id,
+                account: account.account_id,
+                wallet_authority_revision: 1,
+                account_authority_revision: expected_account_revision,
+                locked: false,
+                module: ModuleId::Handshake,
+                persistent_wallet_confirmed: true,
+                recovery_pending: false,
+                retirement_pending: false,
+                hns_reads_ready: true,
+            }
+        );
+        assert!(matches!(
+            service.dispatch(
+                ServiceRequest::WalletAuthority {
+                    request: WalletAuthorityContextRequest::CurrentHnsContext {
+                        network: WalletHandshakeNetwork::Testnet,
+                        network_magic: WalletHandshakeNetwork::Testnet.magic(),
+                        namespace_id,
+                        namespace_lease_generation: 7,
+                        module: ModuleId::Handshake,
+                    },
+                },
+                NOW_MS + 3,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+        assert!(
+            !store
+                .is_locked()
+                .expect("claim mismatch leaves service live")
+        );
+
+        let account_record_id = production_hns_record_id(&account);
+        let next_account_revision = store
+            .with_store_mut(|wallet| {
+                let stored = wallet
+                    .wallet_account::<HnsAccountRecord>(&account_record_id)?
+                    .expect("selected account row");
+                let mut advanced = stored.value;
+                advanced.next_receive_index = 1;
+                wallet.save_wallet_account(&account_record_id, stored.revision, &advanced, 101)
+            })
+            .expect("advance authenticated account revision");
+        assert!(next_account_revision > context.account_authority_revision);
+        let ServiceResponse::WalletAuthority {
+            context: advanced_context,
+        } = service
+            .dispatch(
+                ServiceRequest::WalletAuthority {
+                    request: authority_request,
+                },
+                NOW_MS + 4,
+            )
+            .expect("re-read advanced HNS authority context")
+        else {
+            panic!("advanced wallet authority response")
+        };
+        assert_eq!(
+            advanced_context.account_authority_revision,
+            next_account_revision
+        );
+        assert_eq!(
+            advanced_context.wallet_authority_revision,
+            context.wallet_authority_revision
+        );
+        assert_ne!(advanced_context, context);
+
         let rejected = [
             WalletRequest::Unlock {
                 passphrase: hns_wallet_ffi::SecretString::new(PASSPHRASE.to_owned()),
@@ -5163,7 +5356,7 @@ mod tests {
             assert!(matches!(
                 service.dispatch(
                     ServiceRequest::Wallet { request },
-                    NOW_MS + 2 + u64::try_from(index).expect("bounded request index"),
+                    NOW_MS + 5 + u64::try_from(index).expect("bounded request index"),
                 ),
                 Err(ServiceFailure {
                     code: ServiceErrorCode::UnsupportedCapability,
@@ -5244,6 +5437,72 @@ mod tests {
                 .is_locked()
                 .expect("service drop relocks shared store")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn profile_backed_simnet_reads_never_advertise_browser_authority_context() {
+        const PASSPHRASE: &str = "correct horse battery staple";
+        let directory = native_hns_read_tempdir();
+        let mut account = production_hns_config(9, 0);
+        account.network = HnsNetwork::Simnet;
+        let store = native_hns_profile_store(&directory.path().join("simnet.sqlite3"), &account);
+        let profile = native_hns_profile(
+            account,
+            "127.0.0.1:24191",
+            "Bearer simnet-profile",
+            "Handshake Simnet",
+        );
+        assert_eq!(
+            provision_native_hns_read_profile(&store, 0, &profile, 100)
+                .expect("provision simnet profile"),
+            1
+        );
+        store.lock().expect("lock simnet profile before bootstrap");
+        let mut service = WalletService::new_profile_backed_native_hns_reads(
+            store.clone(),
+            native_hns_bootstrap_passphrase(PASSPHRASE),
+            NativeHnsReadProfileFence::new(1, 100),
+        )
+        .expect("profile-backed simnet reads");
+
+        assert!(
+            !service
+                .runtime
+                .capabilities()
+                .contains(&ServiceCapability::HnsWalletAuthorityContextV1)
+        );
+        assert!(
+            !service
+                .capabilities
+                .contains(&ServiceCapability::HnsWalletAuthorityContextV1)
+        );
+        assert!(matches!(
+            service.dispatch(
+                ServiceRequest::WalletAuthority {
+                    request: WalletAuthorityContextRequest::CurrentHnsContext {
+                        network: WalletHandshakeNetwork::Regtest,
+                        network_magic: WalletHandshakeNetwork::Regtest.magic(),
+                        namespace_id: [45_u8; 16],
+                        namespace_lease_generation: 1,
+                        module: ModuleId::Handshake,
+                    },
+                },
+                NOW_MS,
+            ),
+            Err(ServiceFailure {
+                code: ServiceErrorCode::UnsupportedCapability,
+                unsupported_capability: Some(ServiceCapability::HnsWalletAuthorityContextV1),
+                ..
+            })
+        ));
+        assert!(
+            !store
+                .is_locked()
+                .expect("rejection leaves simnet reads live")
+        );
+        drop(service);
+        assert!(store.is_locked().expect("simnet service drop relocks"));
     }
 
     #[cfg(target_os = "linux")]
@@ -5463,6 +5722,7 @@ mod tests {
                 ])
             );
             for capability in [
+                ServiceCapability::HnsWalletAuthorityContextV1,
                 ServiceCapability::ProviderDispatch,
                 ServiceCapability::PersistentPermissions,
                 ServiceCapability::ValueMovement,
@@ -5563,11 +5823,30 @@ mod tests {
             ));
             assert!(matches!(
                 service.dispatch(
+                    ServiceRequest::WalletAuthority {
+                        request: WalletAuthorityContextRequest::CurrentHnsContext {
+                            network: WalletHandshakeNetwork::Testnet,
+                            network_magic: WalletHandshakeNetwork::Testnet.magic(),
+                            namespace_id: [44_u8; 16],
+                            namespace_lease_generation: 1,
+                            module: ModuleId::Handshake,
+                        },
+                    },
+                    NOW_MS + 3,
+                ),
+                Err(ServiceFailure {
+                    code: ServiceErrorCode::UnsupportedCapability,
+                    unsupported_capability: Some(ServiceCapability::HnsWalletAuthorityContextV1),
+                    ..
+                })
+            ));
+            assert!(matches!(
+                service.dispatch(
                     ServiceRequest::ProviderCapabilities {
                         authority_handle: handle(),
                         authority_revision: 1,
                     },
-                    NOW_MS + 3,
+                    NOW_MS + 4,
                 ),
                 Err(ServiceFailure {
                     code: ServiceErrorCode::UnsupportedCapability,
@@ -5832,6 +6111,11 @@ mod tests {
             service
                 .capabilities
                 .contains(&ServiceCapability::HnsReadOperationsV1)
+        );
+        assert!(
+            !service
+                .capabilities
+                .contains(&ServiceCapability::HnsWalletAuthorityContextV1)
         );
         assert!(
             !service

@@ -11,7 +11,7 @@ use hns_wallet_ffi::{
     PROVIDER_SCHEMA_VERSION, ProviderBinding, ProviderCapabilitySnapshot, ProviderEventEnvelope,
     ProviderEventPayload, ServiceCapability, ServiceErrorCode, ServiceFrame, ServiceHello,
     ServiceLimits, ServiceRequest, ServiceResponse, SessionEnvelope, WALLET_ABI_VERSION,
-    WalletRequest, WalletResponse,
+    WalletAuthorityContextRequest, WalletHnsAuthorityContext, WalletRequest, WalletResponse,
 };
 use hns_wallet_types::{
     AccountId, HostAuthorityHandleId, HostSessionId, ModuleId, PROVIDER_METHOD_WIRE_NAMES,
@@ -161,6 +161,8 @@ pub enum HostError {
     CapabilityUnavailable,
     #[error("request is not in the exact HNS read-operations-v1 surface")]
     InvalidHnsReadRequest,
+    #[error("request is not a valid native HNS wallet authority-context claim")]
+    InvalidHnsWalletAuthorityRequest,
     #[error("pending request capacity is exhausted")]
     PendingRequestCapacity,
     #[error("authority capacity is exhausted")]
@@ -301,6 +303,7 @@ enum RequestClass {
     },
     Wallet(WalletResponseClass),
     HnsRead(HnsReadResponseClass),
+    HnsWalletAuthority(HnsWalletAuthorityResponseClass),
 }
 
 impl RequestClass {
@@ -312,8 +315,57 @@ impl RequestClass {
             | Self::Capabilities { handle, .. }
             | Self::Provider { handle, .. }
             | Self::Approval { handle, .. } => Some(*handle),
-            Self::Wallet(_) | Self::HnsRead(_) => None,
+            Self::Wallet(_) | Self::HnsRead(_) | Self::HnsWalletAuthority(_) => None,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HnsWalletAuthorityResponseClass {
+    request: WalletAuthorityContextRequest,
+}
+
+impl HnsWalletAuthorityResponseClass {
+    fn for_request(request: WalletAuthorityContextRequest) -> Result<Self, HostError> {
+        let WalletAuthorityContextRequest::CurrentHnsContext {
+            network,
+            network_magic,
+            namespace_id,
+            namespace_lease_generation,
+            module,
+        } = request;
+        if network_magic != network.magic()
+            || namespace_id.iter().all(|byte| *byte == 0)
+            || namespace_lease_generation == 0
+            || module != ModuleId::Handshake
+        {
+            return Err(HostError::InvalidHnsWalletAuthorityRequest);
+        }
+        Ok(Self { request })
+    }
+
+    fn matches(self, context: &WalletHnsAuthorityContext) -> bool {
+        let WalletAuthorityContextRequest::CurrentHnsContext {
+            network,
+            network_magic,
+            namespace_id,
+            namespace_lease_generation,
+            module,
+        } = self.request;
+        context.network == network
+            && context.network_magic == network_magic
+            && context.namespace_id == namespace_id
+            && context.namespace_lease_generation == namespace_lease_generation
+            && context.active_wallet.as_bytes() != &[0_u8; 16]
+            && context.account.as_bytes() != &[0_u8; 16]
+            && context.wallet_authority_revision != 0
+            && context.account_authority_revision != 0
+            && !context.locked
+            && context.module == module
+            && context.persistent_wallet_confirmed
+            && !context.recovery_pending
+            && !context.retirement_pending
+            && context.hns_reads_ready
     }
 }
 
@@ -976,6 +1028,26 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
         Ok(queued.frame)
     }
 
+    /// Issue the additive native-only wallet authority-context request.
+    ///
+    /// The returned service value remains evidence only. A product consumer
+    /// must join it to an independently held namespace lease guard and re-read
+    /// it around dependent use; this host does not manufacture that guard.
+    pub fn hns_wallet_authority_context_request(
+        &mut self,
+        request: WalletAuthorityContextRequest,
+    ) -> Result<HostFrame, HostError> {
+        self.require_capability(ServiceCapability::WalletOperations)?;
+        self.require_capability(ServiceCapability::HnsReadOperationsV1)?;
+        self.require_capability(ServiceCapability::HnsWalletAuthorityContextV1)?;
+        let class = HnsWalletAuthorityResponseClass::for_request(request)?;
+        let queued = self.enqueue(
+            ServiceRequest::WalletAuthority { request },
+            RequestClass::HnsWalletAuthority(class),
+        )?;
+        Ok(queued.frame)
+    }
+
     /// Accepts one already-decoded private service frame. Any validation
     /// failure poisons the channel and clears every service-derived value;
     /// callers must explicitly start a new generation.
@@ -1026,6 +1098,15 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
                 && !hello
                     .capabilities
                     .contains(&ServiceCapability::WalletOperations))
+            || (hello
+                .capabilities
+                .contains(&ServiceCapability::HnsWalletAuthorityContextV1)
+                && (!hello
+                    .capabilities
+                    .contains(&ServiceCapability::WalletOperations)
+                    || !hello
+                        .capabilities
+                        .contains(&ServiceCapability::HnsReadOperationsV1)))
         {
             return Err(HostError::HelloMismatch);
         }
@@ -1262,6 +1343,10 @@ impl<C: Clock, E: Entropy> WalletHost<C, E> {
             {
                 Ok(())
             }
+            (
+                RequestClass::HnsWalletAuthority(class),
+                ServiceResponse::WalletAuthority { context },
+            ) if class.matches(context) => Ok(()),
             _ => Err(HostError::ResponseClassMismatch),
         }
     }
@@ -2125,7 +2210,7 @@ mod tests {
 
     use hns_wallet_ffi::{
         AccountSummary, ApprovalSummary, HnsNameDisclosure, ProviderNamespace, SecretString,
-        WalletRuntimeStatus,
+        WalletHandshakeNetwork, WalletRuntimeStatus,
     };
     use hns_wallet_types::{
         Amount, BaseUnits, BrowserRuntimeSessionId, LocalTransactionStatus, PermissionCapability,
@@ -2336,6 +2421,155 @@ mod tests {
         });
         assert!(matches!(result, Err(HostError::HelloMismatch)));
         assert_eq!(host.connection_state(), ConnectionState::Failed);
+    }
+
+    #[test]
+    fn hns_wallet_authority_marker_requires_both_read_prerequisites_at_hello() {
+        for capabilities in [
+            BTreeSet::from([ServiceCapability::HnsWalletAuthorityContextV1]),
+            BTreeSet::from([
+                ServiceCapability::WalletOperations,
+                ServiceCapability::HnsWalletAuthorityContextV1,
+            ]),
+        ] {
+            let (mut host, _) = new_host();
+            let mut offered = required_capabilities();
+            offered.extend(capabilities);
+            let result = host.accept_service_frame(ServiceFrame::Hello {
+                hello: ServiceHello {
+                    protocol_version: WALLET_ABI_VERSION,
+                    platform: host.platform(),
+                    host_session_id: host.host_session_id(),
+                    service_session_id: service_session(),
+                    restart_generation: host.restart_generation(),
+                    capabilities: offered,
+                    limits: ServiceLimits::default(),
+                },
+            });
+            assert!(matches!(result, Err(HostError::HelloMismatch)));
+            assert_eq!(host.connection_state(), ConnectionState::Failed);
+        }
+    }
+
+    #[test]
+    fn exact_hns_wallet_authority_context_is_request_scoped_evidence_only() {
+        let request = WalletAuthorityContextRequest::CurrentHnsContext {
+            network: WalletHandshakeNetwork::Regtest,
+            network_magic: WalletHandshakeNetwork::Regtest.magic(),
+            namespace_id: [7_u8; 16],
+            namespace_lease_generation: 9_007_199_254_740_997,
+            module: ModuleId::Handshake,
+        };
+
+        let (mut missing_marker, _) = new_host();
+        let mut read_capabilities = required_capabilities();
+        read_capabilities.extend([
+            ServiceCapability::WalletOperations,
+            ServiceCapability::HnsReadOperationsV1,
+        ]);
+        negotiate(&mut missing_marker, read_capabilities);
+        assert!(matches!(
+            missing_marker.hns_wallet_authority_context_request(request),
+            Err(HostError::CapabilityUnavailable)
+        ));
+        assert!(missing_marker.pending.is_empty());
+
+        let capabilities = || {
+            let mut capabilities = required_capabilities();
+            capabilities.extend([
+                ServiceCapability::WalletOperations,
+                ServiceCapability::HnsReadOperationsV1,
+                ServiceCapability::HnsWalletAuthorityContextV1,
+            ]);
+            capabilities
+        };
+        let context = WalletHnsAuthorityContext {
+            network: WalletHandshakeNetwork::Regtest,
+            network_magic: WalletHandshakeNetwork::Regtest.magic(),
+            namespace_id: [7_u8; 16],
+            namespace_lease_generation: 9_007_199_254_740_997,
+            active_wallet: WalletId::new([8_u8; 16]),
+            account: AccountId::new([9_u8; 16]),
+            wallet_authority_revision: 9_007_199_254_740_993,
+            account_authority_revision: 9_007_199_254_740_995,
+            locked: false,
+            module: ModuleId::Handshake,
+            persistent_wallet_confirmed: true,
+            recovery_pending: false,
+            retirement_pending: false,
+            hns_reads_ready: true,
+        };
+
+        let (mut host, _) = new_host();
+        negotiate(&mut host, capabilities());
+        let frame = host
+            .hns_wallet_authority_context_request(request)
+            .expect("exact authority-context request");
+        let HostFrame::Request { envelope } = &frame else {
+            panic!("authority request frame")
+        };
+        assert_eq!(envelope.body, ServiceRequest::WalletAuthority { request });
+        let first_request_id = request_id(frame);
+        let response = response_frame(
+            &host,
+            first_request_id,
+            1,
+            ServiceResponse::WalletAuthority { context },
+        );
+        let accepted = host
+            .accept_service_frame(response)
+            .expect("exact authority-context response");
+        assert!(matches!(
+            accepted,
+            HostOutput::Response(AcceptedResponse {
+                response: ServiceResponse::WalletAuthority { context: accepted },
+                ..
+            }) if accepted == context
+        ));
+        assert!(host.pending.is_empty());
+        assert_eq!(host.connection_state(), ConnectionState::Ready);
+
+        let (mut mismatch, _) = new_host();
+        negotiate(&mut mismatch, capabilities());
+        let request_id = request_id(
+            mismatch
+                .hns_wallet_authority_context_request(request)
+                .expect("mismatch authority request"),
+        );
+        let mismatched_context = WalletHnsAuthorityContext {
+            namespace_id: [8_u8; 16],
+            ..context
+        };
+        let response = response_frame(
+            &mismatch,
+            request_id,
+            1,
+            ServiceResponse::WalletAuthority {
+                context: mismatched_context,
+            },
+        );
+        assert!(matches!(
+            mismatch.accept_service_frame(response),
+            Err(HostError::ResponseClassMismatch)
+        ));
+        assert_eq!(mismatch.connection_state(), ConnectionState::Failed);
+
+        let (mut malformed, _) = new_host();
+        negotiate(&mut malformed, capabilities());
+        assert!(matches!(
+            malformed.hns_wallet_authority_context_request(
+                WalletAuthorityContextRequest::CurrentHnsContext {
+                    network: WalletHandshakeNetwork::Regtest,
+                    network_magic: WalletHandshakeNetwork::Regtest.magic(),
+                    namespace_id: [0_u8; 16],
+                    namespace_lease_generation: 9_007_199_254_740_997,
+                    module: ModuleId::Handshake,
+                }
+            ),
+            Err(HostError::InvalidHnsWalletAuthorityRequest)
+        ));
+        assert!(malformed.pending.is_empty());
+        assert_eq!(malformed.connection_state(), ConnectionState::Ready);
     }
 
     #[test]

@@ -18,6 +18,13 @@ boundary:
 - a concrete fail-closed native HNS read-service constructor which binds an
   exact non-value account, authenticated loopback node RPC, and the literal
   shared store authority without enabling browser integration or value;
+- the additive native-only `hnsWalletAuthorityContextV1` wire discriminator
+  required by the Chromium host candidate, emitted only by the ordinary
+  profile-backed mainnet/testnet/regtest service. It binds canonical network,
+  active wallet/account, and authenticated profile/account revisions while
+  treating the opaque namespace/generation as evidence to be joined under a
+  separately held broker guard. This is part of the single initial release
+  protocol, not a parallel product release line;
 - an explicit recovery-only core and profile-backed service opening path for an
   exact already-persisted HNS account/profile with historical value or
   settlement flags. The flags remain identity only; ordinary/full constructors

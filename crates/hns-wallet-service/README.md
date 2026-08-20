@@ -55,16 +55,26 @@ zeroizing, and an exact active revision/update-time fence. It briefly unlocks
 to load and authenticate the profile, relocks before calling the ordinary
 native-read constructor, performs a private internal unlock, and revalidates
 the same fence before returning an already-unlocked service. That closed
-variant admits only the six `hnsReadOperationsV1` wallet reads at the complete
+variant admits the six `hnsReadOperationsV1` wallet reads and one additive
+native-only `walletAuthority/currentHnsContext` request at the complete
 service-request boundary; it rejects lifecycle, recovery, workflow, provider,
-authority, approval, value, and other-module requests. It revalidates the
-active fence before and after every admitted read, discards the result and
-locks if the profile changed, and best-effort locks on drop. The passphrase and
-profile are not new ABI or Serde vocabulary. No checked-in executable calls
-this API. Exclusive cross-process database ownership, private one-shot secret
-delivery outside argv/environment/native messages, process termination on
-lease loss, artifact admission, and installed-product qualification remain
-downstream responsibilities.
+approval, value, and other-module requests. On mainnet, testnet, or regtest it
+advertises `hnsWalletAuthorityContextV1` and binds the request's canonical
+network/magic to the configured account. A positive response carries the
+active wallet/account plus the authenticated profile and account-row
+revisions, and requires unlocked, persistent, nonrecovering, nonretiring,
+read-ready state. The supplied namespace ID and lease generation are only
+echoed evidence for a trusted native consumer that already holds the matching
+broker guard; the response is never independently an authority or a website
+projection. The runtime revalidates the active profile and exact account
+revision around the observation, locks on a change, and best-effort locks on
+drop. Simnet, the generic native-read runtime, the recovery-only runtime, and
+the checked-in executable never advertise the marker. The passphrase remains
+process-local non-Serde input. Exclusive cross-process database ownership,
+private one-shot secret delivery outside argv/environment/native messages,
+the real namespace broker/guard, process termination on lease loss, artifact
+admission, and installed-product qualification remain downstream
+responsibilities.
 
 An explicit
 `WalletService::new_recovery_read_only_profile_backed_native_hns_reads`
@@ -77,7 +87,8 @@ recovery authority. The constructor returns a distinct
 `RecoveryProfileBackedNativeHnsReadRuntime`, not the
 provider-capable ordinary base. Its flags remain identity only, its service
 advertises neither provider dispatch nor persistent permissions nor value, and
-its complete request boundary admits the same exact six non-signing reads.
+its complete request boundary admits the same exact six non-signing reads but
+never the wallet-authority operation or marker.
 Absent, non-flagged, mismatched, stale, revoked, or structurally invalid state
 fails and relocks. Ordinary profile load/bootstrap and the full native-read
 constructor continue to reject these flags under the unchanged production

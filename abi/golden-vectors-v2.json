@@ -197,6 +197,21 @@
           "operation": "wallet",
           "request": { "operation": "status" }
         }
+      },
+      {
+        "name": "walletAuthority",
+        "schemaPointer": "#/$defs/serviceRequest",
+        "value": {
+          "operation": "walletAuthority",
+          "request": {
+            "operation": "currentHnsContext",
+            "network": "regtest",
+            "networkMagic": 2922943951,
+            "namespaceId": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+            "namespaceLeaseGeneration": 9007199254740997,
+            "module": "handshake"
+          }
+        }
       }
     ],
     "walletRequests": [
@@ -320,6 +335,29 @@
               "enabledModules": [],
               "mainnetSettlementEnabled": false
             }
+          }
+        }
+      },
+      {
+        "name": "walletAuthority",
+        "schemaPointer": "#/$defs/serviceResponse",
+        "value": {
+          "result": "walletAuthority",
+          "context": {
+            "network": "regtest",
+            "networkMagic": 2922943951,
+            "namespaceId": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+            "namespaceLeaseGeneration": 9007199254740997,
+            "activeWallet": [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8],
+            "account": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9],
+            "walletAuthorityRevision": 9007199254740993,
+            "accountAuthorityRevision": 9007199254740995,
+            "locked": false,
+            "module": "handshake",
+            "persistentWalletConfirmed": true,
+            "recoveryPending": false,
+            "retirementPending": false,
+            "hnsReadsReady": true
           }
         }
       },
@@ -548,6 +586,24 @@
       "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
       "reason": "the exact HNS read-operations-v1 marker requires the coarse private wallet operation transport",
       "value": { "frameType": "hello", "hello": { "protocolVersion": 2, "platform": "chromiumNativeHost", "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "serviceSessionId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI", "restartGeneration": 1, "capabilities": ["hnsReadOperationsV1"], "limits": { "outerFrameBytes": 1048576, "providerRequestBytes": 65536, "providerResultBytes": 262144, "providerEventBytes": 65536, "approvalFrameBytes": 16384, "approvalLifetimeMs": 90000 } } }
+    },
+    {
+      "name": "privateServiceHelloWalletAuthorityWithoutReadContract",
+      "schemaPointer": "#/$defs/privateWalletServiceFrameV2",
+      "reason": "the native HNS authority-context marker requires both wallet operations and the exact HNS read contract",
+      "value": { "frameType": "hello", "hello": { "protocolVersion": 2, "platform": "chromiumNativeHost", "hostSessionId": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE", "serviceSessionId": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI", "restartGeneration": 1, "capabilities": ["walletOperations", "hnsWalletAuthorityContextV1"], "limits": { "outerFrameBytes": 1048576, "providerRequestBytes": 65536, "providerResultBytes": 262144, "providerEventBytes": 65536, "approvalFrameBytes": 16384, "approvalLifetimeMs": 90000 } } }
+    },
+    {
+      "name": "privateWalletAuthorityZeroNamespace",
+      "schemaPointer": "#/$defs/serviceRequest",
+      "reason": "a broker namespace claim and lease generation must both be nonzero and network magic must be canonical",
+      "value": { "operation": "walletAuthority", "request": { "operation": "currentHnsContext", "network": "regtest", "networkMagic": 2922943951, "namespaceId": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], "namespaceLeaseGeneration": 1, "module": "handshake" } }
+    },
+    {
+      "name": "privateWalletAuthorityRecoveryPending",
+      "schemaPointer": "#/$defs/serviceResponse",
+      "reason": "positive native wallet authority evidence is unavailable during recovery",
+      "value": { "result": "walletAuthority", "context": { "network": "regtest", "networkMagic": 2922943951, "namespaceId": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7], "namespaceLeaseGeneration": 1, "activeWallet": [8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8], "account": [9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9], "walletAuthorityRevision": 1, "accountAuthorityRevision": 1, "locked": false, "module": "handshake", "persistentWalletConfirmed": true, "recoveryPending": true, "retirementPending": false, "hnsReadsReady": true } }
     },
     {
       "name": "privateSnapshotUnknownMethod",

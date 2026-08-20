@@ -117,6 +117,18 @@ allocation. The marker requires the coarse `walletOperations` transport but
 does not imply provider dispatch, browser integration, value movement, or
 product availability.
 
+`hnsWalletAuthorityContextV1` is a separate additive native-only marker and
+does not alter that frozen six-request enum. Its sole request is
+`walletAuthority/currentHnsContext`, carrying a canonical mainnet, testnet, or
+regtest name/magic plus a nonzero opaque namespace and lease generation. The
+positive response binds those fields to one active nonzero wallet/account,
+nonzero authenticated wallet-profile and account-row revisions, and exact
+unlocked/persistent/nonrecovering/nonretiring/read-ready state. The namespace
+claim remains authority owned by the native broker: the service response only
+supplies evidence to compare while the consumer already holds the matching
+guard. It is never a provider or website message. Negotiating this marker
+requires both `walletOperations` and `hnsReadOperationsV1`.
+
 `WalletHost::hns_read_request` is the strict caller path for that contract.
 It accepts no create, restore, unlock, lock, workflow, signing, value, market,
 or other-module operation. Correlated responses must remain non-settlement and
@@ -181,21 +193,26 @@ installed-device qualification. Filesystem paths, process commands, raw signing,
 recovery output, private keys, database keys, preimages, and arbitrary contract
 calls are absent from the protocol.
 
-The encrypted native-HNS-read profile is a wallet library provisioning record,
-not an ABI request, response, capability, or browser message. The checked-in
-subprocess does not load it. Provisioning it therefore does not make any read
-operation or provider available and does not alter the v2 frame vocabulary.
-The library-only profile-backed constructor consumes an owned zeroizing
-passphrase and exact nonsecret profile fence without adding either to this
-schema. Its returned runtime admits only the six marker reads at the decoded
-`ServiceRequest` boundary and rejects ABI unlock/lock and every provider or
-authority request. No checked-in executable invokes that constructor.
+The encrypted native-HNS-read profile remains a wallet library provisioning
+record, not an ABI secret or browser message. The checked-in subprocess does
+not load it, so provisioning it makes no operation or provider available. The
+library-only profile-backed constructor consumes an owned zeroizing passphrase
+and exact nonsecret profile fence without putting either on the wire. Its
+returned ordinary runtime admits the six read requests plus the additive
+authority-context request, and it is the only wallet composition that can
+advertise the latter marker. It independently validates network/magic and
+returns the profile revision and freshly authenticated selected-account row
+revision; it does not authenticate the caller-supplied namespace claim. The
+consumer must compare that claim under its independently held broker guard and
+re-read it around dependent use. Recovery, simnet, generic runtimes, ABI
+unlock/lock, provider requests, and the checked-in executable remain excluded.
 
 Because service capabilities are a closed enum, an older ABI-v2 decoder rejects
-a hello that contains `hnsReadOperationsV1`. The native read service, trusted
-host, and downstream extension adapter must therefore adopt this unreleased v2
-addition together. Older consumers of the checked-in control executable remain
-unaffected because that executable never emits the marker.
+a hello containing either HNS-specific marker. The native read service,
+trusted host, and downstream extension adapter must therefore adopt the exact
+additive vocabulary together. This is one first-release protocol shape, not a
+parallel product release line. Older consumers of the checked-in control
+executable remain unaffected because that executable emits neither marker.
 
 ## Machine-readable contracts
 
@@ -204,7 +221,8 @@ five named roots: private wallet-service frames v2, private provider capability
 snapshots v1, public approval projections v3, public provider event projections
 v1, and signed artifact manifests v2. `../abi/golden-vectors-v2.json` provides
 bounded valid and invalid structural fixtures covering every service request
-and response class, every wallet request/response class, all twelve approval
+and response class (including native wallet-authority evidence), every wallet
+request/response class, all twelve approval
 summaries, all thirteen public events, fresh generation zero, a retained
 nonzero tombstone, private-field leaks, kind mismatches, and rollback metadata.
 Runtime-invalid vectors additionally cover name ordering and SHA3 name/hash

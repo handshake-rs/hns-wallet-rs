@@ -65,6 +65,12 @@
       "maxItems": 16,
       "items": { "$ref": "#/$defs/uint8" }
     },
+    "nonzeroSemanticId16": {
+      "allOf": [
+        { "$ref": "#/$defs/semanticId16" },
+        { "not": { "const": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } }
+      ]
+    },
     "semanticId32": {
       "type": "array",
       "minItems": 32,
@@ -149,6 +155,9 @@
     },
     "moduleId": {
       "enum": ["handshake", "bitcoin", "ethereum"]
+    },
+    "walletHandshakeNetwork": {
+      "enum": ["mainnet", "testnet", "regtest"]
     },
     "finalityModel": {
       "enum": ["proof_of_work_confirmations", "ethereum_finalized_checkpoint"]
@@ -380,6 +389,7 @@
         "typedEvents",
         "walletOperations",
         "hnsReadOperationsV1",
+        "hnsWalletAuthorityContextV1",
         "providerDispatch",
         "valueMovement",
         "browserIntegration"
@@ -452,6 +462,23 @@
           "then": {
             "properties": {
               "capabilities": { "contains": { "const": "walletOperations" } }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "capabilities": { "contains": { "const": "hnsWalletAuthorityContextV1" } }
+            }
+          },
+          "then": {
+            "properties": {
+              "capabilities": {
+                "allOf": [
+                  { "contains": { "const": "walletOperations" } },
+                  { "contains": { "const": "hnsReadOperationsV1" } }
+                ]
+              }
             }
           }
         }
@@ -590,6 +617,40 @@
         }
       ]
     },
+    "walletAuthorityContextRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "network",
+        "networkMagic",
+        "namespaceId",
+        "namespaceLeaseGeneration",
+        "module"
+      ],
+      "properties": {
+        "operation": { "const": "currentHnsContext" },
+        "network": { "$ref": "#/$defs/walletHandshakeNetwork" },
+        "networkMagic": { "$ref": "#/$defs/uint32" },
+        "namespaceId": { "$ref": "#/$defs/nonzeroSemanticId16" },
+        "namespaceLeaseGeneration": { "$ref": "#/$defs/nonzeroUint64" },
+        "module": { "const": "handshake" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "network": { "const": "mainnet" } } },
+          "then": { "properties": { "networkMagic": { "const": 1533997779 } } }
+        },
+        {
+          "if": { "properties": { "network": { "const": "testnet" } } },
+          "then": { "properties": { "networkMagic": { "const": 2974944722 } } }
+        },
+        {
+          "if": { "properties": { "network": { "const": "regtest" } } },
+          "then": { "properties": { "networkMagic": { "const": 2922943951 } } }
+        }
+      ]
+    },
     "serviceRequest": {
       "oneOf": [
         {
@@ -683,6 +744,15 @@
           "properties": {
             "operation": { "const": "wallet" },
             "request": { "$ref": "#/$defs/walletRequest" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "request"],
+          "properties": {
+            "operation": { "const": "walletAuthority" },
+            "request": { "$ref": "#/$defs/walletAuthorityContextRequest" }
           }
         }
       ]
@@ -962,6 +1032,57 @@
         },
         "mainnetSettlementEnabled": { "type": "boolean" }
       }
+    },
+    "walletHnsAuthorityContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "network",
+        "networkMagic",
+        "namespaceId",
+        "namespaceLeaseGeneration",
+        "activeWallet",
+        "account",
+        "walletAuthorityRevision",
+        "accountAuthorityRevision",
+        "locked",
+        "module",
+        "persistentWalletConfirmed",
+        "recoveryPending",
+        "retirementPending",
+        "hnsReadsReady"
+      ],
+      "properties": {
+        "network": { "$ref": "#/$defs/walletHandshakeNetwork" },
+        "networkMagic": { "$ref": "#/$defs/uint32" },
+        "namespaceId": { "$ref": "#/$defs/nonzeroSemanticId16" },
+        "namespaceLeaseGeneration": { "$ref": "#/$defs/nonzeroUint64" },
+        "activeWallet": { "$ref": "#/$defs/nonzeroSemanticId16" },
+        "account": { "$ref": "#/$defs/nonzeroSemanticId16" },
+        "walletAuthorityRevision": { "$ref": "#/$defs/nonzeroUint64" },
+        "accountAuthorityRevision": { "$ref": "#/$defs/nonzeroUint64" },
+        "locked": { "const": false },
+        "module": { "const": "handshake" },
+        "persistentWalletConfirmed": { "const": true },
+        "recoveryPending": { "const": false },
+        "retirementPending": { "const": false },
+        "hnsReadsReady": { "const": true }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "network": { "const": "mainnet" } } },
+          "then": { "properties": { "networkMagic": { "const": 1533997779 } } }
+        },
+        {
+          "if": { "properties": { "network": { "const": "testnet" } } },
+          "then": { "properties": { "networkMagic": { "const": 2974944722 } } }
+        },
+        {
+          "if": { "properties": { "network": { "const": "regtest" } } },
+          "then": { "properties": { "networkMagic": { "const": 2922943951 } } }
+        }
+      ],
+      "$comment": "Native-only wallet evidence joined to the browser's independently held broker lease; this object alone is never an authority or website projection."
     },
     "accountSummary": {
       "type": "object",
@@ -1278,6 +1399,15 @@
           "properties": {
             "result": { "const": "wallet" },
             "response": { "$ref": "#/$defs/walletResponse" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["result", "context"],
+          "properties": {
+            "result": { "const": "walletAuthority" },
+            "context": { "$ref": "#/$defs/walletHnsAuthorityContext" }
           }
         },
         {
