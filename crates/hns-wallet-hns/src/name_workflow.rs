@@ -430,8 +430,10 @@ impl VerifiedCurrentShakedexLock {
         Ok(self)
     }
 
-    /// Consume the account-read authority into an atomic account-prefix
-    /// guard. Value-runtime locks intentionally do not carry this capability.
+    /// Consume the account authority into an atomic account-prefix guard.
+    /// Both the read runtime and the exact same-store full runtime may carry
+    /// this capability; ordinary value callers never receive the guard unless
+    /// they explicitly compose through the Denuo board boundary.
     pub fn into_account_prefix_lease(mut self) -> Result<EntityPrefixSetLease, HnsWalletError> {
         self.board_context
             .take()
@@ -3189,6 +3191,132 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         Ok(context)
     }
 
+    /// Reacquire current, unspent authority for an ordered lock batch using
+    /// the full runtime's exact synchronized account, chain, and mempool
+    /// cache. The cached bindings are independently re-fenced against the node
+    /// and the encrypted account prefix before the capability is returned.
+    pub fn verify_current_shakedex_locks(
+        &self,
+        queries: &[CurrentShakedexLockQuery],
+    ) -> Result<VerifiedCurrentShakedexLockBatch, HnsWalletError> {
+        let scripts = prepare_current_shakedex_lock_queries(queries)?;
+        let selected = self.selected_account_with_revision()?;
+        let account_id = account_entity_id(&selected.account.config);
+        let (binding, mempool) = {
+            let cache = self.cache_read()?;
+            if cache.account != selected.account || cache.account_revision != selected.revision {
+                return Err(HnsWalletError::StaleAccountRead);
+            }
+            (
+                cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?,
+                cache
+                    .mempool_binding
+                    .ok_or(HnsWalletError::StaleNodeSnapshot)?,
+            )
+        };
+        if binding.tip.median_time_past == 0 || self.backend.get_chain_snapshot()? != binding {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        verify_hns_read_chain_identity(&self.backend, selected.account.config.network, binding)?;
+        query_shakedex_lock_mempool(&self.backend, &scripts, binding, Some(mempool))?;
+        let (account_revision, account_prefix_lease) = self.store.try_with_store(|store| {
+            if store.is_locked() {
+                return Err(HnsWalletError::StoreLocked);
+            }
+            store.try_with_entity_read_snapshot(|snapshot| {
+                capture_hns_board_account_snapshot(snapshot, &account_id, &selected.account)
+            })
+        })?;
+        if account_revision != selected.revision {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+
+        let network = shakedex_network_binding(selected.account.config.network)?;
+        let mut locks = Vec::with_capacity(queries.len());
+        let mut owner_outpoints = Vec::with_capacity(queries.len());
+        for query in queries {
+            let validated = validated_name_evidence(&self.backend, &query.name, binding, None)?;
+            let current = validated.current.ok_or(HnsWalletError::InvalidEvidence)?;
+            let owner = current.owner.ok_or(HnsWalletError::InvalidEvidence)?;
+            if owner.output.covenant.kind != CovenantKind::Finalize {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            let context = self.backend.get_name_action_context(
+                HnsNameAction::Transfer,
+                validated.known_name.name_hash,
+                binding,
+                mempool,
+            )?;
+            validate_name_action_context(
+                &selected.account.config,
+                HnsNameAction::Transfer,
+                validated.known_name.name_hash,
+                owner.outpoint,
+                owner.inclusion,
+                binding,
+                mempool,
+                &current.state,
+                &context,
+                true,
+                true,
+            )?;
+            let (_, locking_coin) = canonical_current_name_coin(&owner)?;
+            let descriptor = hns_swap::ShakedexLockDescriptor::from_locking_coin(
+                network,
+                &locking_coin,
+                query.seller_public_key,
+            )
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+            owner_outpoints.push(owner.outpoint);
+            locks.push(VerifiedCurrentShakedexLockEntry {
+                descriptor,
+                locking_coin,
+                current_state: current.state,
+            });
+        }
+
+        let spend = self
+            .backend
+            .get_outpoint_spend_evidence(&owner_outpoints, binding)?;
+        validate_spend_evidence(&spend, binding, &owner_outpoints)?;
+        if spend.entries.iter().any(|entry| entry.spending.is_some()) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+
+        let observed_at_unix = self.clock.now_unix()?;
+        if self.backend.get_chain_snapshot()? != binding {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        query_shakedex_lock_mempool(&self.backend, &scripts, binding, Some(mempool))?;
+        let selected_after = self.selected_account_with_revision()?;
+        if selected_after != selected {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        let context = VerifiedHnsBoardContext {
+            account_id,
+            account: selected.account,
+            account_revision,
+            account_prefix_lease,
+            network,
+            observed_at_unix,
+        };
+        let context = self.store.try_with_store(|store| {
+            store.try_with_entity_read_snapshot(|snapshot| {
+                context.revalidate_unchanged_account(snapshot)
+            })
+        })?;
+        let cache = self.cache_read()?;
+        if cache.binding != Some(binding) || cache.mempool_binding != Some(mempool) {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        Ok(VerifiedCurrentShakedexLockBatch {
+            binding,
+            mempool,
+            context,
+            locks,
+        })
+    }
+
     /// Reacquire current, unspent chain authority for one exact Shakedex lock.
     /// The canonical node supplies NameState, owner, active-chain, mempool, and
     /// MTP evidence; the wallet independently binds the supplied seller key to
@@ -3198,55 +3326,14 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         name: &[u8],
         seller_public_key: [u8; 33],
     ) -> Result<VerifiedCurrentShakedexLock, HnsWalletError> {
-        let cache = self.cache_read()?;
-        let binding = cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?;
-        let mempool = cache
-            .mempool_binding
-            .ok_or(HnsWalletError::StaleNodeSnapshot)?;
-        let config = cache.account.config.clone();
-        drop(cache);
-        if binding.tip.median_time_past == 0 {
-            return Err(HnsWalletError::InvalidEvidence);
+        if !validate_name(name) {
+            return Err(HnsWalletError::InvalidName);
         }
-        let validated = validated_name_evidence(&self.backend, name, binding, None)?;
-        let current = validated.current.ok_or(HnsWalletError::InvalidEvidence)?;
-        let owner = current.owner.ok_or(HnsWalletError::InvalidEvidence)?;
-        if owner.output.covenant.kind != CovenantKind::Finalize {
-            return Err(HnsWalletError::InvalidEvidence);
-        }
-        self.require_action_context(
-            &config,
-            HnsNameAction::Transfer,
-            validated.known_name.name_hash,
-            owner.outpoint,
-            owner.inclusion,
-            binding,
-            mempool,
-            &current.state,
-            true,
-        )?;
-        require_current_owner_unspent(&self.backend, owner.outpoint, binding)?;
-        let (_, locking_coin) = canonical_current_name_coin(&owner)?;
-        let descriptor = hns_swap::ShakedexLockDescriptor::from_locking_coin(
-            shakedex_network_binding(config.network)?,
-            &locking_coin,
+        self.verify_current_shakedex_locks(&[CurrentShakedexLockQuery {
+            name: name.to_vec(),
             seller_public_key,
-        )
-        .map_err(|_| HnsWalletError::InvalidEvidence)?;
-        let cache = self.cache_read()?;
-        if cache.binding != Some(binding) || cache.mempool_binding != Some(mempool) {
-            return Err(HnsWalletError::StaleNodeSnapshot);
-        }
-        let observed_at_unix = self.clock.now_unix()?;
-        Ok(VerifiedCurrentShakedexLock {
-            binding,
-            mempool,
-            observed_at_unix,
-            descriptor,
-            locking_coin,
-            current_state: current.state,
-            board_context: None,
-        })
+        }])?
+        .into_single()
     }
 
     /// Reacquire current, unspent FINALIZE authority for the exact TRANSFER at

@@ -16,7 +16,7 @@ use hns_wallet_hns::{
     validate_hns_shakedex_finalize_final_fee_quote_evidence,
     validate_hns_shakedex_funding_reservations, validate_persisted_hns_shakedex_fee_quote_evidence,
 };
-use hns_wallet_store::{EntityKind, StoredWorkflow, WalletStore};
+use hns_wallet_store::{EntityKind, SharedWalletStore, StoredWorkflow, WalletStore};
 use hns_wallet_types::{
     ApprovalId, BaseUnits, ObjectHash, TransactionHash, WorkflowId, WorkflowKind,
 };
@@ -1821,8 +1821,178 @@ pub struct StoredShakedexValueWorkflow {
     pub workflow: ShakedexValueWorkflow,
 }
 
-pub fn save_prepared_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+/// Same-store production controller for every Shakedex value transition.
+///
+/// The full HNS runtime and this controller must retain clones of one literal
+/// [`SharedWalletStore`] authority. Each local database phase is bounded by a
+/// closure; node, clock, signing, fee-quote, and broadcast calls run only
+/// after that closure releases the mutex. This prevents both independently
+/// unlocked database connections and self-deadlock through runtime reentry.
+pub struct ShakedexValueRuntime<'a, B, C> {
+    store: SharedWalletStore,
+    hns: &'a HnsWalletRuntime<B, C>,
+}
+
+impl<'a, B: HnsBackend, C: HnsClock> ShakedexValueRuntime<'a, B, C> {
+    pub fn new(
+        store: SharedWalletStore,
+        hns: &'a HnsWalletRuntime<B, C>,
+    ) -> Result<Self, ShakedexError> {
+        if !hns.shares_store_authority(&store) {
+            return Err(ShakedexError::StoreAuthorityMismatch);
+        }
+        Ok(Self { store, hns })
+    }
+
+    pub fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
+        self.store.is_same_authority(store) && self.hns.shares_store_authority(store)
+    }
+
+    pub fn load(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Option<StoredShakedexValueWorkflow>, ShakedexError> {
+        self.require_store_authority()?;
+        self.store
+            .try_with_store(|store| load_shakedex_value_workflow(store, workflow_id))
+    }
+
+    pub fn list(&self) -> Result<Vec<StoredShakedexValueWorkflow>, ShakedexError> {
+        self.require_store_authority()?;
+        self.store.try_with_store(list_shakedex_value_workflows)
+    }
+
+    pub fn save_prepared(
+        &self,
+        scope: &HnsShakedexFundingScope,
+        workflow: &ShakedexValueWorkflow,
+    ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+        self.require_store_authority()?;
+        save_prepared_shakedex_value_workflow(&self.store, self.hns, scope, workflow)
+    }
+
+    pub fn register_approval(
+        &self,
+        stored: &StoredShakedexValueWorkflow,
+        approval_id: ApprovalId,
+        origin: &str,
+        expires_at_unix: u64,
+    ) -> Result<(), ShakedexError> {
+        self.require_store_authority()?;
+        register_shakedex_value_approval(
+            &self.store,
+            self.hns,
+            stored,
+            approval_id,
+            origin,
+            expires_at_unix,
+        )
+    }
+
+    pub fn authorize(
+        &self,
+        scope: &HnsShakedexFundingScope,
+        stored: &StoredShakedexValueWorkflow,
+        current_lock: &VerifiedCurrentShakedexLock,
+        approval_id: ApprovalId,
+        origin: &str,
+    ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+        self.require_store_authority()?;
+        authorize_shakedex_value_workflow(
+            &self.store,
+            self.hns,
+            scope,
+            stored,
+            current_lock,
+            approval_id,
+            origin,
+        )
+    }
+
+    pub fn authorize_script_finalize(
+        &self,
+        scope: &HnsShakedexFundingScope,
+        stored: &StoredShakedexValueWorkflow,
+        current_transfer: &VerifiedCurrentShakedexTransfer,
+        approval_id: ApprovalId,
+        origin: &str,
+    ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+        self.require_store_authority()?;
+        authorize_shakedex_script_finalize_workflow(
+            &self.store,
+            self.hns,
+            scope,
+            stored,
+            current_transfer,
+            approval_id,
+            origin,
+        )
+    }
+
+    pub fn cancel_prepared(
+        &self,
+        scope: &HnsShakedexFundingScope,
+        stored: &StoredShakedexValueWorkflow,
+    ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+        self.require_store_authority()?;
+        cancel_prepared_shakedex_value_workflow(&self.store, self.hns, scope, stored)
+    }
+
+    pub fn expire_prepared(
+        &self,
+        scope: &HnsShakedexFundingScope,
+        stored: &StoredShakedexValueWorkflow,
+    ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+        self.require_store_authority()?;
+        expire_prepared_shakedex_value_workflow(&self.store, self.hns, scope, stored)
+    }
+
+    pub fn submit(
+        &self,
+        scope: &HnsShakedexFundingScope,
+        stored: &StoredShakedexValueWorkflow,
+    ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+        self.require_store_authority()?;
+        submit_shakedex_value_workflow(&self.store, self.hns, scope, stored)
+    }
+
+    pub fn rebroadcast(
+        &self,
+        scope: &HnsShakedexFundingScope,
+        stored: &StoredShakedexValueWorkflow,
+    ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+        self.require_store_authority()?;
+        rebroadcast_shakedex_value_workflow(&self.store, self.hns, scope, stored)
+    }
+
+    pub fn release_terminal_reservations(
+        &self,
+        scope: &HnsShakedexFundingScope,
+        stored: &StoredShakedexValueWorkflow,
+    ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+        self.require_store_authority()?;
+        release_terminal_shakedex_value_workflow_reservations(&self.store, self.hns, scope, stored)
+    }
+
+    pub fn reconcile(
+        &self,
+        scope: &HnsShakedexFundingScope,
+        stored: &StoredShakedexValueWorkflow,
+    ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
+        self.require_store_authority()?;
+        reconcile_shakedex_value_workflow(&self.store, self.hns, scope, stored)
+    }
+
+    fn require_store_authority(&self) -> Result<(), ShakedexError> {
+        if !self.hns.shares_store_authority(&self.store) {
+            return Err(ShakedexError::StoreAuthorityMismatch);
+        }
+        Ok(())
+    }
+}
+
+fn save_prepared_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     workflow: &ShakedexValueWorkflow,
@@ -1869,46 +2039,48 @@ pub fn save_prepared_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
             }
         }
     }
-    if let Some(current) = load_shakedex_value_workflow(store, workflow.workflow_id)? {
-        if current.workflow != *workflow {
-            return Err(ShakedexError::InvalidTransition);
+    store.try_with_store_mut(|store| {
+        if let Some(current) = load_shakedex_value_workflow(store, workflow.workflow_id)? {
+            if current.workflow != *workflow {
+                return Err(ShakedexError::InvalidTransition);
+            }
+            validate_hns_shakedex_funding_reservations(
+                store,
+                scope,
+                workflow.funding_reservation(),
+                HnsShakedexFundingReservationState::Prepared,
+            )?;
+            return Ok(current);
         }
-        validate_hns_shakedex_funding_reservations(
+        let batch = create_hns_shakedex_funding_reservations(
             store,
             scope,
             workflow.funding_reservation(),
-            HnsShakedexFundingReservationState::Prepared,
+            updated_at_unix,
         )?;
-        return Ok(current);
-    }
-    let batch = create_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        workflow.funding_reservation(),
-        updated_at_unix,
-    )?;
-    if !batch.deletes().is_empty() || batch.saves().is_empty() {
-        return Err(ShakedexError::Invariant);
-    }
-    let revision = store.save_workflow_with_entity_batch(
-        workflow.workflow_id,
-        WorkflowKind::ShakedexValue,
-        0,
-        workflow,
-        false,
-        updated_at_unix,
-        EntityKind::InputReservation,
-        batch.saves(),
-        batch.deletes(),
-    )?;
-    Ok(StoredShakedexValueWorkflow {
-        revision,
-        workflow: workflow.clone(),
+        if !batch.deletes().is_empty() || batch.saves().is_empty() {
+            return Err(ShakedexError::Invariant);
+        }
+        let revision = store.save_workflow_with_entity_batch(
+            workflow.workflow_id,
+            WorkflowKind::ShakedexValue,
+            0,
+            workflow,
+            false,
+            updated_at_unix,
+            EntityKind::InputReservation,
+            batch.saves(),
+            batch.deletes(),
+        )?;
+        Ok(StoredShakedexValueWorkflow {
+            revision,
+            workflow: workflow.clone(),
+        })
     })
 }
 
-pub fn register_shakedex_value_approval<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+fn register_shakedex_value_approval<B: HnsBackend, C: HnsClock>(
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     stored: &StoredShakedexValueWorkflow,
     approval_id: ApprovalId,
@@ -1917,7 +2089,6 @@ pub fn register_shakedex_value_approval<B: HnsBackend, C: HnsClock>(
 ) -> Result<(), ShakedexError> {
     let now_unix = runtime.shakedex_now_unix()?;
     stored.workflow.validate()?;
-    require_exact_stored_value_workflow(store, stored)?;
     let runtime_scope = runtime.shakedex_funding_scope()?;
     let (wallet_id, account_id) = stored.workflow.wallet_and_account();
     if runtime_scope.wallet_id() != wallet_id || runtime_scope.account_id() != account_id {
@@ -1930,13 +2101,17 @@ pub fn register_shakedex_value_approval<B: HnsBackend, C: HnsClock>(
         return Err(ShakedexError::InvalidTransition);
     }
     let commitment = stored.workflow.approval_commitment(stored.revision)?;
-    store.put_pending_approval(approval_id, origin, &commitment, now_unix, expires_at_unix)?;
-    Ok(())
+    store.try_with_store_mut(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        store
+            .put_pending_approval(approval_id, origin, &commitment, now_unix, expires_at_unix)
+            .map_err(ShakedexError::from)
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn authorize_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+fn authorize_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     stored: &StoredShakedexValueWorkflow,
@@ -1951,7 +2126,6 @@ pub fn authorize_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
     let authorized_at_unix = runtime.shakedex_now_unix()?;
     validate_runtime_scope(runtime, scope)?;
     stored.workflow.validate()?;
-    require_exact_stored_value_workflow(store, stored)?;
     stored.workflow.validate_current_lock(current_lock)?;
     if stored.workflow.stage != ShakedexValueStage::Prepared
         || authorized_at_unix >= stored.workflow.expires_at_unix
@@ -1962,25 +2136,29 @@ pub fn authorize_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
     if scope.wallet_id() != wallet_id || scope.account_id() != account_id {
         return Err(ShakedexError::InvalidEvidence);
     }
-    validate_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        stored.workflow.funding_reservation(),
-        HnsShakedexFundingReservationState::Prepared,
-    )?;
-    let approval = store
-        .get_pending_approval(approval_id, authorized_at_unix)?
-        .ok_or(ShakedexError::ApprovalRequired)?;
-    let commitment = stored.workflow.approval_commitment(stored.revision)?;
-    if approval.origin != origin || approval.request_json.as_slice() != commitment {
-        return Err(ShakedexError::ApprovalRequired);
-    }
-    let expectation = HnsShakedexFundingApprovalExpectation::new(
-        approval_id,
-        origin.to_owned(),
-        commitment,
-        approval.expires_at_unix,
-    )?;
+    let expectation = store.try_with_store(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        validate_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            stored.workflow.funding_reservation(),
+            HnsShakedexFundingReservationState::Prepared,
+        )?;
+        let approval = store
+            .get_pending_approval(approval_id, authorized_at_unix)?
+            .ok_or(ShakedexError::ApprovalRequired)?;
+        let commitment = stored.workflow.approval_commitment(stored.revision)?;
+        if approval.origin != origin || approval.request_json.as_slice() != commitment {
+            return Err(ShakedexError::ApprovalRequired);
+        }
+        HnsShakedexFundingApprovalExpectation::new(
+            approval_id,
+            origin.to_owned(),
+            commitment,
+            approval.expires_at_unix,
+        )
+        .map_err(ShakedexError::from)
+    })?;
     let authorization = runtime.authorize_shakedex_funding_suffix(
         current_lock,
         stored.workflow.funding_reservation(),
@@ -1988,10 +2166,10 @@ pub fn authorize_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
         &expectation,
     )?;
     let (signed_transaction, pending_approval) = authorization.into_parts();
-    if pending_approval.id != approval.id
-        || pending_approval.origin != approval.origin
-        || pending_approval.request_json.as_slice() != approval.request_json.as_slice()
-        || pending_approval.expires_at_unix != approval.expires_at_unix
+    if pending_approval.id != expectation.approval_id()
+        || pending_approval.origin != expectation.origin()
+        || pending_approval.request_json.as_slice() != expectation.request_bytes()
+        || pending_approval.expires_at_unix != expectation.expires_at_unix()
     {
         return Err(ShakedexError::ApprovalRequired);
     }
@@ -2011,7 +2189,6 @@ pub fn authorize_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
         stored.workflow.fee_base_units,
         stored.workflow.maximum_fee,
     )?;
-    require_exact_stored_value_workflow(store, stored)?;
     let commit_now = runtime.shakedex_now_unix()?;
     if commit_now < authorized_at_unix
         || commit_now >= stored.workflow.expires_at_unix
@@ -2022,35 +2199,38 @@ pub fn authorize_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
     let next = stored
         .workflow
         .authorize(approval_id, signed_transaction, quote, commit_now)?;
-    let batch = activate_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        next.funding_reservation(),
-        commit_now,
-    )?;
-    let revision = store
-        .consume_approval_and_save_workflow_with_entity_batch(
-            &pending_approval,
+    store.try_with_store_mut(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        let batch = activate_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            next.funding_reservation(),
             commit_now,
-            next.workflow_id,
-            WorkflowKind::ShakedexValue,
-            stored.revision,
-            &next,
-            true,
-            EntityKind::InputReservation,
-            batch.saves(),
-            batch.deletes(),
-        )?
-        .ok_or(ShakedexError::ApprovalRequired)?;
-    validate_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        next.funding_reservation(),
-        HnsShakedexFundingReservationState::Active,
-    )?;
-    Ok(StoredShakedexValueWorkflow {
-        revision,
-        workflow: next,
+        )?;
+        let revision = store
+            .consume_approval_and_save_workflow_with_entity_batch(
+                &pending_approval,
+                commit_now,
+                next.workflow_id,
+                WorkflowKind::ShakedexValue,
+                stored.revision,
+                &next,
+                true,
+                EntityKind::InputReservation,
+                batch.saves(),
+                batch.deletes(),
+            )?
+            .ok_or(ShakedexError::ApprovalRequired)?;
+        validate_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            next.funding_reservation(),
+            HnsShakedexFundingReservationState::Active,
+        )?;
+        Ok(StoredShakedexValueWorkflow {
+            revision,
+            workflow: next,
+        })
     })
 }
 
@@ -2058,8 +2238,8 @@ pub fn authorize_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
 /// TRANSFER authority. This intentionally does not accept the lock authority
 /// used by buyer fulfillment and seller recovery.
 #[allow(clippy::too_many_arguments)]
-pub fn authorize_shakedex_script_finalize_workflow<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+fn authorize_shakedex_script_finalize_workflow<B: HnsBackend, C: HnsClock>(
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     stored: &StoredShakedexValueWorkflow,
@@ -2074,7 +2254,6 @@ pub fn authorize_shakedex_script_finalize_workflow<B: HnsBackend, C: HnsClock>(
     let authorized_at_unix = runtime.shakedex_now_unix()?;
     validate_runtime_scope(runtime, scope)?;
     stored.workflow.validate()?;
-    require_exact_stored_value_workflow(store, stored)?;
     stored
         .workflow
         .validate_current_transfer(current_transfer)?;
@@ -2087,25 +2266,29 @@ pub fn authorize_shakedex_script_finalize_workflow<B: HnsBackend, C: HnsClock>(
     if scope.wallet_id() != wallet_id || scope.account_id() != account_id {
         return Err(ShakedexError::InvalidEvidence);
     }
-    validate_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        stored.workflow.funding_reservation(),
-        HnsShakedexFundingReservationState::Prepared,
-    )?;
-    let approval = store
-        .get_pending_approval(approval_id, authorized_at_unix)?
-        .ok_or(ShakedexError::ApprovalRequired)?;
-    let commitment = stored.workflow.approval_commitment(stored.revision)?;
-    if approval.origin != origin || approval.request_json.as_slice() != commitment {
-        return Err(ShakedexError::ApprovalRequired);
-    }
-    let expectation = HnsShakedexFundingApprovalExpectation::new(
-        approval_id,
-        origin.to_owned(),
-        commitment,
-        approval.expires_at_unix,
-    )?;
+    let expectation = store.try_with_store(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        validate_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            stored.workflow.funding_reservation(),
+            HnsShakedexFundingReservationState::Prepared,
+        )?;
+        let approval = store
+            .get_pending_approval(approval_id, authorized_at_unix)?
+            .ok_or(ShakedexError::ApprovalRequired)?;
+        let commitment = stored.workflow.approval_commitment(stored.revision)?;
+        if approval.origin != origin || approval.request_json.as_slice() != commitment {
+            return Err(ShakedexError::ApprovalRequired);
+        }
+        HnsShakedexFundingApprovalExpectation::new(
+            approval_id,
+            origin.to_owned(),
+            commitment,
+            approval.expires_at_unix,
+        )
+        .map_err(ShakedexError::from)
+    })?;
     // The runtime reacquires and byte-compares this exact transfer immediately
     // before invoking any ordinary-wallet signing key.
     let authorization = runtime.authorize_shakedex_finalize_funding_suffix(
@@ -2115,10 +2298,10 @@ pub fn authorize_shakedex_script_finalize_workflow<B: HnsBackend, C: HnsClock>(
         &expectation,
     )?;
     let (signed_transaction, pending_approval) = authorization.into_parts();
-    if pending_approval.id != approval.id
-        || pending_approval.origin != approval.origin
-        || pending_approval.request_json.as_slice() != approval.request_json.as_slice()
-        || pending_approval.expires_at_unix != approval.expires_at_unix
+    if pending_approval.id != expectation.approval_id()
+        || pending_approval.origin != expectation.origin()
+        || pending_approval.request_json.as_slice() != expectation.request_bytes()
+        || pending_approval.expires_at_unix != expectation.expires_at_unix()
     {
         return Err(ShakedexError::ApprovalRequired);
     }
@@ -2138,7 +2321,6 @@ pub fn authorize_shakedex_script_finalize_workflow<B: HnsBackend, C: HnsClock>(
         stored.workflow.fee_base_units,
         stored.workflow.maximum_fee,
     )?;
-    require_exact_stored_value_workflow(store, stored)?;
     let commit_now = runtime.shakedex_now_unix()?;
     if commit_now < authorized_at_unix
         || commit_now >= stored.workflow.expires_at_unix
@@ -2149,57 +2331,62 @@ pub fn authorize_shakedex_script_finalize_workflow<B: HnsBackend, C: HnsClock>(
     let next = stored
         .workflow
         .authorize(approval_id, signed_transaction, quote, commit_now)?;
-    let batch = activate_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        next.funding_reservation(),
-        commit_now,
-    )?;
-    let revision = store
-        .consume_approval_and_save_workflow_with_entity_batch(
-            &pending_approval,
+    store.try_with_store_mut(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        let batch = activate_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            next.funding_reservation(),
             commit_now,
-            next.workflow_id,
-            WorkflowKind::ShakedexValue,
-            stored.revision,
-            &next,
-            true,
-            EntityKind::InputReservation,
-            batch.saves(),
-            batch.deletes(),
-        )?
-        .ok_or(ShakedexError::ApprovalRequired)?;
-    validate_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        next.funding_reservation(),
-        HnsShakedexFundingReservationState::Active,
-    )?;
-    Ok(StoredShakedexValueWorkflow {
-        revision,
-        workflow: next,
+        )?;
+        let revision = store
+            .consume_approval_and_save_workflow_with_entity_batch(
+                &pending_approval,
+                commit_now,
+                next.workflow_id,
+                WorkflowKind::ShakedexValue,
+                stored.revision,
+                &next,
+                true,
+                EntityKind::InputReservation,
+                batch.saves(),
+                batch.deletes(),
+            )?
+            .ok_or(ShakedexError::ApprovalRequired)?;
+        validate_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            next.funding_reservation(),
+            HnsShakedexFundingReservationState::Active,
+        )?;
+        Ok(StoredShakedexValueWorkflow {
+            revision,
+            workflow: next,
+        })
     })
 }
 
-pub fn cancel_prepared_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+fn cancel_prepared_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     stored: &StoredShakedexValueWorkflow,
 ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
     let cancelled_at_unix = runtime.shakedex_now_unix()?;
     validate_runtime_scope(runtime, scope)?;
-    terminate_prepared_value_workflow(
-        store,
-        scope,
-        stored,
-        ShakedexValueStage::Cancelled,
-        cancelled_at_unix,
-    )
+    store.try_with_store_mut(|store| {
+        terminate_prepared_value_workflow(
+            store,
+            scope,
+            stored,
+            ShakedexValueStage::Cancelled,
+            cancelled_at_unix,
+        )
+    })
 }
 
-pub fn expire_prepared_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+fn expire_prepared_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     stored: &StoredShakedexValueWorkflow,
@@ -2209,11 +2396,19 @@ pub fn expire_prepared_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
     if now_unix < stored.workflow.expires_at_unix {
         return Err(ShakedexError::InvalidTransition);
     }
-    terminate_prepared_value_workflow(store, scope, stored, ShakedexValueStage::Expired, now_unix)
+    store.try_with_store_mut(|store| {
+        terminate_prepared_value_workflow(
+            store,
+            scope,
+            stored,
+            ShakedexValueStage::Expired,
+            now_unix,
+        )
+    })
 }
 
-pub fn submit_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+fn submit_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     stored: &StoredShakedexValueWorkflow,
@@ -2225,8 +2420,8 @@ pub fn submit_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
     submit_value_workflow(store, runtime, scope, stored)
 }
 
-pub fn rebroadcast_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+fn rebroadcast_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     stored: &StoredShakedexValueWorkflow,
@@ -2274,15 +2469,17 @@ fn terminate_prepared_value_workflow(
 }
 
 fn submit_value_workflow<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     stored: &StoredShakedexValueWorkflow,
 ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
     stored.workflow.validate()?;
     validate_runtime_scope(runtime, scope)?;
-    require_exact_stored_value_workflow(store, stored)?;
-    validate_shakedex_value_workflow_reservations(store, scope, stored)?;
+    store.try_with_store(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        validate_shakedex_value_workflow_reservations(store, scope, stored)
+    })?;
     let signed = stored
         .workflow
         .signed_transaction()
@@ -2358,30 +2555,35 @@ fn submit_value_workflow<B: HnsBackend, C: HnsClock>(
     let fenced = stored
         .workflow
         .begin_submission(refreshed_quote, submission_started_at_unix)?;
-    let reservation_batch = retain_active_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        fenced.funding_reservation(),
-        submission_started_at_unix,
-    )?;
-    if reservation_batch.saves().is_empty() || !reservation_batch.deletes().is_empty() {
-        return Err(ShakedexError::Invariant);
-    }
-    fenced.validate()?;
-    if validate_save_transition(store, stored.revision, &fenced)?.is_some() {
-        return Err(ShakedexError::InvalidTransition);
-    }
-    let fenced_revision = store.save_workflow_with_entity_batch(
-        fenced.workflow_id,
-        WorkflowKind::ShakedexValue,
-        stored.revision,
-        &fenced,
-        true,
-        submission_started_at_unix,
-        EntityKind::InputReservation,
-        reservation_batch.saves(),
-        reservation_batch.deletes(),
-    )?;
+    let fenced_revision = store.try_with_store_mut(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        let reservation_batch = retain_active_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            fenced.funding_reservation(),
+            submission_started_at_unix,
+        )?;
+        if reservation_batch.saves().is_empty() || !reservation_batch.deletes().is_empty() {
+            return Err(ShakedexError::Invariant);
+        }
+        fenced.validate()?;
+        if validate_save_transition(store, stored.revision, &fenced)?.is_some() {
+            return Err(ShakedexError::InvalidTransition);
+        }
+        store
+            .save_workflow_with_entity_batch(
+                fenced.workflow_id,
+                WorkflowKind::ShakedexValue,
+                stored.revision,
+                &fenced,
+                true,
+                submission_started_at_unix,
+                EntityKind::InputReservation,
+                reservation_batch.saves(),
+                reservation_batch.deletes(),
+            )
+            .map_err(ShakedexError::from)
+    })?;
     let returned_transaction = runtime.backend().broadcast_transaction(
         fenced
             .signed_transaction()
@@ -2389,16 +2591,18 @@ fn submit_value_workflow<B: HnsBackend, C: HnsClock>(
     )?;
     let accepted_at_unix = runtime.shakedex_now_unix()?;
     let submitted = fenced.record_broadcast(returned_transaction, accepted_at_unix)?;
-    let revision = save_value_workflow(store, fenced_revision, &submitted, accepted_at_unix)?;
-    validate_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        submitted.funding_reservation(),
-        HnsShakedexFundingReservationState::Active,
-    )?;
-    Ok(StoredShakedexValueWorkflow {
-        revision,
-        workflow: submitted,
+    store.try_with_store_mut(|store| {
+        let revision = save_value_workflow(store, fenced_revision, &submitted, accepted_at_unix)?;
+        validate_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            submitted.funding_reservation(),
+            HnsShakedexFundingReservationState::Active,
+        )?;
+        Ok(StoredShakedexValueWorkflow {
+            revision,
+            workflow: submitted,
+        })
     })
 }
 
@@ -2418,17 +2622,19 @@ fn require_value_runtime_release_qualified() -> Result<(), ShakedexError> {
 /// spender, has reached the workflow's already-approved finality threshold.
 /// This recovery operation is intentionally available while value entrypoints
 /// remain gated: it cannot sign or broadcast new bytes.
-pub fn release_terminal_shakedex_value_workflow_reservations<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+fn release_terminal_shakedex_value_workflow_reservations<B: HnsBackend, C: HnsClock>(
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     stored: &StoredShakedexValueWorkflow,
 ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
     validate_runtime_scope(runtime, scope)?;
     stored.workflow.validate()?;
-    require_exact_stored_value_workflow(store, stored)?;
     if stored.workflow.stage == ShakedexValueStage::ReservationsReleased {
-        validate_shakedex_value_workflow_reservations(store, scope, stored)?;
+        store.try_with_store(|store| {
+            require_exact_stored_value_workflow(store, stored)?;
+            validate_shakedex_value_workflow_reservations(store, scope, stored)
+        })?;
         return Ok(stored.clone());
     }
     if !matches!(
@@ -2443,12 +2649,16 @@ pub fn release_terminal_shakedex_value_workflow_reservations<B: HnsBackend, C: H
     ) {
         return Err(ShakedexError::InvalidTransition);
     }
-    validate_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        stored.workflow.funding_reservation(),
-        HnsShakedexFundingReservationState::Active,
-    )?;
+    store.try_with_store(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        validate_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            stored.workflow.funding_reservation(),
+            HnsShakedexFundingReservationState::Active,
+        )
+        .map_err(ShakedexError::from)
+    })?;
     let signed = stored
         .workflow
         .signed_transaction()
@@ -2472,58 +2682,63 @@ pub fn release_terminal_shakedex_value_workflow_reservations<B: HnsBackend, C: H
         observed_at_unix,
         released_at_unix,
     )?;
-    require_exact_stored_value_workflow(store, stored)?;
-    let batch = delete_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        next.funding_reservation(),
-        HnsShakedexFundingReservationState::Active,
-    )?;
-    if !batch.saves().is_empty() || batch.deletes().is_empty() {
-        return Err(ShakedexError::Invariant);
-    }
-    let revision = store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
-        next.workflow_id,
-        WorkflowKind::ShakedexValue,
-        stored.revision,
-        &next,
-        true,
-        released_at_unix,
-        EntityKind::InputReservation,
-        batch.saves(),
-        batch.deletes(),
-    )?;
-    let released = StoredShakedexValueWorkflow {
-        revision,
-        workflow: next,
-    };
-    validate_shakedex_value_workflow_reservations(store, scope, &released)?;
-    Ok(released)
+    store.try_with_store_mut(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        let batch = delete_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            next.funding_reservation(),
+            HnsShakedexFundingReservationState::Active,
+        )?;
+        if !batch.saves().is_empty() || batch.deletes().is_empty() {
+            return Err(ShakedexError::Invariant);
+        }
+        let revision = store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+            next.workflow_id,
+            WorkflowKind::ShakedexValue,
+            stored.revision,
+            &next,
+            true,
+            released_at_unix,
+            EntityKind::InputReservation,
+            batch.saves(),
+            batch.deletes(),
+        )?;
+        let released = StoredShakedexValueWorkflow {
+            revision,
+            workflow: next,
+        };
+        validate_shakedex_value_workflow_reservations(store, scope, &released)?;
+        Ok(released)
+    })
 }
 
 /// Reconcile reversible signed states. For `ReservationsReleased`, this is a
 /// read-only finality audit: it performs no workflow/reservation mutation and
 /// returns `RecoveryRequired` rather than transitioning out of the terminal
 /// stage when the persisted outcome no longer holds.
-pub fn reconcile_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
-    store: &mut WalletStore,
+fn reconcile_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
+    store: &SharedWalletStore,
     runtime: &HnsWalletRuntime<B, C>,
     scope: &HnsShakedexFundingScope,
     stored: &StoredShakedexValueWorkflow,
 ) -> Result<StoredShakedexValueWorkflow, ShakedexError> {
     validate_runtime_scope(runtime, scope)?;
-    require_exact_stored_value_workflow(store, stored)?;
     let reservations_released = stored.workflow.stage == ShakedexValueStage::ReservationsReleased;
-    validate_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        stored.workflow.funding_reservation(),
-        if reservations_released {
-            HnsShakedexFundingReservationState::Released
-        } else {
-            HnsShakedexFundingReservationState::Active
-        },
-    )?;
+    store.try_with_store(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        validate_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            stored.workflow.funding_reservation(),
+            if reservations_released {
+                HnsShakedexFundingReservationState::Released
+            } else {
+                HnsShakedexFundingReservationState::Active
+            },
+        )
+        .map_err(ShakedexError::from)
+    })?;
     let signed = stored
         .workflow
         .signed_transaction()
@@ -2578,44 +2793,51 @@ pub fn reconcile_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
         {
             return Err(ShakedexError::RecoveryRequired);
         }
+        store.try_with_store(|store| {
+            require_exact_stored_value_workflow(store, stored)?;
+            validate_shakedex_value_workflow_reservations(store, scope, stored)
+        })?;
         return Ok(stored.clone());
     }
     let next =
         stored
             .workflow
             .reconcile(&transaction_evidence, &spend_evidence, observed_at_unix)?;
-    let reservation_batch = retain_active_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        next.funding_reservation(),
-        observed_at_unix,
-    )?;
-    if reservation_batch.saves().is_empty() || !reservation_batch.deletes().is_empty() {
-        return Err(ShakedexError::Invariant);
-    }
-    let revision = match validate_save_transition(store, stored.revision, &next)? {
-        Some(revision) => revision,
-        None => store.save_workflow_with_entity_batch(
-            next.workflow_id,
-            WorkflowKind::ShakedexValue,
-            stored.revision,
-            &next,
-            true,
+    store.try_with_store_mut(|store| {
+        require_exact_stored_value_workflow(store, stored)?;
+        let reservation_batch = retain_active_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            next.funding_reservation(),
             observed_at_unix,
-            EntityKind::InputReservation,
-            reservation_batch.saves(),
-            reservation_batch.deletes(),
-        )?,
-    };
-    validate_hns_shakedex_funding_reservations(
-        store,
-        scope,
-        next.funding_reservation(),
-        HnsShakedexFundingReservationState::Active,
-    )?;
-    Ok(StoredShakedexValueWorkflow {
-        revision,
-        workflow: next,
+        )?;
+        if reservation_batch.saves().is_empty() || !reservation_batch.deletes().is_empty() {
+            return Err(ShakedexError::Invariant);
+        }
+        let revision = match validate_save_transition(store, stored.revision, &next)? {
+            Some(revision) => revision,
+            None => store.save_workflow_with_entity_batch(
+                next.workflow_id,
+                WorkflowKind::ShakedexValue,
+                stored.revision,
+                &next,
+                true,
+                observed_at_unix,
+                EntityKind::InputReservation,
+                reservation_batch.saves(),
+                reservation_batch.deletes(),
+            )?,
+        };
+        validate_hns_shakedex_funding_reservations(
+            store,
+            scope,
+            next.funding_reservation(),
+            HnsShakedexFundingReservationState::Active,
+        )?;
+        Ok(StoredShakedexValueWorkflow {
+            revision,
+            workflow: next,
+        })
     })
 }
 
@@ -3643,6 +3865,56 @@ mod tests {
             scope,
             store,
         )
+    }
+
+    #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "these compile-time release gates are asserted deliberately so a qualification flip requires an explicit test review"
+    )]
+    fn production_value_and_board_controllers_require_one_shared_store_authority() {
+        let config = HnsRuntimeConfig {
+            wallet_id: WalletId::new([0x81; 16]),
+            account_id: AccountId::new([0x82; 16]),
+            account_derivation_index: 3,
+            network: HnsNetwork::Regtest,
+            birthday_height: 1,
+            restore_lookahead: 10,
+            minimum_confirmations: 1,
+            dust_threshold: BaseUnits::new(1),
+            value_operations_enabled: false,
+            settlement_enabled: false,
+        };
+        let store = SharedWalletStore::new(
+            WalletStore::create(":memory:", "same-store-controller-passphrase")
+                .expect("shared controller store"),
+        );
+        let runtime = HnsWalletRuntime::open_shared(
+            ProductionNextUnusedBackend,
+            store.clone(),
+            config,
+            SystemClock,
+        )
+        .expect("same-store full runtime");
+        let value = ShakedexValueRuntime::new(store.clone(), &runtime)
+            .expect("same-store value controller");
+        assert!(value.shares_store_authority(&store));
+        let board = crate::DenuoBoardRuntime::new_value(&runtime, store.clone())
+            .expect("same-store board controller");
+        assert!(board.shares_store_authority(&store));
+
+        let different = SharedWalletStore::new(
+            WalletStore::create(":memory:", "different-controller-passphrase")
+                .expect("different controller store"),
+        );
+        assert!(matches!(
+            ShakedexValueRuntime::new(different.clone(), &runtime),
+            Err(ShakedexError::StoreAuthorityMismatch)
+        ));
+        assert!(matches!(
+            crate::DenuoBoardRuntime::new_value(&runtime, different),
+            Err(ShakedexError::StoreAuthorityMismatch)
+        ));
     }
 
     #[test]

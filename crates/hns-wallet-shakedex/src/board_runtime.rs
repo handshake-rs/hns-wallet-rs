@@ -1,6 +1,6 @@
 use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketMessage};
 use hns_wallet_hns::{
-    CurrentShakedexLockQuery, HnsAccountReadRuntime, HnsBackend, HnsClock,
+    CurrentShakedexLockQuery, HnsAccountReadRuntime, HnsBackend, HnsClock, HnsWalletRuntime,
     MAX_CURRENT_SHAKEDEX_LOCK_BATCH, SystemClock, VerifiedCurrentShakedexLock,
     VerifiedCurrentShakedexLockBatch, VerifiedHnsBoardContext,
 };
@@ -208,8 +208,71 @@ impl CurrentDenuoBoardOffers {
 /// Cancellation admission is a separate negative-authority path: it binds an
 /// authenticated tombstone to the exact persisted listing plus selected
 /// account network/time, but deliberately performs no current-lock query.
+enum DenuoHnsRuntime<'a, B, C> {
+    AccountRead(&'a HnsAccountReadRuntime<B, C>),
+    Value(&'a HnsWalletRuntime<B, C>),
+}
+
+impl<B: HnsBackend, C: HnsClock> DenuoHnsRuntime<'_, B, C> {
+    fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
+        match self {
+            Self::AccountRead(runtime) => runtime.shares_store_authority(store),
+            Self::Value(runtime) => runtime.shares_store_authority(store),
+        }
+    }
+
+    fn observe_board_context(&self) -> Result<VerifiedHnsBoardContext, ShakedexError> {
+        match self {
+            Self::AccountRead(runtime) => runtime.observe_board_context().map_err(Into::into),
+            Self::Value(runtime) => runtime.observe_board_context().map_err(Into::into),
+        }
+    }
+
+    fn observe_board_cancellation_context(
+        &self,
+    ) -> Result<hns_wallet_hns::VerifiedHnsBoardCancellationContext, ShakedexError> {
+        match self {
+            Self::AccountRead(runtime) => runtime
+                .observe_board_cancellation_context()
+                .map_err(Into::into),
+            Self::Value(runtime) => runtime
+                .observe_board_cancellation_context()
+                .map_err(Into::into),
+        }
+    }
+
+    fn verify_current_shakedex_lock(
+        &self,
+        name: &[u8],
+        seller_public_key: [u8; 33],
+    ) -> Result<VerifiedCurrentShakedexLock, ShakedexError> {
+        match self {
+            Self::AccountRead(runtime) => runtime
+                .verify_current_shakedex_lock(name, seller_public_key)
+                .map_err(Into::into),
+            Self::Value(runtime) => runtime
+                .verify_current_shakedex_lock(name, seller_public_key)
+                .map_err(Into::into),
+        }
+    }
+
+    fn verify_current_shakedex_locks(
+        &self,
+        queries: &[CurrentShakedexLockQuery],
+    ) -> Result<VerifiedCurrentShakedexLockBatch, ShakedexError> {
+        match self {
+            Self::AccountRead(runtime) => runtime
+                .verify_current_shakedex_locks(queries)
+                .map_err(Into::into),
+            Self::Value(runtime) => runtime
+                .verify_current_shakedex_locks(queries)
+                .map_err(Into::into),
+        }
+    }
+}
+
 pub struct DenuoBoardRuntime<'a, B, C = SystemClock> {
-    hns: &'a HnsAccountReadRuntime<B, C>,
+    hns: DenuoHnsRuntime<'a, B, C>,
     store: SharedWalletStore,
 }
 
@@ -221,7 +284,27 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
         if !hns.shares_store_authority(&store) {
             return Err(ShakedexError::StoreAuthorityMismatch);
         }
-        Ok(Self { hns, store })
+        Ok(Self {
+            hns: DenuoHnsRuntime::AccountRead(hns),
+            store,
+        })
+    }
+
+    /// Compose board admission, discovery, and current-offer reacquisition
+    /// directly with the exact full signing runtime. This avoids a second
+    /// mutable account cache or independently opened database connection in
+    /// the production value service.
+    pub fn new_value(
+        hns: &'a HnsWalletRuntime<B, C>,
+        store: SharedWalletStore,
+    ) -> Result<Self, ShakedexError> {
+        if !hns.shares_store_authority(&store) {
+            return Err(ShakedexError::StoreAuthorityMismatch);
+        }
+        Ok(Self {
+            hns: DenuoHnsRuntime::Value(hns),
+            store,
+        })
     }
 
     pub fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {

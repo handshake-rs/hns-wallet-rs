@@ -2974,6 +2974,81 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         self.store.is_same_authority(store)
     }
 
+    /// Reauthenticate the full runtime's cached account against the exact
+    /// shared store row before an adjacent product component relies on it.
+    /// A store mutation that has not yet been synchronized into the runtime
+    /// is reported as stale instead of silently mixing two account revisions.
+    pub fn selected_account_with_revision(
+        &self,
+    ) -> Result<SelectedHnsAccountRevision, HnsWalletError> {
+        let (account, cached_revision) = {
+            let cache = self.cache_read()?;
+            (cache.account.clone(), cache.account_revision)
+        };
+        let account_id = account_entity_id(&account.config);
+        let current_revision = self.store.try_with_store(|store| {
+            if store.is_locked() {
+                return Err(HnsWalletError::StoreLocked);
+            }
+            store.try_with_entity_read_snapshot(|snapshot| {
+                validate_hns_board_account_snapshot(snapshot, &account_id, &account)
+            })
+        })?;
+        if current_revision != cached_revision {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        Ok(SelectedHnsAccountRevision {
+            account,
+            revision: current_revision,
+        })
+    }
+
+    /// Observe the exact full-runtime account, Shakedex network, and trusted
+    /// time while retaining a refreshable encrypted account-prefix guard.
+    /// This is metadata/cancellation authority only; it cannot sign or move
+    /// value and must be consumed by an exact same-store board operation.
+    pub fn observe_board_context(&self) -> Result<VerifiedHnsBoardContext, HnsWalletError> {
+        let selected = self.selected_account_with_revision()?;
+        let account_id = account_entity_id(&selected.account.config);
+        let (account_revision, account_prefix_lease) = self.store.try_with_store(|store| {
+            if store.is_locked() {
+                return Err(HnsWalletError::StoreLocked);
+            }
+            store.try_with_entity_read_snapshot(|snapshot| {
+                capture_hns_board_account_snapshot(snapshot, &account_id, &selected.account)
+            })
+        })?;
+        if account_revision != selected.revision {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        let observed_at_unix = self.clock.now_unix()?;
+        let selected_after_clock = self.selected_account_with_revision()?;
+        if selected_after_clock != selected {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        let context = VerifiedHnsBoardCancellationContext {
+            account_id,
+            account: selected.account,
+            account_revision,
+            account_prefix_lease,
+            network: shakedex_network_binding(selected_after_clock.account.config.network)?,
+            observed_at_unix,
+        };
+        self.store.try_with_store(|store| {
+            store.try_with_entity_read_snapshot(|snapshot| {
+                context.revalidate_unchanged_account(snapshot)
+            })
+        })
+    }
+
+    /// Preserve the purpose-specific cancellation API while sharing the full
+    /// runtime's exact account/network/time fence implementation.
+    pub fn observe_board_cancellation_context(
+        &self,
+    ) -> Result<VerifiedHnsBoardCancellationContext, HnsWalletError> {
+        self.observe_board_context()
+    }
+
     pub fn register<'a>(&'a self, registry: &mut ModuleRegistry<'a>) -> Result<(), RegistryError> {
         registry.register_utxo_settlement(self)
     }

@@ -216,8 +216,10 @@ before live relay enablement. Persisted board state remains cache data: every
 purchase or value action must reacquire fresh locking-coin and chain evidence.
 
 The offline `DenuoBoardRuntime` now supplies that admission/reacquisition join
-without enabling live discovery. Construction requires an
-`HnsAccountReadRuntime` and a clone of its literal same Arc-backed
+without enabling live discovery. A non-value composition may use an
+`HnsAccountReadRuntime`; the production value composition instead uses the
+full `HnsWalletRuntime` so it does not maintain a second mutable account cache.
+Both constructors require a clone of the runtime's literal same Arc-backed
 `SharedWalletStore`; a separately opened connection to the same path is not the
 same authority. The canonical offer envelope is first decoded as an
 `AuthenticatedFixedPriceListing`, so its signature and exact content hash can
@@ -421,6 +423,16 @@ regtest/restart/reorg/product qualification are still required before any gate
 can change. The current regressions are covered by the exact CI evidence in
 `QUALIFICATION.md`; focused historical runs do not replace product or network
 qualification. Reverse Dutch is deferred.
+
+`ShakedexValueRuntime` is now the only public orchestration surface for those
+aggregate value transitions. It proves literal shared-store identity at
+construction and before each operation. Database validation and CAS phases run
+inside short store closures; current-lock/TRANSFER acquisition, signing,
+fee-quote calls, broadcast, and chain observation run only after the closure
+has released the store mutex. Thus a production service can combine provider,
+board, and signing state under one decrypted-key authority without reopening
+SQLite or deadlocking when the HNS runtime re-enters the store. This
+composition work does not alter any release gate.
 
 ## Market intents and sessions
 
