@@ -49,7 +49,8 @@ pub use native_read_profile::{
     provision_native_hns_read_profile, revoke_native_hns_read_profile,
 };
 pub use native_value_runtime::{
-    PersistentHnsValueConfig, PersistentHnsValueRuntime, PersistentShakedexConfig,
+    NativeHnsValueSnapshot, PersistentHnsValueConfig, PersistentHnsValueRuntime,
+    PersistentShakedexConfig, TRUSTED_NATIVE_HNS_VALUE_ORIGIN, TrustedNativeHnsValueAction,
 };
 
 pub const MAX_SEEN_REQUEST_IDS: usize = 4_096;
@@ -119,6 +120,22 @@ pub trait ServiceRuntime {
         &mut self,
         approval: &PendingApproval,
     ) -> Result<ApprovalSummary, ServiceFailure>;
+
+    /// Prepare an approval issued by a trusted native product surface without
+    /// manufacturing browser authority/session fields. Ordinary runtimes fail
+    /// closed; the concrete same-store HNS value runtime is the only current
+    /// implementation.
+    fn prepare_trusted_hns_value_approval(
+        &mut self,
+        _: ApprovalId,
+        _: ApprovalKind,
+        _: &ApprovedCall,
+        _: u64,
+    ) -> Result<ApprovalSummary, ServiceFailure> {
+        Err(ServiceFailure::unsupported(
+            ServiceCapability::HnsValueOperationsV1,
+        ))
+    }
 
     /// Select the one minimized Handshake account that an approved origin may
     /// learn through `hns_requestAccounts`. The service validates and persists
@@ -327,9 +344,10 @@ pub struct PersistentHnsAccountConfig {
     pub account_label: String,
 }
 
-/// Concrete non-value runtime which can select and disclose only one exact
-/// authenticated pre-existing HNS account. Synchronized chain reads remain a
-/// separate unavailable composition.
+/// Concrete lifecycle runtime which can select and disclose only one exact
+/// authenticated pre-existing HNS account. Persisted value flags grant no
+/// capability here; synchronized reads and signing remain separate unavailable
+/// compositions.
 pub struct PersistentHnsAccountRuntime {
     store: SharedWalletStore,
     selector: HnsExistingAccountSelector,

@@ -21,7 +21,9 @@ use hns_wallet_hns::{
     HnsClock, HnsNetwork, HnsRuntimeConfig, HnsWalletError, HnsWalletRuntime, KnownName,
     NameOperation, NameOperationState, PrepareNameFinalize, PrepareNameTransfer,
 };
-use hns_wallet_provider::{ApprovedCall, PendingApproval, ProviderMethod, SelectedNamespace};
+use hns_wallet_provider::{
+    APPROVAL_LIFETIME_SECONDS, ApprovedCall, PendingApproval, ProviderMethod, SelectedNamespace,
+};
 use hns_wallet_shakedex::{
     DenuoPublicationAcceptancePolicy, DenuoTransportRuntime, MAX_SHAKEDEX_OFFER_PAGE_SIZE,
     PrepareBuyerTrade, PrepareScriptFinalize, PrepareSellerOffer,
@@ -32,8 +34,8 @@ use hns_wallet_shakedex::{
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::{
-    AccountId, Amount, ApprovalId, ApprovalKind, BaseUnits, FinalityModel, ModuleId, ObjectHash,
-    WalletAsset, WorkflowId,
+    AccountId, Amount, ApprovalId, ApprovalKind, BaseUnits, FinalityModel, HnsNameReceiveTarget,
+    ModuleId, ObjectHash, ReceiveTarget, SyncStatus, TransactionSummary, WalletAsset, WorkflowId,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -44,11 +46,60 @@ use super::{
     MAX_HNS_NAME_BYTES, MAX_JAVASCRIPT_SAFE_INTEGER, MAX_PROVIDER_HNS_READ_ITEMS,
     MAX_PUBLIC_STRING_BYTES, ServiceError, ServiceRuntime, WalletService, bounded_provider_value,
     hns_native_name_import_failure, hns_read_failure, hns_read_result_bound, hns_runtime_failure,
-    invalid_request, is_printable_ascii, lowercase_hex, persistent_store_failure,
-    public_hns_amount, public_hns_name_read, public_hns_name_summary, public_hns_receive_target,
-    public_hns_transaction_summary, validate_empty_params, validate_hns_account_summary,
-    validate_hns_wallet_read_scope, wallet_locked,
+    invalid_request, is_printable_ascii, lowercase_hex, native_hns_name_summary,
+    persistent_store_failure, public_hns_amount, public_hns_name_read, public_hns_name_summary,
+    public_hns_receive_target, public_hns_transaction_summary, validate_approval_summary,
+    validate_empty_params, validate_hns_account_summary, validate_hns_wallet_read_scope,
+    wallet_locked,
 };
+
+/// Reserved origin commitment used only by the installed native value UI.
+/// It is deliberately a valid loopback origin so the existing encrypted
+/// approval records retain one canonical origin encoding, but it never grants
+/// or stands in for browser-engine authority.
+pub const TRUSTED_NATIVE_HNS_VALUE_ORIGIN: &str = "http://localhost";
+
+/// One coherent, minimized full-runtime projection for trusted native UI.
+/// Chain/mempool bindings, coins, scripts, raw transactions, and keys remain
+/// inside the HNS runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeHnsValueSnapshot {
+    pub account_id: AccountId,
+    pub balance: Amount,
+    pub receive_target: ReceiveTarget,
+    pub name_receive_target: HnsNameReceiveTarget,
+    pub transactions: Vec<TransactionSummary>,
+    pub known_names: Vec<super::NativeHnsNameSummary>,
+    pub module_status: SyncStatus,
+}
+
+/// Opaque, single-owner permit proving that the exact native value action was
+/// prepared and its canonical summary validated. Private fields prevent a
+/// downstream embedding from manufacturing an execute-only shortcut.
+pub struct TrustedNativeHnsValueAction {
+    approval_id: ApprovalId,
+    kind: ApprovalKind,
+    call: ApprovedCall,
+    expires_at_unix: u64,
+    summary: ApprovalSummary,
+}
+
+impl TrustedNativeHnsValueAction {
+    pub const fn summary(&self) -> &ApprovalSummary {
+        &self.summary
+    }
+
+    pub const fn expires_at_unix(&self) -> u64 {
+        self.expires_at_unix
+    }
+}
+
+struct TrustedHnsValueApproval<'a> {
+    id: ApprovalId,
+    kind: ApprovalKind,
+    call: &'a ApprovedCall,
+    expires_at_unix: u64,
+}
 
 /// Trusted product inputs for a full HNS runtime that was opened over the
 /// same unlocked store and then relocked before service construction.
@@ -194,7 +245,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
             active_wallet: (!locked).then_some(self.configured.wallet_id),
             enabled_modules: BTreeSet::from([ModuleId::Handshake]),
             mainnet_settlement_enabled: self.configured.network == HnsNetwork::Mainnet
-                && self.configured.value_operations_enabled,
+                && self.configured.settlement_enabled,
         })
     }
 
@@ -883,9 +934,30 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
         &mut self,
         approval: &PendingApproval,
     ) -> Result<ApprovalSummary, ServiceFailure> {
+        self.prepare_trusted_hns_value_approval(
+            approval.id,
+            approval.kind,
+            &approval.call,
+            approval.expires_at_unix,
+        )
+    }
+
+    fn prepare_trusted_hns_value_approval(
+        &mut self,
+        approval_id: ApprovalId,
+        approval_kind: ApprovalKind,
+        call: &ApprovedCall,
+        expires_at_unix: u64,
+    ) -> Result<ApprovalSummary, ServiceFailure> {
+        let approval = TrustedHnsValueApproval {
+            id: approval_id,
+            kind: approval_kind,
+            call,
+            expires_at_unix,
+        };
         match (approval.kind, approval.call.method) {
             (ApprovalKind::Send, ProviderMethod::HnsSend) => {
-                let (params, prepared) = self.prepare_send(&approval.call)?;
+                let (params, prepared) = self.prepare_send(approval.call)?;
                 self.runtime
                     .register_send_approval(
                         approval.id,
@@ -907,7 +979,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                 })
             }
             (ApprovalKind::NameTransfer, ProviderMethod::HnsTransferName) => {
-                let (_, prepared) = self.prepare_transfer(&approval.call)?;
+                let (_, prepared) = self.prepare_transfer(approval.call)?;
                 self.runtime
                     .register_name_operation_approval(
                         approval.id,
@@ -930,7 +1002,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                 })
             }
             (ApprovalKind::NameFinalize, ProviderMethod::HnsFinalizeName) => {
-                let (_, prepared) = self.prepare_finalize(&approval.call)?;
+                let (_, prepared) = self.prepare_finalize(approval.call)?;
                 self.runtime
                     .register_name_operation_approval(
                         approval.id,
@@ -950,7 +1022,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                 })
             }
             (ApprovalKind::NameMarketOffer, ProviderMethod::NameMarketCreateFixedPriceOffer) => {
-                let prepared = self.prepare_seller_offer_creation(&approval.call)?;
+                let prepared = self.prepare_seller_offer_creation(approval.call)?;
                 self.runtime
                     .register_name_operation_approval(
                         approval.id,
@@ -979,7 +1051,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                 })
             }
             (ApprovalKind::NameMarketOffer, ProviderMethod::NameMarketCancelOffer) => {
-                let (_, seller) = self.prepare_cancel_offer(&approval.call)?;
+                let (_, seller) = self.prepare_cancel_offer(approval.call)?;
                 Ok(ApprovalSummary::NameMarketOffer {
                     action: NameMarketApprovalAction::Cancel,
                     name: prepared_name_text(&seller.name)?,
@@ -998,7 +1070,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                 })
             }
             (ApprovalKind::NameMarketPurchase, ProviderMethod::NameMarketAcceptOffer) => {
-                let (params, prepared) = self.prepare_buyer_trade(&approval.call)?;
+                let (params, prepared) = self.prepare_buyer_trade(approval.call)?;
                 self.shakedex_runtime()?
                     .register_approval(
                         prepared.workflow_id,
@@ -1028,7 +1100,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                 })
             }
             (ApprovalKind::NameMarketPurchase, ProviderMethod::NameMarketFinalizePurchase) => {
-                let (params, prepared) = self.prepare_script_finalize(&approval.call)?;
+                let (params, prepared) = self.prepare_script_finalize(approval.call)?;
                 self.shakedex_runtime()?
                     .register_approval(
                         prepared.workflow_id,
@@ -1059,7 +1131,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                 })
             }
             (ApprovalKind::NameMarketOffer, ProviderMethod::NameMarketRecoverName) => {
-                let (params, seller, prepared) = self.prepare_seller_recovery(&approval.call)?;
+                let (params, seller, prepared) = self.prepare_seller_recovery(approval.call)?;
                 self.shakedex_runtime()?
                     .register_approval(
                         prepared.workflow_id,
@@ -1267,6 +1339,202 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
 }
 
 impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsValueRuntime<B, C>> {
+    /// Perform one full reconciliation and return the bounded native value
+    /// projection. This bypasses website permissions, not wallet locking or any
+    /// chain/store validation performed by the full runtime.
+    pub fn synchronize_trusted_native_hns_value(
+        &self,
+    ) -> Result<NativeHnsValueSnapshot, ServiceFailure> {
+        let selected = self.runtime.reconcile()?;
+        let balance = self.runtime.runtime.balance().map_err(chain_failure)?;
+        let receive_target = self
+            .runtime
+            .runtime
+            .receive_target()
+            .map_err(chain_failure)?;
+        let name_receive_target = self
+            .runtime
+            .runtime
+            .name_receive_target()
+            .map_err(hns_read_failure)?;
+        let transactions = self
+            .runtime
+            .runtime
+            .transaction_history()
+            .map_err(chain_failure)?;
+        let names = self
+            .runtime
+            .runtime
+            .list_names()
+            .map_err(hns_read_failure)?;
+        if transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS
+            || names.len() > MAX_PROVIDER_HNS_READ_ITEMS
+        {
+            return Err(hns_read_result_bound());
+        }
+        let known_names = names
+            .iter()
+            .map(native_hns_name_summary)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(NativeHnsValueSnapshot {
+            account_id: selected.account_id,
+            balance,
+            receive_target,
+            name_receive_target,
+            transactions,
+            known_names,
+            module_status: self.runtime.runtime.sync_status(),
+        })
+    }
+
+    /// Return seconds from the exact clock authority retained by the signing
+    /// runtime. Native approval expiry and execution therefore cannot be bound
+    /// to a separately configurable UI clock.
+    pub fn trusted_native_hns_value_now_unix(&self) -> Result<u64, ServiceFailure> {
+        self.runtime
+            .runtime
+            .trusted_now_unix()
+            .map_err(hns_runtime_failure)
+    }
+
+    /// Prepare and durably bind one native approval to an exact call. Browser
+    /// authority fields are intentionally absent: native code owns only the
+    /// process-local action token layered above this method.
+    pub fn prepare_trusted_native_hns_value_action(
+        &mut self,
+        approval_id: ApprovalId,
+        kind: ApprovalKind,
+        call: ApprovedCall,
+        expires_at_unix: u64,
+    ) -> Result<TrustedNativeHnsValueAction, ServiceFailure> {
+        validate_trusted_native_value_call(approval_id, kind, &call)?;
+        let now_unix = self.trusted_native_hns_value_now_unix()?;
+        if expires_at_unix <= now_unix
+            || expires_at_unix > now_unix.saturating_add(APPROVAL_LIFETIME_SECONDS)
+        {
+            return Err(invalid_request("native value approval lifetime is invalid"));
+        }
+        let summary = self.runtime.prepare_trusted_hns_value_approval(
+            approval_id,
+            kind,
+            &call,
+            expires_at_unix,
+        )?;
+        let validation = (|| {
+            if summary.approval_kind() != kind {
+                return Err(invalid_request("native value approval kind is mismatched"));
+            }
+            summary
+                .validate()
+                .map_err(|_| invalid_request("native value approval summary is invalid"))?;
+            validate_approval_summary(&call, &summary)
+        })();
+        if let Err(failure) = validation {
+            let _ = self.discard_trusted_native_hns_value_action_by_id(approval_id, now_unix);
+            return Err(failure);
+        }
+        Ok(TrustedNativeHnsValueAction {
+            approval_id,
+            kind,
+            call,
+            expires_at_unix,
+            summary,
+        })
+    }
+
+    /// Execute one closed, non-approval Shakedex query for trusted native UI.
+    /// The account and native origin remain Rust-owned, and no generic provider
+    /// dispatch surface is exposed to the embedding application.
+    pub fn query_trusted_native_shakedex(
+        &mut self,
+        call: ApprovedCall,
+    ) -> Result<Value, ServiceFailure> {
+        if call.origin.as_str() != TRUSTED_NATIVE_HNS_VALUE_ORIGIN
+            || call.namespace != SelectedNamespace::Hns
+            || call.request_nonce == 0
+            || !matches!(
+                call.method,
+                ProviderMethod::NameMarketListOffers | ProviderMethod::NameMarketGetSession
+            )
+        {
+            return Err(invalid_request("native Shakedex query is invalid"));
+        }
+        self.runtime.execute_provider(call)
+    }
+
+    /// Import one exact canonical name into the full runtime's bounded watch
+    /// set. This is a trusted native management operation, not a value approval
+    /// or browser/provider input surface.
+    pub fn import_trusted_native_hns_value_name_exact_text(
+        &self,
+        name: &str,
+    ) -> Result<super::NativeHnsNameSummary, ServiceFailure> {
+        if name.is_empty()
+            || name.len() > MAX_HNS_NAME_BYTES
+            || !name.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        {
+            return Err(invalid_request("Handshake name text is invalid"));
+        }
+        self.runtime.reconcile()?;
+        let imported = self
+            .runtime
+            .runtime
+            .import_name(name.as_bytes())
+            .map_err(hns_native_name_import_failure)?;
+        native_hns_name_summary(&imported)
+    }
+
+    /// Re-prepare, revalidate, sign, persist, and broadcast one exact approved
+    /// native action. The runtime's encrypted approval commitment remains the
+    /// authority; this method never accepts a raw transaction or signing key.
+    pub fn execute_trusted_native_hns_value_action(
+        &mut self,
+        action: TrustedNativeHnsValueAction,
+    ) -> Result<Value, ServiceFailure> {
+        let TrustedNativeHnsValueAction {
+            approval_id,
+            kind,
+            call,
+            expires_at_unix,
+            summary: _,
+        } = action;
+        validate_trusted_native_value_call(approval_id, kind, &call)?;
+        let now_unix = self.trusted_native_hns_value_now_unix()?;
+        if expires_at_unix <= now_unix {
+            self.discard_trusted_native_hns_value_action_by_id(approval_id, now_unix)?;
+            return Err(invalid_request("native value approval has expired"));
+        }
+        let result = self
+            .runtime
+            .execute_approved_provider(call, approval_id, now_unix);
+        if result.is_err() {
+            let _ = self.discard_trusted_native_hns_value_action_by_id(approval_id, now_unix);
+        }
+        result
+    }
+
+    /// Remove any encrypted approval artifact for a rejected or abandoned
+    /// native action. Absence is idempotent and never becomes an approval.
+    pub fn discard_trusted_native_hns_value_action(
+        &self,
+        action: TrustedNativeHnsValueAction,
+    ) -> Result<(), ServiceFailure> {
+        let now_unix = self.trusted_native_hns_value_now_unix()?;
+        self.discard_trusted_native_hns_value_action_by_id(action.approval_id, now_unix)
+    }
+
+    fn discard_trusted_native_hns_value_action_by_id(
+        &self,
+        approval_id: ApprovalId,
+        now_unix: u64,
+    ) -> Result<(), ServiceFailure> {
+        self.runtime
+            .store
+            .with_store_mut(|store| store.take_pending_approval(approval_id, now_unix))
+            .map(|_| ())
+            .map_err(persistent_store_failure)
+    }
+
     /// Compose the hostile-page provider and the full HNS signing runtime over
     /// one literal SharedWalletStore authority. The runtime must have been
     /// opened while that store was privately unlocked; construction is
@@ -1306,6 +1574,24 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         let runtime = PersistentHnsValueRuntime::new(store.clone(), config, configured);
         Self::new(store, runtime, true)
     }
+}
+
+fn validate_trusted_native_value_call(
+    approval_id: ApprovalId,
+    kind: ApprovalKind,
+    call: &ApprovedCall,
+) -> Result<(), ServiceFailure> {
+    if approval_id.as_bytes().iter().all(|byte| *byte == 0)
+        || call.origin.as_str() != TRUSTED_NATIVE_HNS_VALUE_ORIGIN
+        || call.namespace != SelectedNamespace::Hns
+        || call.request_nonce == 0
+        || call.method.approval() != Some(kind)
+    {
+        return Err(invalid_request(
+            "native value action does not match its approval binding",
+        ));
+    }
+    Ok(())
 }
 
 fn shakedex_child_nonce(domain: &[u8], workflow_id: WorkflowId, request_nonce: u64) -> u64 {

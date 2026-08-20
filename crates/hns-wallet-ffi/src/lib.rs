@@ -754,7 +754,10 @@ impl ApprovalSummary {
         }
     }
 
-    fn validate(&self) -> Result<(), AbiError> {
+    /// Validate one structured approval summary independently of a browser
+    /// prompt envelope. Trusted native products use the same canonical summary
+    /// checks before displaying a locally prepared value action.
+    pub fn validate(&self) -> Result<(), AbiError> {
         match self {
             Self::Permissions {
                 capabilities,

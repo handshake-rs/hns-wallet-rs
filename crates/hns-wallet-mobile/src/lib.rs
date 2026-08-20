@@ -5,14 +5,14 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use hns_wallet_ffi::{
-    AbiError, AccountSummary, HnsNameDisclosure, HostFrame, HostPlatform, SecretString,
-    ServiceCapability, ServiceErrorCode, ServiceFailure, ServiceResponse, WalletRequest,
-    WalletResponse, WalletRuntimeStatus, decode_service_frame, encode_host_frame,
+    AbiError, AccountSummary, ApprovalSummary, HnsNameDisclosure, HostFrame, HostPlatform,
+    SecretString, ServiceCapability, ServiceErrorCode, ServiceFailure, ServiceResponse,
+    WalletRequest, WalletResponse, WalletRuntimeStatus, decode_service_frame, encode_host_frame,
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountRecord, HnsExistingAccountSelector, HnsRuntimeConfig,
-    HnsWalletBootstrap, HnsWalletError, KnownName, NameOwnershipStatus, NameResourceStatus,
-    RecoveryPhrase,
+    HnsWalletBootstrap, HnsWalletError, HnsWalletRuntime, KnownName, NameOwnershipStatus,
+    NameResourceStatus, RecoveryPhrase,
 };
 /// Backend composition types exposed for downstream native shells. The
 /// concrete RPC adapter accepts authenticated loopback sockets only; production
@@ -24,17 +24,23 @@ pub use hns_wallet_hns::{
 use hns_wallet_host::{
     Clock, ClockError, HostError, HostOutput, SystemClock, SystemEntropy, WalletHost,
 };
+use hns_wallet_provider::{
+    APPROVAL_LIFETIME_SECONDS, ApprovedCall, Origin, ProviderMethod, SelectedNamespace,
+};
 use hns_wallet_service::{
     MAX_JAVASCRIPT_SAFE_INTEGER, NativeHnsNameOwnershipStatus, NativeHnsNameResourceStatus,
-    NativeHnsNameSummary, PersistentHnsAccountConfig, PersistentHnsAccountRuntime,
-    PersistentHnsReadConfig, PersistentHnsReadRuntime, ServiceError, ServiceRuntime, WalletService,
+    NativeHnsNameSummary, NativeHnsValueSnapshot, PersistentHnsAccountConfig,
+    PersistentHnsAccountRuntime, PersistentHnsReadConfig, PersistentHnsReadRuntime,
+    PersistentHnsValueConfig, PersistentHnsValueRuntime, PersistentShakedexConfig, ServiceError,
+    ServiceRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN, TrustedNativeHnsValueAction, WalletService,
 };
 use hns_wallet_store::{SharedWalletStore, StoreError, WalletStore};
 use hns_wallet_types::{
-    AccountId, Amount, HnsNameReceiveTarget, ModuleId, ReceiveTarget, SyncPhase, SyncStatus,
-    TransactionSummary, WalletAsset,
+    AccountId, Amount, ApprovalId, ApprovalKind, BaseUnits, HnsNameReceiveTarget, ModuleId,
+    ReceiveTarget, SyncPhase, SyncStatus, TransactionSummary, WalletAsset,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -44,6 +50,7 @@ pub const MOBILE_ACCOUNT_LABEL: &str = "Handshake";
 const STORE_PASSPHRASE_DOMAIN: &str = "hns-wallet-mobile/store-passphrase/v1:";
 const RESTART_GENERATION: u64 = 1;
 const MAX_MOBILE_WALLET_ACCOUNTS: usize = 2;
+const MOBILE_ACTION_TOKEN_BYTES: usize = 32;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +197,89 @@ pub struct MobileHnsReadController<B, C = HnsReadSystemClock> {
     account_config: HnsRuntimeConfig,
 }
 
+/// Full same-store native HNS controller. It retains the signing runtime and
+/// the private service behind an installed-product boundary, exposes no raw
+/// provider frames, and permits at most one exact process-local value approval
+/// at a time.
+pub struct MobileHnsValueController<B: HnsBackend, C: HnsClock = HnsReadSystemClock> {
+    session: MobileControllerSession<PersistentHnsValueRuntime<B, C>>,
+    account_config: HnsRuntimeConfig,
+    pending: Option<PendingMobileHnsValueAction>,
+}
+
+struct PendingMobileHnsValueAction {
+    action_token: [u8; MOBILE_ACTION_TOKEN_BYTES],
+    action: TrustedNativeHnsValueAction,
+}
+
+/// Closed native value vocabulary. The selected account and native origin are
+/// inserted by Rust and can never be supplied or replaced by Kotlin, Swift, a
+/// WebView, or website content.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+pub enum MobileHnsValueIntent {
+    Send {
+        recipient: String,
+        amount: BaseUnits,
+        maximum_fee: BaseUnits,
+    },
+    TransferName {
+        name: String,
+        recipient: String,
+        maximum_fee: BaseUnits,
+    },
+    FinalizeName {
+        name: String,
+        expected_recipient: Option<String>,
+        maximum_fee: BaseUnits,
+    },
+    CreateFixedPriceOffer {
+        name: String,
+        price: BaseUnits,
+        maximum_fee: BaseUnits,
+        listing_lifetime_seconds: u64,
+    },
+    CancelOffer {
+        seller_session_id: String,
+    },
+    AcceptOffer {
+        listing_id: String,
+        maximum_fee: BaseUnits,
+    },
+    FinalizePurchase {
+        session_id: String,
+        maximum_fee: BaseUnits,
+    },
+    RecoverName {
+        seller_session_id: String,
+        maximum_fee: BaseUnits,
+    },
+}
+
+/// Closed non-signing Shakedex query vocabulary for the installed native UI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "query", rename_all = "camelCase", deny_unknown_fields)]
+pub enum MobileShakedexQuery {
+    ListOffers {
+        cursor: Option<String>,
+        limit: Option<u16>,
+    },
+    GetSession {
+        session_id: String,
+    },
+}
+
+/// Exact summary displayed by native UI before one value action can execute.
+/// The opaque action token is process-local, random, single-use, and carries no
+/// signing authority after this controller is locked or dropped.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileHnsValueApproval {
+    pub action_token: String,
+    pub expires_at_unix: u64,
+    pub summary: ApprovalSummary,
+}
+
 /// A newly created controller and its one-time dedicated recovery display.
 /// The phrase is not exposed as an ordinary public field or through `Debug`.
 pub struct MobileWalletCreation {
@@ -217,13 +307,46 @@ impl<R: ServiceRuntime> MobileControllerSession<R> {
         }
     }
 
-    fn negotiate(&mut self) -> Result<(), MobileWalletError> {
+    fn negotiate_non_value(&mut self) -> Result<(), MobileWalletError> {
         let hello = self.host.hello_frame()?;
         match self.exchange(hello)? {
             HostOutput::Negotiated(session)
                 if !session
                     .capabilities
                     .contains(&ServiceCapability::ValueMovement)
+                    && !session
+                        .capabilities
+                        .contains(&ServiceCapability::BrowserIntegration) =>
+            {
+                Ok(())
+            }
+            _ => Err(MobileWalletError::UnexpectedResponse),
+        }
+    }
+
+    fn negotiate_value(&mut self, require_shakedex: bool) -> Result<(), MobileWalletError> {
+        let hello = self.host.hello_frame()?;
+        match self.exchange(hello)? {
+            HostOutput::Negotiated(session)
+                if session
+                    .capabilities
+                    .contains(&ServiceCapability::WalletOperations)
+                    && session
+                        .capabilities
+                        .contains(&ServiceCapability::HnsReadOperationsV1)
+                    && session
+                        .capabilities
+                        .contains(&ServiceCapability::HnsValueOperationsV1)
+                    && session
+                        .capabilities
+                        .contains(&ServiceCapability::ProviderDispatch)
+                    && session
+                        .capabilities
+                        .contains(&ServiceCapability::ValueMovement)
+                    && (!require_shakedex
+                        || session
+                            .capabilities
+                            .contains(&ServiceCapability::DenuoShakedexV1))
                     && !session
                         .capabilities
                         .contains(&ServiceCapability::BrowserIntegration) =>
@@ -358,9 +481,10 @@ impl MobileWalletController {
         )
     }
 
-    /// Open exactly one existing non-value HNS account and start locked. The
-    /// database key is used only for authenticated discovery and is not kept by
-    /// the controller; native code must unwrap it again for each unlock.
+    /// Open exactly one existing structurally valid HNS account and start
+    /// locked. Persisted value flags remain authenticated identity facts but do
+    /// not become authority in this lifecycle-only controller. The database key
+    /// is used only for discovery and is not retained.
     pub fn open(
         path: impl AsRef<Path>,
         database_key: &MobileDatabaseKey,
@@ -391,7 +515,8 @@ impl MobileWalletController {
         host: MobileHost,
     ) -> Result<Self, MobileWalletError> {
         let store = SharedWalletStore::new(store);
-        let selector = HnsExistingAccountSelector::new(store.clone(), account_config.clone());
+        let selector =
+            HnsExistingAccountSelector::new_lifecycle(store.clone(), account_config.clone());
         let selector = match selector {
             Ok(selector) => selector,
             Err(error) => {
@@ -416,7 +541,7 @@ impl MobileWalletController {
             account_config,
             platform,
         };
-        controller.session.negotiate()?;
+        controller.session.negotiate_non_value()?;
         Ok(controller)
     }
 
@@ -453,6 +578,68 @@ impl MobileWalletController {
             backend,
             clock,
         )
+    }
+
+    /// Consume this lifecycle controller and activate the full same-store HNS
+    /// value runtime. The database is unlocked only while the full runtime
+    /// authenticates and persists its exact account policy, then it is relocked
+    /// before the private value service is constructed.
+    pub fn into_hns_value<B: HnsBackend>(
+        self,
+        database_key: &MobileDatabaseKey,
+        backend: B,
+        shakedex: Option<PersistentShakedexConfig>,
+    ) -> Result<MobileHnsValueController<B>, MobileWalletError> {
+        self.into_hns_value_with_clock(database_key, backend, HnsReadSystemClock, shakedex)
+    }
+
+    /// Clock-injectable value activation for deterministic installed products
+    /// and qualification fixtures.
+    pub fn into_hns_value_with_clock<B: HnsBackend, C: HnsClock>(
+        mut self,
+        database_key: &MobileDatabaseKey,
+        backend: B,
+        clock: C,
+        shakedex: Option<PersistentShakedexConfig>,
+    ) -> Result<MobileHnsValueController<B, C>, MobileWalletError> {
+        self.lock()?;
+        let store = self.session.store.clone();
+        let platform = self.platform;
+        let mut account_config = self.account_config.clone();
+        account_config.value_operations_enabled = true;
+        if shakedex.is_some() {
+            account_config.settlement_enabled = true;
+        }
+        let require_shakedex = shakedex.is_some();
+        drop(self);
+
+        let passphrase = database_key.store_passphrase();
+        store.unlock(passphrase.as_str())?;
+        let opened =
+            HnsWalletRuntime::open_shared(backend, store.clone(), account_config.clone(), clock);
+        // Construction of the service and all subsequent lifecycle always
+        // begin locked, including every full-runtime activation failure.
+        store.lock()?;
+        let runtime = opened?;
+        let service = WalletService::new_persistent_hns_value(
+            store.clone(),
+            PersistentHnsValueConfig {
+                runtime,
+                account_label: MOBILE_ACCOUNT_LABEL.to_owned(),
+                shakedex,
+            },
+        )?;
+        let mut controller = MobileHnsValueController {
+            session: MobileControllerSession::new(
+                store,
+                WalletHost::new_system(platform.into(), RESTART_GENERATION)?,
+                service,
+            ),
+            account_config,
+            pending: None,
+        };
+        controller.session.negotiate_value(require_shakedex)?;
+        Ok(controller)
     }
 
     pub fn status(&mut self) -> Result<WalletRuntimeStatus, MobileWalletError> {
@@ -557,7 +744,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
             session: MobileControllerSession::new(store, host, service),
             account_config,
         };
-        controller.session.negotiate()?;
+        controller.session.negotiate_non_value()?;
         Ok(controller)
     }
 
@@ -727,6 +914,501 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
     }
 }
 
+impl<B: HnsBackend> MobileHnsValueController<B, HnsReadSystemClock> {
+    /// Open one existing installed wallet directly into its full HNS value
+    /// composition. Startup remains locked and no pending approval survives a
+    /// process restart.
+    pub fn open(
+        path: impl AsRef<Path>,
+        database_key: &MobileDatabaseKey,
+        platform: MobilePlatform,
+        backend: B,
+        shakedex: Option<PersistentShakedexConfig>,
+    ) -> Result<Self, MobileWalletError> {
+        Self::open_with_clock(
+            path,
+            database_key,
+            platform,
+            backend,
+            HnsReadSystemClock,
+            shakedex,
+        )
+    }
+}
+
+impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
+    /// Clock-injectable full-value open path. Exact account discovery first
+    /// runs through the structural lifecycle controller, which grants no node
+    /// or signing authority by itself.
+    pub fn open_with_clock(
+        path: impl AsRef<Path>,
+        database_key: &MobileDatabaseKey,
+        platform: MobilePlatform,
+        backend: B,
+        clock: C,
+        shakedex: Option<PersistentShakedexConfig>,
+    ) -> Result<Self, MobileWalletError> {
+        MobileWalletController::open(path, database_key, platform)?.into_hns_value_with_clock(
+            database_key,
+            backend,
+            clock,
+            shakedex,
+        )
+    }
+
+    pub const fn account_config(&self) -> &HnsRuntimeConfig {
+        &self.account_config
+    }
+
+    pub fn status(&mut self) -> Result<WalletRuntimeStatus, MobileWalletError> {
+        match self.session.wallet_request(WalletRequest::Status)? {
+            WalletResponse::Status { status } => Ok(status),
+            _ => Err(MobileWalletError::UnexpectedResponse),
+        }
+    }
+
+    pub fn unlock(&mut self, database_key: &MobileDatabaseKey) -> Result<(), MobileWalletError> {
+        self.lock()?;
+        let mut passphrase = database_key.store_passphrase();
+        let passphrase = SecretString::new(std::mem::take(&mut *passphrase));
+        match self
+            .session
+            .wallet_request(WalletRequest::Unlock { passphrase })?
+        {
+            WalletResponse::Unlocked => Ok(()),
+            _ => Err(MobileWalletError::UnexpectedResponse),
+        }
+    }
+
+    pub fn lock(&mut self) -> Result<(), MobileWalletError> {
+        let discard = self.discard_pending_action();
+        let lock = match self.session.wallet_request(WalletRequest::Lock) {
+            Ok(WalletResponse::Locked) => Ok(()),
+            Ok(_) => Err(MobileWalletError::UnexpectedResponse),
+            Err(error) => Err(error),
+        };
+        discard?;
+        lock
+    }
+
+    pub fn accounts(&mut self) -> Result<Vec<AccountSummary>, MobileWalletError> {
+        match self.session.wallet_request(WalletRequest::ListAccounts)? {
+            WalletResponse::Accounts { accounts } => Ok(accounts),
+            _ => Err(MobileWalletError::UnexpectedResponse),
+        }
+    }
+
+    /// Perform one full reconciliation and return only the same minimized
+    /// native projection used by the read controller.
+    pub fn synchronize(&mut self) -> Result<MobileHnsReadSnapshot, MobileWalletError> {
+        if self.pending.is_some() {
+            return Err(MobileWalletError::ValueActionPending);
+        }
+        let result = self.synchronize_inner();
+        if result.is_err() {
+            self.session.lock_after_request_error();
+        }
+        result
+    }
+
+    fn synchronize_inner(&self) -> Result<MobileHnsReadSnapshot, MobileWalletError> {
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        let snapshot = self
+            .session
+            .service
+            .synchronize_trusted_native_hns_value()
+            .map_err(mobile_service_failure)?;
+        mobile_hns_value_snapshot(self.account_config.account_id, snapshot)
+    }
+
+    /// Query the synchronized Denuo/Shakedex board or one local trade session
+    /// without exposing generic provider JSON as an input surface.
+    pub fn query_shakedex(
+        &mut self,
+        query: MobileShakedexQuery,
+    ) -> Result<Value, MobileWalletError> {
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        if self.pending.is_some() {
+            return Err(MobileWalletError::ValueActionPending);
+        }
+        let request_nonce = random_nonzero_request_nonce()?;
+        let origin = Origin::parse(TRUSTED_NATIVE_HNS_VALUE_ORIGIN)
+            .map_err(|_| MobileWalletError::InvalidValueAction)?;
+        let (method, params) = query.into_provider_parts(self.account_config.account_id);
+        let result = self
+            .session
+            .service
+            .query_trusted_native_shakedex(ApprovedCall {
+                origin,
+                namespace: SelectedNamespace::Hns,
+                method,
+                params,
+                request_nonce,
+            })
+            .map_err(mobile_service_failure);
+        if result.is_err() {
+            self.session.lock_after_request_error();
+        }
+        result
+    }
+
+    /// Import one exact canonical Handshake name while retaining the full
+    /// value composition. The input is never normalized or rewritten.
+    pub fn import_name_exact_text(
+        &mut self,
+        name: &str,
+    ) -> Result<MobileHnsNameSummary, MobileWalletError> {
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        if self.pending.is_some() {
+            return Err(MobileWalletError::ValueActionPending);
+        }
+        match self
+            .session
+            .service
+            .import_trusted_native_hns_value_name_exact_text(name)
+        {
+            Ok(summary) => mobile_native_hns_name_summary(summary),
+            Err(failure) => {
+                if failure.code != ServiceErrorCode::InvalidRequest {
+                    self.session.lock_after_request_error();
+                }
+                Err(mobile_service_failure(failure))
+            }
+        }
+    }
+
+    /// Prepare one exact value action and return the only summary the installed
+    /// UI may approve. A second action is rejected until the first is approved,
+    /// rejected, expired, or the controller is locked.
+    pub fn prepare_value_action(
+        &mut self,
+        intent: MobileHnsValueIntent,
+    ) -> Result<MobileHnsValueApproval, MobileWalletError> {
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        if self.pending.is_some() {
+            return Err(MobileWalletError::ValueActionPending);
+        }
+        let now_unix = self
+            .session
+            .service
+            .trusted_native_hns_value_now_unix()
+            .map_err(mobile_service_failure)?;
+        let expires_at_unix = now_unix
+            .checked_add(APPROVAL_LIFETIME_SECONDS)
+            .ok_or(MobileWalletError::InvalidValueAction)?;
+        let action_token = random_nonzero_bytes()?;
+        let approval_id = ApprovalId::new(random_nonzero_bytes()?);
+        let request_nonce = random_nonzero_request_nonce()?;
+        let origin = Origin::parse(TRUSTED_NATIVE_HNS_VALUE_ORIGIN)
+            .map_err(|_| MobileWalletError::InvalidValueAction)?;
+        let (kind, method, params) = intent.into_provider_parts(self.account_config.account_id);
+        let call = ApprovedCall {
+            origin,
+            namespace: SelectedNamespace::Hns,
+            method,
+            params,
+            request_nonce,
+        };
+        let action = self
+            .session
+            .service
+            .prepare_trusted_native_hns_value_action(approval_id, kind, call, expires_at_unix)
+            .map_err(mobile_service_failure)?;
+        let summary = action.summary().clone();
+        let expires_at_unix = action.expires_at_unix();
+        self.pending = Some(PendingMobileHnsValueAction {
+            action_token,
+            action,
+        });
+        Ok(MobileHnsValueApproval {
+            action_token: lowercase_hex(&action_token),
+            expires_at_unix,
+            summary,
+        })
+    }
+
+    /// Consume the process-local token exactly once, then re-prepare and
+    /// execute the approval-bound action through the HNS runtime.
+    pub fn approve_value_action(&mut self, action_token: &str) -> Result<Value, MobileWalletError> {
+        self.require_pending_token(action_token)?;
+        let pending = self
+            .pending
+            .take()
+            .ok_or(MobileWalletError::NoPendingValueAction)?;
+        let result = self
+            .session
+            .service
+            .execute_trusted_native_hns_value_action(pending.action)
+            .map_err(mobile_service_failure);
+        if result.is_err() {
+            self.session.lock_after_request_error();
+        }
+        result
+    }
+
+    /// Reject one pending action and remove its encrypted runtime approval.
+    pub fn reject_value_action(&mut self, action_token: &str) -> Result<(), MobileWalletError> {
+        self.require_pending_token(action_token)?;
+        let result = self.discard_pending_action();
+        if result.is_err() {
+            self.session.lock_after_request_error();
+        }
+        result
+    }
+
+    fn require_pending_token(&self, action_token: &str) -> Result<(), MobileWalletError> {
+        let pending = self
+            .pending
+            .as_ref()
+            .ok_or(MobileWalletError::NoPendingValueAction)?;
+        if !mobile_action_token_matches(&pending.action_token, action_token) {
+            return Err(MobileWalletError::InvalidActionToken);
+        }
+        Ok(())
+    }
+
+    fn discard_pending_action(&mut self) -> Result<(), MobileWalletError> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        self.session
+            .service
+            .discard_trusted_native_hns_value_action(pending.action)
+            .map_err(mobile_service_failure)
+    }
+}
+
+impl MobileHnsValueIntent {
+    fn into_provider_parts(self, account: AccountId) -> (ApprovalKind, ProviderMethod, Value) {
+        let market_account = lowercase_hex(account.as_bytes());
+        match self {
+            Self::Send {
+                recipient,
+                amount,
+                maximum_fee,
+            } => (
+                ApprovalKind::Send,
+                ProviderMethod::HnsSend,
+                json!({
+                    "account": account,
+                    "recipient": recipient,
+                    "amount": amount,
+                    "maximumFee": maximum_fee,
+                }),
+            ),
+            Self::TransferName {
+                name,
+                recipient,
+                maximum_fee,
+            } => (
+                ApprovalKind::NameTransfer,
+                ProviderMethod::HnsTransferName,
+                json!({
+                    "account": account,
+                    "name": name,
+                    "recipient": recipient,
+                    "maximumFee": maximum_fee,
+                }),
+            ),
+            Self::FinalizeName {
+                name,
+                expected_recipient,
+                maximum_fee,
+            } => (
+                ApprovalKind::NameFinalize,
+                ProviderMethod::HnsFinalizeName,
+                json!({
+                    "account": account,
+                    "name": name,
+                    "expectedRecipient": expected_recipient,
+                    "maximumFee": maximum_fee,
+                }),
+            ),
+            Self::CreateFixedPriceOffer {
+                name,
+                price,
+                maximum_fee,
+                listing_lifetime_seconds,
+            } => (
+                ApprovalKind::NameMarketOffer,
+                ProviderMethod::NameMarketCreateFixedPriceOffer,
+                json!({
+                    "account": market_account,
+                    "name": name,
+                    "price": price,
+                    "maximumFee": maximum_fee,
+                    "listingLifetimeSeconds": listing_lifetime_seconds,
+                }),
+            ),
+            Self::CancelOffer { seller_session_id } => (
+                ApprovalKind::NameMarketOffer,
+                ProviderMethod::NameMarketCancelOffer,
+                json!({
+                    "account": market_account,
+                    "sellerSessionId": seller_session_id,
+                }),
+            ),
+            Self::AcceptOffer {
+                listing_id,
+                maximum_fee,
+            } => (
+                ApprovalKind::NameMarketPurchase,
+                ProviderMethod::NameMarketAcceptOffer,
+                json!({
+                    "account": market_account,
+                    "listingId": listing_id,
+                    "maximumFee": maximum_fee,
+                }),
+            ),
+            Self::FinalizePurchase {
+                session_id,
+                maximum_fee,
+            } => (
+                ApprovalKind::NameMarketPurchase,
+                ProviderMethod::NameMarketFinalizePurchase,
+                json!({
+                    "account": market_account,
+                    "sessionId": session_id,
+                    "maximumFee": maximum_fee,
+                }),
+            ),
+            Self::RecoverName {
+                seller_session_id,
+                maximum_fee,
+            } => (
+                ApprovalKind::NameMarketOffer,
+                ProviderMethod::NameMarketRecoverName,
+                json!({
+                    "account": market_account,
+                    "sellerSessionId": seller_session_id,
+                    "maximumFee": maximum_fee,
+                }),
+            ),
+        }
+    }
+}
+
+impl MobileShakedexQuery {
+    fn into_provider_parts(self, account: AccountId) -> (ProviderMethod, Value) {
+        match self {
+            Self::ListOffers { cursor, limit } => (
+                ProviderMethod::NameMarketListOffers,
+                json!({
+                    "cursor": cursor,
+                    "limit": limit,
+                }),
+            ),
+            Self::GetSession { session_id } => (
+                ProviderMethod::NameMarketGetSession,
+                json!({
+                    "account": lowercase_hex(account.as_bytes()),
+                    "sessionId": session_id,
+                }),
+            ),
+        }
+    }
+}
+
+fn mobile_hns_value_snapshot(
+    expected_account: AccountId,
+    snapshot: NativeHnsValueSnapshot,
+) -> Result<MobileHnsReadSnapshot, MobileWalletError> {
+    if snapshot.account_id != expected_account
+        || snapshot.balance.asset != WalletAsset::Hns
+        || snapshot
+            .transactions
+            .iter()
+            .any(|transaction| transaction.module != ModuleId::Handshake)
+        || snapshot.module_status.phase != SyncPhase::Ready
+        || snapshot.module_status.validated_height != snapshot.module_status.scanned_height
+        || snapshot.module_status.target_height != Some(snapshot.module_status.validated_height)
+        || snapshot.module_status.last_error.is_some()
+    {
+        return Err(MobileWalletError::Hns(HnsWalletError::InvalidEvidence));
+    }
+    validate_mobile_hns_receive_targets(
+        expected_account,
+        &snapshot.receive_target,
+        &snapshot.name_receive_target,
+    )?;
+    if snapshot.receive_target.display == snapshot.name_receive_target.display {
+        return Err(MobileWalletError::Hns(HnsWalletError::InvalidEvidence));
+    }
+    let mut known_names = snapshot
+        .known_names
+        .into_iter()
+        .map(mobile_native_hns_name_summary)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut unique_names = BTreeSet::new();
+    let mut unique_hashes = BTreeSet::new();
+    if !known_names.iter().all(|name| {
+        unique_names.insert(name.name.clone()) && unique_hashes.insert(name.name_hash.clone())
+    }) {
+        return Err(MobileWalletError::Hns(HnsWalletError::InvalidEvidence));
+    }
+    known_names.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.name_hash.cmp(&right.name_hash))
+    });
+    Ok(MobileHnsReadSnapshot {
+        balance: snapshot.balance,
+        receive_target: snapshot.receive_target,
+        name_receive_target: snapshot.name_receive_target,
+        transaction_history: snapshot.transactions,
+        known_names,
+        module_status: snapshot.module_status,
+    })
+}
+
+fn random_nonzero_bytes<const N: usize>() -> Result<[u8; N], MobileWalletError> {
+    for _ in 0..8 {
+        let mut bytes = [0_u8; N];
+        getrandom::fill(&mut bytes).map_err(|_| MobileWalletError::Randomness)?;
+        if bytes.iter().any(|byte| *byte != 0) {
+            return Ok(bytes);
+        }
+    }
+    Err(MobileWalletError::Randomness)
+}
+
+fn random_nonzero_request_nonce() -> Result<u64, MobileWalletError> {
+    Ok(u64::from_be_bytes(random_nonzero_bytes()?))
+}
+
+fn mobile_action_token_matches(
+    expected: &[u8; MOBILE_ACTION_TOKEN_BYTES],
+    candidate: &str,
+) -> bool {
+    if candidate.len() != MOBILE_ACTION_TOKEN_BYTES * 2 {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (index, pair) in candidate.as_bytes().chunks_exact(2).enumerate() {
+        let decode = |byte| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        let Some(high) = decode(pair[0]) else {
+            return false;
+        };
+        let Some(low) = decode(pair[1]) else {
+            return false;
+        };
+        difference |= expected[index] ^ ((high << 4) | low);
+    }
+    difference == 0
+}
+
 fn validate_mobile_hns_receive_targets(
     expected_account: AccountId,
     receive_target: &ReceiveTarget,
@@ -892,6 +1574,16 @@ pub enum MobileWalletError {
     UnexpectedResponse,
     #[error("private mobile wallet controller failed closed and must be reopened")]
     ControllerFailed,
+    #[error("a native HNS value action is already pending")]
+    ValueActionPending,
+    #[error("there is no pending native HNS value action")]
+    NoPendingValueAction,
+    #[error("native HNS value action token is invalid")]
+    InvalidActionToken,
+    #[error("native HNS value action is invalid")]
+    InvalidValueAction,
+    #[error("secure native randomness is unavailable")]
+    Randomness,
     #[error("wallet service rejected the request ({code:?}): {message}")]
     ServiceFailure {
         code: ServiceErrorCode,
@@ -1289,6 +1981,107 @@ mod tests {
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].account_id, restored_config.account_id);
         restored.lock().expect("lock restored wallet");
+    }
+
+    #[test]
+    fn flagged_value_account_reopens_for_lifecycle_but_not_ordinary_reads() {
+        let directory = private_tempdir();
+        let path = directory.path().join("flagged-lifecycle.sqlite3");
+        let key = MobileDatabaseKey::new([0x8a; MOBILE_DATABASE_KEY_BYTES]).expect("database key");
+        let creation = MobileWalletController::create(
+            &path,
+            &key,
+            MobilePlatform::Android,
+            HnsBootstrapPolicy::new(HnsNetwork::Regtest, 0),
+        )
+        .expect("create lifecycle controller");
+        let (controller, _recovery_phrase) = creation.into_parts();
+        drop(controller);
+
+        let mut store = WalletStore::open(&path).expect("open store for release-policy fixture");
+        let passphrase = key.store_passphrase();
+        store
+            .unlock(passphrase.as_str())
+            .expect("unlock release-policy fixture");
+        let mut accounts = store
+            .wallet_accounts::<HnsAccountRecord>(MAX_MOBILE_WALLET_ACCOUNTS)
+            .expect("load exact account");
+        assert_eq!(accounts.len(), 1);
+        let mut stored = accounts.pop().expect("one account");
+        stored.value.config.value_operations_enabled = true;
+        stored.value.config.settlement_enabled = true;
+        store
+            .save_wallet_account(&stored.id, stored.revision, &stored.value, 1_800_000_001)
+            .expect("persist qualified-policy-shaped fixture");
+        store.lock();
+        drop(store);
+
+        let lifecycle = MobileWalletController::open(&path, &key, MobilePlatform::Android)
+            .expect("flagged account remains lifecycle-reopenable");
+        assert!(lifecycle.account_config().value_operations_enabled);
+        assert!(lifecycle.account_config().settlement_enabled);
+        let probe = Arc::new(MockReadProbe::default());
+        assert!(matches!(
+            lifecycle.into_hns_reads_with_clock(MockReadBackend::new(probe), MockReadClock),
+            Err(MobileWalletError::Hns(
+                HnsWalletError::RuntimeIntegrationUnavailable
+            ))
+        ));
+
+        let lifecycle = MobileWalletController::open(&path, &key, MobilePlatform::Ios)
+            .expect("reopen after rejected ordinary-read composition");
+        let probe = Arc::new(MockReadProbe::default());
+        assert!(matches!(
+            lifecycle.into_hns_value_with_clock(
+                &key,
+                MockReadBackend::new(probe),
+                MockReadClock,
+                None,
+            ),
+            Err(MobileWalletError::Hns(
+                HnsWalletError::RuntimeIntegrationUnavailable
+            ))
+        ));
+
+        let mut reopened = MobileWalletController::open(&path, &key, MobilePlatform::Android)
+            .expect("failed activation leaves wallet safely reopenable");
+        assert!(reopened.status().expect("locked lifecycle status").locked);
+    }
+
+    #[test]
+    fn native_value_intents_insert_the_exact_account_and_tokens_are_canonical() {
+        let account = AccountId::new([0x42; 16]);
+        let (kind, method, params) = MobileHnsValueIntent::Send {
+            recipient: "rs1qexample".to_owned(),
+            amount: BaseUnits::new(12_345),
+            maximum_fee: BaseUnits::new(678),
+        }
+        .into_provider_parts(account);
+        assert_eq!(kind, ApprovalKind::Send);
+        assert_eq!(method, ProviderMethod::HnsSend);
+        assert_eq!(params["account"], json!(account));
+        assert_eq!(params["recipient"], "rs1qexample");
+        assert_eq!(params["amount"], json!(BaseUnits::new(12_345)));
+        assert_eq!(params["maximumFee"], json!(BaseUnits::new(678)));
+        assert!(params.get("origin").is_none());
+
+        let token = [0xab; MOBILE_ACTION_TOKEN_BYTES];
+        let encoded = lowercase_hex(&token);
+        assert!(mobile_action_token_matches(&token, &encoded));
+        assert!(!mobile_action_token_matches(
+            &token,
+            &encoded.to_uppercase()
+        ));
+        assert!(!mobile_action_token_matches(
+            &token,
+            &encoded[..encoded.len() - 2]
+        ));
+        let mut changed = encoded.into_bytes();
+        changed[17] = b'0';
+        assert!(!mobile_action_token_matches(
+            &token,
+            std::str::from_utf8(&changed).expect("ASCII token")
+        ));
     }
 
     #[test]

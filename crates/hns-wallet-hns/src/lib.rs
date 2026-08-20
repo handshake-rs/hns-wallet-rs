@@ -1608,15 +1608,14 @@ impl HnsRuntimeConfig {
     /// authority. Every ordinary and full runtime constructor uses this path.
     pub fn validate(&self) -> Result<(), HnsWalletError> {
         self.validate_structure()?;
-        if self.network == HnsNetwork::Mainnet
-            && (self.value_operations_enabled || self.settlement_enabled)
+        if (self.value_operations_enabled || self.settlement_enabled)
+            && (!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED || !HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED)
         {
-            return Err(HnsWalletError::MainnetDisabled);
-        }
-        if (!HNS_VALUE_RUNTIME_RELEASE_QUALIFIED || !HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED)
-            && (self.value_operations_enabled || self.settlement_enabled)
-        {
-            return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+            return Err(if self.network == HnsNetwork::Mainnet {
+                HnsWalletError::MainnetDisabled
+            } else {
+                HnsWalletError::RuntimeIntegrationUnavailable
+            });
         }
         Ok(())
     }
@@ -1785,6 +1784,11 @@ impl fmt::Debug for HnsWalletBootstrap {
 enum HnsAccountReadMode {
     OrdinaryNonValue,
     PersistedRecoveryReadOnly,
+    /// Structure-only selection for a private native lifecycle controller.
+    /// This mode can authenticate an account whose persisted release flags are
+    /// enabled, but it is rejected by every synchronized-read constructor and
+    /// therefore cannot become node, signing, or settlement authority.
+    LifecycleStructural,
 }
 
 impl HnsAccountReadMode {
@@ -1802,6 +1806,7 @@ impl HnsAccountReadMode {
                     return Err(HnsWalletError::InvalidRuntimeConfiguration);
                 }
             }
+            Self::LifecycleStructural => config.validate_structure()?,
         }
         Ok(())
     }
@@ -1837,6 +1842,20 @@ impl HnsExistingAccountSelector {
         expected: HnsRuntimeConfig,
     ) -> Result<Self, HnsWalletError> {
         Self::new_with_mode(store, expected, HnsAccountReadMode::OrdinaryNonValue)
+    }
+
+    /// Select one exact account for private native create/open/lock lifecycle
+    /// control without interpreting persisted value flags as authority.
+    ///
+    /// The resulting selector can be used by the account-only service runtime,
+    /// but synchronized read and full value constructors independently reject
+    /// it. This lets an installed wallet remain reopenable while its product-
+    /// owned node is unavailable or a release gate is temporarily closed.
+    pub fn new_lifecycle(
+        store: SharedWalletStore,
+        expected: HnsRuntimeConfig,
+    ) -> Result<Self, HnsWalletError> {
+        Self::new_with_mode(store, expected, HnsAccountReadMode::LifecycleStructural)
     }
 
     fn new_with_mode(
@@ -3358,6 +3377,35 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 .then_with(|| left.name_hash.cmp(&right.name_hash))
         });
         Ok(names)
+    }
+
+    /// Return the next dedicated name-ownership receive target from the full
+    /// runtime's exact synchronized account. This uses the separated
+    /// `HnsName`, change-zero branch and can never alias the ordinary payment
+    /// receive branch.
+    pub fn name_receive_target(&self) -> Result<HnsNameReceiveTarget, HnsWalletError> {
+        let cache = self.cache_read()?;
+        ensure_ready(&cache).map_err(|_| HnsWalletError::StaleNodeSnapshot)?;
+        let account = cache.account.clone();
+        drop(cache);
+        let derivation = DerivationReference {
+            role: KeyRole::HnsName,
+            account: account_number(&account),
+            change: 0,
+            index: account.next_name_index,
+        };
+        let store = self.store_lock()?;
+        let public_key = derive_hns_public_key(&store, account.config.wallet_id, derivation)?;
+        let target = HnsNameReceiveTarget {
+            module: ModuleId::Handshake,
+            account: account.config.account_id,
+            display: receive_address(account.config.network, &public_key)?,
+            derivation_index: derivation.index,
+        };
+        target
+            .validate()
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        Ok(target)
     }
 
     pub fn get_name(&self, name_hash: [u8; 32]) -> Result<Option<KnownName>, HnsWalletError> {
@@ -5231,6 +5279,9 @@ fn prepare_hns_account_read(
                 store,
                 &fenced_account.config,
             )
+        }
+        HnsAccountReadMode::LifecycleStructural => {
+            return Err(HnsWalletError::RuntimeIntegrationUnavailable);
         }
     }
     .map_err(map_shakedex_restore_error)?;
@@ -12335,7 +12386,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_flagged_accounts_open_only_through_the_recovery_read_wrapper() {
+    fn persisted_flagged_accounts_reject_ordinary_reads_but_allow_closed_lifecycle() {
         for (network, value_operations_enabled, settlement_enabled) in [
             (HnsNetwork::Mainnet, true, false),
             (HnsNetwork::Mainnet, false, true),
@@ -12371,6 +12422,16 @@ mod tests {
                 Err(HnsWalletError::MainnetDisabled)
                     | Err(HnsWalletError::RuntimeIntegrationUnavailable)
             ));
+            let lifecycle =
+                HnsExistingAccountSelector::new_lifecycle(store.clone(), config.clone())
+                    .expect("structure-only lifecycle selector");
+            assert_eq!(
+                lifecycle
+                    .selected_account()
+                    .expect("exact lifecycle account")
+                    .config,
+                config
+            );
 
             let full_store = WalletStore::create(":memory:", PRODUCTION_FOLLOWUP_PASSPHRASE)
                 .expect("create ordinary full-runtime store");
