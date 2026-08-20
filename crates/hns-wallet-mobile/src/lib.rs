@@ -11,17 +11,19 @@ use hns_wallet_ffi::{
     SecretString, ServiceCapability, ServiceErrorCode, ServiceFailure, ServiceResponse,
     WalletRequest, WalletResponse, WalletRuntimeStatus, decode_service_frame, encode_host_frame,
 };
+/// Backend composition types exposed for downstream native shells. The RPC
+/// adapter remains available for explicitly configured local deployments; a
+/// host can instead open the wallet-owned direct peer coordinator below and
+/// compose its [`EmbeddedHnsBackend`] without endpoint credentials.
+pub use hns_wallet_hns::{
+    EmbeddedHnsBackend, HnsBackend, HnsBootstrapPolicy, HnsClock, HnsDirectPeerConfig,
+    HnsDirectPeerCoordinator, HnsDirectPeerError, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
+    SystemClock as HnsReadSystemClock,
+};
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountRecord, HnsExistingAccountSelector, HnsRuntimeConfig,
     HnsWalletBootstrap, HnsWalletError, HnsWalletRuntime, KnownName, NameOwnershipStatus,
-    NameResourceStatus, RecoveryPhrase,
-};
-/// Backend composition types exposed for downstream native shells. The
-/// concrete RPC adapter accepts authenticated loopback sockets only; production
-/// Android/iOS transport and lifecycle integration remain external.
-pub use hns_wallet_hns::{
-    HnsBackend, HnsBootstrapPolicy, HnsClock, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
-    SystemClock as HnsReadSystemClock,
+    NameResourceStatus, RecoveryPhrase, open_wallet_direct_hns_peer_coordinator,
 };
 use hns_wallet_host::{
     Clock, ClockError, HostError, HostOutput, SystemClock, SystemEntropy, WalletHost,
@@ -600,6 +602,39 @@ impl MobileWalletController {
 
     pub const fn account_config(&self) -> &HnsRuntimeConfig {
         &self.account_config
+    }
+
+    /// Open the wallet-owned direct HNS peer coordinator for this exact
+    /// encrypted account. This consumes no endpoint, RPC credential, relay,
+    /// or third-party index configuration: the coordinator derives its watch
+    /// set from the locally encrypted account and uses ordinary HNS peers.
+    ///
+    /// The controller returns locked. A host retains the coordinator while it
+    /// later consumes this lifecycle controller into the read or value runtime;
+    /// synchronization then runs only while that same wallet store is unlocked.
+    pub fn open_direct_hns_peer_coordinator(
+        &mut self,
+        database_key: &MobileDatabaseKey,
+        peer_config: HnsDirectPeerConfig,
+    ) -> Result<HnsDirectPeerCoordinator, MobileWalletError> {
+        self.lock()?;
+        let store = self.session.store.clone();
+        let account_config = self.account_config.clone();
+        let passphrase = database_key.store_passphrase();
+        store.unlock(passphrase.as_str())?;
+        let now_unix = HnsReadSystemClock.now_unix()?;
+        let opened = open_wallet_direct_hns_peer_coordinator(
+            store.clone(),
+            &account_config,
+            peer_config,
+            now_unix,
+        );
+        let relocked = store.lock();
+        match (opened, relocked) {
+            (Ok(coordinator), Ok(())) => Ok(coordinator),
+            (Err(error), _) => Err(error.into()),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
     }
 
     /// Consume this lifecycle-only controller and install a synchronized HNS
@@ -1734,6 +1769,8 @@ pub enum MobileWalletError {
     #[error(transparent)]
     Hns(#[from] HnsWalletError),
     #[error(transparent)]
+    DirectHns(#[from] HnsDirectPeerError),
+    #[error(transparent)]
     Host(#[from] HostError),
     #[error(transparent)]
     Clock(#[from] ClockError),
@@ -2185,6 +2222,37 @@ mod tests {
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].account_id, restored_config.account_id);
         restored.lock().expect("lock restored wallet");
+    }
+
+    #[test]
+    fn lifecycle_opens_a_wallet_owned_direct_peer_coordinator_without_rpc_credentials() {
+        let directory = private_tempdir();
+        let path = directory.path().join("direct-peer-wallet.sqlite3");
+        let key = MobileDatabaseKey::new([0x7a; MOBILE_DATABASE_KEY_BYTES]).expect("database key");
+        let creation = MobileWalletController::create(
+            &path,
+            &key,
+            MobilePlatform::Android,
+            HnsBootstrapPolicy::new(HnsNetwork::Regtest, 0),
+        )
+        .expect("create direct-peer wallet");
+        let (mut controller, _recovery) = creation.into_parts();
+        let coordinator = controller
+            .open_direct_hns_peer_coordinator(
+                &key,
+                HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            )
+            .expect("open direct coordinator without an endpoint or credential");
+        let scan = coordinator
+            .backend()
+            .light_scan_status()
+            .expect("wallet-owned direct index");
+        assert_eq!(
+            scan.watched_scripts,
+            controller.account_config().restore_lookahead as usize * 4
+        );
+        assert_eq!(scan.watched_names, 0);
+        assert!(controller.status().expect("controller relocked").locked);
     }
 
     #[test]
