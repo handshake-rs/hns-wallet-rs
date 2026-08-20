@@ -34,9 +34,10 @@ pub use price_board::{
 };
 pub use session_board::{
     DenuoSwapHandshakeAdmission, DenuoSwapHandshakePolicy, DenuoSwapHandshakeRecord,
-    DenuoSwapHandshakeSnapshot, DenuoSwapHandshakeStage, MAX_DENUO_SWAP_HANDSHAKES,
-    admit_denuo_fill_grant, admit_denuo_match_request, admit_denuo_swap_hello,
-    admit_denuo_swap_proposal, load_denuo_swap_handshake, load_denuo_swap_handshakes,
+    DenuoSwapHandshakeSnapshot, DenuoSwapHandshakeStage, DenuoSwapPeerStatus,
+    MAX_DENUO_SWAP_HANDSHAKES, admit_denuo_fill_grant, admit_denuo_match_request,
+    admit_denuo_swap_hello, admit_denuo_swap_proposal, load_denuo_swap_handshake,
+    load_denuo_swap_handshakes, validate_denuo_swap_peer_status,
 };
 pub use settlement_key::{
     CrossChainSwapKey, CrossChainSwapKeyAllocation, CrossChainSwapKeyError,

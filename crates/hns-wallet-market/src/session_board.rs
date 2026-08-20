@@ -1,6 +1,7 @@
 use hns_marketplace_protocol::{
     AssetId, CrossChainMessage, FillGrant, MarketIntent, MarketPair, MatchRequest, NetworkBinding,
-    PriceRound, SwapSessionHello, SwapSessionProposal,
+    PriceRound, SwapFundingStatus, SwapRedeemStatus, SwapRefundStatus, SwapSessionHello,
+    SwapSessionProposal,
 };
 use hns_wallet_store::{
     EntityBatchSave, EntityKind, EntityPrefixSetLease, StoreError, StoredEntity, WalletStore,
@@ -170,6 +171,27 @@ pub enum DenuoSwapHandshakeAdmission {
     Created(DenuoSwapHandshakeSnapshot),
     Advanced(DenuoSwapHandshakeSnapshot),
     Existing(DenuoSwapHandshakeSnapshot),
+}
+
+/// A signed, session-correlated status received directly from a Denuo peer.
+/// It is intentionally not execution evidence: callers must verify the
+/// referenced transaction through their own HNS or Kyoto light-client before
+/// applying any [`crate::VerifiedEvidence`] to the durable swap journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DenuoSwapPeerStatus {
+    Funding(SwapFundingStatus),
+    Redeem(SwapRedeemStatus),
+    Refund(SwapRefundStatus),
+}
+
+impl DenuoSwapPeerStatus {
+    pub const fn session_id(&self) -> SessionId {
+        match self {
+            Self::Funding(status) => SessionId::new(status.swap_session_id),
+            Self::Redeem(status) => SessionId::new(status.swap_session_id),
+            Self::Refund(status) => SessionId::new(status.swap_session_id),
+        }
+    }
 }
 
 impl DenuoSwapHandshakeAdmission {
@@ -457,6 +479,43 @@ pub fn admit_denuo_swap_hello(
     record.hello_accepted_at_unix = Some(accepted_at_unix);
     record.hello = Some(hello);
     Ok(DenuoSwapHandshakeAdmission::Advanced(record.snapshot()))
+}
+
+/// Authenticate one direct-peer Denuo settlement status against the exact
+/// locally retained bilateral agreement. This function performs no workflow
+/// mutation: a counterparty signature is coordination metadata, never proof
+/// that the claimed funding, redemption, or refund occurred on either chain.
+pub fn validate_denuo_swap_peer_status(
+    store: &WalletStore,
+    policy: &DenuoSwapHandshakePolicy,
+    envelope_bytes: &[u8],
+    now_unix: u64,
+) -> Result<DenuoSwapPeerStatus, MarketError> {
+    let (_, message) = decode_canonical_envelope(envelope_bytes)?;
+    let status = match message {
+        CrossChainMessage::SwapFundingStatus(status) => DenuoSwapPeerStatus::Funding(status),
+        CrossChainMessage::SwapRedeemStatus(status) => DenuoSwapPeerStatus::Redeem(status),
+        CrossChainMessage::SwapRefundStatus(status) => DenuoSwapPeerStatus::Refund(status),
+        _ => return Err(MarketError::InvalidDenuoPeerMessage),
+    };
+    let record = load_denuo_swap_handshake(store, policy, status.session_id())?
+        .ok_or(MarketError::UnknownDenuoSwapHandshake)?;
+    let hello = record
+        .hello
+        .as_ref()
+        .ok_or(MarketError::InvalidDenuoSwapHandshake)?;
+    match &status {
+        DenuoSwapPeerStatus::Funding(status) => status
+            .verify_for_session(hello, policy.network(), now_unix)
+            .map_err(|_| MarketError::InvalidDenuoPeerMessage)?,
+        DenuoSwapPeerStatus::Redeem(status) => status
+            .verify_for_session(hello, policy.network(), now_unix)
+            .map_err(|_| MarketError::InvalidDenuoPeerMessage)?,
+        DenuoSwapPeerStatus::Refund(status) => status
+            .verify_for_session(hello, policy.network(), now_unix)
+            .map_err(|_| MarketError::InvalidDenuoPeerMessage)?,
+    }
+    Ok(status)
 }
 
 fn verify_proposal(
@@ -794,8 +853,9 @@ fn handshake_record_id(policy: &DenuoSwapHandshakePolicy, session_id: SessionId)
 #[cfg(test)]
 mod tests {
     use hns_marketplace_protocol::{
-        AssetAmount, ChainAnchor, ChainId, DeadlineKind, MARKETPLACE_PROTOCOL_VERSION,
-        PriceObservation, PriceRoundPolicy, RationalPrice, SettlementDeadline, SignedObjectHeader,
+        AssetAmount, ChainAnchor, ChainId, DeadlineKind, FundingState,
+        MARKETPLACE_PROTOCOL_VERSION, PriceObservation, PriceRoundPolicy, RationalPrice,
+        SettlementDeadline, SignedObjectHeader,
     };
     use hns_primitives::BlockHash;
 
@@ -1110,6 +1170,37 @@ mod tests {
             open_denuo_execution(&mut maker_store, &policy, session_id, 1_900_000_000)
                 .expect("reopen existing execution"),
             maker_execution,
+        );
+
+        let mut funding_status = SwapFundingStatus {
+            header: header(4, 129, 200),
+            swap_session_id: session_id.into_bytes(),
+            chain: ChainId::HANDSHAKE,
+            lock_commitment: hello.offered_lock_commitment,
+            transaction_id: [42; 32],
+            output_index: 0,
+            amount: hello.offered_amount,
+            confirmations: hello.offered_minimum_confirmations,
+            state: FundingState::Confirmed,
+            signature: [0; 64],
+        };
+        funding_status
+            .sign(&MAKER_SETTLEMENT_SECRET)
+            .expect("sign peer funding status");
+        let funding_envelope = envelope(CrossChainMessage::SwapFundingStatus(funding_status), 78);
+        for store in [&maker_store, &taker_store] {
+            assert!(matches!(
+                validate_denuo_swap_peer_status(store, &policy, &funding_envelope, 129)
+                    .expect("validate signed peer status"),
+                DenuoSwapPeerStatus::Funding(_)
+            ));
+        }
+        // The authenticated peer claim is not sufficient to move durable
+        // execution state; each wallet still needs independent chain proof.
+        assert_eq!(
+            open_denuo_execution(&mut taker_store, &policy, session_id, 1_900_000_000)
+                .expect("status does not mutate execution"),
+            taker_execution,
         );
 
         let wrong_correlation = envelope(CrossChainMessage::SwapSessionHello(hello), 78);
