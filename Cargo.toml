@@ -70,7 +70,12 @@ zeroize = { version = "1.8.1", features = ["derive"] }
 # to one immutable revision; no mutable branch, tag, or sibling checkout is
 # allowed. This source adoption does not imply downstream release qualification.
 hns-covenants = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-header-consensus = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
 hns-marketplace-protocol = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-light-chain = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "23bb433952a86e22e01f5c5d95123d8f7c2a6355" }
+hns-light-sync = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "23bb433952a86e22e01f5c5d95123d8f7c2a6355" }
+hns-light-wallet = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "23bb433952a86e22e01f5c5d95123d8f7c2a6355" }
+hns-p2p-wire = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
 hns-primitives = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
 hns-script = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
 hns-swap = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
@@ -90,3 +95,16 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# The light-engine repositories intentionally depend on the published 0.3
+# protocol line. Patch that registry line to the wallet's exact reviewed
+# hns-rs revision so canonical headers, transactions, and primitive types have
+# one Cargo source identity across the embedded runtime.
+[patch.crates-io]
+hns-covenants = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-encoding = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-header-consensus = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-p2p-wire = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-primitives = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-transaction = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }
+hns-urkel-proof = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "9c6d722b1b277ca58df750e7157cf44e48971d96" }

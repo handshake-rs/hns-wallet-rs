@@ -1,6 +1,7 @@
 #![doc = "Handshake wallet key roles, restoration, UTXO selection, and name workflows."]
 #![forbid(unsafe_code)]
 
+mod light_authority;
 mod name_workflow;
 mod node_rpc;
 mod shakedex_funding;
@@ -10,6 +11,10 @@ mod shakedex_key;
 #[allow(dead_code)]
 mod hnsa_hnsr_publisher;
 
+pub use light_authority::{
+    AcceptedHnsHeader, EncryptedHnsLightAuthority, HNS_LIGHT_CHAIN_FORMAT_VERSION, HnsLightError,
+    HnsLightFloor, PersistedHeaderRound,
+};
 pub use name_workflow::{
     AuthorizedNameOperation, CurrentShakedexLockQuery, HnsNameAction, HnsNameLifecycle,
     NameActionContextEvidence, NameActionIneligibility, NameOperation, NameOperationState,

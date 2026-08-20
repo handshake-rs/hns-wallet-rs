@@ -59,6 +59,7 @@ pub enum EntityKind {
     DerivedAddress,
     HnsUtxo,
     HnsTransaction,
+    HnsLightChain,
     KnownName,
     NameOwnerOutpoint,
     NameTransfer,
@@ -95,6 +96,7 @@ impl EntityKind {
             Self::DerivedAddress => "derived_address",
             Self::HnsUtxo => "hns_utxo",
             Self::HnsTransaction => "hns_transaction",
+            Self::HnsLightChain => "hns_light_chain",
             Self::KnownName => "known_name",
             Self::NameOwnerOutpoint => "name_owner_outpoint",
             Self::NameTransfer => "name_transfer",
@@ -1394,6 +1396,13 @@ impl WalletStore {
             hns_transactions,
             delete_hns_transaction,
             HnsTransaction
+        ),
+        (
+            save_hns_light_chain,
+            hns_light_chain,
+            hns_light_chain_records,
+            delete_hns_light_chain,
+            HnsLightChain
         ),
         (
             save_known_name,
