@@ -2,10 +2,11 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
+use std::ops::{Deref, DerefMut};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
@@ -442,6 +443,34 @@ pub struct SharedWalletStore {
     inner: Arc<Mutex<WalletStore>>,
 }
 
+/// Exclusive synchronous access retained by one stateful wallet runtime.
+///
+/// Most integrations should prefer [`SharedWalletStore::try_with_store`] or
+/// [`SharedWalletStore::try_with_store_mut`]. This guard exists for runtimes
+/// whose existing transaction helpers borrow one `WalletStore` across several
+/// dependent local operations. It must never cross an external call, async
+/// suspension point, or callback into untrusted code.
+///
+/// Poison recovery always clears the decrypted record key and returns an error
+/// instead of yielding a guard.
+pub struct SharedWalletStoreGuard<'a> {
+    guard: MutexGuard<'a, WalletStore>,
+}
+
+impl Deref for SharedWalletStoreGuard<'_> {
+    type Target = WalletStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for SharedWalletStoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
 impl SharedWalletStore {
     pub fn new(store: WalletStore) -> Self {
         Self {
@@ -481,6 +510,23 @@ impl SharedWalletStore {
     /// store/key authority. Path equality is deliberately insufficient.
     pub fn is_same_authority(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Retain exclusive synchronous access for a stateful wallet runtime.
+    ///
+    /// Do not hold the returned guard while performing network I/O, awaiting,
+    /// or calling caller-provided code. Bounded one-operation integrations
+    /// should use the closure APIs instead.
+    pub fn runtime_guard(&self) -> Result<SharedWalletStoreGuard<'_>, StoreError> {
+        let guard = match self.inner.lock() {
+            Ok(store) => store,
+            Err(poisoned) => {
+                let mut store = poisoned.into_inner();
+                store.lock();
+                return Err(StoreError::Concurrency);
+            }
+        };
+        Ok(SharedWalletStoreGuard { guard })
     }
 
     pub fn with_store_mut<T>(

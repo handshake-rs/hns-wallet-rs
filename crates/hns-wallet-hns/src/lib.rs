@@ -74,7 +74,8 @@ use hns_wallet_chain_api::{
 };
 use hns_wallet_store::{
     EntityBatchDelete, EntityBatchSave, EntityKind, EntityPrefixSetLease, EntityReadSnapshot,
-    SecretKind, SharedWalletStore, StoreError, StoredEntity, StoredWorkflow, WalletStore,
+    SecretKind, SharedWalletStore, SharedWalletStoreGuard, StoreError, StoredEntity,
+    StoredWorkflow, WalletStore,
 };
 use hns_wallet_types::{
     AccountId, Amount, ApprovalId, BaseUnits, ChainCapabilities, DerivationReference, FeeModel,
@@ -2824,106 +2825,127 @@ impl fmt::Debug for HnsPreparedSettlement {
 pub struct HnsWalletRuntime<B, C = SystemClock> {
     backend: B,
     clock: C,
-    store: Mutex<WalletStore>,
+    store: SharedWalletStore,
     cache: RwLock<HnsRuntimeCache>,
 }
 
 impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     pub fn open(
         backend: B,
-        mut store: WalletStore,
+        store: WalletStore,
+        config: HnsRuntimeConfig,
+        clock: C,
+    ) -> Result<Self, HnsWalletError> {
+        Self::open_shared(backend, SharedWalletStore::new(store), config, clock)
+    }
+
+    /// Open the full HNS runtime over the exact Arc-backed store/key authority
+    /// shared with provider, browser-service, and Denuo components.
+    ///
+    /// The supplied store must already be unlocked. Every clone observes the
+    /// same lock transition, and [`Self::shares_store_authority`] lets the
+    /// enclosing product reject a separately opened connection even when it
+    /// names the same database path.
+    pub fn open_shared(
+        backend: B,
+        store: SharedWalletStore,
         config: HnsRuntimeConfig,
         clock: C,
     ) -> Result<Self, HnsWalletError> {
         config.validate()?;
-        if store.is_locked() {
+        if store.is_locked()? {
             return Err(HnsWalletError::StoreLocked);
         }
-        for stored in store.list_entities_by_id_prefix::<HnsAccountRecord>(
-            EntityKind::WalletAccount,
-            config.wallet_id.as_bytes(),
-            MAX_HISTORY_RESULTS,
-        )? {
-            if stored.id != account_entity_id(&stored.value.config)
-                || stored.value.config.wallet_id != config.wallet_id
-            {
-                return Err(HnsWalletError::InvalidEvidence);
-            }
-            if stored.value.config.account_id != config.account_id
-                && stored.value.config.account_derivation_index == config.account_derivation_index
-            {
-                return Err(HnsWalletError::DuplicateAccountDerivation);
-            }
-        }
-        let existing: Option<StoredEntity<HnsAccountRecord>> =
-            store.wallet_account(&account_entity_id(&config))?;
-        let (account, account_revision) = match existing {
-            Some(mut stored) => {
-                if !same_account_identity(&stored.value.config, &config) {
-                    return Err(HnsWalletError::AccountConfigurationMismatch);
+        let (account, account_revision, coins, transactions) =
+            store.try_with_store_mut(|wallet| {
+                for stored in wallet.list_entities_by_id_prefix::<HnsAccountRecord>(
+                    EntityKind::WalletAccount,
+                    config.wallet_id.as_bytes(),
+                    MAX_HISTORY_RESULTS,
+                )? {
+                    if stored.id != account_entity_id(&stored.value.config)
+                        || stored.value.config.wallet_id != config.wallet_id
+                    {
+                        return Err(HnsWalletError::InvalidEvidence);
+                    }
+                    if stored.value.config.account_id != config.account_id
+                        && stored.value.config.account_derivation_index
+                            == config.account_derivation_index
+                    {
+                        return Err(HnsWalletError::DuplicateAccountDerivation);
+                    }
                 }
-                if stored.value.config != config {
-                    stored.value.config = config;
-                    stored.revision = store.save_wallet_account(
-                        &account_entity_id(&stored.value.config),
-                        stored.revision,
-                        &stored.value,
-                        clock.now_unix()?,
-                    )?;
-                }
-                (stored.value, stored.revision)
-            }
-            None => {
-                let external_scan_end = config.restore_lookahead - 1;
-                let account = HnsAccountRecord {
-                    config,
-                    next_receive_index: 0,
-                    next_change_index: 0,
-                    next_name_index: 0,
-                    next_shakedex_index: 0,
-                    external_scan_end,
-                    internal_scan_end: external_scan_end,
-                    name_scan_end: external_scan_end,
-                    shakedex_scan_end: external_scan_end,
-                    shakedex_scan_complete: false,
-                    shakedex_scan_in_progress: false,
-                    last_used_external: None,
-                    last_used_internal: None,
-                    last_used_name: None,
-                    last_used_shakedex: None,
+                let existing: Option<StoredEntity<HnsAccountRecord>> =
+                    wallet.wallet_account(&account_entity_id(&config))?;
+                let (account, account_revision) = match existing {
+                    Some(mut stored) => {
+                        if !same_account_identity(&stored.value.config, &config) {
+                            return Err(HnsWalletError::AccountConfigurationMismatch);
+                        }
+                        if stored.value.config != config {
+                            stored.value.config = config;
+                            stored.revision = wallet.save_wallet_account(
+                                &account_entity_id(&stored.value.config),
+                                stored.revision,
+                                &stored.value,
+                                clock.now_unix()?,
+                            )?;
+                        }
+                        (stored.value, stored.revision)
+                    }
+                    None => {
+                        let external_scan_end = config.restore_lookahead - 1;
+                        let account = HnsAccountRecord {
+                            config,
+                            next_receive_index: 0,
+                            next_change_index: 0,
+                            next_name_index: 0,
+                            next_shakedex_index: 0,
+                            external_scan_end,
+                            internal_scan_end: external_scan_end,
+                            name_scan_end: external_scan_end,
+                            shakedex_scan_end: external_scan_end,
+                            shakedex_scan_complete: false,
+                            shakedex_scan_in_progress: false,
+                            last_used_external: None,
+                            last_used_internal: None,
+                            last_used_name: None,
+                            last_used_shakedex: None,
+                        };
+                        let revision = wallet.save_wallet_account(
+                            &account_entity_id(&account.config),
+                            0,
+                            &account,
+                            clock.now_unix()?,
+                        )?;
+                        (account, revision)
+                    }
                 };
-                let revision = store.save_wallet_account(
-                    &account_entity_id(&account.config),
-                    0,
-                    &account,
-                    clock.now_unix()?,
-                )?;
-                (account, revision)
-            }
-        };
-        let entity_prefix = account_entity_prefix(&account.config);
-        let coins = store
-            .list_entities_by_id_prefix::<TrackedHnsCoin>(
-                EntityKind::HnsUtxo,
-                &entity_prefix,
-                MAX_WALLET_COINS,
-            )?
-            .into_iter()
-            .map(|entity| entity.value)
-            .collect();
-        let transactions = store
-            .list_entities_by_id_prefix::<HnsTransactionRecord>(
-                EntityKind::HnsTransaction,
-                &entity_prefix,
-                MAX_HISTORY_RESULTS,
-            )?
-            .into_iter()
-            .map(|entity| entity.value)
-            .collect();
+                let entity_prefix = account_entity_prefix(&account.config);
+                let coins = wallet
+                    .list_entities_by_id_prefix::<TrackedHnsCoin>(
+                        EntityKind::HnsUtxo,
+                        &entity_prefix,
+                        MAX_WALLET_COINS,
+                    )?
+                    .into_iter()
+                    .map(|entity| entity.value)
+                    .collect();
+                let transactions = wallet
+                    .list_entities_by_id_prefix::<HnsTransactionRecord>(
+                        EntityKind::HnsTransaction,
+                        &entity_prefix,
+                        MAX_HISTORY_RESULTS,
+                    )?
+                    .into_iter()
+                    .map(|entity| entity.value)
+                    .collect();
+                Ok::<_, HnsWalletError>((account, account_revision, coins, transactions))
+            })?;
         Ok(Self {
             backend,
             clock,
-            store: Mutex::new(store),
+            store,
             cache: RwLock::new(HnsRuntimeCache {
                 account,
                 account_revision,
@@ -2944,6 +2966,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
 
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Prove that another component retains the identical process-local
+    /// database/key authority used by this signing runtime.
+    pub fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
+        self.store.is_same_authority(store)
     }
 
     pub fn register<'a>(&'a self, registry: &mut ModuleRegistry<'a>) -> Result<(), RegistryError> {
@@ -4208,10 +4236,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .map_err(|_| HnsWalletError::RuntimePoisoned)
     }
 
-    fn store_lock(&self) -> Result<std::sync::MutexGuard<'_, WalletStore>, HnsWalletError> {
-        self.store
-            .lock()
-            .map_err(|_| HnsWalletError::RuntimePoisoned)
+    fn store_lock(&self) -> Result<SharedWalletStoreGuard<'_>, HnsWalletError> {
+        self.store.runtime_guard().map_err(HnsWalletError::from)
     }
 
     fn quote_final_transaction_once(
@@ -9987,6 +10013,43 @@ mod tests {
             selector,
         )
         .expect("synchronized account read runtime")
+    }
+
+    #[test]
+    fn full_runtime_retains_the_exact_shared_store_and_lock_authority() {
+        let (store, config) = production_followup_read_store();
+        let runtime = HnsWalletRuntime::open_shared(
+            ProductionFollowupReadBackend::new(
+                store.clone(),
+                &config,
+                ProductionFollowupReadFault::Healthy,
+            ),
+            store.clone(),
+            config,
+            ProductionFollowupClock,
+        )
+        .expect("open full runtime over shared authority");
+
+        assert!(runtime.shares_store_authority(&store));
+        let (different_store, _) = production_followup_read_store();
+        assert!(!runtime.shares_store_authority(&different_store));
+
+        store.lock().expect("lock shared authority");
+        assert!(
+            runtime
+                .store_lock()
+                .expect("locked runtime guard")
+                .is_locked()
+        );
+        store
+            .unlock(PRODUCTION_FOLLOWUP_PASSPHRASE)
+            .expect("unlock shared authority");
+        assert!(
+            !runtime
+                .store_lock()
+                .expect("runtime observes shared unlock")
+                .is_locked()
+        );
     }
 
     fn zero_value_incoming_candidate(recipient: &DerivedHnsAddress) -> IncomingTransferCandidate {
