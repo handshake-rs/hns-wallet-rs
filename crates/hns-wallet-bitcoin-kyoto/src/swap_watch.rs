@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     BitcoinCheckpoint, BitcoinHtlc, BitcoinWalletError, HtlcSpendBranch, MIN_HTLC_DUST_SATS,
-    VerifiedBitcoinLock, htlc_commitment, verify_htlc_funding, verify_signed_bitcoin_htlc_spend,
+    VerifiedBitcoinHtlcSpend, VerifiedBitcoinLock, htlc_commitment, verify_htlc_funding,
+    verify_signed_bitcoin_htlc_spend,
 };
 
 const BITCOIN_SWAP_WATCH_SCHEMA_VERSION: u16 = 1;
@@ -88,6 +89,16 @@ pub struct BitcoinHtlcWatchSnapshot {
     pub preimage_revealed: bool,
 }
 
+/// One HTLC spend re-authenticated from this wallet's compact-filter chain
+/// view. The observation is available only while the caller presents the
+/// exact checkpoint to which the watch was reconciled, preventing stale or
+/// reorged watch data from advancing a recovery workflow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedBitcoinHtlcSpendObservation {
+    pub spend: VerifiedBitcoinHtlcSpend,
+    pub confirmation_count: u32,
+}
+
 /// Re-authenticated encrypted HTLC observation state. Raw transactions and a
 /// revealed preimage are available only through explicit accessors and are
 /// never included in `Debug` output.
@@ -152,6 +163,34 @@ impl BitcoinHtlcWatch {
                 value_sats: self.persisted.expected_value_sats,
                 confirmation_count: funding.confirmation_count,
                 htlc: self.persisted.htlc.clone(),
+            })
+    }
+
+    /// Return a complete, locally re-verified HTLC spend only when this watch
+    /// is still reconciled to the caller's current compact-filter checkpoint.
+    /// The raw transaction is verified again against the exact retained
+    /// funding outpoint and witness branch before it is returned.
+    pub fn verified_spend_at(
+        &self,
+        current_checkpoint: BitcoinCheckpoint,
+    ) -> Option<VerifiedBitcoinHtlcSpendObservation> {
+        if current_checkpoint != self.persisted.scanned_checkpoint {
+            return None;
+        }
+        let funding = self.persisted.funding.as_ref()?;
+        let spend = self.persisted.spend.as_ref()?;
+        let branch = spend.branch?;
+        let lock = self.verified_lock_at(current_checkpoint)?;
+        let verified =
+            verify_signed_bitcoin_htlc_spend(&spend.raw_transaction, &lock, branch).ok()?;
+        (verified.txid.into_bytes() == spend.txid
+            && verified.wtxid == spend.wtxid
+            && verified.revealed_preimage == spend.preimage
+            && funding.confirmation_count >= self.persisted.minimum_confirmations
+            && spend.confirmation_count != 0)
+            .then_some(VerifiedBitcoinHtlcSpendObservation {
+                spend: verified,
+                confirmation_count: spend.confirmation_count,
             })
     }
 }
@@ -1045,9 +1084,23 @@ mod tests {
                 .confirmation_count,
             2
         );
+        let observed_spend = watch
+            .verified_spend_at(spend_tip)
+            .expect("checkpoint-bound canonical spend");
+        assert_eq!(observed_spend.spend.branch, HtlcSpendBranch::Redeem);
+        assert_eq!(observed_spend.spend.revealed_preimage, Some(PREIMAGE));
+        assert_eq!(observed_spend.confirmation_count, 1);
         assert!(
             watch
                 .verified_lock_at(BitcoinCheckpoint {
+                    height: 102,
+                    block_hash: [99; 32],
+                })
+                .is_none()
+        );
+        assert!(
+            watch
+                .verified_spend_at(BitcoinCheckpoint {
                     height: 102,
                     block_hash: [99; 32],
                 })
