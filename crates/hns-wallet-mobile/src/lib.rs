@@ -223,7 +223,12 @@ struct PendingMobileHnsValueAction {
 /// inserted by Rust and can never be supplied or replaced by Kotlin, Swift, a
 /// WebView, or website content.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "action",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum MobileHnsValueIntent {
     Send {
         recipient: String,
@@ -265,7 +270,12 @@ pub enum MobileHnsValueIntent {
 
 /// Closed non-signing Shakedex query vocabulary for the installed native UI.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "query", rename_all = "camelCase", deny_unknown_fields)]
+#[serde(
+    tag = "query",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum MobileShakedexQuery {
     ListOffers {
         cursor: Option<String>,
@@ -2276,6 +2286,40 @@ mod tests {
             &token,
             std::str::from_utf8(&changed).expect("ASCII token")
         ));
+    }
+
+    #[test]
+    fn native_value_and_query_wire_vocabulary_is_closed_camel_case() {
+        let transfer = MobileHnsValueIntent::TransferName {
+            name: "example".to_owned(),
+            recipient: "rs1qrecipient".to_owned(),
+            maximum_fee: BaseUnits::new(123),
+        };
+        let encoded = serde_json::to_value(&transfer).expect("serialize native transfer");
+        assert_eq!(encoded["action"], "transferName");
+        assert_eq!(encoded["maximumFee"], "123");
+        assert!(encoded.get("maximum_fee").is_none());
+        assert_eq!(
+            serde_json::from_value::<MobileHnsValueIntent>(encoded)
+                .expect("deserialize native transfer"),
+            transfer
+        );
+
+        let query = MobileShakedexQuery::GetSession {
+            session_id: "11".repeat(32),
+        };
+        let encoded = serde_json::to_value(&query).expect("serialize native query");
+        assert_eq!(encoded["query"], "getSession");
+        assert_eq!(encoded["sessionId"], "11".repeat(32));
+        assert!(encoded.get("session_id").is_none());
+        assert!(
+            serde_json::from_value::<MobileShakedexQuery>(json!({
+                "query": "getSession",
+                "sessionId": "11".repeat(32),
+                "account": "caller-controlled"
+            }))
+            .is_err()
+        );
     }
 
     #[test]
