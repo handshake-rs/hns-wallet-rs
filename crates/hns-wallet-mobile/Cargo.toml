@@ -14,10 +14,13 @@ publish = ["crates-io"]
 
 [dependencies]
 getrandom.workspace = true
+hns-primitives.workspace = true
+hns-swap.workspace = true
 hns-wallet-ffi.workspace = true
 hns-wallet-hns.workspace = true
 hns-wallet-host.workspace = true
 hns-wallet-provider.workspace = true
+hns-wallet-shakedex.workspace = true
 hns-wallet-service.workspace = true
 hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true
