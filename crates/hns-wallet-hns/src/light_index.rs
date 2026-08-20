@@ -300,6 +300,18 @@ impl EncryptedHnsLightIndex {
         }
     }
 
+    /// Wallet account bound to this index.
+    #[must_use]
+    pub const fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    /// Selected Handshake consensus network.
+    #[must_use]
+    pub const fn consensus_network(&self) -> Network {
+        self.network
+    }
+
     /// Exact canonical watch set used to construct peer bloom filters.
     #[must_use]
     pub const fn watch_set(&self) -> &HnsLightWatchSet {
@@ -529,7 +541,7 @@ fn watched_outputs(
     Ok(outpoints)
 }
 
-fn add_watched_outputs(
+pub(crate) fn add_watched_outputs(
     transaction: &Transaction,
     txid: CanonicalTransactionHash,
     scripts: &BTreeSet<WalletAddressKey>,
@@ -550,7 +562,7 @@ fn add_watched_outputs(
     Ok(())
 }
 
-fn transaction_relevant(
+pub(crate) fn transaction_relevant(
     transaction: &Transaction,
     scripts: &BTreeSet<WalletAddressKey>,
     names: &BTreeSet<[u8; 32]>,

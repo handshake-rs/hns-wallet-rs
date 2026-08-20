@@ -1,6 +1,7 @@
 #![doc = "Handshake wallet key roles, restoration, UTXO selection, and name workflows."]
 #![forbid(unsafe_code)]
 
+mod embedded_backend;
 mod light_authority;
 mod light_index;
 mod name_workflow;
@@ -12,6 +13,7 @@ mod shakedex_key;
 #[allow(dead_code)]
 mod hnsa_hnsr_publisher;
 
+pub use embedded_backend::{EmbeddedHnsBackend, HnsLightNetwork};
 pub use light_authority::{
     AcceptedHnsHeader, EncryptedHnsLightAuthority, HNS_LIGHT_CHAIN_FORMAT_VERSION, HnsLightError,
     HnsLightFloor, PersistedHeaderRound,
@@ -819,6 +821,8 @@ pub struct MempoolSnapshotBinding {
 pub enum HnsFeeRateSource {
     MinimumRelay,
     Mempool,
+    /// Lower-median relay floor advertised by connected untrusted peers.
+    PeerRelay,
 }
 
 /// Exact node-resolved HSD policy evidence for one serialized transaction.
@@ -8826,7 +8830,7 @@ fn validate_final_fee_quote_evidence(
     }
     match quote.rate_source {
         HnsFeeRateSource::MinimumRelay if quote.rate_sample_count == 0 => {}
-        HnsFeeRateSource::Mempool if quote.rate_sample_count > 0 => {}
+        HnsFeeRateSource::Mempool | HnsFeeRateSource::PeerRelay if quote.rate_sample_count > 0 => {}
         _ => return Err(HnsWalletError::InvalidFeeQuote),
     }
     Ok(())
