@@ -35,6 +35,7 @@ use bdk_wallet::template::Bip84;
 use bdk_wallet::{KeychainKind, SignOptions, Wallet};
 use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
+use hns_marketplace_protocol::{MarketPair, NetworkBinding as DenuoNetworkBinding};
 use hns_wallet_chain_api::SettlementSigner;
 use hns_wallet_types::{
     ChainCapabilities, FeeModel, FinalityModel, HashAlgorithm, LocktimeModel, ObjectHash,
@@ -56,6 +57,10 @@ pub const MAX_BITCOIN_SWAP_KEY_INDEX: u32 = 100_000;
 pub const DEFAULT_REQUIRED_PEERS: u8 = 3;
 pub const MAX_KYOTO_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_KYOTO_SYNC_TIMEOUT: Duration = Duration::from_secs(86_400);
+/// Domain-separated commitment to an exact Bitcoin P2WSH HTLC as it appears
+/// in a signed Denuo HNS/BTC session. It binds the bilateral network, amount,
+/// and full witness script—not merely the script hash advertised by a peer.
+pub const DENUO_BITCOIN_HTLC_COMMITMENT_DOMAIN: &[u8] = b"hns-wallet-rs/denuo-bitcoin-htlc/v1";
 /// Wallet-private HKDF-SHA256 salt for Bitcoin atomic-swap keys. This is not a
 /// registered BIP-32 purpose or an interoperable descriptor path.
 pub const BITCOIN_SWAP_DERIVATION_DOMAIN: &[u8] = b"hns-wallet-rs/bitcoin-atomic-swap-key/v1";
@@ -1207,6 +1212,51 @@ pub fn htlc_commitment(htlc: &BitcoinHtlc) -> ObjectHash {
     ObjectHash::new(hasher.finalize().into())
 }
 
+/// Produce the exact Bitcoin lock commitment which may be placed into the
+/// Bitcoin side of a signed Denuo HNS/BTC session. A funding status still
+/// carries its independently verified outpoint and amount; this commitment
+/// ensures that the outpoint's P2WSH program is for the same hashlock, keys,
+/// refund locktime, and chain network that both parties accepted.
+pub fn denuo_bitcoin_htlc_commitment(
+    network: DenuoNetworkBinding,
+    htlc: &BitcoinHtlc,
+    value_sats: u64,
+) -> Result<ObjectHash, BitcoinWalletError> {
+    network
+        .validate_for_pair(MarketPair::HNS_BTC)
+        .map_err(|_| BitcoinWalletError::InvalidHtlc)?;
+    htlc.validate()?;
+    if value_sats < MIN_HTLC_DUST_SATS {
+        return Err(BitcoinWalletError::InvalidAmount);
+    }
+    let network = network
+        .encode()
+        .map_err(|_| BitcoinWalletError::InvalidHtlc)?;
+    let script_length =
+        u16::try_from(htlc.witness_script.len()).map_err(|_| BitcoinWalletError::InvalidHtlc)?;
+    let mut hasher = Sha256::new();
+    hasher.update(DENUO_BITCOIN_HTLC_COMMITMENT_DOMAIN);
+    hasher.update(network);
+    hasher.update(value_sats.to_le_bytes());
+    hasher.update(script_length.to_le_bytes());
+    hasher.update(&htlc.witness_script);
+    Ok(ObjectHash::new(hasher.finalize().into()))
+}
+
+/// Verify a Bitcoin descriptor against the commitment frozen in a Denuo
+/// session before funding or accepting a claimed funding transaction.
+pub fn verify_denuo_bitcoin_htlc_commitment(
+    expected: ObjectHash,
+    network: DenuoNetworkBinding,
+    htlc: &BitcoinHtlc,
+    value_sats: u64,
+) -> Result<(), BitcoinWalletError> {
+    if denuo_bitcoin_htlc_commitment(network, htlc, value_sats)? != expected {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum BitcoinWalletError {
     #[error("invalid Bitcoin module configuration")]
@@ -1344,6 +1394,8 @@ mod tests {
     use super::*;
     use bdk_wallet::bitcoin::bip32::DerivationPath;
     use bdk_wallet::bitcoin::secp256k1::{Secp256k1, SecretKey};
+    use hns_marketplace_protocol::ChainId;
+    use hns_primitives::BlockHash;
     use hns_wallet_chain_api::{SettlementSigner, SettlementSigningError};
     use hns_wallet_store::WalletStore;
 
@@ -1388,6 +1440,37 @@ mod tests {
                 script_pubkey: htlc.script_pubkey(),
             }],
         }
+    }
+
+    fn denuo_network(counterchain_network: u64) -> DenuoNetworkBinding {
+        DenuoNetworkBinding {
+            hns_magic: 0x5b6e_c393,
+            hns_genesis: BlockHash::new([1; 32]),
+            counterchain: ChainId::BITCOIN,
+            counterchain_network,
+            counterchain_genesis: [2; 32],
+        }
+    }
+
+    #[test]
+    fn denuo_bitcoin_commitment_binds_network_amount_and_exact_htlc_script() {
+        let htlc = htlc();
+        let network = denuo_network(1);
+        let commitment = denuo_bitcoin_htlc_commitment(network, &htlc, 50_000)
+            .expect("canonical Denuo Bitcoin commitment");
+        verify_denuo_bitcoin_htlc_commitment(commitment, network, &htlc, 50_000)
+            .expect("same descriptor verifies");
+        assert!(verify_denuo_bitcoin_htlc_commitment(commitment, network, &htlc, 50_001).is_err());
+        assert!(
+            verify_denuo_bitcoin_htlc_commitment(commitment, denuo_network(2), &htlc, 50_000,)
+                .is_err()
+        );
+        let changed_script =
+            BitcoinHtlc::new(htlc.hashlock, key(3), key(5), 500).expect("different refund key");
+        assert!(
+            verify_denuo_bitcoin_htlc_commitment(commitment, network, &changed_script, 50_000,)
+                .is_err()
+        );
     }
 
     #[test]

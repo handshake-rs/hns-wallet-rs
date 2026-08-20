@@ -19,6 +19,7 @@ bip157.workspace = true
 bip39.workspace = true
 bitcoin.workspace = true
 hkdf.workspace = true
+hns-marketplace-protocol.workspace = true
 hns-wallet-chain-api.workspace = true
 hns-wallet-store.workspace = true
 hns-wallet-types.workspace = true
@@ -29,6 +30,7 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+hns-primitives.workspace = true
 tempfile = "3.20.0"
 
 [lints]

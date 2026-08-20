@@ -916,6 +916,8 @@ dependencies = [
  "bip39",
  "bitcoin",
  "hkdf",
+ "hns-marketplace-protocol",
+ "hns-primitives",
  "hns-wallet-chain-api",
  "hns-wallet-store",
  "hns-wallet-types",
