@@ -704,10 +704,60 @@ pub fn recover_denuo_handoff_as_retry(
     )
 }
 
+pub(crate) struct DenuoAcceptedReplay {
+    pub(crate) envelope_bytes: Vec<u8>,
+    pub(crate) network_magic: u32,
+    pub(crate) network_genesis: [u8; 32],
+    pub(crate) attempt_id: [u8; 32],
+    pub(crate) record_sequence: u64,
+    pub(crate) prepared_at_unix: u64,
+    pub(crate) envelope_id: [u8; 32],
+    pub(crate) envelope_digest: [u8; 32],
+    pub(crate) content_id: [u8; 32],
+    pub(crate) message_kind: DenuoOutboxMessageKind,
+    pub(crate) request_id: u64,
+}
+
 pub struct StoredDenuoPublicationOutbox {
     pub revision: u64,
     pub updated_at_unix: u64,
     pub outbox: DenuoPublicationOutbox,
+}
+
+pub(crate) fn accepted_denuo_replays(
+    store: &WalletStore,
+) -> Result<Vec<DenuoAcceptedReplay>, ShakedexError> {
+    let stored = load_denuo_publication_outbox(store)?;
+    let mut entries = stored
+        .outbox
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry.state, DenuoOutboxState::RelayAccepted { .. }))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| (entry.created_at_unix, entry.message_kind, entry.request_id));
+    entries
+        .into_iter()
+        .map(|entry| {
+            let acceptance = entry
+                .acceptance
+                .as_ref()
+                .ok_or(ShakedexError::CorruptDenuoOutbox)?;
+            let expected = validate_persisted_denuo_publication_acceptance(acceptance)?;
+            Ok(DenuoAcceptedReplay {
+                envelope_bytes: entry.envelope_bytes.clone(),
+                network_magic: expected.network_magic,
+                network_genesis: expected.network_genesis.into_bytes(),
+                attempt_id: expected.attempt_id.into_bytes(),
+                record_sequence: expected.record_sequence,
+                prepared_at_unix: expected.prepared_at_unix,
+                envelope_id: expected.envelope_id.into_bytes(),
+                envelope_digest: expected.envelope_digest.into_bytes(),
+                content_id: expected.content_id.into_bytes(),
+                message_kind: expected.message_kind,
+                request_id: expected.request_id,
+            })
+        })
+        .collect()
 }
 
 pub fn load_denuo_publication_outbox(

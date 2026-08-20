@@ -700,7 +700,7 @@ dependencies = [
 [[package]]
 name = "hns-covenants"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e#88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=9c6d722b1b277ca58df750e7157cf44e48971d96#9c6d722b1b277ca58df750e7157cf44e48971d96"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -712,7 +712,7 @@ dependencies = [
 [[package]]
 name = "hns-encoding"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e#88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=9c6d722b1b277ca58df750e7157cf44e48971d96#9c6d722b1b277ca58df750e7157cf44e48971d96"
 dependencies = [
  "thiserror",
 ]
@@ -720,7 +720,7 @@ dependencies = [
 [[package]]
 name = "hns-marketplace-protocol"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e#88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=9c6d722b1b277ca58df750e7157cf44e48971d96#9c6d722b1b277ca58df750e7157cf44e48971d96"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -728,6 +728,7 @@ dependencies = [
  "hns-primitives",
  "hns-swap",
  "k256",
+ "sha2",
  "thiserror",
  "zeroize",
 ]
@@ -735,7 +736,7 @@ dependencies = [
 [[package]]
 name = "hns-p2p-experimental"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e#88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=9c6d722b1b277ca58df750e7157cf44e48971d96#9c6d722b1b277ca58df750e7157cf44e48971d96"
 dependencies = [
  "hex",
  "hns-encoding",
@@ -749,7 +750,7 @@ dependencies = [
 [[package]]
 name = "hns-primitives"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e#88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=9c6d722b1b277ca58df750e7157cf44e48971d96#9c6d722b1b277ca58df750e7157cf44e48971d96"
 dependencies = [
  "hex",
  "thiserror",
@@ -758,7 +759,7 @@ dependencies = [
 [[package]]
 name = "hns-script"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e#88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=9c6d722b1b277ca58df750e7157cf44e48971d96#9c6d722b1b277ca58df750e7157cf44e48971d96"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -775,7 +776,7 @@ dependencies = [
 [[package]]
 name = "hns-swap"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e#88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=9c6d722b1b277ca58df750e7157cf44e48971d96#9c6d722b1b277ca58df750e7157cf44e48971d96"
 dependencies = [
  "blake2",
  "hns-covenants",
@@ -792,7 +793,7 @@ dependencies = [
 [[package]]
 name = "hns-transaction"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e#88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=9c6d722b1b277ca58df750e7157cf44e48971d96#9c6d722b1b277ca58df750e7157cf44e48971d96"
 dependencies = [
  "blake2",
  "hns-covenants",
@@ -804,7 +805,7 @@ dependencies = [
 [[package]]
 name = "hns-urkel-proof"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e#88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=9c6d722b1b277ca58df750e7157cf44e48971d96#9c6d722b1b277ca58df750e7157cf44e48971d96"
 dependencies = [
  "blake2",
  "hns-primitives",
@@ -882,6 +883,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hns-covenants",
+ "hns-marketplace-protocol",
  "hns-primitives",
  "hns-script",
  "hns-swap",

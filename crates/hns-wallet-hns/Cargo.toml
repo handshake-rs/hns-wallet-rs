@@ -20,6 +20,7 @@ getrandom.workspace = true
 hex.workspace = true
 hkdf.workspace = true
 hns-covenants.workspace = true
+hns-marketplace-protocol.workspace = true
 hns-primitives.workspace = true
 hns-script.workspace = true
 hns-swap.workspace = true

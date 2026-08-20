@@ -450,6 +450,77 @@ pub struct CoinSelection {
     pub change: BaseUnits,
 }
 
+pub const MAX_DENUO_NAME_MARKET_TRANSPORT_PAGE: usize = 256;
+pub const MAX_DENUO_NAME_MARKET_ENVELOPE_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DenuoTransportMessageKind {
+    Offer,
+    Cancellation,
+}
+
+/// Exact durable publication attempt sent to the authenticated local node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DenuoPublicationHandoff {
+    pub network_magic: u32,
+    pub network_genesis: [u8; 32],
+    pub attempt_id: [u8; 32],
+    pub record_sequence: u64,
+    pub prepared_at_unix: u64,
+    pub envelope_id: [u8; 32],
+    pub envelope_digest: [u8; 32],
+    pub content_id: [u8; 32],
+    pub message_kind: DenuoTransportMessageKind,
+    pub request_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenuoPublicationAcceptance {
+    pub relay_revision: u64,
+    pub kind: DenuoTransportMessageKind,
+    pub content_id: [u8; 32],
+    pub inserted: bool,
+    pub accepted_at_unix: u64,
+    pub receipt_bytes: Vec<u8>,
+    pub propagation_attempted: usize,
+    pub propagation_written: usize,
+    pub propagation_failed: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenuoTransportEvent {
+    pub revision: u64,
+    pub received_at_unix: u64,
+    pub kind: DenuoTransportMessageKind,
+    pub content_id: [u8; 32],
+    pub envelope_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenuoTransportEventPage {
+    pub instance_nonce: [u8; 32],
+    pub cursor_reset: bool,
+    pub oldest_revision: u64,
+    pub head_revision: u64,
+    pub events: Vec<DenuoTransportEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenuoTransportSnapshotRecord {
+    pub kind: DenuoTransportMessageKind,
+    pub content_id: [u8; 32],
+    pub envelope_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenuoTransportSnapshotPage {
+    pub instance_nonce: [u8; 32],
+    pub snapshot_revision: u64,
+    pub next_offset: Option<usize>,
+    pub records: Vec<DenuoTransportSnapshotRecord>,
+}
+
 pub trait HnsBackend {
     /// Returns the current initialized tip and durable chain epoch without
     /// receiving any wallet script identifiers.
@@ -552,6 +623,37 @@ pub trait HnsBackend {
         _binding: SnapshotBinding,
         _expected_mempool: MempoolSnapshotBinding,
     ) -> Result<NameActionContextEvidence, HnsWalletError> {
+        Err(HnsWalletError::RuntimeIntegrationUnavailable)
+    }
+
+    /// Hand one exact durably prepared Denuo publication to the authenticated
+    /// local node and require its endpoint-signed acceptance receipt.
+    fn publish_denuo_name_market(
+        &self,
+        _envelope_bytes: &[u8],
+        _handoff: DenuoPublicationHandoff,
+    ) -> Result<DenuoPublicationAcceptance, HnsWalletError> {
+        Err(HnsWalletError::RuntimeIntegrationUnavailable)
+    }
+
+    /// Read one process-instance-bound page of untrusted marketplace events.
+    fn get_denuo_name_market_events(
+        &self,
+        _expected_instance_nonce: Option<[u8; 32]>,
+        _after_revision: u64,
+        _limit: usize,
+    ) -> Result<DenuoTransportEventPage, HnsWalletError> {
+        Err(HnsWalletError::RuntimeIntegrationUnavailable)
+    }
+
+    /// Rebuild from a coherent latest-state snapshot after a node restart or
+    /// retained-event-window gap.
+    fn get_denuo_name_market_snapshot(
+        &self,
+        _expected_revision: Option<u64>,
+        _offset: usize,
+        _limit: usize,
+    ) -> Result<DenuoTransportSnapshotPage, HnsWalletError> {
         Err(HnsWalletError::RuntimeIntegrationUnavailable)
     }
 }
@@ -2967,6 +3069,19 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
 
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Trusted wall-clock seconds from the exact clock authority retained by
+    /// this runtime. Adjacent same-store transports use this instead of
+    /// introducing a second independently configurable time source.
+    pub fn trusted_now_unix(&self) -> Result<u64, HnsWalletError> {
+        self.clock.now_unix()
+    }
+
+    /// Exact canonical network binding for adjacent Shakedex/Denuo runtime
+    /// composition.
+    pub fn shakedex_network(&self) -> Result<NetworkBinding, HnsWalletError> {
+        shakedex_network_binding(self.configured_runtime_config()?.network)
     }
 
     /// Prove that another component retains the identical process-local

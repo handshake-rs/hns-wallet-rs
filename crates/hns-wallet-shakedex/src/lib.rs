@@ -11,6 +11,7 @@ mod plans;
 mod seller_offer;
 mod trade_runtime;
 mod transactions;
+mod transport;
 mod value_workflow;
 
 pub use acceptance::{
@@ -75,6 +76,9 @@ pub use transactions::{
     prepare_current_script_finalize, prepare_current_seller_recovery, prepare_script_finalize,
     prepare_seller_recovery, verify_signed_buyer_fulfillment, verify_signed_script_finalize,
     verify_signed_seller_recovery,
+};
+pub use transport::{
+    DenuoTransportCursorSnapshot, DenuoTransportRuntime, DenuoTransportSyncReport,
 };
 pub use value_workflow::{
     MAX_SHAKEDEX_VALUE_WORKFLOWS, ShakedexChainObservation, ShakedexReservationReleaseEvidence,

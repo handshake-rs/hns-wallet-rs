@@ -23,7 +23,8 @@ use hns_wallet_hns::{
 };
 use hns_wallet_provider::{ApprovedCall, PendingApproval, ProviderMethod, SelectedNamespace};
 use hns_wallet_shakedex::{
-    MAX_SHAKEDEX_OFFER_PAGE_SIZE, PrepareBuyerTrade, PrepareScriptFinalize, PrepareSellerOffer,
+    DenuoPublicationAcceptancePolicy, DenuoTransportRuntime, MAX_SHAKEDEX_OFFER_PAGE_SIZE,
+    PrepareBuyerTrade, PrepareScriptFinalize, PrepareSellerOffer,
     SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED, SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED,
     SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, SellerOfferPreview, SellerOfferStage, ShakedexError,
     ShakedexOfferPage, ShakedexSellerPolicy, ShakedexTradePreview, ShakedexTradeRuntime,
@@ -62,14 +63,7 @@ pub struct PersistentHnsValueConfig<B, C> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistentShakedexConfig {
     pub seller_policy: ShakedexSellerPolicy,
-}
-
-impl Default for PersistentShakedexConfig {
-    fn default() -> Self {
-        Self {
-            seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
-        }
-    }
+    pub acceptance_policy: DenuoPublicationAcceptancePolicy,
 }
 
 /// Provider-capable HNS runtime with one exact account and one exact encrypted
@@ -251,6 +245,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         trade
             .recover_seller_publications()
             .map_err(shakedex_failure)?;
+        self.sync_shakedex_transport()?;
         Ok(())
     }
 
@@ -315,11 +310,24 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         ShakedexTradeRuntime::new(&self.runtime, self.store.clone()).map_err(shakedex_failure)
     }
 
+    fn sync_shakedex_transport(&self) -> Result<(), ServiceFailure> {
+        let config = self.require_shakedex()?;
+        DenuoTransportRuntime::new(
+            &self.runtime,
+            self.store.clone(),
+            config.acceptance_policy.clone(),
+        )
+        .and_then(|transport| transport.sync())
+        .map(|_| ())
+        .map_err(shakedex_failure)
+    }
+
     fn parse_market_params<T: DeserializeOwned>(
         &self,
         call: &ApprovedCall,
         account: impl FnOnce(&T) -> &str,
     ) -> Result<T, ServiceFailure> {
+        self.sync_shakedex_transport()?;
         let selected = self.assert_hns_call(call)?;
         let params: T = serde_json::from_value(call.params.clone())
             .map_err(|_| invalid_request("name-market parameters are invalid"))?;
@@ -572,6 +580,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
     }
 
     fn provider_market_offers(&self, call: &ApprovedCall) -> Result<Value, ServiceFailure> {
+        self.sync_shakedex_transport()?;
         self.assert_hns_call(call)?;
         let params: NameMarketListOffersParams = if call.params.is_null() {
             NameMarketListOffersParams::default()
@@ -611,6 +620,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
             let seller = trade
                 .advance_seller_offer(session_id)
                 .map_err(shakedex_failure)?;
+            self.sync_shakedex_transport()?;
             return bounded_provider_value(json!({
                 "kind": "sellerOffer",
                 "session": public_seller_offer(&seller)?,
@@ -715,6 +725,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
             .shakedex_runtime()?
             .cancel_seller_offer(workflow_id)
             .map_err(shakedex_failure)?;
+        self.sync_shakedex_transport()?;
         public_seller_offer(&cancelled)
     }
 
@@ -1282,7 +1293,10 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             return Err(ServiceError::InvalidPersistentHnsAccount);
         }
         if config.shakedex.as_ref().is_some_and(|shakedex| {
-            !configured.settlement_enabled || shakedex.seller_policy.validate().is_err()
+            !configured.settlement_enabled
+                || shakedex.seller_policy.validate().is_err()
+                || config.runtime.shakedex_network().ok()
+                    != Some(shakedex.acceptance_policy.network())
         }) {
             return Err(ServiceError::InvalidPersistentHnsAccount);
         }

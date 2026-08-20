@@ -92,6 +92,25 @@ impl DenuoPublicationAcceptancePolicy {
         self.fingerprint
     }
 
+    pub const fn network(&self) -> NetworkBinding {
+        NetworkBinding {
+            magic: self.network_magic,
+            genesis: hns_primitives::BlockHash::new(self.network_genesis.into_bytes()),
+        }
+    }
+
+    pub const fn hrm(&self) -> &DenuoHrmRootBinding {
+        &self.hrm
+    }
+
+    pub const fn hnsa(&self) -> &DenuoHnsaEndpointBinding {
+        &self.hnsa
+    }
+
+    pub const fn maximum_receipt_lifetime_seconds(&self) -> u32 {
+        self.maximum_receipt_lifetime_seconds
+    }
+
     fn validate_fields(&self) -> Result<(), ShakedexError> {
         let endpoint_key_is_valid =
             VerifyingKey::from_sec1_bytes(&self.hnsa.endpoint_public_key).is_ok();

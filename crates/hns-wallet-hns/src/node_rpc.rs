@@ -18,26 +18,34 @@ use hns_covenants::{
     Covenant, CovenantKind, MAX_COVENANT_ITEM_SIZE, MAX_COVENANT_ITEMS, MAX_NAME_STATE_SIZE,
     NameState,
 };
+use hns_marketplace_protocol::{
+    DenuoPublicationAcceptanceExpectation, DenuoPublicationMessageKind,
+    MAX_DENUO_PUBLICATION_ACCEPTANCE_BYTES, verify_denuo_publication_acceptance,
+};
 use hns_primitives::{Dollarydoos, Height, NameHash, TransactionHash as CanonicalTransactionHash};
 use hns_transaction::{Address, Coin, MAX_TRANSACTION_RAW_SIZE, Outpoint, Output, Transaction};
 use hns_wallet_types::{BaseUnits, TransactionHash};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     ActiveNameOwnerCoinEvidence, ActiveNameOwnerCoinSourceBinding, BlockHashEvidence, ChainTip,
-    ConfirmedWalletPage, ConfirmedWalletPageRequest, HistoryEntry, HnsBackend, HnsFeeRateSource,
-    HnsInputCoinEvidence, HnsNameAction, HnsNameLifecycle, HnsNetwork, HnsOutpoint,
-    HnsTransactionFeeQuote, HnsWalletError, IncomingTransferCandidate,
-    IncomingTransferSourceBinding, IncomingTransfersPage, IncomingTransfersPageRequest,
-    IndexedWalletCoin, MAX_HISTORY_RESULTS, MAX_MEMPOOL_SCAN_RESULTS, MAX_OUTPOINT_SPEND_BATCH,
-    MAX_RESTORE_SCRIPTS_PER_QUERY, MAX_SCAN_CURSOR_BYTES, MAX_SCAN_PAGE_RESULTS,
-    MempoolSnapshotBinding, MempoolWalletPage, MempoolWalletPageRequest, NameActionContextEvidence,
-    NameActionIneligibility, NameEvidence, NameProofResponse, OutpointSpendEntry,
-    OutpointSpendEvidence, SnapshotBinding, SpendingTransactionEvidence, TransactionEvidence,
-    TransactionInclusion, TransactionStatus, WalletAddressKey, WalletCoin,
+    ConfirmedWalletPage, ConfirmedWalletPageRequest, DenuoPublicationAcceptance,
+    DenuoPublicationHandoff, DenuoTransportEvent, DenuoTransportEventPage,
+    DenuoTransportMessageKind, DenuoTransportSnapshotPage, DenuoTransportSnapshotRecord,
+    HistoryEntry, HnsBackend, HnsFeeRateSource, HnsInputCoinEvidence, HnsNameAction,
+    HnsNameLifecycle, HnsNetwork, HnsOutpoint, HnsTransactionFeeQuote, HnsWalletError,
+    IncomingTransferCandidate, IncomingTransferSourceBinding, IncomingTransfersPage,
+    IncomingTransfersPageRequest, IndexedWalletCoin, MAX_DENUO_NAME_MARKET_ENVELOPE_BYTES,
+    MAX_DENUO_NAME_MARKET_TRANSPORT_PAGE, MAX_HISTORY_RESULTS, MAX_MEMPOOL_SCAN_RESULTS,
+    MAX_OUTPOINT_SPEND_BATCH, MAX_RESTORE_SCRIPTS_PER_QUERY, MAX_SCAN_CURSOR_BYTES,
+    MAX_SCAN_PAGE_RESULTS, MempoolSnapshotBinding, MempoolWalletPage, MempoolWalletPageRequest,
+    NameActionContextEvidence, NameActionIneligibility, NameEvidence, NameProofResponse,
+    OutpointSpendEntry, OutpointSpendEvidence, SnapshotBinding, SpendingTransactionEvidence,
+    TransactionEvidence, TransactionInclusion, TransactionStatus, WalletAddressKey, WalletCoin,
 };
 
 const WALLET_RPC_API_VERSION: u16 = 1;
@@ -55,6 +63,7 @@ const MAX_MEMPOOL_RELATIONS: usize = 4_096;
 const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 const INCOMING_TRANSFER_PROJECTION_VERSION: u8 = 1;
 const ACTIVE_NAME_OWNER_COIN_PROJECTION_VERSION: u8 = 1;
+const DENUO_OUTBOX_ENVELOPE_ID_DOMAIN: &[u8] = b"hns-wallet-denuo-outbox-envelope-v1\0";
 
 /// Trusted local configuration for the authenticated wallet RPC boundary.
 ///
@@ -673,6 +682,7 @@ fn error_code_message(code: &str) -> &'static str {
         "chain_uninitialized" => "node active chain is not initialized",
         "transaction_orphan" => "node rejected an orphan transaction",
         "transaction_rejected" => "node rejected the transaction",
+        "denuo_name_market_rejected" => "node rejected the Denuo name-market publication or cursor",
         "invalid_fee_quote_transaction" => "node rejected the fee quote transaction",
         "fee_quote_input_unavailable" => "node could not resolve a fee quote input",
         _ => "node wallet RPC returned an unknown error",
@@ -705,6 +715,7 @@ fn validate_rpc_error(status: u16, error: &RpcWireError) -> Result<(), HnsWallet
         "invalid_contract" => (409, false),
         "stale_snapshot" => (409, true),
         "transaction_orphan" => (409, true),
+        "denuo_name_market_rejected" => (409, true),
         "fee_quote_input_unavailable" => (409, true),
         "contract_registry_full" => (507, false),
         "transaction_rejected" => (422, false),
@@ -792,6 +803,9 @@ fn validate_rpc_error(status: u16, error: &RpcWireError) -> Result<(), HnsWallet
         }
         "transaction_orphan" => {
             error.message == "the transaction has unresolved inputs and was not relayed as accepted"
+        }
+        "denuo_name_market_rejected" => {
+            error.message == "the local Denuo V2 relay rejected the publication or event cursor"
         }
         "fee_quote_input_unavailable" => {
             error.message
@@ -1036,6 +1050,63 @@ struct WireBroadcastResult {
     attempted_peers: usize,
     queued_peers: usize,
     failed_peers: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDenuoPropagation {
+    attempted: usize,
+    written: usize,
+    failed: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDenuoPublicationAcceptance {
+    revision: u64,
+    kind: String,
+    content_hash: String,
+    inserted: bool,
+    accepted_at_unix: u64,
+    acceptance_receipt_hex: String,
+    propagation: WireDenuoPropagation,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDenuoEvent {
+    revision: u64,
+    received_at_unix: u64,
+    kind: String,
+    content_hash: String,
+    envelope_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDenuoEventPage {
+    instance_nonce: String,
+    cursor_reset: bool,
+    oldest_revision: u64,
+    head_revision: u64,
+    events: Vec<WireDenuoEvent>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDenuoSnapshotRecord {
+    kind: String,
+    content_hash: String,
+    envelope_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireDenuoSnapshotPage {
+    instance_nonce: String,
+    snapshot_revision: u64,
+    next_offset: Option<usize>,
+    records: Vec<WireDenuoSnapshotRecord>,
 }
 
 #[derive(Deserialize)]
@@ -1528,6 +1599,43 @@ fn expected_mempool_json(binding: MempoolSnapshotBinding) -> Value {
         "instance_nonce": hex::encode(binding.instance_nonce),
         "generation": binding.generation,
     })
+}
+
+fn denuo_message_kind(kind: DenuoTransportMessageKind) -> DenuoPublicationMessageKind {
+    match kind {
+        DenuoTransportMessageKind::Offer => DenuoPublicationMessageKind::Offer,
+        DenuoTransportMessageKind::Cancellation => DenuoPublicationMessageKind::Cancellation,
+    }
+}
+
+fn denuo_kind_name(kind: DenuoTransportMessageKind) -> &'static str {
+    match kind {
+        DenuoTransportMessageKind::Offer => "offer",
+        DenuoTransportMessageKind::Cancellation => "cancellation",
+    }
+}
+
+fn decode_denuo_kind(kind: &str) -> Result<DenuoTransportMessageKind, HnsWalletError> {
+    match kind {
+        "offer" => Ok(DenuoTransportMessageKind::Offer),
+        "cancellation" => Ok(DenuoTransportMessageKind::Cancellation),
+        _ => Err(protocol_error()),
+    }
+}
+
+fn denuo_expectation(handoff: DenuoPublicationHandoff) -> DenuoPublicationAcceptanceExpectation {
+    DenuoPublicationAcceptanceExpectation {
+        network_magic: handoff.network_magic,
+        network_genesis: handoff.network_genesis,
+        attempt_id: handoff.attempt_id,
+        record_sequence: handoff.record_sequence,
+        prepared_at_unix: handoff.prepared_at_unix,
+        envelope_id: handoff.envelope_id,
+        envelope_digest: handoff.envelope_digest,
+        content_id: handoff.content_id,
+        message_kind: denuo_message_kind(handoff.message_kind),
+        request_id: handoff.request_id,
+    }
 }
 
 impl HnsBackend for HnsNodeRpcBackend {
@@ -2090,6 +2198,197 @@ impl HnsBackend for HnsNodeRpcBackend {
         }
         let _ = response.newly_admitted;
         Ok(returned)
+    }
+
+    fn publish_denuo_name_market(
+        &self,
+        envelope_bytes: &[u8],
+        handoff: DenuoPublicationHandoff,
+    ) -> Result<DenuoPublicationAcceptance, HnsWalletError> {
+        if envelope_bytes.is_empty()
+            || envelope_bytes.len() > MAX_DENUO_NAME_MARKET_ENVELOPE_BYTES
+            || handoff.network_genesis == [0; 32]
+            || handoff.attempt_id == [0; 32]
+            || handoff.record_sequence == 0
+            || handoff.envelope_id == [0; 32]
+            || handoff.envelope_digest == [0; 32]
+            || handoff.content_id == [0; 32]
+            || handoff.request_id == 0
+        {
+            return Err(protocol_error());
+        }
+        let mut envelope_id = Sha256::new();
+        Digest::update(&mut envelope_id, DENUO_OUTBOX_ENVELOPE_ID_DOMAIN);
+        Digest::update(&mut envelope_id, envelope_bytes);
+        if <[u8; 32]>::from(envelope_id.finalize()) != handoff.envelope_id
+            || <[u8; 32]>::from(Sha256::digest(envelope_bytes)) != handoff.envelope_digest
+        {
+            return Err(protocol_error());
+        }
+        let response: WireDenuoPublicationAcceptance = self.rpc(serde_json::json!({
+            "method": "denuo_name_market_publish",
+            "params": {
+                "envelope_hex": hex::encode(envelope_bytes),
+                "handoff": {
+                    "network_magic": handoff.network_magic,
+                    "network_genesis": hex::encode(handoff.network_genesis),
+                    "attempt_id": hex::encode(handoff.attempt_id),
+                    "record_sequence": handoff.record_sequence,
+                    "prepared_at_unix": handoff.prepared_at_unix,
+                    "envelope_id": hex::encode(handoff.envelope_id),
+                    "envelope_digest": hex::encode(handoff.envelope_digest),
+                    "content_id": hex::encode(handoff.content_id),
+                    "message_kind": denuo_kind_name(handoff.message_kind),
+                    "request_id": handoff.request_id,
+                }
+            },
+        }))?;
+        let kind = decode_denuo_kind(&response.kind)?;
+        let content_id = decode_hex_32(&response.content_hash)?;
+        let receipt_bytes = decode_lower_hex(
+            &response.acceptance_receipt_hex,
+            MAX_DENUO_PUBLICATION_ACCEPTANCE_BYTES,
+        )?;
+        let verified =
+            verify_denuo_publication_acceptance(&receipt_bytes).map_err(|_| protocol_error())?;
+        if response.revision == 0
+            || kind != handoff.message_kind
+            || content_id != handoff.content_id
+            || response.accepted_at_unix < handoff.prepared_at_unix
+            || response
+                .propagation
+                .written
+                .checked_add(response.propagation.failed)
+                != Some(response.propagation.attempted)
+            || verified.expectation() != denuo_expectation(handoff)
+            || verified.issued_at_unix() != response.accepted_at_unix
+        {
+            return Err(protocol_error());
+        }
+        Ok(DenuoPublicationAcceptance {
+            relay_revision: response.revision,
+            kind,
+            content_id,
+            inserted: response.inserted,
+            accepted_at_unix: response.accepted_at_unix,
+            receipt_bytes,
+            propagation_attempted: response.propagation.attempted,
+            propagation_written: response.propagation.written,
+            propagation_failed: response.propagation.failed,
+        })
+    }
+
+    fn get_denuo_name_market_events(
+        &self,
+        expected_instance_nonce: Option<[u8; 32]>,
+        after_revision: u64,
+        limit: usize,
+    ) -> Result<DenuoTransportEventPage, HnsWalletError> {
+        if limit == 0 || limit > MAX_DENUO_NAME_MARKET_TRANSPORT_PAGE {
+            return Err(protocol_error());
+        }
+        let response: WireDenuoEventPage = self.rpc(serde_json::json!({
+            "method": "denuo_name_market_events",
+            "params": {
+                "expected_instance_nonce": expected_instance_nonce.map(hex::encode),
+                "after_revision": after_revision,
+                "limit": limit,
+            },
+        }))?;
+        let instance_nonce = decode_hex_32(&response.instance_nonce)?;
+        if instance_nonce == [0; 32]
+            || response.events.len() > limit
+            || response.oldest_revision > response.head_revision.saturating_add(1)
+            || (!response.cursor_reset && after_revision > response.head_revision)
+            || response.cursor_reset
+                != expected_instance_nonce.is_some_and(|expected| expected != instance_nonce)
+        {
+            return Err(protocol_error());
+        }
+        let mut previous = after_revision;
+        let mut events = Vec::new();
+        events
+            .try_reserve_exact(response.events.len())
+            .map_err(|_| protocol_error())?;
+        for wire in response.events {
+            if wire.revision <= previous
+                || wire.revision < response.oldest_revision
+                || wire.revision > response.head_revision
+            {
+                return Err(protocol_error());
+            }
+            previous = wire.revision;
+            let envelope_bytes =
+                decode_lower_hex(&wire.envelope_hex, MAX_DENUO_NAME_MARKET_ENVELOPE_BYTES)?;
+            if envelope_bytes.is_empty() {
+                return Err(protocol_error());
+            }
+            events.push(DenuoTransportEvent {
+                revision: wire.revision,
+                received_at_unix: wire.received_at_unix,
+                kind: decode_denuo_kind(&wire.kind)?,
+                content_id: decode_hex_32(&wire.content_hash)?,
+                envelope_bytes,
+            });
+        }
+        Ok(DenuoTransportEventPage {
+            instance_nonce,
+            cursor_reset: response.cursor_reset,
+            oldest_revision: response.oldest_revision,
+            head_revision: response.head_revision,
+            events,
+        })
+    }
+
+    fn get_denuo_name_market_snapshot(
+        &self,
+        expected_revision: Option<u64>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<DenuoTransportSnapshotPage, HnsWalletError> {
+        if limit == 0 || limit > MAX_DENUO_NAME_MARKET_TRANSPORT_PAGE {
+            return Err(protocol_error());
+        }
+        let response: WireDenuoSnapshotPage = self.rpc(serde_json::json!({
+            "method": "denuo_name_market_snapshot",
+            "params": {
+                "expected_revision": expected_revision,
+                "offset": offset,
+                "limit": limit,
+            },
+        }))?;
+        let instance_nonce = decode_hex_32(&response.instance_nonce)?;
+        if instance_nonce == [0; 32]
+            || expected_revision.is_some_and(|expected| expected != response.snapshot_revision)
+            || response.records.len() > limit
+            || response.next_offset.is_some_and(|next| {
+                next != offset.saturating_add(response.records.len()) || next <= offset
+            })
+        {
+            return Err(protocol_error());
+        }
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(response.records.len())
+            .map_err(|_| protocol_error())?;
+        for wire in response.records {
+            let envelope_bytes =
+                decode_lower_hex(&wire.envelope_hex, MAX_DENUO_NAME_MARKET_ENVELOPE_BYTES)?;
+            if envelope_bytes.is_empty() {
+                return Err(protocol_error());
+            }
+            records.push(DenuoTransportSnapshotRecord {
+                kind: decode_denuo_kind(&wire.kind)?,
+                content_id: decode_hex_32(&wire.content_hash)?,
+                envelope_bytes,
+            });
+        }
+        Ok(DenuoTransportSnapshotPage {
+            instance_nonce,
+            snapshot_revision: response.snapshot_revision,
+            next_offset: response.next_offset,
+            records,
+        })
     }
 
     fn quote_transaction_fee(

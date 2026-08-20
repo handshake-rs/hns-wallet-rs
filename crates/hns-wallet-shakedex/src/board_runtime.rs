@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketMessage};
 use hns_wallet_hns::{
     CurrentShakedexLockQuery, HnsAccountReadRuntime, HnsBackend, HnsClock, HnsWalletRuntime,
@@ -458,6 +460,37 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                 cancellation_hash: expected_cancellation_hash,
                 revision,
             })
+        })
+    }
+
+    /// Remove active rows absent from one coherent node latest-state snapshot
+    /// while retaining signed cancellation tombstones and sequence watermarks.
+    pub(crate) fn reconcile_transport_snapshot(
+        &self,
+        active_listing_hashes: &BTreeSet<ObjectHash>,
+    ) -> Result<u64, ShakedexError> {
+        self.require_store_authority()?;
+        let context = self.hns.observe_board_cancellation_context()?;
+        self.store.try_with_store_mut(|store| {
+            let (context, loaded) = store.try_with_entity_read_snapshot(|snapshot| {
+                let context = context.revalidate_unchanged_account(snapshot)?;
+                let loaded = load_name_market_board_state_from_snapshot(snapshot)?;
+                Ok::<_, ShakedexError>((context, loaded))
+            })?;
+            let mut board = loaded.board.clone();
+            if !board.retain_transport_active_listings(context.network(), active_listing_hashes)? {
+                return Ok(loaded.logical_revision);
+            }
+            let updated_at_unix = context.observed_at_unix();
+            let account_prefix_lease = context.into_account_prefix_lease();
+            save_loaded_name_market_board_with_guard(
+                store,
+                loaded.logical_revision,
+                &board,
+                updated_at_unix,
+                loaded,
+                account_prefix_lease,
+            )
         })
     }
 

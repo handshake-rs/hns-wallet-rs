@@ -314,6 +314,23 @@ impl NameMarketBoard {
         self.offers.iter().find(|offer| offer.listing_hash == hash)
     }
 
+    pub(crate) fn retain_transport_active_listings(
+        &mut self,
+        network: hns_swap::NetworkBinding,
+        active_listing_hashes: &BTreeSet<ObjectHash>,
+    ) -> Result<bool, ShakedexError> {
+        self.validate()?;
+        let before = self.offers.len();
+        self.offers.retain(|offer| {
+            offer.status == BoardOfferStatus::Cancelled
+                || offer.network_magic != network.magic
+                || offer.network_genesis.as_bytes() != network.genesis.as_bytes()
+                || active_listing_hashes.contains(&offer.listing_hash)
+        });
+        self.validate()?;
+        Ok(self.offers.len() != before)
+    }
+
     pub fn apply_offer(
         &mut self,
         listing: &VerifiedFixedPriceListing,
