@@ -11,11 +11,12 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hns_header_consensus::{Header, Network};
+use hns_light_chain::ChainLimits;
 use hns_light_p2p::{
     PeerConfig, PeerConnection, PeerError, PeerEvent, PeerMetadata, WalletPeerEvent,
     light_wallet_version,
 };
-use hns_light_sync::PeerId;
+use hns_light_sync::{PeerId, SyncConfig};
 use hns_light_wallet::{
     BloomUpdate, HsdBloomFilter, VerifiedWalletBlock, WalletBlockEvidence, WalletHeaderAnchor,
 };
@@ -23,15 +24,17 @@ use hns_p2p_wire::{
     Inventory, InventoryKind, NetAddress, NetworkMagic, Packet, ProofPacket, SERVICE_BLOOM,
     SERVICE_NETWORK,
 };
-use hns_primitives::{BlockHash, NameHash, TreeRoot};
+use hns_primitives::{BlockHash, BlockTime, NameHash, TreeRoot};
 use hns_transaction::Transaction;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    EmbeddedHnsBackend, EncryptedHnsLightAuthority, EncryptedHnsLightIndex, HnsLightNetwork,
-    HnsNetwork, HnsWalletError, PersistedHeaderRound, VerifiedHnsNameProof,
+    EmbeddedHnsBackend, EncryptedHnsLightAuthority, EncryptedHnsLightIndex, HnsLightFloor,
+    HnsLightNetwork, HnsNetwork, HnsRuntimeConfig, HnsWalletError, PersistedHeaderRound,
+    VerifiedHnsNameProof, derive_hns_light_watch_set,
 };
+use hns_wallet_store::SharedWalletStore;
 
 const PEER_ID_DOMAIN: &[u8] = b"hns-wallet-rs/direct-peer-id/v1";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -871,6 +874,61 @@ impl HnsDirectPeerCoordinator {
     }
 }
 
+/// Open the direct peer coordinator owned by one encrypted wallet account.
+///
+/// This is the composition boundary used by installed mobile, browser, and
+/// extension wallets: no RPC endpoint, node credential, relay, or external
+/// index is accepted. The persisted account is re-authenticated while its
+/// complete public watch set is derived, then that exact set is installed into
+/// the encrypted filtered-block index before any direct peer scan can begin.
+pub fn open_wallet_direct_hns_peer_coordinator(
+    store: SharedWalletStore,
+    account: &HnsRuntimeConfig,
+    peer_config: HnsDirectPeerConfig,
+    now_unix: u64,
+) -> Result<HnsDirectPeerCoordinator, HnsDirectPeerError> {
+    account
+        .validate_structure()
+        .map_err(HnsDirectPeerError::Wallet)?;
+    if peer_config.network != account.network {
+        return Err(HnsDirectPeerError::InvalidConfiguration);
+    }
+    let birthday_height = u32::try_from(account.birthday_height)
+        .map_err(|_| HnsDirectPeerError::InvalidConfiguration)?;
+    let watch_set = store
+        .try_with_store(|wallet| derive_hns_light_watch_set(wallet, account))
+        .map_err(HnsDirectPeerError::Wallet)?;
+    let sync_config = SyncConfig {
+        max_peers: peer_config.target_peers,
+        minimum_peer_agreement: peer_config.minimum_block_views,
+        round_timeout_seconds: peer_config.connect_timeout.as_secs(),
+        max_peer_failures: 3,
+    };
+    let authority = EncryptedHnsLightAuthority::open_or_create(
+        store.clone(),
+        account.account_id,
+        account.network,
+        birthday_height,
+        HnsLightFloor::default(),
+        BlockTime::new(now_unix),
+        ChainLimits::default(),
+        sync_config,
+    )
+    .map_err(|error| HnsDirectPeerError::LightAuthority(error.to_string()))?;
+    let mut index = EncryptedHnsLightIndex::open_or_create(
+        store,
+        account.account_id,
+        account.network,
+        birthday_height,
+        now_unix,
+    )
+    .map_err(|error| HnsDirectPeerError::LightIndex(error.to_string()))?;
+    index
+        .install_watch_set(watch_set, now_unix)
+        .map_err(|error| HnsDirectPeerError::LightIndex(error.to_string()))?;
+    HnsDirectPeerCoordinator::new(authority, index, peer_config)
+}
+
 impl NativePeer {
     fn request_headers(
         &mut self,
@@ -1324,6 +1382,10 @@ fn now_unix_or(fallback: u64) -> u64 {
 pub enum HnsDirectPeerError {
     #[error(transparent)]
     Wallet(#[from] HnsWalletError),
+    #[error("wallet-owned HNS light authority could not be opened: {0}")]
+    LightAuthority(String),
+    #[error("wallet-owned HNS filtered-block index could not be opened: {0}")]
+    LightIndex(String),
     #[error("standard Handshake peer failed: {0}")]
     Peer(String),
     #[error("standard Handshake peer I/O failed: {0:?}")]
@@ -1384,6 +1446,53 @@ impl From<PeerError> for HnsDirectPeerError {
 )]
 mod tests {
     use super::*;
+    use hns_wallet_store::{SecretKind, WalletStore};
+    use hns_wallet_types::{AccountId, BaseUnits, WalletId};
+
+    fn direct_wallet_config() -> HnsRuntimeConfig {
+        HnsRuntimeConfig {
+            wallet_id: WalletId::new([71; 16]),
+            account_id: AccountId::new([72; 16]),
+            account_derivation_index: 0,
+            network: HnsNetwork::Regtest,
+            birthday_height: 0,
+            restore_lookahead: 1,
+            minimum_confirmations: 1,
+            dust_threshold: BaseUnits::new(crate::DEFAULT_DUST_THRESHOLD),
+            value_operations_enabled: false,
+            settlement_enabled: false,
+        }
+    }
+
+    #[test]
+    fn direct_wallet_factory_derives_and_installs_the_persisted_account_watch_set() {
+        let config = direct_wallet_config();
+        let mut wallet = WalletStore::create(":memory:", "direct wallet test passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[73; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let coordinator = open_wallet_direct_hns_peer_coordinator(
+            hns_wallet_store::SharedWalletStore::new(wallet),
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now,
+        )
+        .unwrap();
+        let scan = coordinator.backend().light_scan_status().unwrap();
+        assert_eq!(scan.watched_scripts, 4);
+        assert_eq!(scan.watched_names, 0);
+        assert_eq!(scan.birthday_height, 0);
+    }
 
     #[test]
     fn production_defaults_use_diverse_untrusted_peers() {

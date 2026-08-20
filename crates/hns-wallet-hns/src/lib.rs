@@ -34,6 +34,7 @@ pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
 pub use peer_coordinator::{
     ConnectedHnsPeer, HnsBlockScanProgress, HnsDirectPeerConfig, HnsDirectPeerCoordinator,
     HnsDirectPeerError, HnsHeaderRoundProgress, NativeHnsPeerPool,
+    open_wallet_direct_hns_peer_coordinator,
 };
 pub use shakedex_funding::{
     HnsPreparedShakedexFunding, HnsShakedexChangeReservation,
