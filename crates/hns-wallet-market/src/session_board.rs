@@ -858,10 +858,16 @@ mod tests {
         SettlementDeadline, SignedObjectHeader,
     };
     use hns_primitives::BlockHash;
+    use hns_wallet_bitcoin_kyoto::VerifiedBitcoinLock;
+    use hns_wallet_chain_api::VerifiedLock;
+    use hns_wallet_types::TransactionHash;
+    use hns_wallet_types::{Amount, ModuleId, WalletAsset};
 
     use super::*;
     use crate::{
-        DenuoSwapHandshakeStage, admit_denuo_market_intent, bootstrap_denuo_price_round_cache,
+        DenuoSwapHandshakeStage, LocallyVerifiedSwapFunding, VerifiedEvidence, WalletStoreJournal,
+        admit_denuo_market_intent, apply_locally_verified_denuo_funding,
+        bootstrap_denuo_price_round_cache, canonical_hns_descriptor, denuo_execution_workflow_id,
         open_denuo_execution,
     };
     use hns_wallet_bitcoin_kyoto::build_denuo_bitcoin_htlc;
@@ -1202,6 +1208,79 @@ mod tests {
                 .expect("status does not mutate execution"),
             taker_execution,
         );
+
+        // Only after local proof-bound HNS evidence has been applied does the
+        // execution journal progress to first-chain funded.
+        let workflow_id = denuo_execution_workflow_id(session_id);
+        let mut execution = maker_store
+            .load_workflow::<crate::SwapSession>(workflow_id)
+            .expect("load execution")
+            .expect("execution exists")
+            .state;
+        {
+            let mut journal = WalletStoreJournal {
+                store: &mut maker_store,
+                workflow_id,
+                updated_at_unix: 130,
+            };
+            execution
+                .apply(VerifiedEvidence::RefundsValidated, 130, &mut journal)
+                .expect("refunds prepared");
+            execution
+                .apply(VerifiedEvidence::FundingReady, 131, &mut journal)
+                .expect("first funding ready");
+        }
+        let hns =
+            canonical_hns_descriptor(&hello, hns_marketplace_protocol::SwapAssetSide::Offered)
+                .expect("canonical HNS descriptor");
+        let first_funded = apply_locally_verified_denuo_funding(
+            &mut maker_store,
+            &policy,
+            session_id,
+            LocallyVerifiedSwapFunding::Hns(VerifiedLock {
+                module: ModuleId::Handshake,
+                session_id,
+                funding_id: TransactionHash::new([43; 32]),
+                amount: Amount::new(WalletAsset::Hns, u128::from(hns.value.get())),
+                hashlock: ObjectHash::new(hns.hashlock),
+                absolute_timelock: u64::from(hns.refund_locktime),
+                confirmation_count: hello.offered_minimum_confirmations,
+                evidence_hash: ObjectHash::new([44; 32]),
+            }),
+            132,
+        )
+        .expect("locally verified first HNS funding");
+        assert_eq!(first_funded.state, crate::SwapState::FirstFunded);
+
+        let mut second_ready = first_funded;
+        {
+            let mut journal = WalletStoreJournal {
+                store: &mut maker_store,
+                workflow_id,
+                updated_at_unix: 133,
+            };
+            second_ready
+                .apply(VerifiedEvidence::SecondFundingReady, 133, &mut journal)
+                .expect("second funding ready");
+        }
+        let bitcoin =
+            build_denuo_bitcoin_htlc(&hello, hns_marketplace_protocol::SwapAssetSide::Received)
+                .expect("canonical Bitcoin descriptor");
+        let both_funded = apply_locally_verified_denuo_funding(
+            &mut maker_store,
+            &policy,
+            session_id,
+            LocallyVerifiedSwapFunding::Bitcoin(VerifiedBitcoinLock {
+                funding_txid: TransactionHash::new([45; 32]),
+                output_index: 0,
+                value_sats: bitcoin.value_sats,
+                confirmation_count: hello.received_minimum_confirmations,
+                htlc: bitcoin.htlc,
+            }),
+            134,
+        )
+        .expect("locally verified second Bitcoin funding");
+        assert_eq!(both_funded.state, crate::SwapState::BothFunded);
 
         let wrong_correlation = envelope(CrossChainMessage::SwapSessionHello(hello), 78);
         assert_eq!(

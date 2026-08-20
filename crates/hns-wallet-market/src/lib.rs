@@ -9,7 +9,8 @@ mod settlement_key;
 use std::collections::BTreeMap;
 
 use hns_marketplace_protocol::{AssetId, ChainId, DeadlineKind, SwapAssetSide, SwapSessionHello};
-use hns_wallet_bitcoin_kyoto::build_denuo_bitcoin_htlc;
+use hns_wallet_bitcoin_kyoto::{VerifiedBitcoinLock, build_denuo_bitcoin_htlc};
+use hns_wallet_chain_api::VerifiedLock;
 use hns_wallet_store::{StoreError, WalletStore};
 use hns_wallet_types::{
     Amount, BaseUnits, ModuleId, ObjectHash, SessionId, WalletAsset, WorkflowId, WorkflowKind,
@@ -552,6 +553,181 @@ pub fn open_denuo_execution(
         return Err(MarketError::Invariant);
     }
     Ok(expected)
+}
+
+/// A funding lock independently verified by one wallet's chain authority.
+/// Constructing this value is not verification: callers must obtain the HNS
+/// variant from the HNS wallet's proof-bound settlement verifier or the
+/// Bitcoin variant from Kyoto's compact-filter watch/verifier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocallyVerifiedSwapFunding {
+    Hns(VerifiedLock),
+    Bitcoin(VerifiedBitcoinLock),
+}
+
+impl LocallyVerifiedSwapFunding {
+    const fn module(&self) -> ModuleId {
+        match self {
+            Self::Hns(_) => ModuleId::Handshake,
+            Self::Bitcoin(_) => ModuleId::Bitcoin,
+        }
+    }
+}
+
+/// Advance a durable Denuo execution only with locally verified funding
+/// evidence. The peer's Denuo funding status is intentionally not accepted as
+/// an argument here: it can inform UI/transport state, but cannot cause this
+/// state transition.
+pub fn apply_locally_verified_denuo_funding(
+    store: &mut WalletStore,
+    policy: &DenuoSwapHandshakePolicy,
+    session_id: SessionId,
+    funding: LocallyVerifiedSwapFunding,
+    now_unix: u64,
+) -> Result<SwapSession, MarketError> {
+    let workflow_id = denuo_execution_workflow_id(session_id);
+    let stored = store
+        .load_workflow::<SwapSession>(workflow_id)?
+        .ok_or(MarketError::UnknownDenuoSwapHandshake)?;
+    if stored.kind != WorkflowKind::AtomicSwap || stored.state.id != session_id {
+        return Err(MarketError::DenuoSwapHandshakeConflict);
+    }
+    let terms = stored
+        .state
+        .accepted_denuo_terms
+        .as_deref()
+        .ok_or(MarketError::InvalidDenuoSwapHandshake)?;
+    let hello =
+        SwapSessionHello::decode(terms).map_err(|_| MarketError::CorruptDenuoSwapHandshake)?;
+    if hello.encode().ok().as_deref() != Some(terms)
+        || SessionId::new(hello.swap_session_id) != session_id
+        || hello.verify_agreement(policy.network()).is_err()
+    {
+        return Err(MarketError::CorruptDenuoSwapHandshake);
+    }
+    verify_local_funding_against_denuo_terms(&hello, &funding)?;
+    let evidence = match stored.state.state {
+        SwapState::FirstFundingPending if funding.module() == stored.state.first_module => {
+            VerifiedEvidence::FirstFundingConfirmed {
+                evidence: funding_evidence_id(&funding),
+            }
+        }
+        SwapState::SecondFundingPending if funding.module() == stored.state.second_module => {
+            VerifiedEvidence::SecondFundingConfirmed {
+                evidence: funding_evidence_id(&funding),
+            }
+        }
+        _ => return Err(MarketError::InvalidTransition),
+    };
+    let mut session = stored.state;
+    let mut journal = WalletStoreJournal {
+        store,
+        workflow_id,
+        updated_at_unix: now_unix,
+    };
+    session.apply(evidence, now_unix, &mut journal)?;
+    Ok(session)
+}
+
+fn verify_local_funding_against_denuo_terms(
+    hello: &SwapSessionHello,
+    funding: &LocallyVerifiedSwapFunding,
+) -> Result<(), MarketError> {
+    match funding {
+        LocallyVerifiedSwapFunding::Hns(lock) => {
+            let side = hns_side(hello)?;
+            let descriptor = canonical_hns_descriptor(hello, side)?;
+            let minimum_confirmations = confirmation_minimum(hello, side);
+            if lock.module != ModuleId::Handshake
+                || lock.session_id != SessionId::new(hello.swap_session_id)
+                || lock.amount.asset != WalletAsset::Hns
+                || lock.amount.base_units.get() != u128::from(descriptor.value.get())
+                || lock.hashlock.as_bytes() != &descriptor.hashlock
+                || lock.absolute_timelock != u64::from(descriptor.refund_locktime)
+                || lock.confirmation_count < minimum_confirmations
+            {
+                return Err(MarketError::InvalidEvidence);
+            }
+        }
+        LocallyVerifiedSwapFunding::Bitcoin(lock) => {
+            let side = bitcoin_side(hello)?;
+            let descriptor = build_denuo_bitcoin_htlc(hello, side)
+                .map_err(|_| MarketError::InvalidDenuoSwapHandshake)?;
+            let minimum_confirmations = confirmation_minimum(hello, side);
+            if lock.value_sats != descriptor.value_sats
+                || lock.confirmation_count < minimum_confirmations
+                || lock.htlc != descriptor.htlc
+            {
+                return Err(MarketError::InvalidEvidence);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn funding_evidence_id(funding: &LocallyVerifiedSwapFunding) -> ObjectHash {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hns-wallet-rs/verified-denuo-funding/v1");
+    match funding {
+        LocallyVerifiedSwapFunding::Hns(lock) => {
+            hasher.update([0]);
+            hasher.update(lock.funding_id.as_bytes());
+            hasher.update(lock.evidence_hash.as_bytes());
+        }
+        LocallyVerifiedSwapFunding::Bitcoin(lock) => {
+            hasher.update([1]);
+            hasher.update(lock.funding_txid.as_bytes());
+            hasher.update(lock.output_index.to_be_bytes());
+        }
+    }
+    ObjectHash::new(hasher.finalize().into())
+}
+
+fn hns_side(hello: &SwapSessionHello) -> Result<SwapAssetSide, MarketError> {
+    if hello.offered_asset == AssetId::HNS {
+        Ok(SwapAssetSide::Offered)
+    } else if hello.received_asset == AssetId::HNS {
+        Ok(SwapAssetSide::Received)
+    } else {
+        Err(MarketError::InvalidPair)
+    }
+}
+
+fn bitcoin_side(hello: &SwapSessionHello) -> Result<SwapAssetSide, MarketError> {
+    if hello.offered_asset == AssetId::BTC {
+        Ok(SwapAssetSide::Offered)
+    } else if hello.received_asset == AssetId::BTC {
+        Ok(SwapAssetSide::Received)
+    } else {
+        Err(MarketError::InvalidPair)
+    }
+}
+
+fn canonical_hns_descriptor(
+    hello: &SwapSessionHello,
+    side: SwapAssetSide,
+) -> Result<hns_swap::HnsHtlc, MarketError> {
+    hello
+        .build_hns_htlc(
+            side,
+            match side {
+                SwapAssetSide::Offered => hello.taker_settlement_public_key,
+                SwapAssetSide::Received => hello.maker_settlement_public_key,
+            },
+            match side {
+                SwapAssetSide::Offered => hello.maker_settlement_public_key,
+                SwapAssetSide::Received => hello.taker_settlement_public_key,
+            },
+        )
+        .map(|binding| binding.descriptor)
+        .map_err(|_| MarketError::InvalidDenuoSwapHandshake)
+}
+
+fn confirmation_minimum(hello: &SwapSessionHello, side: SwapAssetSide) -> u32 {
+    match side {
+        SwapAssetSide::Offered => hello.offered_minimum_confirmations,
+        SwapAssetSide::Received => hello.received_minimum_confirmations,
+    }
 }
 
 /// Reconstruct both lock descriptors from the mutually signed terms.  The
