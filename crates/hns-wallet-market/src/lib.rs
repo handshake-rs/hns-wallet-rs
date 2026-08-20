@@ -310,6 +310,12 @@ pub struct SwapSession {
     pub received: Amount,
     pub price_round_hash: ObjectHash,
     pub hashlock: ObjectHash,
+    /// Canonical encoded, jointly signed Denuo `SwapSessionHello` for an
+    /// execution opened from the Denuo board. Generic non-Denuo sessions keep
+    /// this empty; a Denuo execution never relies on a board record surviving
+    /// independently of its durable recovery journal.
+    #[serde(default)]
+    pub accepted_denuo_terms: Option<Vec<u8>>,
     pub timeouts: TimeoutPlan,
     pub first_funding: Option<ObjectHash>,
     pub second_funding: Option<ObjectHash>,
@@ -348,6 +354,7 @@ impl SwapSession {
             received: quote.received,
             price_round_hash: quote.price_round_hash,
             hashlock,
+            accepted_denuo_terms: None,
             timeouts,
             first_funding: None,
             second_funding: None,
@@ -515,16 +522,23 @@ pub fn open_denuo_execution(
     if now_unix < expected_accepted_at {
         return Err(MarketError::InvalidEvidence);
     }
+    let encoded_terms = hello
+        .encode()
+        .map_err(|_| MarketError::CorruptDenuoSwapHandshake)?;
     let workflow_id = denuo_execution_workflow_id(session_id);
     if let Some(existing) = store.load_workflow::<SwapSession>(workflow_id)? {
-        if existing.kind != WorkflowKind::AtomicSwap || existing.state.id != session_id {
+        if existing.kind != WorkflowKind::AtomicSwap
+            || existing.state.id != session_id
+            || existing.state.accepted_denuo_terms.as_deref() != Some(encoded_terms.as_slice())
+        {
             return Err(MarketError::DenuoSwapHandshakeConflict);
         }
         return Ok(existing.state);
     }
     // A new execution must still be inside the signed new-funding window.
     // Existing execution journals deliberately remain recoverable afterwards.
-    let expected = swap_session_from_accepted_hello(hello, now_unix)?;
+    let mut expected = swap_session_from_accepted_hello(hello, now_unix)?;
+    expected.accepted_denuo_terms = Some(encoded_terms);
     let saved_revision = store.save_workflow(
         workflow_id,
         WorkflowKind::AtomicSwap,
