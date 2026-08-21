@@ -9,10 +9,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::Network as BitcoinNetwork;
+use bdk_wallet::bitcoin::Transaction;
+use bdk_wallet::bitcoin::consensus::deserialize;
+use bdk_wallet::bitcoin::hashes::Hash;
 use hns_wallet_bitcoin_kyoto::{
-    BIP39_SEED_BYTES, BitcoinWalletError, EncryptedPersistedBitcoinWallet, KyotoRuntimeConfig,
-    KyotoSupervisor, KyotoSyncReceipt, KyotoWalletState, StoredKyotoWalletState,
+    BIP39_SEED_BYTES, BitcoinBroadcastReceipt, BitcoinTransactionRecord, BitcoinWalletError,
+    EncryptedPersistedBitcoinWallet, KyotoRuntimeConfig, KyotoSupervisor, KyotoSyncReceipt,
+    KyotoWalletState, StoredKyotoWalletState, authorize_native_send, bitcoin_value_runtime_permit,
     create_persisted_descriptor_wallet_from_seed, load_persisted_descriptor_wallet_from_seed,
+    persist_prepared_bitcoin_broadcast, prepare_native_send,
 };
 use hns_wallet_hns::{HnsNetwork, HnsRuntimeConfig};
 use hns_wallet_store::{SecretKind, SharedWalletStore};
@@ -23,6 +28,8 @@ use zeroize::Zeroizing;
 use crate::MobileWalletError;
 
 const BITCOIN_RECOVERY_SCRIPT_INDEX: u32 = 1;
+const BITCOIN_SEND_APPROVAL_LIFETIME_SECONDS: u64 = 300;
+const MOBILE_ACTION_TOKEN_BYTES: usize = 32;
 
 /// Configuration for one wallet-owned Kyoto client. `data_dir` is an app
 /// private directory, never a server endpoint or a hosted index state.
@@ -83,6 +90,40 @@ pub struct MobileBitcoinSnapshot {
     pub required_peer_count: u8,
 }
 
+/// The only information an installed UI receives before it explicitly
+/// approves one exact Bitcoin spend. Its opaque token is process-local and
+/// has no signing authority after it is consumed, rejected, expired, or the
+/// wallet locks.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileBitcoinSendApproval {
+    pub action_token: String,
+    pub destination: String,
+    pub amount_sats: u64,
+    pub fee_sats: u64,
+    pub maximum_fee_sats: u64,
+    pub expires_at_unix: u64,
+}
+
+/// Bounded evidence that the exact persisted transaction was accepted by the
+/// wallet-owned Kyoto peer set. This deliberately contains no transaction
+/// bytes or private derivation information.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileBitcoinBroadcastReceipt {
+    pub txid: String,
+    pub wtxid: String,
+    pub attempt_count: u16,
+    pub submitted_at_unix: Option<u64>,
+}
+
+struct PendingMobileBitcoinSend {
+    action_token: [u8; MOBILE_ACTION_TOKEN_BYTES],
+    prepared: hns_wallet_bitcoin_kyoto::PreparedBitcoinSend,
+    maximum_fee_sats: u64,
+    expires_at_unix: u64,
+}
+
 /// Wallet-owned Kyoto state for the installed HNS/Bitcoin product. It opens
 /// only while the shared encrypted store is unlocked and tears down its direct
 /// peer node before that store is relocked.
@@ -94,6 +135,7 @@ pub struct MobileBitcoinValueController {
     wallet: Option<EncryptedPersistedBitcoinWallet>,
     supervisor: Option<KyotoSupervisor>,
     receive_address: Option<String>,
+    pending_send: Option<PendingMobileBitcoinSend>,
 }
 
 impl MobileBitcoinValueController {
@@ -111,6 +153,7 @@ impl MobileBitcoinValueController {
             wallet: None,
             supervisor: None,
             receive_address: None,
+            pending_send: None,
         })
     }
 
@@ -246,6 +289,145 @@ impl MobileBitcoinValueController {
         })
     }
 
+    /// Prepare one exact on-chain Bitcoin payment from the local BIP84 wallet.
+    /// This obtains the direct peers' bounded minimum fee rate but does not
+    /// sign, persist a broadcast intent, or send transaction bytes.
+    pub fn prepare_send(
+        &mut self,
+        destination: &str,
+        amount_sats: u64,
+        maximum_fee_sats: u64,
+    ) -> Result<MobileBitcoinSendApproval, MobileWalletError> {
+        if self.pending_send.is_some() {
+            return Err(MobileWalletError::BitcoinActionPending);
+        }
+        if maximum_fee_sats == 0 {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        let now_unix = now_unix()?;
+        let expires_at_unix = now_unix
+            .checked_add(BITCOIN_SEND_APPROVAL_LIFETIME_SECONDS)
+            .ok_or(MobileWalletError::InvalidBitcoinAction)?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let fee_rate_sat_vb = runtime.block_on(supervisor.minimum_broadcast_fee_rate_sat_vb())?;
+        let prepared = prepare_native_send(
+            self.wallet_mut()?,
+            destination,
+            amount_sats,
+            fee_rate_sat_vb,
+            maximum_fee_sats,
+        )?;
+        let action_token = random_nonzero_bytes()?;
+        let approval = MobileBitcoinSendApproval {
+            action_token: lowercase_hex(&action_token),
+            destination: prepared.destination.clone(),
+            amount_sats: prepared.amount_sats,
+            fee_sats: prepared.fee_sats,
+            maximum_fee_sats,
+            expires_at_unix,
+        };
+        self.pending_send = Some(PendingMobileBitcoinSend {
+            action_token,
+            prepared,
+            maximum_fee_sats,
+            expires_at_unix,
+        });
+        Ok(approval)
+    }
+
+    /// Consume the one process-local approval, persist the exact signed bytes
+    /// before network I/O, then submit only that persisted transaction through
+    /// Kyoto. A later failure may leave a durable prepared/submission record;
+    /// callers must not assume it is safe to create a replacement transaction.
+    pub fn approve_send(
+        &mut self,
+        action_token: &str,
+    ) -> Result<MobileBitcoinBroadcastReceipt, MobileWalletError> {
+        self.require_pending_send_token(action_token)?;
+        let now_unix = now_unix()?;
+        if self
+            .pending_send
+            .as_ref()
+            .is_none_or(|pending| now_unix >= pending.expires_at_unix)
+        {
+            self.pending_send = None;
+            return Err(MobileWalletError::BitcoinActionExpired);
+        }
+        let permit = bitcoin_value_runtime_permit()?;
+        let pending = self
+            .pending_send
+            .take()
+            .ok_or(MobileWalletError::NoPendingBitcoinAction)?;
+        let mut raw_transaction = Zeroizing::new(authorize_native_send(
+            self.wallet
+                .as_ref()
+                .ok_or(MobileWalletError::BitcoinRuntimeInactive)?,
+            &permit,
+            pending.prepared,
+        )?);
+        let transaction: Transaction = deserialize(raw_transaction.as_slice())
+            .map_err(|_| MobileWalletError::InvalidBitcoinAction)?;
+        let txid = transaction.compute_txid().to_byte_array();
+        self.wallet_mut()?.persist(now_unix)?;
+        let expected_revision = self.store.try_with_store(|store| {
+            store
+                .bitcoin_transaction::<BitcoinTransactionRecord>(&txid)
+                .map(|record| record.map_or(0, |stored| stored.revision))
+        })?;
+        let wallet = self
+            .wallet
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let prepared = self.store.try_with_store_mut(|store| {
+            persist_prepared_bitcoin_broadcast(
+                wallet,
+                store,
+                raw_transaction.as_slice(),
+                hns_wallet_bitcoin_kyoto::derive_bitcoin_broadcast_approval(
+                    wallet,
+                    raw_transaction.as_slice(),
+                    pending.maximum_fee_sats,
+                    pending.expires_at_unix,
+                )?
+                .commitment,
+                pending.maximum_fee_sats,
+                expected_revision,
+                now_unix,
+                pending.expires_at_unix,
+            )
+        })?;
+        raw_transaction.fill(0);
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let receipt = runtime.block_on(supervisor.broadcast_prepared_transaction(
+            &permit,
+            prepared.txid,
+            now_unix,
+        ))?;
+        Ok(mobile_broadcast_receipt(receipt))
+    }
+
+    /// Reject the displayed Bitcoin approval without persisting or sending a
+    /// transaction. The token is verified exactly like the approve path.
+    pub fn reject_send(&mut self, action_token: &str) -> Result<(), MobileWalletError> {
+        self.require_pending_send_token(action_token)?;
+        self.pending_send = None;
+        Ok(())
+    }
+
     /// Stop the direct node before the shared store is relocked. A durable
     /// recovery journal remains in the encrypted store and is reconstructed on
     /// the next unlock.
@@ -258,6 +440,7 @@ impl MobileBitcoinValueController {
         self.wallet.take();
         self.runtime.take();
         self.receive_address = None;
+        self.pending_send = None;
         shutdown.map_err(MobileWalletError::from)?;
         Ok(())
     }
@@ -282,6 +465,17 @@ impl MobileBitcoinValueController {
             .as_mut()
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)
     }
+
+    fn require_pending_send_token(&self, action_token: &str) -> Result<(), MobileWalletError> {
+        let pending = self
+            .pending_send
+            .as_ref()
+            .ok_or(MobileWalletError::NoPendingBitcoinAction)?;
+        if !action_token_matches(&pending.action_token, action_token) {
+            return Err(MobileWalletError::InvalidBitcoinActionToken);
+        }
+        Ok(())
+    }
 }
 
 impl Drop for MobileBitcoinValueController {
@@ -295,6 +489,58 @@ fn now_unix() -> Result<u64, MobileWalletError> {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .map_err(|_| MobileWalletError::BitcoinClockUnavailable)
+}
+
+fn random_nonzero_bytes<const N: usize>() -> Result<[u8; N], MobileWalletError> {
+    for _ in 0..8 {
+        let mut bytes = [0_u8; N];
+        getrandom::fill(&mut bytes).map_err(|_| MobileWalletError::Randomness)?;
+        if bytes.iter().any(|byte| *byte != 0) {
+            return Ok(bytes);
+        }
+    }
+    Err(MobileWalletError::Randomness)
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
+fn action_token_matches(expected: &[u8; MOBILE_ACTION_TOKEN_BYTES], candidate: &str) -> bool {
+    if candidate.len() != MOBILE_ACTION_TOKEN_BYTES * 2 {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (index, pair) in candidate.as_bytes().chunks_exact(2).enumerate() {
+        let decode = |byte| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        let Some(high) = decode(pair[0]) else {
+            return false;
+        };
+        let Some(low) = decode(pair[1]) else {
+            return false;
+        };
+        difference |= expected[index] ^ ((high << 4) | low);
+    }
+    difference == 0
+}
+
+fn mobile_broadcast_receipt(receipt: BitcoinBroadcastReceipt) -> MobileBitcoinBroadcastReceipt {
+    MobileBitcoinBroadcastReceipt {
+        txid: lowercase_hex(&receipt.txid),
+        wtxid: lowercase_hex(&receipt.wtxid),
+        attempt_count: receipt.attempt_count,
+        submitted_at_unix: receipt.submitted_at_unix,
+    }
 }
 
 const fn bitcoin_network_name(network: BitcoinNetwork) -> &'static str {

@@ -6,7 +6,10 @@ mod bitcoin;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-pub use bitcoin::{MobileBitcoinDirectConfig, MobileBitcoinSnapshot, MobileBitcoinValueController};
+pub use bitcoin::{
+    MobileBitcoinBroadcastReceipt, MobileBitcoinDirectConfig, MobileBitcoinSendApproval,
+    MobileBitcoinSnapshot, MobileBitcoinValueController,
+};
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
 use hns_swap::NetworkBinding;
@@ -1895,6 +1898,16 @@ pub enum MobileWalletError {
     BitcoinRuntimeInactive,
     #[error("the direct Bitcoin runtime could not be created")]
     BitcoinRuntimeUnavailable,
+    #[error("a direct Bitcoin send approval is already pending")]
+    BitcoinActionPending,
+    #[error("there is no pending direct Bitcoin send approval")]
+    NoPendingBitcoinAction,
+    #[error("the direct Bitcoin send approval token is invalid")]
+    InvalidBitcoinActionToken,
+    #[error("the direct Bitcoin send approval has expired")]
+    BitcoinActionExpired,
+    #[error("the direct Bitcoin send request is invalid")]
+    InvalidBitcoinAction,
     #[error("private wallet host/service response was unexpected")]
     UnexpectedResponse,
     #[error("private mobile wallet controller failed closed and must be reopened")]
