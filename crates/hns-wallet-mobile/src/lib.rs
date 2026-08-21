@@ -1250,15 +1250,13 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         &mut self,
         peer: &mut HnsDirectDenuoPeer,
     ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
-        let result = self
-            .session
+        // A direct peer is untrusted transport. A malformed packet, a closed
+        // socket, or a timeout must discard that peer at the caller boundary,
+        // never lock the wallet that independently owns chain and board state.
+        self.session
             .service
             .begin_wallet_owned_direct_shakedex(peer)
-            .map_err(mobile_service_failure);
-        if result.is_err() {
-            self.session.lock_after_request_error();
-        }
-        result
+            .map_err(mobile_service_failure)
     }
 
     /// Process an explicitly bounded number of messages from a wallet-owned
@@ -1268,15 +1266,10 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         peer: &mut HnsDirectDenuoPeer,
         message_limit: usize,
     ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
-        let result = self
-            .session
+        self.session
             .service
             .synchronize_wallet_owned_direct_shakedex(peer, message_limit)
-            .map_err(mobile_service_failure);
-        if result.is_err() {
-            self.session.lock_after_request_error();
-        }
-        result
+            .map_err(mobile_service_failure)
     }
 
     /// Write one due local board publication to a negotiated wallet peer and
@@ -1285,15 +1278,10 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         &mut self,
         peer: &mut HnsDirectDenuoPeer,
     ) -> Result<Option<ObjectHash>, MobileWalletError> {
-        let result = self
-            .session
+        self.session
             .service
             .announce_wallet_owned_direct_shakedex(peer)
-            .map_err(mobile_service_failure);
-        if result.is_err() {
-            self.session.lock_after_request_error();
-        }
-        result
+            .map_err(mobile_service_failure)
     }
 
     /// Import one exact canonical Handshake name while retaining the full
