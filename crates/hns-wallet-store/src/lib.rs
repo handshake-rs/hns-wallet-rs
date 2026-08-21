@@ -80,9 +80,6 @@ pub enum EntityKind {
     BitcoinTransaction,
     EthereumAccount,
     EthereumTransaction,
-    MarketIntent,
-    FillGrant,
-    PriceRound,
     SwapSession,
     RefundTransaction,
     HnsRecoveryState,
@@ -120,9 +117,6 @@ impl EntityKind {
             Self::BitcoinTransaction => "bitcoin_transaction",
             Self::EthereumAccount => "ethereum_account",
             Self::EthereumTransaction => "ethereum_transaction",
-            Self::MarketIntent => "market_intent",
-            Self::FillGrant => "fill_grant",
-            Self::PriceRound => "price_round",
             Self::SwapSession => "swap_session",
             Self::RefundTransaction => "refund_transaction",
             Self::HnsRecoveryState => "hns_recovery_state",
@@ -1522,27 +1516,6 @@ impl WalletStore {
             ethereum_transactions,
             delete_ethereum_transaction,
             EthereumTransaction
-        ),
-        (
-            save_market_intent,
-            market_intent,
-            market_intents,
-            delete_market_intent,
-            MarketIntent
-        ),
-        (
-            save_fill_grant,
-            fill_grant,
-            fill_grants,
-            delete_fill_grant,
-            FillGrant
-        ),
-        (
-            save_price_round,
-            price_round,
-            price_rounds,
-            delete_price_round,
-            PriceRound
         ),
         (
             save_swap_session,
@@ -4180,12 +4153,6 @@ CREATE TABLE ethereum_accounts(id BLOB PRIMARY KEY, address BLOB NOT NULL,
     state_json BLOB NOT NULL) STRICT;
 CREATE TABLE ethereum_transactions(txid BLOB PRIMARY KEY, raw BLOB, status_json BLOB NOT NULL,
     first_seen_unix INTEGER NOT NULL) STRICT;
-CREATE TABLE market_intents(id BLOB PRIMARY KEY, sequence INTEGER NOT NULL,
-    state_json BLOB NOT NULL, expires_at_unix INTEGER NOT NULL) STRICT;
-CREATE TABLE fill_grants(id BLOB PRIMARY KEY, intent_id BLOB NOT NULL,
-    state_json BLOB NOT NULL, expires_at_unix INTEGER NOT NULL) STRICT;
-CREATE TABLE price_rounds(round_hash BLOB PRIMARY KEY, pair TEXT NOT NULL,
-    state_json BLOB NOT NULL, expires_at_unix INTEGER NOT NULL) STRICT;
 CREATE TABLE swap_sessions(id BLOB PRIMARY KEY, state_json BLOB NOT NULL,
     updated_at_unix INTEGER NOT NULL) STRICT;
 CREATE TABLE htlc_secrets(session_id BLOB PRIMARY KEY, encrypted_secret BLOB NOT NULL,
@@ -4287,6 +4254,14 @@ fn reject_unmigrated_legacy_entities(
     transaction: &rusqlite::Transaction<'_>,
 ) -> Result<(), StoreError> {
     for table in LEGACY_ENTITY_TABLES {
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [*table],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            continue;
+        }
         let query = format!("SELECT EXISTS(SELECT 1 FROM {table} LIMIT 1)");
         let populated: bool = transaction.query_row(&query, [], |row| row.get(0))?;
         if populated {
@@ -4711,8 +4686,8 @@ const fn workflow_kind(kind: WorkflowKind) -> &'static str {
         WorkflowKind::ShakedexBuyerPlan => "shakedex_buyer_plan",
         WorkflowKind::ShakedexSellerOffer => "shakedex_seller_offer",
         WorkflowKind::ShakedexValue => "shakedex_value",
-        WorkflowKind::MarketIntent => "market_intent",
-        WorkflowKind::FillReservation => "fill_reservation",
+        WorkflowKind::DirectOffer => "direct_offer",
+        WorkflowKind::DirectOfferTake => "direct_offer_take",
         WorkflowKind::AtomicSwap => "atomic_swap",
         WorkflowKind::Refund => "refund",
     }
@@ -4729,8 +4704,8 @@ fn parse_workflow_kind(value: &str) -> Result<WorkflowKind, StoreError> {
         "shakedex_buyer_plan" => Ok(WorkflowKind::ShakedexBuyerPlan),
         "shakedex_seller_offer" => Ok(WorkflowKind::ShakedexSellerOffer),
         "shakedex_value" => Ok(WorkflowKind::ShakedexValue),
-        "market_intent" => Ok(WorkflowKind::MarketIntent),
-        "fill_reservation" => Ok(WorkflowKind::FillReservation),
+        "direct_offer" => Ok(WorkflowKind::DirectOffer),
+        "direct_offer_take" => Ok(WorkflowKind::DirectOfferTake),
         "atomic_swap" => Ok(WorkflowKind::AtomicSwap),
         "refund" => Ok(WorkflowKind::Refund),
         _ => Err(StoreError::CorruptMetadata),

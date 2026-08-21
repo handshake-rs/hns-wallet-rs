@@ -8,6 +8,7 @@
 
 use std::collections::BTreeSet;
 
+use hns_marketplace_protocol::NameMarketMessage;
 use hns_wallet_chain_api::{
     AuthorizeSend, BroadcastReceipt, BroadcastSend, ChainError, ChainModule, SendRequest,
 };
@@ -1409,6 +1410,23 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         self.runtime
             .direct_shakedex_transport()?
             .synchronize(peer, now_unix, message_limit)
+            .map_err(direct_denuo_failure)
+    }
+
+    /// Process one name-market message that the direct peer multiplexer has
+    /// already classified. It preserves the normal Shakedex board authority
+    /// while allowing the same negotiated socket to carry direct HNS/BTC
+    /// offer/session messages in adjacent service ticks.
+    pub fn service_wallet_owned_direct_shakedex_message(
+        &self,
+        peer: &mut HnsDirectDenuoPeer,
+        request_id: u64,
+        message: NameMarketMessage,
+    ) -> Result<DirectDenuoBoardSyncReport, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .direct_shakedex_transport()?
+            .handle_received_message(peer, request_id, message)
             .map_err(direct_denuo_failure)
     }
 

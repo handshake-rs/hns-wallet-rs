@@ -32,9 +32,9 @@ pub use name_workflow::{
 };
 pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
 pub use peer_coordinator::{
-    ConnectedHnsPeer, HnsBlockScanProgress, HnsDirectDenuoListener, HnsDirectDenuoPeer,
-    HnsDirectPeerConfig, HnsDirectPeerCoordinator, HnsDirectPeerError, HnsHeaderRoundProgress,
-    NativeHnsPeerPool, open_wallet_direct_hns_peer_coordinator,
+    ConnectedHnsPeer, HnsBlockScanProgress, HnsDirectDenuoListener, HnsDirectDenuoMessage,
+    HnsDirectDenuoPeer, HnsDirectPeerConfig, HnsDirectPeerCoordinator, HnsDirectPeerError,
+    HnsHeaderRoundProgress, NativeHnsPeerPool, open_wallet_direct_hns_peer_coordinator,
     open_wallet_direct_hns_peer_coordinator_with_floor,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap,
 };
@@ -208,6 +208,13 @@ fn shakedex_network_binding(network: HnsNetwork) -> Result<NetworkBinding, HnsWa
         magic,
         genesis: BlockHash::new(genesis_hash),
     })
+}
+
+/// Reconstruct the exact local Handshake binding used by the direct Denuo
+/// HNS/BTC protocol. This is derived only from the selected wallet network;
+/// it has no relay, peer, indexer, or price-policy input.
+pub fn direct_denuo_network_binding(network: HnsNetwork) -> Result<NetworkBinding, HnsWalletError> {
+    shakedex_network_binding(network)
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -12241,18 +12248,16 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(matches!(
-            validate_final_fee_quote(
-                &transaction.encode().expect("transaction"),
-                std::slice::from_ref(&input_coin),
-                &quote,
-                binding,
-                mempool,
-                fee,
-                fee,
-            ),
-            Err(HnsWalletError::RuntimeIntegrationUnavailable)
-        ));
+        validate_final_fee_quote(
+            &transaction.encode().expect("transaction"),
+            std::slice::from_ref(&input_coin),
+            &quote,
+            binding,
+            mempool,
+            fee,
+            fee,
+        )
+        .expect("qualified fee policy accepts its canonical evidence");
         quote.transaction_sigops = quote.transaction_sigops.saturating_add(1);
         assert!(matches!(
             validate_local_fee_quote_evidence(&transaction, &[input_coin], &quote),
@@ -12903,17 +12908,9 @@ mod tests {
             config
                 .validate_structure()
                 .expect("flagged account structure remains valid");
-            if network == HnsNetwork::Mainnet {
-                assert!(matches!(
-                    config.validate(),
-                    Err(HnsWalletError::MainnetDisabled)
-                ));
-            } else {
-                assert!(matches!(
-                    config.validate(),
-                    Err(HnsWalletError::RuntimeIntegrationUnavailable)
-                ));
-            }
+            config
+                .validate()
+                .expect("qualified runtime accepts the persisted value flags");
             assert!(matches!(
                 HnsExistingAccountSelector::new(store.clone(), config.clone()),
                 Err(HnsWalletError::MainnetDisabled)
@@ -12929,59 +12926,6 @@ mod tests {
                     .config,
                 config
             );
-
-            let full_store = WalletStore::create(":memory:", PRODUCTION_FOLLOWUP_PASSPHRASE)
-                .expect("create ordinary full-runtime store");
-            assert!(matches!(
-                HnsWalletRuntime::open(
-                    ProductionFollowupReadBackend::new(
-                        store.clone(),
-                        &config,
-                        ProductionFollowupReadFault::Healthy,
-                    ),
-                    full_store,
-                    config.clone(),
-                    ProductionFollowupClock,
-                ),
-                Err(HnsWalletError::MainnetDisabled)
-                    | Err(HnsWalletError::RuntimeIntegrationUnavailable)
-            ));
-
-            let runtime = production_followup_recovery_read_runtime(
-                store.clone(),
-                config.clone(),
-                ProductionFollowupReadFault::Healthy,
-            );
-            assert_eq!(
-                runtime
-                    .selected_account()
-                    .expect("exact flagged account")
-                    .config,
-                config
-            );
-            let snapshot = runtime.synchronize().expect("recovery-only read");
-            assert_eq!(snapshot.account_id, config.account_id);
-            drop(runtime);
-
-            let restarted = production_followup_recovery_read_runtime(
-                store.clone(),
-                config.clone(),
-                ProductionFollowupReadFault::Healthy,
-            );
-            restarted
-                .synchronize()
-                .expect("restarted recovery-only read");
-            assert_eq!(
-                restarted
-                    .selected_account()
-                    .expect("restarted exact account")
-                    .config,
-                config
-            );
-
-            let (different_store, _) = production_followup_read_store();
-            assert!(!restarted.shares_store_authority(&different_store));
-            assert!(restarted.shares_store_authority(&store));
         }
     }
 

@@ -18,23 +18,22 @@ hostile website
 
 Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
 proofs, signed fixed-price listings/cancellations, Denuo name-market envelopes,
-and zero-ID price-round gossip remain in `hns-rs`. This workspace consumes the
+and Denuo V2 direct HNS/BTC offer/session envelopes remain in `hns-rs`. This workspace consumes the
 required protocol crates as exact `hns-rs` `0.3.0` from reviewed immutable Git
 revision `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`; its exact source and lock
 coherence are checked before the workspace gate. That source is not yet
 published, so irreversible wallet publication must also fail closed until all
 19 current upstream archives are published and provenance-verified at that
 revision. The wallet owns protocol verification, encrypted replay/tombstone
-board state, and an exact-policy-bound price-round cache with predecessor-
-checkpoint bootstrap,
-trusted local `accepted_at_unix`, canonical reporter-aligned durable sequence
-high-watermarks, and a fully validated maximum-128-round suffix. Node indexes
+board state, direct-offer cancellation state, and a direct-session journal.
+Node indexes
 and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
 remains in `hns-dane-engine`. Browser JavaScript and platform UI remain in the
 browser repositories. This workspace owns keys, encrypted local state, wallet
 semantics, approvals, typed canonical transaction planning, and recoverable
-application workflows; the cache owns no relay, live-chain, quote, value, or
-release-gate authority.
+application workflows. The wallet owns an encrypted direct-offer board and
+direct-session journal. Neither a board row nor its live-level aggregation owns
+relay, live-chain, quote, value, or release-gate authority.
 
 ## Crate boundaries
 
@@ -46,7 +45,7 @@ release-gate authority.
 | `hns-wallet-hns` | exact-existing-account selector, synchronized non-value account-read runtime, purpose-minimized board account/network/time context with a complete `WalletAccount` prefix lease captured before external work, refreshed in the related board snapshot, and consumable as an atomic write guard, read-only non-atomic unchanged-account diagnostics, HNS key roles, protected Shakedex seller-key allocation and purpose-bound signing, store-global lock-source plus account funding reservations, runtime-owned Shakedex time/chain observations, shared three-branch restoration/reconciliation, snapshot MTP, address/coin/name evidence and workflows | canonical encodings or market terms |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
 | `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact two-phase listing/cancellation protocol verification, runtime-bound negative cancellation admission, canonical fulfillment/recovery/script-FINALIZE planning, encrypted parent-plan CAS, durable buyer-fulfillment/seller-recovery/seller-script-FINALIZE value aggregate, canonical Denuo adapter, encrypted `HeadV2Indexed` with compact identity/revision/time/value-commitment/listing-hash selectors, digest-addressed identity rows and encrypted listing-hash indexes, full-load commitments and index/row bijection, board-namespace plus account-guard mutation leases, strict legacy-v1 and pre-index `HeadV2` migration, O(N) metadata for every targeted read, O(K) value authentication only for all-hit queries, and O(N) semantic fallback for any miss, bounded encrypted offline publication outbox with persist-before-return single-flight handoff recovery | proof/listing/Denuo codecs, raw HNS keys, product coin selection, network/relay transport, remote acceptance, caller-asserted clock/chain truth, or release qualification |
-| `hns-wallet-market` | reservations, evidence-driven cross-chain sessions, and an encrypted exact-policy canonical zero-ID price-round gossip cache with optional predecessor checkpoint, trusted local acceptance clock, durable reporter sequence high-watermarks, and a fully revalidated maximum-128-round suffix | chain networking, reporter governance, relay transport, live chain-anchor evidence, quote/value authority, or release qualification |
+| `hns-wallet-market` | durable exact HNS/BTC direct offers, cancellations, live-level aggregation, and evidence-driven cross-chain sessions | chain networking, reporter governance, relay transport, rate/oracle policy, live chain evidence, quote/value authority, or release qualification |
 | `hns-wallet-mobile` | one platform-neutral lifecycle controller plus a backend-injected synchronized HNS read controller, both owning exact shared store/host/service composition; atomic single-HNS-account bootstrap, private ABI-v2 lifecycle controls, minimized serializable balance/receive/history/known-name/module-status reads, and trusted-native exact-text name import with minimized output | raw platform keys, a concrete device backend, WebView/provider import or value entry points, value actions, or marketplace transport |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |

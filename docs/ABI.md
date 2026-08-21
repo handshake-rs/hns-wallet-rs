@@ -86,11 +86,11 @@ nonzero tombstone generation. Pages supply none of these binding values.
 Approval expiry is Unix milliseconds with a maximum lifetime of 90,000 ms.
 Free-form display lines are forbidden. The closed approval union covers
 permissions, module enablement, send, name transfer/finalize, typed signature,
-name offer/purchase, market intent/fill, and swap redeem/refund. Value summaries
-carry integer asset amounts, maximum fee, recipient, chain/finality and, where
-applicable, price round and refund time. An incomplete or kind-mismatched
-summary fails closed. Recovery-phrase display is not a provider/service
-operation.
+name offer/purchase, direct offer/direct-offer take, and swap redeem/refund.
+Value summaries carry integer given/received asset amounts, maximum fee,
+recipient, chain/finality, and, where applicable, refund time. An incomplete or
+kind-mismatched summary fails closed. Recovery-phrase display is not a
+provider/service operation.
 
 Every approval-schema-v3 `Permissions` summary carried by private ABI v2 has a
 required `hnsNames` list. It is empty unless Names is requested and always

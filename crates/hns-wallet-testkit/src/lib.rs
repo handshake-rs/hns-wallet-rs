@@ -75,7 +75,7 @@ pub fn hns_btc_session() -> SwapSession {
         ModuleId::Handshake,
         ModuleId::Bitcoin,
         VerifiedQuote {
-            price_round_hash: ObjectHash::new([3; 32]),
+            terms_id: ObjectHash::new([3; 32]),
             offered: Amount::new(WalletAsset::Hns, 1_000_000),
             received: Amount::new(WalletAsset::Btc, 10_000),
             valid_until_unix: TEST_NOW_UNIX + 600,

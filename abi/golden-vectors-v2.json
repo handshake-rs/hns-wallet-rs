@@ -463,14 +463,14 @@
         "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "nameMarket_acceptOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "nameMarketPurchase", "name": "example", "listingId": "listing-1", "payment": { "asset": "HNS", "baseUnits": "5000" }, "recipient": "hs1qseller", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["settlementCanBeDelayed"] } }
       },
       {
-        "name": "marketIntent",
+        "name": "directOffer",
         "schemaPointer": "#/$defs/publicApprovalProjectionV3",
-        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_publishMarketIntent", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "marketIntent", "action": "publish", "marketIntentId": null, "offered": { "asset": "HNS", "baseUnits": "1000" }, "requestedAsset": "BTC", "priceRound": "HNS-BTC-100", "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["settlementCanBeDelayed"] } }
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_publishDirectOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "directOffer", "action": "publish", "directOfferId": null, "offered": { "asset": "HNS", "baseUnits": "1000" }, "received": { "asset": "BTC", "baseUnits": "20" }, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["settlementCanBeDelayed"] } }
       },
       {
-        "name": "fillAcceptance",
+        "name": "directOfferTake",
         "schemaPointer": "#/$defs/publicApprovalProjectionV3",
-        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_acceptFill", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "fillAcceptance", "marketIntentId": "intent-1", "fillId": "fill-1", "offered": { "asset": "HNS", "baseUnits": "1000" }, "expected": { "asset": "BTC", "baseUnits": "20" }, "priceRound": "HNS-BTC-100", "refundTimeoutUnixMs": 300000, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["refundRequiresManualAction", "settlementCanBeDelayed"] } }
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_acceptDirectOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "directOfferTake", "directOfferId": "offer-1", "swapSessionId": "session-1", "offered": { "asset": "HNS", "baseUnits": "1000" }, "received": { "asset": "BTC", "baseUnits": "20" }, "refundTimeoutUnixMs": 300000, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["refundRequiresManualAction", "settlementCanBeDelayed"] } }
       },
       {
         "name": "swapRedeem",
@@ -493,8 +493,7 @@
       { "name": "transactionsChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "transactionsChanged", "payload": { "modules": ["ethereum"] } } },
       { "name": "namesChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "namesChanged", "payload": { "names": ["example"] } } },
       { "name": "nameMarketChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "nameMarketChanged", "payload": { "listingIds": ["listing-1"] } } },
-      { "name": "priceRoundChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "priceRoundChanged", "payload": { "pairs": ["HNS-BTC"] } } },
-      { "name": "marketIntentChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "marketIntentChanged", "payload": { "marketIntentIds": ["intent-1"] } } },
+      { "name": "directOfferChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "directOfferChanged", "payload": { "directOfferIds": ["offer-1"] } } },
       { "name": "swapSessionChanged", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "swapSessionChanged", "payload": { "swapSessionIds": ["swap-1"] } } },
       { "name": "walletLocked", "schemaPointer": "#/$defs/publicProviderEventProjectionV1", "value": { "schemaVersion": 1, "kind": "event", "event": "walletLocked", "payload": {} } }
     ],

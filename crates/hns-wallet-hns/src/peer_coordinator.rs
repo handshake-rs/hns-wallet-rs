@@ -182,6 +182,20 @@ pub struct HnsDirectDenuoPeer {
     next_request_id: u64,
 }
 
+/// One canonical Denuo application message received on a negotiated direct
+/// peer. Name-market replication and direct HNS/BTC offers share only the
+/// socket; they retain separate protocol identities and validation paths.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HnsDirectDenuoMessage {
+    NameMarket {
+        request_id: u64,
+        message: NameMarketMessage,
+    },
+    CrossChain {
+        envelope: Vec<u8>,
+    },
+}
+
 /// A wallet-owned, nonblocking TCP admission point for direct Denuo peers.
 ///
 /// This listener is deliberately narrower than a Handshake node listener. It
@@ -394,12 +408,38 @@ impl HnsDirectDenuoPeer {
         &mut self,
         now_unix: u64,
     ) -> Result<(u64, NameMarketMessage), HnsDirectPeerError> {
+        match self.receive_denuo_message(now_unix)? {
+            HnsDirectDenuoMessage::NameMarket {
+                request_id,
+                message,
+            } => Ok((request_id, message)),
+            HnsDirectDenuoMessage::CrossChain { .. } => Err(HnsDirectPeerError::Denuo(
+                "received a cross-chain Denuo envelope in a name-market-only exchange".to_owned(),
+            )),
+        }
+    }
+
+    /// Receive one canonical Denuo application envelope and classify it by
+    /// protocol identity. This performs no market admission or swap state
+    /// transition; the caller routes the typed message to its local authority.
+    pub fn receive_denuo_message(
+        &mut self,
+        now_unix: u64,
+    ) -> Result<HnsDirectDenuoMessage, HnsDirectPeerError> {
         for _ in 0..DENUO_MAX_RESPONSE_EVENTS {
             match self.connection.receive_event(now_unix)? {
                 PeerEvent::Experimental {
                     packet_type,
                     payload,
                 } if packet_type == DENUO_EXTENSION_PACKET.value() => {
+                    let envelope =
+                        DenuoExtensionEnvelope::decode(&payload, MAX_DENUO_MARKET_PAYLOAD)
+                            .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+                    if envelope.protocol_id == hns_p2p_experimental::CROSS_CHAIN_MARKET_PROTOCOL_ID
+                    {
+                        validate_cross_chain_envelope(&payload)?;
+                        return Ok(HnsDirectDenuoMessage::CrossChain { envelope: payload });
+                    }
                     let (registry, request_id, message) =
                         NameMarketMessage::decode_envelope(&payload)
                             .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
@@ -409,7 +449,10 @@ impl HnsDirectDenuoPeer {
                         ));
                     }
                     validate_denuo_market_hello(self.network, &message)?;
-                    return Ok((request_id, message));
+                    return Ok(HnsDirectDenuoMessage::NameMarket {
+                        request_id,
+                        message,
+                    });
                 }
                 PeerEvent::Experimental { .. }
                 | PeerEvent::Ignored(_)
@@ -439,6 +482,33 @@ impl HnsDirectDenuoPeer {
         Ok(())
     }
 
+    /// Send one canonical cross-chain message under a fresh nonzero
+    /// correlation id and return that id. A distinct id is retained even for
+    /// inventory messages so every follow-up get/offer exchange is
+    /// unambiguous to the direct peer.
+    pub fn send_cross_chain_message(
+        &mut self,
+        message: &CrossChainMessage,
+    ) -> Result<u64, HnsDirectPeerError> {
+        let request_id = self.next_request_id;
+        self.send_cross_chain_message_with_request_id(request_id, message)?;
+        self.next_request_id = request_id.checked_add(1).unwrap_or(1);
+        Ok(request_id)
+    }
+
+    /// Send one canonical cross-chain response under the caller's already
+    /// validated request id.
+    pub fn send_cross_chain_message_with_request_id(
+        &mut self,
+        request_id: u64,
+        message: &CrossChainMessage,
+    ) -> Result<(), HnsDirectPeerError> {
+        let envelope = message
+            .encode_envelope(request_id)
+            .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+        self.send_cross_chain_envelope(&envelope)
+    }
+
     /// Receive one canonical HNS/BTC Denuo envelope from the direct socket.
     /// This never accepts a generic experimental payload or performs a market
     /// state transition; callers must route it to the persisted market
@@ -447,30 +517,12 @@ impl HnsDirectDenuoPeer {
         &mut self,
         now_unix: u64,
     ) -> Result<Vec<u8>, HnsDirectPeerError> {
-        for _ in 0..DENUO_MAX_RESPONSE_EVENTS {
-            match self.connection.receive_event(now_unix)? {
-                PeerEvent::Experimental {
-                    packet_type,
-                    payload,
-                } if packet_type == DENUO_EXTENSION_PACKET.value() => {
-                    validate_cross_chain_envelope(&payload)?;
-                    return Ok(payload);
-                }
-                PeerEvent::Experimental { .. }
-                | PeerEvent::Ignored(_)
-                | PeerEvent::Addresses(_)
-                | PeerEvent::Wallet(_) => {}
-                PeerEvent::Rejected(reject) => {
-                    return Err(HnsDirectPeerError::PeerRejected(format!("{reject:?}")));
-                }
-                PeerEvent::Ready(_)
-                | PeerEvent::Send(_)
-                | PeerEvent::Headers(_)
-                | PeerEvent::Proof(_)
-                | PeerEvent::Pong(_) => return Err(HnsDirectPeerError::UnexpectedPeerEvent),
-            }
+        match self.receive_denuo_message(now_unix)? {
+            HnsDirectDenuoMessage::CrossChain { envelope } => Ok(envelope),
+            HnsDirectDenuoMessage::NameMarket { .. } => Err(HnsDirectPeerError::Denuo(
+                "received a name-market Denuo envelope in a cross-chain-only exchange".to_owned(),
+            )),
         }
-        Err(HnsDirectPeerError::ResponseEventLimit)
     }
 }
 

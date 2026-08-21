@@ -11,7 +11,9 @@ pub use bitcoin::{
     MobileBitcoinBroadcastReceipt, MobileBitcoinDirectConfig, MobileBitcoinSendApproval,
     MobileBitcoinSnapshot, MobileBitcoinValueController,
 };
-pub use market::MobileDenuoSessionController;
+pub use market::{
+    MobileDenuoDirectAdmission, MobileDenuoDirectTransportReport, MobileDenuoSessionController,
+};
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
 use hns_swap::NetworkBinding;
@@ -26,9 +28,9 @@ use hns_wallet_ffi::{
 /// compose its [`EmbeddedHnsBackend`] without endpoint credentials.
 pub use hns_wallet_hns::{
     EmbeddedHnsBackend, HnsBackend, HnsBootstrapPolicy, HnsClock, HnsDirectDenuoListener,
-    HnsDirectDenuoPeer, HnsDirectPeerConfig, HnsDirectPeerCoordinator, HnsDirectPeerError,
-    HnsHeaderRoundProgress, HnsLightFloor, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
-    SystemClock as HnsReadSystemClock,
+    HnsDirectDenuoMessage, HnsDirectDenuoPeer, HnsDirectPeerConfig, HnsDirectPeerCoordinator,
+    HnsDirectPeerError, HnsHeaderRoundProgress, HnsLightFloor, HnsNetwork, HnsNodeRpcBackend,
+    HnsNodeRpcConfig, SystemClock as HnsReadSystemClock,
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountRecord, HnsExistingAccountSelector, HnsRuntimeConfig,
@@ -39,6 +41,7 @@ use hns_wallet_hns::{
 use hns_wallet_host::{
     Clock, ClockError, HostError, HostOutput, SystemClock, SystemEntropy, WalletHost,
 };
+use hns_wallet_market::{DenuoDirectOfferBoardPolicy, DenuoDirectSwapPolicy};
 use hns_wallet_provider::{
     APPROVAL_LIFETIME_SECONDS, ApprovedCall, Origin, ProviderMethod, SelectedNamespace,
 };
@@ -1172,6 +1175,32 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         )
     }
 
+    /// Construct the adjacent direct HNS/BTC Denuo controller from this
+    /// exact value runtime's encrypted store and selected HNS network. No
+    /// peer, relay, indexer, price reporter, or caller-supplied policy enters
+    /// this construction.
+    pub fn direct_denuo_session_controller(
+        &self,
+    ) -> Result<MobileDenuoSessionController, MobileWalletError> {
+        let hns_network =
+            hns_wallet_hns::direct_denuo_network_binding(self.account_config.network)?;
+        let (counterchain_network, counterchain_genesis) =
+            MobileBitcoinDirectConfig::direct_denuo_counterchain(self.account_config.network);
+        let network = hns_marketplace_protocol::NetworkBinding {
+            hns_magic: hns_network.magic,
+            hns_genesis: hns_network.genesis,
+            counterchain: hns_marketplace_protocol::ChainId::BITCOIN,
+            counterchain_network,
+            counterchain_genesis,
+        };
+        let board_policy = DenuoDirectOfferBoardPolicy::new(network)?;
+        let swap_policy = DenuoDirectSwapPolicy::new(board_policy)?;
+        Ok(MobileDenuoSessionController::new(
+            self.session.store.clone(),
+            swap_policy,
+        ))
+    }
+
     pub fn status(&mut self) -> Result<WalletRuntimeStatus, MobileWalletError> {
         match self.session.wallet_request(WalletRequest::Status)? {
             WalletResponse::Status { status } => Ok(status),
@@ -1294,6 +1323,21 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         self.session
             .service
             .synchronize_wallet_owned_direct_shakedex(peer, message_limit)
+            .map_err(mobile_service_failure)
+    }
+
+    /// Service one name-market message classified by the direct peer
+    /// multiplexer. This leaves cross-chain HNS/BTC envelopes for the separate
+    /// durable direct-session controller.
+    pub fn service_wallet_owned_direct_shakedex_message(
+        &mut self,
+        peer: &mut HnsDirectDenuoPeer,
+        request_id: u64,
+        message: hns_marketplace_protocol::NameMarketMessage,
+    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+        self.session
+            .service
+            .service_wallet_owned_direct_shakedex_message(peer, request_id, message)
             .map_err(mobile_service_failure)
     }
 
@@ -2011,16 +2055,16 @@ mod tests {
             config.seller_policy,
             ShakedexSellerPolicy::no_marketplace_fee()
         );
-        assert_eq!(config.acceptance_policy.network().magic, 1_535_399_072);
-        assert_eq!(config.acceptance_policy.hrm().sequence, 7);
+        let PersistentDenuoTransport::RelayAcceptance(acceptance_policy) = &config.transport else {
+            panic!("explicit legacy relay policy must select relay transport");
+        };
+        assert_eq!(acceptance_policy.network().magic, 1_535_399_072);
+        assert_eq!(acceptance_policy.hrm().sequence, 7);
         assert_eq!(
-            config.acceptance_policy.hnsa().canonical_service_name,
+            acceptance_policy.hnsa().canonical_service_name,
             b"relay-market"
         );
-        assert_eq!(
-            config.acceptance_policy.maximum_receipt_lifetime_seconds(),
-            120
-        );
+        assert_eq!(acceptance_policy.maximum_receipt_lifetime_seconds(), 120);
 
         let mut unknown_field: Value =
             serde_json::from_slice(&encoded).expect("decode test policy");
@@ -2429,7 +2473,7 @@ mod tests {
     }
 
     #[test]
-    fn flagged_value_account_reopens_for_lifecycle_but_not_ordinary_reads() {
+    fn flagged_value_account_reopens_for_lifecycle_uses_value_composition() {
         let directory = private_tempdir();
         let path = directory.path().join("flagged-lifecycle.sqlite3");
         let key = MobileDatabaseKey::new([0x8a; MOBILE_DATABASE_KEY_BYTES]).expect("database key");
@@ -2476,20 +2520,13 @@ mod tests {
         let lifecycle = MobileWalletController::open(&path, &key, MobilePlatform::Ios)
             .expect("reopen after rejected ordinary-read composition");
         let probe = Arc::new(MockReadProbe::default());
-        assert!(matches!(
-            lifecycle.into_hns_value_with_clock(
-                &key,
-                MockReadBackend::new(probe),
-                MockReadClock,
-                None,
-            ),
-            Err(MobileWalletError::Hns(
-                HnsWalletError::RuntimeIntegrationUnavailable
-            ))
-        ));
+        let mut value = lifecycle
+            .into_hns_value_with_clock(&key, MockReadBackend::new(probe), MockReadClock, None)
+            .expect("qualified value composition accepts the persisted value flags");
+        value.lock().expect("relock qualified value controller");
 
         let mut reopened = MobileWalletController::open(&path, &key, MobilePlatform::Android)
-            .expect("failed activation leaves wallet safely reopenable");
+            .expect("qualified value activation leaves wallet safely reopenable");
         assert!(reopened.status().expect("locked lifecycle status").locked);
     }
 

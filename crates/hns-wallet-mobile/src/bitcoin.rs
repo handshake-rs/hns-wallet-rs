@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::Network as BitcoinNetwork;
 use bdk_wallet::bitcoin::Transaction;
+use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
 use bdk_wallet::bitcoin::consensus::deserialize;
 use bdk_wallet::bitcoin::hashes::Hash;
 use hns_wallet_bitcoin_kyoto::{
@@ -42,15 +43,37 @@ pub struct MobileBitcoinDirectConfig {
 
 impl MobileBitcoinDirectConfig {
     pub fn for_hns_wallet(network: HnsNetwork, data_dir: PathBuf) -> Self {
-        let network = match network {
-            HnsNetwork::Mainnet => BitcoinNetwork::Bitcoin,
-            HnsNetwork::Testnet => BitcoinNetwork::Testnet,
-            HnsNetwork::Regtest | HnsNetwork::Simnet => BitcoinNetwork::Regtest,
-        };
+        let network = Self::bitcoin_network_for_hns(network);
         Self {
             network,
             data_dir,
             required_peers: hns_wallet_bitcoin_kyoto::DEFAULT_REQUIRED_PEERS,
+        }
+    }
+
+    /// The exact Bitcoin network binding paired with an HNS network by the
+    /// installed direct wallet. The identifier and genesis come from the
+    /// wallet's own Bitcoin library, not a peer, relay, or price source.
+    pub fn direct_denuo_counterchain(network: HnsNetwork) -> (u64, [u8; 32]) {
+        let network = Self::bitcoin_network_for_hns(network);
+        let network_id = match network {
+            BitcoinNetwork::Bitcoin => 1,
+            BitcoinNetwork::Testnet => 2,
+            BitcoinNetwork::Regtest => 3,
+            BitcoinNetwork::Testnet4 => 4,
+            BitcoinNetwork::Signet => 5,
+        };
+        (
+            network_id,
+            genesis_block(network).block_hash().to_byte_array(),
+        )
+    }
+
+    const fn bitcoin_network_for_hns(network: HnsNetwork) -> BitcoinNetwork {
+        match network {
+            HnsNetwork::Mainnet => BitcoinNetwork::Bitcoin,
+            HnsNetwork::Testnet => BitcoinNetwork::Testnet,
+            HnsNetwork::Regtest | HnsNetwork::Simnet => BitcoinNetwork::Regtest,
         }
     }
 

@@ -607,7 +607,7 @@ pub enum NameMarketApprovalAction {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum MarketIntentApprovalAction {
+pub enum DirectOfferApprovalAction {
     Publish,
     Cancel,
 }
@@ -699,21 +699,19 @@ pub enum ApprovalSummary {
         maximum_fee: Amount,
         warnings: BTreeSet<ApprovalWarning>,
     },
-    MarketIntent {
-        action: MarketIntentApprovalAction,
-        market_intent_id: Option<String>,
+    DirectOffer {
+        action: DirectOfferApprovalAction,
+        direct_offer_id: Option<String>,
         offered: Amount,
-        requested_asset: WalletAsset,
-        price_round: String,
+        received: Amount,
         maximum_fee: Amount,
         warnings: BTreeSet<ApprovalWarning>,
     },
-    FillAcceptance {
-        market_intent_id: String,
-        fill_id: String,
+    DirectOfferTake {
+        direct_offer_id: String,
+        swap_session_id: String,
         offered: Amount,
-        expected: Amount,
-        price_round: String,
+        received: Amount,
         refund_timeout_unix_ms: u64,
         maximum_fee: Amount,
         warnings: BTreeSet<ApprovalWarning>,
@@ -747,8 +745,8 @@ impl ApprovalSummary {
             Self::TypedSignature { .. } => ApprovalKind::TypedSignature,
             Self::NameMarketOffer { .. } => ApprovalKind::NameMarketOffer,
             Self::NameMarketPurchase { .. } => ApprovalKind::NameMarketPurchase,
-            Self::MarketIntent { .. } => ApprovalKind::MarketIntent,
-            Self::FillAcceptance { .. } => ApprovalKind::FillAcceptance,
+            Self::DirectOffer { .. } => ApprovalKind::DirectOffer,
+            Self::DirectOfferTake { .. } => ApprovalKind::DirectOfferTake,
             Self::SwapRedeem { .. } => ApprovalKind::SwapRedeem,
             Self::SwapRefund { .. } => ApprovalKind::SwapRefund,
         }
@@ -847,42 +845,39 @@ impl ApprovalSummary {
                 validate_public_string(listing_id)?;
                 validate_value_movement(*payment, recipient, *maximum_fee, warnings)?;
             }
-            Self::MarketIntent {
-                market_intent_id,
+            Self::DirectOffer {
+                direct_offer_id,
                 offered,
-                requested_asset,
-                price_round,
+                received,
                 maximum_fee,
                 warnings,
                 ..
             } => {
-                if offered.asset == *requested_asset || maximum_fee.asset != offered.asset {
+                if offered.asset == received.asset || maximum_fee.asset != offered.asset {
                     return Err(AbiError::InvalidApproval);
                 }
-                validate_optional_public_string(market_intent_id)?;
-                validate_public_string(price_round)?;
+                validate_optional_public_string(direct_offer_id)?;
                 validate_amount(*offered, false)?;
+                validate_amount(*received, false)?;
                 validate_amount(*maximum_fee, true)?;
                 validate_warnings(warnings)?;
             }
-            Self::FillAcceptance {
-                market_intent_id,
-                fill_id,
+            Self::DirectOfferTake {
+                direct_offer_id,
+                swap_session_id,
                 offered,
-                expected,
-                price_round,
+                received,
                 refund_timeout_unix_ms,
                 maximum_fee,
                 warnings,
             } => {
-                if offered.asset == expected.asset || maximum_fee.asset != offered.asset {
+                if offered.asset == received.asset || maximum_fee.asset != offered.asset {
                     return Err(AbiError::InvalidApproval);
                 }
-                validate_public_string(market_intent_id)?;
-                validate_public_string(fill_id)?;
-                validate_public_string(price_round)?;
+                validate_public_string(direct_offer_id)?;
+                validate_public_string(swap_session_id)?;
                 validate_amount(*offered, false)?;
-                validate_amount(*expected, false)?;
+                validate_amount(*received, false)?;
                 validate_amount(*maximum_fee, true)?;
                 validate_warnings(warnings)?;
                 if *refund_timeout_unix_ms == 0 {
@@ -955,18 +950,15 @@ impl ApprovalSummary {
                 method,
                 "nameMarket_acceptOffer" | "nameMarket_finalizePurchase"
             ),
-            Self::MarketIntent { action, .. } => matches!(
+            Self::DirectOffer { action, .. } => matches!(
                 (method, *action),
                 (
-                    "swap_publishMarketIntent",
-                    MarketIntentApprovalAction::Publish
-                ) | (
-                    "swap_cancelMarketIntent",
-                    MarketIntentApprovalAction::Cancel
-                )
+                    "swap_publishDirectOffer",
+                    DirectOfferApprovalAction::Publish
+                ) | ("swap_cancelDirectOffer", DirectOfferApprovalAction::Cancel)
             ),
-            Self::FillAcceptance { .. } => {
-                matches!(method, "swap_requestMatch" | "swap_acceptFill")
+            Self::DirectOfferTake { .. } => {
+                matches!(method, "swap_takeDirectOffer" | "swap_acceptDirectOffer")
             }
             Self::SwapRedeem { .. } => method == "swap_redeem",
             Self::SwapRefund { .. } => method == "swap_refund",
@@ -1067,11 +1059,8 @@ pub enum ProviderEventPayload {
     NameMarketChanged {
         listing_ids: Vec<String>,
     },
-    PriceRoundChanged {
-        pairs: Vec<String>,
-    },
-    MarketIntentChanged {
-        market_intent_ids: Vec<String>,
+    DirectOfferChanged {
+        direct_offer_ids: Vec<String>,
     },
     SwapSessionChanged {
         swap_session_ids: Vec<String>,
@@ -1104,9 +1093,8 @@ impl ProviderEventPayload {
             }
             Self::NamesChanged { names } => validate_public_strings(names)?,
             Self::NameMarketChanged { listing_ids } => validate_public_strings(listing_ids)?,
-            Self::PriceRoundChanged { pairs } => validate_public_strings(pairs)?,
-            Self::MarketIntentChanged { market_intent_ids } => {
-                validate_public_strings(market_intent_ids)?;
+            Self::DirectOfferChanged { direct_offer_ids } => {
+                validate_public_strings(direct_offer_ids)?;
             }
             Self::SwapSessionChanged { swap_session_ids } => {
                 validate_public_strings(swap_session_ids)?;
@@ -2134,12 +2122,12 @@ mod tests {
             }),
         );
         assert_json_round_trip(
-            &ProviderEventPayload::MarketIntentChanged {
-                market_intent_ids: vec!["intent-1".to_owned()],
+            &ProviderEventPayload::DirectOfferChanged {
+                direct_offer_ids: vec!["offer-1".to_owned()],
             },
             serde_json::json!({
-                "event": "marketIntentChanged",
-                "marketIntentIds": ["intent-1"],
+                "event": "directOfferChanged",
+                "directOfferIds": ["offer-1"],
             }),
         );
     }
@@ -2445,8 +2433,8 @@ mod tests {
             ApprovalKind::TypedSignature,
             ApprovalKind::NameMarketOffer,
             ApprovalKind::NameMarketPurchase,
-            ApprovalKind::MarketIntent,
-            ApprovalKind::FillAcceptance,
+            ApprovalKind::DirectOffer,
+            ApprovalKind::DirectOfferTake,
             ApprovalKind::SwapRedeem,
             ApprovalKind::SwapRefund,
         ];

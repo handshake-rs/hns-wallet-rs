@@ -1795,12 +1795,11 @@ mod tests {
 
         let mut flagged = config.clone();
         flagged.value_operations_enabled = true;
-        assert!(matches!(
-            allocation_next_index(&store, &flagged),
-            Err(HnsShakedexKeyAllocationError::Wallet(
-                HnsWalletError::RuntimeIntegrationUnavailable
-            ))
-        ));
+        assert_eq!(
+            allocation_next_index(&store, &flagged)
+                .expect("qualified allocation reads its existing high water"),
+            1
+        );
         assert_eq!(
             allocation_next_index_for_persisted_recovery_read(&store, &flagged)
                 .expect("authenticate existing high water for recovery scan"),

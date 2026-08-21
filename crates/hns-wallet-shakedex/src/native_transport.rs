@@ -164,9 +164,28 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
         let mut report = DirectDenuoBoardSyncReport::default();
         for _ in 0..message_limit {
             let (request_id, message) = peer.receive_name_market(now_unix)?;
-            report.messages_received = report.messages_received.saturating_add(1);
-            self.handle_message(peer, request_id, message, &mut report)?;
+            merge_report(
+                &mut report,
+                self.handle_received_message(peer, request_id, message)?,
+            );
         }
+        Ok(report)
+    }
+
+    /// Process one already-demultiplexed canonical name-market message. This
+    /// lets a mobile peer service name offers alongside direct HNS/BTC Denuo
+    /// traffic without a packet for one protocol being consumed by the other.
+    pub fn handle_received_message(
+        &self,
+        peer: &mut HnsDirectDenuoPeer,
+        request_id: u64,
+        message: NameMarketMessage,
+    ) -> Result<DirectDenuoBoardSyncReport, WalletNativeDenuoTransportError> {
+        let mut report = DirectDenuoBoardSyncReport {
+            messages_received: 1,
+            ..DirectDenuoBoardSyncReport::default()
+        };
+        self.handle_message(peer, request_id, message, &mut report)?;
         Ok(report)
     }
 
@@ -330,6 +349,23 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
             feature_flags: 0,
         })
     }
+}
+
+fn merge_report(into: &mut DirectDenuoBoardSyncReport, next: DirectDenuoBoardSyncReport) {
+    into.messages_received = into
+        .messages_received
+        .saturating_add(next.messages_received);
+    into.messages_sent = into.messages_sent.saturating_add(next.messages_sent);
+    into.inventory_hashes_requested = into
+        .inventory_hashes_requested
+        .saturating_add(next.inventory_hashes_requested);
+    into.offers_admitted = into.offers_admitted.saturating_add(next.offers_admitted);
+    into.cancellations_admitted = into
+        .cancellations_admitted
+        .saturating_add(next.cancellations_admitted);
+    into.marketplace_records_rejected = into
+        .marketplace_records_rejected
+        .saturating_add(next.marketplace_records_rejected);
 }
 
 fn rejected_marketplace_record(error: &ShakedexError) -> bool {

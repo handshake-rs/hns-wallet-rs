@@ -172,12 +172,11 @@ pub enum ProviderMethod {
     NameMarketFinalizePurchase,
     NameMarketRecoverName,
     SwapGetSupportedPairs,
-    SwapGetPriceRound,
-    SwapListMarketIntents,
-    SwapPublishMarketIntent,
-    SwapCancelMarketIntent,
-    SwapRequestMatch,
-    SwapAcceptFill,
+    SwapListDirectOffers,
+    SwapPublishDirectOffer,
+    SwapCancelDirectOffer,
+    SwapTakeDirectOffer,
+    SwapAcceptDirectOffer,
     SwapGetSession,
     SwapRedeem,
     SwapRefund,
@@ -219,12 +218,11 @@ impl ProviderMethod {
         Self::NameMarketFinalizePurchase,
         Self::NameMarketRecoverName,
         Self::SwapGetSupportedPairs,
-        Self::SwapGetPriceRound,
-        Self::SwapListMarketIntents,
-        Self::SwapPublishMarketIntent,
-        Self::SwapCancelMarketIntent,
-        Self::SwapRequestMatch,
-        Self::SwapAcceptFill,
+        Self::SwapListDirectOffers,
+        Self::SwapPublishDirectOffer,
+        Self::SwapCancelDirectOffer,
+        Self::SwapTakeDirectOffer,
+        Self::SwapAcceptDirectOffer,
         Self::SwapGetSession,
         Self::SwapRedeem,
         Self::SwapRefund,
@@ -306,12 +304,11 @@ impl ProviderMethod {
             | Self::NameMarketGetSession
             | Self::NameMarketFinalizePurchase
             | Self::NameMarketRecoverName => Some(PermissionCapability::NameMarket),
-            Self::SwapGetPriceRound
-            | Self::SwapListMarketIntents
-            | Self::SwapPublishMarketIntent
-            | Self::SwapCancelMarketIntent
-            | Self::SwapRequestMatch
-            | Self::SwapAcceptFill => Some(PermissionCapability::CrossChainMarket),
+            Self::SwapListDirectOffers
+            | Self::SwapPublishDirectOffer
+            | Self::SwapCancelDirectOffer
+            | Self::SwapTakeDirectOffer
+            | Self::SwapAcceptDirectOffer => Some(PermissionCapability::CrossChainMarket),
             Self::SwapGetSession | Self::SwapRedeem | Self::SwapRefund => {
                 Some(PermissionCapability::SwapSettlement)
             }
@@ -338,10 +335,12 @@ impl ProviderMethod {
                 Some(ApprovalKind::NameMarketPurchase)
             }
             Self::NameMarketRecoverName => Some(ApprovalKind::NameMarketOffer),
-            Self::SwapPublishMarketIntent | Self::SwapCancelMarketIntent => {
-                Some(ApprovalKind::MarketIntent)
+            Self::SwapPublishDirectOffer | Self::SwapCancelDirectOffer => {
+                Some(ApprovalKind::DirectOffer)
             }
-            Self::SwapRequestMatch | Self::SwapAcceptFill => Some(ApprovalKind::FillAcceptance),
+            Self::SwapTakeDirectOffer | Self::SwapAcceptDirectOffer => {
+                Some(ApprovalKind::DirectOfferTake)
+            }
             Self::SwapRedeem => Some(ApprovalKind::SwapRedeem),
             Self::SwapRefund => Some(ApprovalKind::SwapRefund),
             _ => None,
@@ -1307,8 +1306,7 @@ pub enum ProviderEvent {
     TransactionsChanged,
     NamesChanged,
     NameMarketChanged,
-    PriceRoundChanged,
-    MarketIntentChanged,
+    DirectOfferChanged,
     SwapSessionChanged,
     WalletLocked,
 }
@@ -1417,12 +1415,12 @@ mod tests {
 
     #[test]
     fn canonical_provider_method_set_has_exact_wire_round_trips() {
-        assert_eq!(ProviderMethod::ALL.len(), 43);
+        assert_eq!(ProviderMethod::ALL.len(), 42);
         let names: BTreeSet<_> = ProviderMethod::ALL
             .into_iter()
             .map(ProviderMethod::wire_name)
             .collect();
-        assert_eq!(names.len(), 43);
+        assert_eq!(names.len(), 42);
         for (index, method) in ProviderMethod::ALL.into_iter().enumerate() {
             assert_eq!(method.wire_name(), PROVIDER_METHOD_WIRE_NAMES[index]);
             assert!(matches!(

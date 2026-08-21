@@ -28,22 +28,21 @@ independently disabled.
 - The wallet database and keys live in a native/mobile wallet process. Website
   JavaScript, extension local storage, and native-messaging frames never carry
   seed or raw private-key bytes.
-- Denuo/Brontide authenticates a connection, not a listing, price, fill, chain
+- Denuo/Brontide authenticates a connection, not a listing, live-board level,
+  swap take, chain
   state, or peer claim. Fixed-price discovery checks the exact registry/message
   family, canonical signature/content hash, monotonic seller/name sequence,
   network/genesis, active time window, and exact locking coin locally. The
   protocol verifier does not establish that caller-supplied coin as current or
   unspent; only fresh authenticated HNS adapter evidence may do so. Persisted
-  cache bytes never become action authority after restart. Separately, the
-  price-round cache accepts canonical zero-ID gossip under an exact local policy
-  and a caller-owned trusted `accepted_at_unix` clock. An explicit predecessor
-  checkpoint authenticates only that predecessor and its current link, not
-  earlier ancestry. Canonical reporter-aligned sequence high-watermarks survive
-  omission and pruning from the authenticated maximum-128-round suffix, while
-  a pruned round hash/ID leaves duplicate detection. Full retained-row restart
-  validation still supplies neither a live chain anchor nor quote/value
-  authority, and it does not detect rollback of the complete authenticated
-  database snapshot. The schema-v3 publication outbox can separately retain a
+  cache bytes never become action authority after restart. The HNS/BTC direct
+  board persists only exact signed offer terms and cancellations. It has no
+  price feed, price history, reporter/source set, or external oracle. A live
+  board level is a display aggregation; proposal, accepted hello, and funding
+  each verify one original offer and its exact amounts. Full retained-row
+  restart validation still supplies neither live chain nor value authority, and
+  it does not detect rollback of the complete authenticated database snapshot.
+  The schema-v3 publication outbox can separately retain a
   canonical endpoint-signed receipt for one exact prepared envelope. Its full
   wallet-supplied HRM/HNSA policy, endpoint window, maximum lifetime, exact
   handoff identity, and signature are revalidated after restart. Network
@@ -358,8 +357,8 @@ Amounts are integer base units serialized to JavaScript as decimal strings.
 Arithmetic is checked; prices and fees never use floating point. Value-moving
 methods require a typed approval of at most 90 seconds bound to the service
 session and exact authority handle/revision. Production UI must display asset,
-exact amount, recipient, fee maximum, chain, finality policy, price-round
-commitment, and refund timeout. Free-form approval display lines are rejected.
+exact amount given and received, recipient, fee maximum, chain, finality policy,
+and refund timeout. Free-form approval display lines are rejected.
 
 The library supplies the policy and state boundary; the current browser UI does
 not yet provide every approval screen. No mainnet enablement may infer approval

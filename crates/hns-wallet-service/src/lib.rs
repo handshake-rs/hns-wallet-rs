@@ -2550,8 +2550,8 @@ fn value_movement_approval(kind: ApprovalKind) -> bool {
             | ApprovalKind::NameFinalize
             | ApprovalKind::NameMarketOffer
             | ApprovalKind::NameMarketPurchase
-            | ApprovalKind::MarketIntent
-            | ApprovalKind::FillAcceptance
+            | ApprovalKind::DirectOffer
+            | ApprovalKind::DirectOfferTake
             | ApprovalKind::SwapRedeem
             | ApprovalKind::SwapRefund
     )

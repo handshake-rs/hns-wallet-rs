@@ -244,12 +244,11 @@
         "nameMarket_finalizePurchase",
         "nameMarket_recoverName",
         "swap_getSupportedPairs",
-        "swap_getPriceRound",
-        "swap_listMarketIntents",
-        "swap_publishMarketIntent",
-        "swap_cancelMarketIntent",
-        "swap_requestMatch",
-        "swap_acceptFill",
+        "swap_listDirectOffers",
+        "swap_publishDirectOffer",
+        "swap_cancelDirectOffer",
+        "swap_takeDirectOffer",
+        "swap_acceptDirectOffer",
         "swap_getSession",
         "swap_redeem",
         "swap_refund"
@@ -257,7 +256,7 @@
     },
     "providerMethods": {
       "type": "array",
-      "maxItems": 43,
+      "maxItems": 42,
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/providerMethod" },
       "$comment": "Presence in this closed vocabulary does not imply runtime availability. The snapshot contains only methods supported by the negotiated runtime; hns_requestAccounts requires the service's atomic permission/account join and an explicit runtime account selector."
@@ -278,10 +277,10 @@
         "nameMarket_acceptOffer",
         "nameMarket_finalizePurchase",
         "nameMarket_recoverName",
-        "swap_publishMarketIntent",
-        "swap_cancelMarketIntent",
-        "swap_requestMatch",
-        "swap_acceptFill",
+        "swap_publishDirectOffer",
+        "swap_cancelDirectOffer",
+        "swap_takeDirectOffer",
+        "swap_acceptDirectOffer",
         "swap_redeem",
         "swap_refund"
       ]
@@ -866,16 +865,15 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "action", "marketIntentId", "offered", "requestedAsset", "priceRound", "maximumFee", "warnings"],
+          "required": ["kind", "action", "directOfferId", "offered", "received", "maximumFee", "warnings"],
           "properties": {
-            "kind": { "const": "marketIntent" },
+            "kind": { "const": "directOffer" },
             "action": { "enum": ["publish", "cancel"] },
-            "marketIntentId": {
+            "directOfferId": {
               "oneOf": [{ "$ref": "#/$defs/asciiString" }, { "type": "null" }]
             },
             "offered": { "$ref": "#/$defs/privateNonzeroAmount" },
-            "requestedAsset": { "$ref": "#/$defs/walletAsset" },
-            "priceRound": { "$ref": "#/$defs/asciiString" },
+            "received": { "$ref": "#/$defs/privateNonzeroAmount" },
             "maximumFee": { "$ref": "#/$defs/privateAmount" },
             "warnings": { "$ref": "#/$defs/approvalWarnings" }
           }
@@ -883,14 +881,13 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "marketIntentId", "fillId", "offered", "expected", "priceRound", "refundTimeoutUnixMs", "maximumFee", "warnings"],
+          "required": ["kind", "directOfferId", "swapSessionId", "offered", "received", "refundTimeoutUnixMs", "maximumFee", "warnings"],
           "properties": {
-            "kind": { "const": "fillAcceptance" },
-            "marketIntentId": { "$ref": "#/$defs/asciiString" },
-            "fillId": { "$ref": "#/$defs/asciiString" },
+            "kind": { "const": "directOfferTake" },
+            "directOfferId": { "$ref": "#/$defs/asciiString" },
+            "swapSessionId": { "$ref": "#/$defs/asciiString" },
             "offered": { "$ref": "#/$defs/privateNonzeroAmount" },
-            "expected": { "$ref": "#/$defs/privateNonzeroAmount" },
-            "priceRound": { "$ref": "#/$defs/asciiString" },
+            "received": { "$ref": "#/$defs/privateNonzeroAmount" },
             "refundTimeoutUnixMs": { "$ref": "#/$defs/nonzeroUint64" },
             "maximumFee": { "$ref": "#/$defs/privateAmount" },
             "warnings": { "$ref": "#/$defs/approvalWarnings" }
@@ -993,16 +990,16 @@
           "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameMarketPurchase" } } } } }
         },
         {
-          "if": { "properties": { "method": { "const": "swap_publishMarketIntent" } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "marketIntent" }, "action": { "const": "publish" } } } } }
+          "if": { "properties": { "method": { "const": "swap_publishDirectOffer" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOffer" }, "action": { "const": "publish" } } } } }
         },
         {
-          "if": { "properties": { "method": { "const": "swap_cancelMarketIntent" } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "marketIntent" }, "action": { "const": "cancel" } } } } }
+          "if": { "properties": { "method": { "const": "swap_cancelDirectOffer" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOffer" }, "action": { "const": "cancel" } } } } }
         },
         {
-          "if": { "properties": { "method": { "enum": ["swap_requestMatch", "swap_acceptFill"] } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "fillAcceptance" } } } } }
+          "if": { "properties": { "method": { "enum": ["swap_takeDirectOffer", "swap_acceptDirectOffer"] } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOfferTake" } } } } }
         },
         {
           "if": { "properties": { "method": { "const": "swap_redeem" } } },
@@ -1486,19 +1483,10 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["event", "pairs"],
+          "required": ["event", "directOfferIds"],
           "properties": {
-            "event": { "const": "priceRoundChanged" },
-            "pairs": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/asciiString" } }
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["event", "marketIntentIds"],
-          "properties": {
-            "event": { "const": "marketIntentChanged" },
-            "marketIntentIds": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/asciiString" } }
+            "event": { "const": "directOfferChanged" },
+            "directOfferIds": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/asciiString" } }
           }
         },
         {
@@ -1749,16 +1737,15 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "action", "marketIntentId", "offered", "requestedAsset", "priceRound", "maximumFee", "warnings"],
+          "required": ["kind", "action", "directOfferId", "offered", "received", "maximumFee", "warnings"],
           "properties": {
-            "kind": { "const": "marketIntent" },
+            "kind": { "const": "directOffer" },
             "action": { "enum": ["publish", "cancel"] },
-            "marketIntentId": {
+            "directOfferId": {
               "oneOf": [{ "$ref": "#/$defs/publicString" }, { "type": "null" }]
             },
             "offered": { "$ref": "#/$defs/publicNonzeroAmount" },
-            "requestedAsset": { "$ref": "#/$defs/walletAsset" },
-            "priceRound": { "$ref": "#/$defs/publicString" },
+            "received": { "$ref": "#/$defs/publicNonzeroAmount" },
             "maximumFee": { "$ref": "#/$defs/publicAmount" },
             "warnings": { "$ref": "#/$defs/approvalWarnings" }
           }
@@ -1766,14 +1753,13 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["kind", "marketIntentId", "fillId", "offered", "expected", "priceRound", "refundTimeoutUnixMs", "maximumFee", "warnings"],
+          "required": ["kind", "directOfferId", "swapSessionId", "offered", "received", "refundTimeoutUnixMs", "maximumFee", "warnings"],
           "properties": {
-            "kind": { "const": "fillAcceptance" },
-            "marketIntentId": { "$ref": "#/$defs/publicString" },
-            "fillId": { "$ref": "#/$defs/publicString" },
+            "kind": { "const": "directOfferTake" },
+            "directOfferId": { "$ref": "#/$defs/publicString" },
+            "swapSessionId": { "$ref": "#/$defs/publicString" },
             "offered": { "$ref": "#/$defs/publicNonzeroAmount" },
-            "expected": { "$ref": "#/$defs/publicNonzeroAmount" },
-            "priceRound": { "$ref": "#/$defs/publicString" },
+            "received": { "$ref": "#/$defs/publicNonzeroAmount" },
             "refundTimeoutUnixMs": { "$ref": "#/$defs/positiveSafeUint" },
             "maximumFee": { "$ref": "#/$defs/publicAmount" },
             "warnings": { "$ref": "#/$defs/approvalWarnings" }
@@ -1874,16 +1860,16 @@
           "then": { "properties": { "summary": { "properties": { "kind": { "const": "nameMarketPurchase" } } } } }
         },
         {
-          "if": { "properties": { "method": { "const": "swap_publishMarketIntent" } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "marketIntent" }, "action": { "const": "publish" } } } } }
+          "if": { "properties": { "method": { "const": "swap_publishDirectOffer" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOffer" }, "action": { "const": "publish" } } } } }
         },
         {
-          "if": { "properties": { "method": { "const": "swap_cancelMarketIntent" } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "marketIntent" }, "action": { "const": "cancel" } } } } }
+          "if": { "properties": { "method": { "const": "swap_cancelDirectOffer" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOffer" }, "action": { "const": "cancel" } } } } }
         },
         {
-          "if": { "properties": { "method": { "enum": ["swap_requestMatch", "swap_acceptFill"] } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "fillAcceptance" } } } } }
+          "if": { "properties": { "method": { "enum": ["swap_takeDirectOffer", "swap_acceptDirectOffer"] } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOfferTake" } } } } }
         },
         {
           "if": { "properties": { "method": { "const": "swap_redeem" } } },
@@ -1947,14 +1933,8 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["pairs"],
-          "properties": { "pairs": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/publicString" } } }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["marketIntentIds"],
-          "properties": { "marketIntentIds": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/publicString" } } }
+          "required": ["directOfferIds"],
+          "properties": { "directOfferIds": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/publicString" } } }
         },
         {
           "type": "object",
@@ -1989,8 +1969,7 @@
             "transactionsChanged",
             "namesChanged",
             "nameMarketChanged",
-            "priceRoundChanged",
-            "marketIntentChanged",
+            "directOfferChanged",
             "swapSessionChanged",
             "walletLocked"
           ]
@@ -2023,12 +2002,8 @@
           "then": { "properties": { "payload": { "required": ["listingIds"], "maxProperties": 1 } } }
         },
         {
-          "if": { "properties": { "event": { "const": "priceRoundChanged" } } },
-          "then": { "properties": { "payload": { "required": ["pairs"], "maxProperties": 1 } } }
-        },
-        {
-          "if": { "properties": { "event": { "const": "marketIntentChanged" } } },
-          "then": { "properties": { "payload": { "required": ["marketIntentIds"], "maxProperties": 1 } } }
+          "if": { "properties": { "event": { "const": "directOfferChanged" } } },
+          "then": { "properties": { "payload": { "required": ["directOfferIds"], "maxProperties": 1 } } }
         },
         {
           "if": { "properties": { "event": { "const": "swapSessionChanged" } } },

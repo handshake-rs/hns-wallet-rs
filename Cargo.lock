@@ -700,7 +700,7 @@ dependencies = [
 [[package]]
 name = "hns-covenants"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -712,7 +712,7 @@ dependencies = [
 [[package]]
 name = "hns-encoding"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "thiserror",
 ]
@@ -720,7 +720,7 @@ dependencies = [
 [[package]]
 name = "hns-header-consensus"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -785,7 +785,7 @@ dependencies = [
 [[package]]
 name = "hns-marketplace-protocol"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -801,7 +801,7 @@ dependencies = [
 [[package]]
 name = "hns-mining"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "blake2",
  "hns-covenants",
@@ -815,7 +815,7 @@ dependencies = [
 [[package]]
 name = "hns-p2p-experimental"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "hex",
  "hns-encoding",
@@ -829,7 +829,7 @@ dependencies = [
 [[package]]
 name = "hns-p2p-wire"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -844,7 +844,7 @@ dependencies = [
 [[package]]
 name = "hns-primitives"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "hex",
  "thiserror",
@@ -853,7 +853,7 @@ dependencies = [
 [[package]]
 name = "hns-script"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "blake2",
  "hns-encoding",
@@ -870,7 +870,7 @@ dependencies = [
 [[package]]
 name = "hns-swap"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "blake2",
  "hns-covenants",
@@ -887,7 +887,7 @@ dependencies = [
 [[package]]
 name = "hns-transaction"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "blake2",
  "hns-covenants",
@@ -899,7 +899,7 @@ dependencies = [
 [[package]]
 name = "hns-urkel-proof"
 version = "0.3.0"
-source = "git+https://github.com/handshake-rs/hns-rs.git?rev=126fee8feb6f9e3e55a753c481ca5c9758870b0c#126fee8feb6f9e3e55a753c481ca5c9758870b0c"
+source = "git+https://github.com/handshake-rs/hns-rs.git?rev=42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8#42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8"
 dependencies = [
  "blake2",
  "hns-primitives",
@@ -1043,6 +1043,7 @@ dependencies = [
  "bdk_wallet",
  "getrandom 0.3.4",
  "hns-header-consensus",
+ "hns-marketplace-protocol",
  "hns-primitives",
  "hns-swap",
  "hns-transaction",
@@ -1050,6 +1051,7 @@ dependencies = [
  "hns-wallet-ffi",
  "hns-wallet-hns",
  "hns-wallet-host",
+ "hns-wallet-market",
  "hns-wallet-provider",
  "hns-wallet-service",
  "hns-wallet-shakedex",
@@ -1081,6 +1083,7 @@ name = "hns-wallet-service"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "hns-marketplace-protocol",
  "hns-wallet-chain-api",
  "hns-wallet-ffi",
  "hns-wallet-hns",

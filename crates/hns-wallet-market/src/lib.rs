@@ -1,12 +1,9 @@
 #![doc = "Chain-neutral, evidence-driven market and atomic-swap workflow state."]
 #![forbid(unsafe_code)]
 
-mod intent_board;
-mod price_board;
+mod direct_board;
 mod session_board;
 mod settlement_key;
-
-use std::collections::BTreeMap;
 
 use hns_marketplace_protocol::{AssetId, ChainId, DeadlineKind, SwapAssetSide, SwapSessionHello};
 use hns_wallet_bitcoin_kyoto::{
@@ -17,32 +14,24 @@ use hns_wallet_chain_api::{Preimage, VerifiedLock};
 use hns_wallet_hns::VerifiedNativeHtlcSpend;
 use hns_wallet_store::{SecretKind, StoreError, WalletStore};
 use hns_wallet_types::{
-    Amount, BaseUnits, ModuleId, ObjectHash, SessionId, WalletAsset, WorkflowId, WorkflowKind,
+    Amount, ModuleId, ObjectHash, SessionId, WalletAsset, WorkflowId, WorkflowKind,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub use intent_board::{
-    DenuoIntentBoardPolicy, DenuoIntentPeerEvent, DenuoIntentPeerSession, DenuoIntentPeerStep,
-    DenuoMarketIntentAdmission, DenuoMarketIntentCancellationAdmission, DenuoMarketIntentRecord,
-    DenuoMarketIntentSnapshot, MAX_DENUO_MARKET_INTENTS, MAX_PENDING_DENUO_INTENT_REQUESTS,
-    admit_denuo_market_intent, admit_denuo_market_intent_cancellation,
-    denuo_market_intent_inventory, load_denuo_market_intent, load_denuo_market_intents,
-    prune_denuo_market_intents,
-};
-pub use price_board::{
-    DenuoPriceRoundAdmission, DenuoPriceRoundPolicy, DenuoPriceRoundSnapshot,
-    DenuoVerifiedPriceRound, MAX_DENUO_PRICE_ROUND_HISTORY, admit_denuo_price_round,
-    bootstrap_denuo_price_round_cache, load_denuo_price_round_cache,
-    load_denuo_verified_price_round,
+pub use direct_board::{
+    DenuoDirectOfferAdmission, DenuoDirectOfferBoardPolicy, DenuoDirectOfferCancellationAdmission,
+    DenuoDirectOfferLevel, DenuoDirectOfferRecord, DenuoDirectOfferSnapshot,
+    MAX_DENUO_DIRECT_OFFERS, admit_denuo_direct_offer, admit_denuo_direct_offer_cancellation,
+    denuo_direct_offer_inventory, live_denuo_direct_offer_levels, load_denuo_direct_offer,
+    load_denuo_direct_offers,
 };
 pub use session_board::{
-    DenuoSwapHandshakeAdmission, DenuoSwapHandshakePolicy, DenuoSwapHandshakeRecord,
-    DenuoSwapHandshakeSnapshot, DenuoSwapHandshakeStage, DenuoSwapPeerStatus,
-    MAX_DENUO_SWAP_HANDSHAKES, admit_denuo_fill_grant, admit_denuo_match_request,
-    admit_denuo_swap_hello, admit_denuo_swap_proposal, load_denuo_swap_handshake,
-    load_denuo_swap_handshakes, validate_denuo_swap_peer_status,
+    DenuoDirectSwapAdmission, DenuoDirectSwapPeerStatus, DenuoDirectSwapPolicy,
+    DenuoDirectSwapRecord, DenuoDirectSwapSnapshot, DenuoDirectSwapStage, MAX_DENUO_DIRECT_SWAPS,
+    admit_denuo_direct_offer_take, admit_denuo_direct_swap_hello, admit_denuo_direct_swap_proposal,
+    load_denuo_direct_swap, load_denuo_direct_swaps, validate_denuo_direct_swap_peer_status,
 };
 pub use settlement_key::{
     CrossChainSwapKey, CrossChainSwapKeyAllocation, CrossChainSwapKeyError,
@@ -50,7 +39,6 @@ pub use settlement_key::{
     derive_cross_chain_swap_key_from_store, load_cross_chain_swap_key_allocation,
 };
 
-pub const MAX_ACTIVE_RESERVATIONS: usize = 64;
 pub const MAX_CONCURRENT_SWAP_SESSIONS: usize = 16;
 
 const DENUO_EXECUTION_WORKFLOW_DOMAIN: &[u8] = b"hns-wallet-rs/denuo-execution-workflow/v1";
@@ -58,7 +46,9 @@ const DENUO_OBSERVED_PREIMAGE_DOMAIN: &[u8] = b"hns-wallet-rs/denuo-observed-pre
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedQuote {
-    pub price_round_hash: ObjectHash,
+    /// Identifier of the signed exact terms that authorized this quote. For a
+    /// direct HNS/BTC swap this is the maker's direct-offer ID.
+    pub terms_id: ObjectHash,
     pub offered: Amount,
     pub received: Amount,
     pub valid_until_unix: u64,
@@ -75,191 +65,6 @@ impl VerifiedQuote {
         }
         Ok(())
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct MarketIntentState {
-    pub intent_id: ObjectHash,
-    pub sequence: u64,
-    pub offered_asset: WalletAsset,
-    pub accepted_asset: WalletAsset,
-    pub total: BaseUnits,
-    pub reserved: BaseUnits,
-    pub completed: BaseUnits,
-    pub minimum_partial_fill: BaseUnits,
-    pub partial_fills: bool,
-    pub expires_at_unix: u64,
-    pub reservations: BTreeMap<SessionId, Reservation>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct MarketIntentParameters {
-    pub intent_id: ObjectHash,
-    pub sequence: u64,
-    pub offered_asset: WalletAsset,
-    pub accepted_asset: WalletAsset,
-    pub total: BaseUnits,
-    pub minimum_partial_fill: BaseUnits,
-    pub partial_fills: bool,
-    pub expires_at_unix: u64,
-}
-
-impl MarketIntentState {
-    pub fn new(parameters: MarketIntentParameters, now_unix: u64) -> Result<Self, MarketError> {
-        if parameters.sequence == 0
-            || parameters.offered_asset == parameters.accepted_asset
-            || parameters.total.is_zero()
-            || parameters.minimum_partial_fill.is_zero()
-            || parameters.minimum_partial_fill > parameters.total
-            || parameters.expires_at_unix <= now_unix
-        {
-            return Err(MarketError::InvalidIntent);
-        }
-        Ok(Self {
-            intent_id: parameters.intent_id,
-            sequence: parameters.sequence,
-            offered_asset: parameters.offered_asset,
-            accepted_asset: parameters.accepted_asset,
-            total: parameters.total,
-            reserved: BaseUnits::ZERO,
-            completed: BaseUnits::ZERO,
-            minimum_partial_fill: parameters.minimum_partial_fill,
-            partial_fills: parameters.partial_fills,
-            expires_at_unix: parameters.expires_at_unix,
-            reservations: BTreeMap::new(),
-        })
-    }
-
-    pub fn available(&self) -> Result<BaseUnits, MarketError> {
-        self.total
-            .checked_sub(self.completed)
-            .and_then(|remaining| remaining.checked_sub(self.reserved))
-            .map_err(|_| MarketError::Invariant)
-    }
-
-    pub fn reserve(
-        &mut self,
-        session_id: SessionId,
-        quote: VerifiedQuote,
-        fill_grant_expires_at_unix: u64,
-        now_unix: u64,
-    ) -> Result<FillGrantState, MarketError> {
-        quote.validate(now_unix)?;
-        self.expire_reservations(now_unix)?;
-        if now_unix >= self.expires_at_unix
-            || fill_grant_expires_at_unix <= now_unix
-            || fill_grant_expires_at_unix > self.expires_at_unix
-            || self.reservations.contains_key(&session_id)
-            || self.reservations.len() >= MAX_ACTIVE_RESERVATIONS
-            || quote.offered.asset != self.offered_asset
-            || quote.received.asset != self.accepted_asset
-            || quote.offered.base_units < self.minimum_partial_fill
-        {
-            return Err(MarketError::ReservationRejected);
-        }
-        let available = self.available()?;
-        if quote.offered.base_units > available
-            || (!self.partial_fills && quote.offered.base_units != available)
-        {
-            return Err(MarketError::ReservationRejected);
-        }
-        self.reserved = self
-            .reserved
-            .checked_add(quote.offered.base_units)
-            .map_err(|_| MarketError::Invariant)?;
-        let reservation_sequence = self
-            .sequence
-            .checked_add(
-                u64::try_from(self.reservations.len()).map_err(|_| MarketError::Invariant)? + 1,
-            )
-            .ok_or(MarketError::Invariant)?;
-        self.reservations.insert(
-            session_id,
-            Reservation {
-                offered: quote.offered.base_units,
-                received: quote.received.base_units,
-                price_round_hash: quote.price_round_hash,
-                expires_at_unix: fill_grant_expires_at_unix,
-                reservation_sequence,
-            },
-        );
-        Ok(FillGrantState {
-            intent_id: self.intent_id,
-            intent_sequence: self.sequence,
-            session_id,
-            offered: quote.offered,
-            received: quote.received,
-            price_round_hash: quote.price_round_hash,
-            expires_at_unix: fill_grant_expires_at_unix,
-            reservation_sequence,
-        })
-    }
-
-    pub fn complete_reservation(&mut self, session_id: SessionId) -> Result<(), MarketError> {
-        let reservation = self
-            .reservations
-            .remove(&session_id)
-            .ok_or(MarketError::UnknownReservation)?;
-        self.reserved = self
-            .reserved
-            .checked_sub(reservation.offered)
-            .map_err(|_| MarketError::Invariant)?;
-        self.completed = self
-            .completed
-            .checked_add(reservation.offered)
-            .map_err(|_| MarketError::Invariant)?;
-        if self.completed > self.total {
-            return Err(MarketError::Invariant);
-        }
-        Ok(())
-    }
-
-    pub fn release_reservation(&mut self, session_id: SessionId) -> Result<(), MarketError> {
-        let reservation = self
-            .reservations
-            .remove(&session_id)
-            .ok_or(MarketError::UnknownReservation)?;
-        self.reserved = self
-            .reserved
-            .checked_sub(reservation.offered)
-            .map_err(|_| MarketError::Invariant)?;
-        Ok(())
-    }
-
-    pub fn expire_reservations(&mut self, now_unix: u64) -> Result<usize, MarketError> {
-        let expired: Vec<_> = self
-            .reservations
-            .iter()
-            .filter_map(|(session, reservation)| {
-                (reservation.expires_at_unix <= now_unix).then_some(*session)
-            })
-            .collect();
-        for session in &expired {
-            self.release_reservation(*session)?;
-        }
-        Ok(expired.len())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct Reservation {
-    pub offered: BaseUnits,
-    pub received: BaseUnits,
-    pub price_round_hash: ObjectHash,
-    pub expires_at_unix: u64,
-    pub reservation_sequence: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct FillGrantState {
-    pub intent_id: ObjectHash,
-    pub intent_sequence: u64,
-    pub session_id: SessionId,
-    pub offered: Amount,
-    pub received: Amount,
-    pub price_round_hash: ObjectHash,
-    pub expires_at_unix: u64,
-    pub reservation_sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -287,9 +92,9 @@ impl TimeoutPlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SwapState {
-    IntentPublished,
-    MatchRequested,
-    FillReserved,
+    OfferPublished,
+    OfferTakeReceived,
+    OfferReserved,
     TermsFrozen,
     RefundsPrepared,
     FirstFundingPending,
@@ -315,7 +120,7 @@ pub struct SwapSession {
     pub second_module: ModuleId,
     pub offered: Amount,
     pub received: Amount,
-    pub price_round_hash: ObjectHash,
+    pub terms_id: ObjectHash,
     pub hashlock: ObjectHash,
     /// Canonical encoded, jointly signed Denuo `SwapSessionHello` for an
     /// execution opened from the Denuo board. Generic non-Denuo sessions keep
@@ -354,12 +159,12 @@ impl SwapSession {
         Ok(Self {
             id,
             revision: 0,
-            state: SwapState::IntentPublished,
+            state: SwapState::OfferPublished,
             first_module,
             second_module,
             offered: quote.offered,
             received: quote.received,
-            price_round_hash: quote.price_round_hash,
+            terms_id: quote.terms_id,
             hashlock,
             accepted_denuo_terms: None,
             timeouts,
@@ -394,14 +199,14 @@ impl SwapSession {
 
     fn transition(&mut self, evidence: VerifiedEvidence, now_unix: u64) -> Result<(), MarketError> {
         let next = match (self.state, evidence) {
-            (SwapState::IntentPublished, VerifiedEvidence::MatchRequestValidated) => {
-                SwapState::MatchRequested
+            (SwapState::OfferPublished, VerifiedEvidence::OfferTakeValidated) => {
+                SwapState::OfferTakeReceived
             }
-            (SwapState::MatchRequested, VerifiedEvidence::FillGrantValidated) => {
-                SwapState::FillReserved
+            (SwapState::OfferTakeReceived, VerifiedEvidence::OfferReserved) => {
+                SwapState::OfferReserved
             }
-            (SwapState::FillReserved, VerifiedEvidence::TermsApproved { price_round_hash })
-                if price_round_hash == self.price_round_hash =>
+            (SwapState::OfferReserved, VerifiedEvidence::TermsApproved { terms_id })
+                if terms_id == self.terms_id =>
             {
                 SwapState::TermsFrozen
             }
@@ -506,39 +311,39 @@ pub fn denuo_execution_workflow_id(session_id: SessionId) -> WorkflowId {
 /// exact existing journal is returned, while any mismatch fails closed.
 pub fn open_denuo_execution(
     store: &mut WalletStore,
-    policy: &DenuoSwapHandshakePolicy,
+    policy: &DenuoDirectSwapPolicy,
     session_id: SessionId,
     now_unix: u64,
 ) -> Result<SwapSession, MarketError> {
-    let record = load_denuo_swap_handshake(store, policy, session_id)?
-        .ok_or(MarketError::UnknownDenuoSwapHandshake)?;
+    let record = load_denuo_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
     let hello = record
         .hello
         .as_ref()
-        .ok_or(MarketError::InvalidDenuoSwapHandshake)?;
+        .ok_or(MarketError::InvalidDenuoDirectSwap)?;
     let expected_accepted_at = record
         .hello_accepted_at_unix
-        .ok_or(MarketError::CorruptDenuoSwapHandshake)?;
+        .ok_or(MarketError::CorruptDenuoDirectSwap)?;
     // Re-authenticate the retained record at its original admission moment.
     // This permits recovery after a funding deadline, but does not let this
     // constructor authorize new funding after that deadline.
     hello
         .verify_agreement(policy.network())
-        .map_err(|_| MarketError::CorruptDenuoSwapHandshake)?;
+        .map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
     verify_canonical_denuo_lock_commitments(hello)?;
     if now_unix < expected_accepted_at {
         return Err(MarketError::InvalidEvidence);
     }
     let encoded_terms = hello
         .encode()
-        .map_err(|_| MarketError::CorruptDenuoSwapHandshake)?;
+        .map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
     let workflow_id = denuo_execution_workflow_id(session_id);
     if let Some(existing) = store.load_workflow::<SwapSession>(workflow_id)? {
         if existing.kind != WorkflowKind::AtomicSwap
             || existing.state.id != session_id
             || existing.state.accepted_denuo_terms.as_deref() != Some(encoded_terms.as_slice())
         {
-            return Err(MarketError::DenuoSwapHandshakeConflict);
+            return Err(MarketError::DenuoDirectSwapConflict);
         }
         return Ok(existing.state);
     }
@@ -646,7 +451,7 @@ impl LocallyVerifiedSwapSpend {
 /// state transition.
 pub fn apply_locally_verified_denuo_funding(
     store: &mut WalletStore,
-    policy: &DenuoSwapHandshakePolicy,
+    policy: &DenuoDirectSwapPolicy,
     session_id: SessionId,
     funding: LocallyVerifiedSwapFunding,
     now_unix: u64,
@@ -654,22 +459,21 @@ pub fn apply_locally_verified_denuo_funding(
     let workflow_id = denuo_execution_workflow_id(session_id);
     let stored = store
         .load_workflow::<SwapSession>(workflow_id)?
-        .ok_or(MarketError::UnknownDenuoSwapHandshake)?;
+        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
     if stored.kind != WorkflowKind::AtomicSwap || stored.state.id != session_id {
-        return Err(MarketError::DenuoSwapHandshakeConflict);
+        return Err(MarketError::DenuoDirectSwapConflict);
     }
     let terms = stored
         .state
         .accepted_denuo_terms
         .as_deref()
-        .ok_or(MarketError::InvalidDenuoSwapHandshake)?;
-    let hello =
-        SwapSessionHello::decode(terms).map_err(|_| MarketError::CorruptDenuoSwapHandshake)?;
+        .ok_or(MarketError::InvalidDenuoDirectSwap)?;
+    let hello = SwapSessionHello::decode(terms).map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
     if hello.encode().ok().as_deref() != Some(terms)
         || SessionId::new(hello.swap_session_id) != session_id
         || hello.verify_agreement(policy.network()).is_err()
     {
-        return Err(MarketError::CorruptDenuoSwapHandshake);
+        return Err(MarketError::CorruptDenuoDirectSwap);
     }
     verify_local_funding_against_denuo_terms(&hello, &funding)?;
     let evidence = match stored.state.state {
@@ -703,7 +507,7 @@ pub fn apply_locally_verified_denuo_funding(
 /// the durable state transition, so an interruption cannot strand recovery.
 pub fn apply_locally_verified_denuo_first_redemption(
     store: &mut WalletStore,
-    policy: &DenuoSwapHandshakePolicy,
+    policy: &DenuoDirectSwapPolicy,
     session_id: SessionId,
     spend: LocallyVerifiedSwapSpend,
     now_unix: u64,
@@ -756,7 +560,7 @@ pub fn apply_locally_verified_denuo_first_redemption(
 /// secret handoff step.
 pub fn apply_locally_verified_denuo_second_redemption(
     store: &mut WalletStore,
-    policy: &DenuoSwapHandshakePolicy,
+    policy: &DenuoDirectSwapPolicy,
     session_id: SessionId,
     spend: LocallyVerifiedSwapSpend,
     now_unix: u64,
@@ -810,7 +614,7 @@ pub fn apply_locally_verified_denuo_second_redemption(
 /// confirmed observation rather than trusting a peer refund status.
 pub fn apply_locally_verified_denuo_refund(
     store: &mut WalletStore,
-    policy: &DenuoSwapHandshakePolicy,
+    policy: &DenuoDirectSwapPolicy,
     session_id: SessionId,
     spend: LocallyVerifiedSwapSpend,
     now_unix: u64,
@@ -871,28 +675,27 @@ pub fn load_locally_verified_denuo_preimage(
 
 fn load_denuo_execution_for_local_evidence(
     store: &WalletStore,
-    policy: &DenuoSwapHandshakePolicy,
+    policy: &DenuoDirectSwapPolicy,
     session_id: SessionId,
     workflow_id: WorkflowId,
 ) -> Result<hns_wallet_store::StoredWorkflow<SwapSession>, MarketError> {
     let stored = store
         .load_workflow::<SwapSession>(workflow_id)?
-        .ok_or(MarketError::UnknownDenuoSwapHandshake)?;
+        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
     if stored.kind != WorkflowKind::AtomicSwap || stored.state.id != session_id {
-        return Err(MarketError::DenuoSwapHandshakeConflict);
+        return Err(MarketError::DenuoDirectSwapConflict);
     }
     let terms = stored
         .state
         .accepted_denuo_terms
         .as_deref()
-        .ok_or(MarketError::InvalidDenuoSwapHandshake)?;
-    let hello =
-        SwapSessionHello::decode(terms).map_err(|_| MarketError::CorruptDenuoSwapHandshake)?;
+        .ok_or(MarketError::InvalidDenuoDirectSwap)?;
+    let hello = SwapSessionHello::decode(terms).map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
     if hello.encode().ok().as_deref() != Some(terms)
         || SessionId::new(hello.swap_session_id) != session_id
         || hello.verify_agreement(policy.network()).is_err()
     {
-        return Err(MarketError::CorruptDenuoSwapHandshake);
+        return Err(MarketError::CorruptDenuoDirectSwap);
     }
     Ok(stored)
 }
@@ -953,7 +756,7 @@ fn verify_local_funding_against_denuo_terms(
         LocallyVerifiedSwapFunding::Bitcoin(lock) => {
             let side = bitcoin_side(hello)?;
             let descriptor = build_denuo_bitcoin_htlc(hello, side)
-                .map_err(|_| MarketError::InvalidDenuoSwapHandshake)?;
+                .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
             let minimum_confirmations = confirmation_minimum(hello, side);
             if lock.value_sats != descriptor.value_sats
                 || lock.confirmation_count < minimum_confirmations
@@ -1021,7 +824,7 @@ fn canonical_hns_descriptor(
             },
         )
         .map(|binding| binding.descriptor)
-        .map_err(|_| MarketError::InvalidDenuoSwapHandshake)
+        .map_err(|_| MarketError::InvalidDenuoDirectSwap)
 }
 
 fn confirmation_minimum(hello: &SwapSessionHello, side: SwapAssetSide) -> u32 {
@@ -1063,17 +866,17 @@ fn verify_canonical_denuo_lock_commitment(
                         SwapAssetSide::Received => hello.taker_settlement_public_key,
                     },
                 )
-                .map_err(|_| MarketError::InvalidDenuoSwapHandshake)?
+                .map_err(|_| MarketError::InvalidDenuoDirectSwap)?
                 .descriptor_hash
         }
         AssetId::BTC => build_denuo_bitcoin_htlc(hello, side)
-            .map_err(|_| MarketError::InvalidDenuoSwapHandshake)?
+            .map_err(|_| MarketError::InvalidDenuoDirectSwap)?
             .commitment
             .into_bytes(),
         _ => return Err(MarketError::InvalidPair),
     };
     if computed != commitment {
-        return Err(MarketError::InvalidDenuoSwapHandshake);
+        return Err(MarketError::InvalidDenuoDirectSwap);
     }
     Ok(())
 }
@@ -1122,7 +925,7 @@ fn swap_session_from_accepted_hello(
         first_module,
         second_module,
         VerifiedQuote {
-            price_round_hash: ObjectHash::new(hello.price_round_hash),
+            terms_id: ObjectHash::new(hello.direct_offer_id),
             offered,
             received,
             // The signed session itself is the source of execution terms;
@@ -1137,8 +940,8 @@ fn swap_session_from_accepted_hello(
         },
         now_unix,
     )?;
-    // The Denuo board has already admitted MatchRequest, FillGrant and the
-    // exact double-signed terms. Persist one execution baseline instead of
+    // The Denuo board has already admitted the exact direct offer, its take,
+    // and the exact double-signed terms. Persist one execution baseline instead of
     // replaying those historic state transitions after a restart.
     session.state = SwapState::TermsFrozen;
     session.revision = 1;
@@ -1171,9 +974,9 @@ fn other_chain(chain: ChainId) -> Result<ChainId, MarketError> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VerifiedEvidence {
-    MatchRequestValidated,
-    FillGrantValidated,
-    TermsApproved { price_round_hash: ObjectHash },
+    OfferTakeValidated,
+    OfferReserved,
+    TermsApproved { terms_id: ObjectHash },
     RefundsValidated,
     FundingReady,
     FirstFundingConfirmed { evidence: ObjectHash },
@@ -1250,56 +1053,36 @@ impl SwapJournal for MemoryJournal {
 
 #[derive(Debug, Eq, Error, PartialEq)]
 pub enum MarketError {
-    #[error("invalid market intent")]
-    InvalidIntent,
     #[error("invalid or stale verified quote")]
     InvalidQuote,
-    #[error("invalid Denuo price-round admission policy")]
-    InvalidDenuoPriceRoundPolicy,
-    #[error("invalid or unexpected canonical Denuo V2 price-round envelope")]
-    InvalidDenuoPriceRound,
-    #[error("Denuo price-round cache was created under another admission policy")]
-    DenuoPriceRoundPolicyMismatch,
-    #[error("Denuo price-round replay, rollback, or equivocation was rejected")]
-    DenuoPriceRoundReplay,
-    #[error("persisted Denuo price-round cache is corrupt or noncanonical")]
-    CorruptDenuoPriceRoundCache,
-    #[error("the retained Denuo price round no longer has its required predecessor")]
-    DenuoPriceRoundHistoryUnavailable,
-    #[error("invalid Denuo market-intent board policy")]
-    InvalidDenuoIntentBoardPolicy,
-    #[error("invalid or unexpected canonical Denuo V2 market-intent envelope")]
-    InvalidDenuoMarketIntent,
-    #[error("Denuo market-intent replay, resurrection, or conflict was rejected")]
-    DenuoMarketIntentReplay,
-    #[error("persisted Denuo market-intent board is corrupt or noncanonical")]
-    CorruptDenuoMarketIntentBoard,
-    #[error("Denuo market-intent board reached its bounded capacity")]
-    DenuoMarketIntentCapacity,
-    #[error("requested Denuo market intent is unknown")]
-    UnknownDenuoMarketIntent,
-    #[error("invalid Denuo bilateral swap-handshake policy")]
-    InvalidDenuoSwapHandshakePolicy,
-    #[error("invalid or unexpected canonical Denuo V2 bilateral swap message")]
-    InvalidDenuoSwapHandshake,
-    #[error("the referenced Denuo price round is not retained locally")]
-    UnknownDenuoPriceRound,
-    #[error("the referenced Denuo bilateral swap handshake is unknown")]
-    UnknownDenuoSwapHandshake,
-    #[error("Denuo bilateral swap handshake conflicts with accepted state")]
-    DenuoSwapHandshakeConflict,
-    #[error("Denuo bilateral swap handshake capacity reached")]
-    DenuoSwapHandshakeCapacity,
-    #[error("persisted Denuo bilateral swap handshake is corrupt or noncanonical")]
-    CorruptDenuoSwapHandshake,
+    #[error("invalid direct HNS/BTC offer-board policy")]
+    InvalidDenuoDirectOfferPolicy,
+    #[error("invalid or unexpected canonical direct HNS/BTC offer envelope")]
+    InvalidDenuoDirectOffer,
+    #[error("direct HNS/BTC offer conflicts with retained signed terms")]
+    DenuoDirectOfferConflict,
+    #[error("persisted direct HNS/BTC offer board is corrupt or noncanonical")]
+    CorruptDenuoDirectOfferBoard,
+    #[error("direct HNS/BTC offer board reached its bounded capacity")]
+    DenuoDirectOfferCapacity,
+    #[error("requested direct HNS/BTC offer is unknown")]
+    UnknownDenuoDirectOffer,
+    #[error("invalid direct HNS/BTC swap policy")]
+    InvalidDenuoDirectSwapPolicy,
+    #[error("invalid or unexpected canonical direct HNS/BTC swap message")]
+    InvalidDenuoDirectSwap,
+    #[error("the referenced direct HNS/BTC swap is unknown")]
+    UnknownDenuoDirectSwap,
+    #[error("direct HNS/BTC swap conflicts with accepted state")]
+    DenuoDirectSwapConflict,
+    #[error("direct HNS/BTC swap capacity reached")]
+    DenuoDirectSwapCapacity,
+    #[error("persisted direct HNS/BTC swap is corrupt or noncanonical")]
+    CorruptDenuoDirectSwap,
     #[error("invalid, unexpected, or resource-exhausting Denuo peer message")]
     InvalidDenuoPeerMessage,
     #[error("unsupported or inconsistent asset pair")]
     InvalidPair,
-    #[error("quantity reservation rejected")]
-    ReservationRejected,
-    #[error("reservation is unknown")]
-    UnknownReservation,
     #[error("unsafe settlement timeouts")]
     UnsafeTimeouts,
     #[error("verified evidence does not permit this transition")]
@@ -1338,35 +1121,11 @@ mod tests {
 
     fn quote() -> VerifiedQuote {
         VerifiedQuote {
-            price_round_hash: ObjectHash::new([3; 32]),
+            terms_id: ObjectHash::new([3; 32]),
             offered: Amount::new(WalletAsset::Hns, 1_000),
             received: Amount::new(WalletAsset::Btc, 25),
             valid_until_unix: 1_000,
         }
-    }
-
-    #[test]
-    fn reservations_cannot_double_spend_and_expiry_releases_quantity() {
-        let mut intent = MarketIntentState::new(
-            MarketIntentParameters {
-                intent_id: ObjectHash::new([1; 32]),
-                sequence: 1,
-                offered_asset: WalletAsset::Hns,
-                accepted_asset: WalletAsset::Btc,
-                total: BaseUnits::new(2_000),
-                minimum_partial_fill: BaseUnits::new(100),
-                partial_fills: true,
-                expires_at_unix: 900,
-            },
-            1,
-        )
-        .expect("intent");
-        let session = SessionId::new([2; 32]);
-        intent.reserve(session, quote(), 20, 10).expect("reserve");
-        assert!(intent.reserve(session, quote(), 21, 11).is_err());
-        assert_eq!(intent.reserved, BaseUnits::new(1_000));
-        assert_eq!(intent.expire_reservations(20).expect("expire"), 1);
-        assert_eq!(intent.reserved, BaseUnits::ZERO);
     }
 
     #[test]
@@ -1387,10 +1146,10 @@ mod tests {
         .expect("session");
         let mut journal = MemoryJournal::default();
         let steps = [
-            VerifiedEvidence::MatchRequestValidated,
-            VerifiedEvidence::FillGrantValidated,
+            VerifiedEvidence::OfferTakeValidated,
+            VerifiedEvidence::OfferReserved,
             VerifiedEvidence::TermsApproved {
-                price_round_hash: ObjectHash::new([3; 32]),
+                terms_id: ObjectHash::new([3; 32]),
             },
             VerifiedEvidence::RefundsValidated,
             VerifiedEvidence::FundingReady,
@@ -1444,10 +1203,10 @@ mod tests {
         .expect("session");
         let mut journal = MemoryJournal::default();
         for evidence in [
-            VerifiedEvidence::MatchRequestValidated,
-            VerifiedEvidence::FillGrantValidated,
+            VerifiedEvidence::OfferTakeValidated,
+            VerifiedEvidence::OfferReserved,
             VerifiedEvidence::TermsApproved {
-                price_round_hash: ObjectHash::new([3; 32]),
+                terms_id: ObjectHash::new([3; 32]),
             },
             VerifiedEvidence::RefundsValidated,
             VerifiedEvidence::FundingReady,
@@ -1486,7 +1245,7 @@ mod tests {
                 created_at: 10,
                 expires_at: 900,
             },
-            fill_grant_hash: [3; 32],
+            direct_offer_id: [3; 32],
             swap_session_id: [4; 32],
             maker_settlement_public_key: [2; 33],
             taker_settlement_public_key: [3; 33],
@@ -1494,7 +1253,6 @@ mod tests {
             offered_amount: AssetAmount::new(1_000),
             received_asset: AssetId::BTC,
             received_amount: AssetAmount::new(25),
-            price_round_hash: [5; 32],
             hashlock: [6; 32],
             first_funding_chain,
             offered_lock_commitment: [7; 32],

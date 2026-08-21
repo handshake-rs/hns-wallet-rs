@@ -757,7 +757,9 @@ mod tests {
                 .expect("recover after reopen");
             assert_eq!(recovered.public_key(), allocated.compressed_public_key());
         }
-        std::fs::remove_file(path).expect("remove test database");
+        std::fs::remove_file(&path).expect("remove test database");
+        std::fs::remove_dir(path.parent().expect("test database directory"))
+            .expect("remove test database directory");
     }
 
     #[test]
@@ -777,7 +779,7 @@ mod tests {
 
         let mut hello = SwapSessionHello {
             header: header(network()),
-            fill_grant_hash: [10; 32],
+            direct_offer_id: [10; 32],
             swap_session_id: maker_request.session_id.into_bytes(),
             maker_settlement_public_key: maker.public_key(),
             taker_settlement_public_key: taker.public_key(),
@@ -785,7 +787,6 @@ mod tests {
             offered_amount: AssetAmount::new(1_000),
             received_asset: AssetId::BTC,
             received_amount: AssetAmount::new(10_000),
-            price_round_hash: [13; 32],
             hashlock: [14; 32],
             first_funding_chain: ChainId::HANDSHAKE,
             offered_lock_commitment: [0; 32],
@@ -825,9 +826,17 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("system time")
             .as_nanos();
-        std::env::temp_dir().join(format!(
-            "hns-wallet-cross-chain-key-{}-{nanos}.sqlite",
+        let directory = std::env::temp_dir().join(format!(
+            "hns-wallet-cross-chain-key-{}-{nanos}",
             std::process::id()
-        ))
+        ));
+        std::fs::create_dir(&directory).expect("create test database directory");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &directory,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("restrict test database directory");
+        directory.join("wallet.sqlite")
     }
 }

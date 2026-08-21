@@ -434,54 +434,25 @@ board, and signing state under one decrypted-key authority without reopening
 SQLite or deadlocking when the HNS runtime re-enters the store. This
 composition work does not alter any release gate.
 
-## Market intents and sessions
+## Direct HNS/BTC offers and sessions
 
-Market intents freeze offered/received integer amounts and a verified price-
-round hash. Reservations enforce expiration, partial-fill policy, available
-quantity, monotonic sequences, and double-reservation prevention. Peers cannot
-advance a swap by claiming funding/redeem/refund; only verified evidence can.
+The cross-chain Denuo path is a direct, signed fixed-terms HNS/BTC board. A
+maker chooses one indivisible pair of integer amounts; a taker selects that
+specific offer. The protocol carries no price round, price reporter, source,
+oracle, external feed, historical rate, partial-fill reservation, or matching
+engine. A live board may group active offers by their exact BTC-per-HNS ratio,
+but that is presentation only and never changes the signed settlement amounts.
 
-The session state includes terms frozen, refunds prepared, first/second funding,
-both funded, first redemption, secret observation, second redemption,
-completion, refund eligibility/broadcast/refunded, and terminal failure. Timeout
-plans require the first refund to exceed the second by a safety margin. The
-canonical funding order is the side with the longer refund window first; the
-shorter side funds only after sufficient confirmation evidence, preserving time
-for secret observation and the first-chain redemption.
+An offer take binds the original offer ID to one swap-session ID and a distinct
+taker settlement key. The maker proposal and the accepted session hello bind
+both settlement authorities, the original terms, hashlock, descriptor
+commitments, confirmation requirements, and asymmetric refund deadlines. Peers
+cannot advance a swap by claiming funding, redemption, or refund; every value
+transition requires independently verified local chain evidence.
 
-HNS/BTC uses SHA-256 native HTLCs on both chains. HNS/ETH uses the HNS script
-and the approved native-ETH contract. Neither pair is advertised because full
-HNS adapters, Bitcoin signed settlement, Helios runtime evidence, integrated
-success/refund/restart/reorg tests, and real-network qualification are absent.
-Ethereum synchronization, history, send, authoritative evidence, and settlement
-permits are unavailable, and chain ID 1 is rejected unconditionally.
-
-## Price rounds and Denuo
-
-Canonical reporter observations, quorum rounds, intents, fill grants, name
-offers, cancellations, and swap messages live in the
-`hns-marketplace-protocol` boundary in `hns-rs`. The wallet consumes it only at
-the pinned immutable revision, never through a sibling path. The fixed-price
-name board consumes its canonical Denuo envelopes. A separate wallet-market
-cache admits only canonical V2 zero-request-ID `PriceRound` gossip whose
-network, pair, signatures, quorum, sources, time bounds, linked interval, and
-circuit breaker satisfy an exact caller-owned policy. A fresh cache accepts an
-unlinked current round or an exact predecessor checkpoint plus its linked
-current round; it does not prove ancestry before a non-genesis checkpoint. The
-caller supplies `accepted_at_unix` from a trusted local/product clock, never
-from the peer or browser, and freshness is relative only to that input.
-
-The encrypted CAS head aligns durable-overall and retired-prefix sequence high-
-watermarks with the policy's canonical sorted reporter list and advances an
-authenticated linked suffix capped at 128 rounds. A seen reporter must advance
-its nonzero sequence even after omission or suffix pruning. Pruning removes the
-old round hash and ID from duplicate detection while retaining those reporter
-high-watermarks. Load re-decodes and exactly re-encodes every retained row,
-verifies all adjacent links and policy bindings, and replays retained
-observations from the authenticated retired-prefix boundary to the durable
-high-watermarks. The public snapshot remains metadata only, provides no
-automatic quote conversion, and does not itself confer price, chain, or value
-authority. Stored anchors are not checked against live chains. Price governance,
-reporter enrollment, peer cooldown/scoring, live anchor verification, relay/
-browser integration, and product qualification remain unavailable; every
-release gate remains false.
+The longer-deadline offered-asset lock funds first. The other side funds only
+after the required confirmation evidence, preserving time for preimage
+observation and first-chain redemption. HNS/BTC uses SHA-256 native HTLCs on
+both chains. The Android product still requires complete wallet-controlled
+fund/redeem/refund execution, direct-peer transport/UI wiring, recovery and
+reorg testing, and release qualification before it can advertise settlement.
