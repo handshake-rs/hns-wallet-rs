@@ -26,6 +26,7 @@ hns-light-p2p.workspace = true
 hns-light-sync.workspace = true
 hns-light-wallet.workspace = true
 hns-marketplace-protocol.workspace = true
+hns-p2p-experimental.workspace = true
 hns-p2p-wire.workspace = true
 hns-primitives.workspace = true
 hns-script.workspace = true

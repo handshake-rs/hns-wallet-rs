@@ -32,8 +32,8 @@ pub use name_workflow::{
 };
 pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
 pub use peer_coordinator::{
-    ConnectedHnsPeer, HnsBlockScanProgress, HnsDirectPeerConfig, HnsDirectPeerCoordinator,
-    HnsDirectPeerError, HnsHeaderRoundProgress, NativeHnsPeerPool,
+    ConnectedHnsPeer, HnsBlockScanProgress, HnsDirectDenuoPeer, HnsDirectPeerConfig,
+    HnsDirectPeerCoordinator, HnsDirectPeerError, HnsHeaderRoundProgress, NativeHnsPeerPool,
     open_wallet_direct_hns_peer_coordinator, open_wallet_direct_hns_peer_coordinator_with_floor,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap,
 };
