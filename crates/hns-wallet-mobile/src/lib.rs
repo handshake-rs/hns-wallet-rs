@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod bitcoin;
+mod market;
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -10,6 +11,7 @@ pub use bitcoin::{
     MobileBitcoinBroadcastReceipt, MobileBitcoinDirectConfig, MobileBitcoinSendApproval,
     MobileBitcoinSnapshot, MobileBitcoinValueController,
 };
+pub use market::MobileDenuoSessionController;
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
 use hns_swap::NetworkBinding;
@@ -1908,6 +1910,8 @@ pub enum MobileWalletError {
     BitcoinActionExpired,
     #[error("the direct Bitcoin send request is invalid")]
     InvalidBitcoinAction,
+    #[error("the direct Denuo HNS/Bitcoin session message is invalid")]
+    InvalidDenuoSessionMessage,
     #[error("private wallet host/service response was unexpected")]
     UnexpectedResponse,
     #[error("private mobile wallet controller failed closed and must be reopened")]
@@ -1937,6 +1941,8 @@ pub enum MobileWalletError {
     DirectHns(#[from] HnsDirectPeerError),
     #[error(transparent)]
     Bitcoin(#[from] hns_wallet_bitcoin_kyoto::BitcoinWalletError),
+    #[error(transparent)]
+    Market(#[from] hns_wallet_market::MarketError),
     #[error(transparent)]
     Host(#[from] HostError),
     #[error(transparent)]
