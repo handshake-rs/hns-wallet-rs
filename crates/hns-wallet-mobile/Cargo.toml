@@ -14,6 +14,7 @@ publish = ["crates-io"]
 
 [dependencies]
 getrandom.workspace = true
+hns-header-consensus.workspace = true
 hns-primitives.workspace = true
 hns-swap.workspace = true
 hns-wallet-ffi.workspace = true

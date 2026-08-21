@@ -918,6 +918,59 @@ pub fn open_wallet_direct_hns_peer_coordinator_with_floor(
     rollback_floor: HnsLightFloor,
     now_unix: u64,
 ) -> Result<HnsDirectPeerCoordinator, HnsDirectPeerError> {
+    open_wallet_direct_hns_peer_coordinator_with_initializer(
+        store,
+        account,
+        peer_config,
+        rollback_floor,
+        now_unix,
+        |_| Ok(()),
+    )
+}
+
+/// Open a direct coordinator after replacing a pristine new-wallet genesis
+/// checkpoint with a locally verified, product-pinned header acceleration
+/// stream. The stream is never peer authority: after it is committed the
+/// coordinator remains in header-syncing state and requires fresh direct-peer
+/// agreement before it can issue current-chain evidence.
+pub fn open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap<I>(
+    store: SharedWalletStore,
+    account: &HnsRuntimeConfig,
+    peer_config: HnsDirectPeerConfig,
+    rollback_floor: HnsLightFloor,
+    expected_height: u32,
+    expected_hash: [u8; 32],
+    headers: I,
+    now_unix: u64,
+) -> Result<HnsDirectPeerCoordinator, HnsDirectPeerError>
+where
+    I: IntoIterator<Item = Header>,
+{
+    open_wallet_direct_hns_peer_coordinator_with_initializer(
+        store,
+        account,
+        peer_config,
+        rollback_floor,
+        now_unix,
+        |authority| {
+            authority
+                .bootstrap_from_genesis_headers(headers, expected_height, expected_hash, now_unix)
+                .map(|_| ())
+        },
+    )
+}
+
+fn open_wallet_direct_hns_peer_coordinator_with_initializer<F>(
+    store: SharedWalletStore,
+    account: &HnsRuntimeConfig,
+    peer_config: HnsDirectPeerConfig,
+    rollback_floor: HnsLightFloor,
+    now_unix: u64,
+    initialize_authority: F,
+) -> Result<HnsDirectPeerCoordinator, HnsDirectPeerError>
+where
+    F: FnOnce(&mut EncryptedHnsLightAuthority) -> Result<(), crate::HnsLightError>,
+{
     account
         .validate_structure()
         .map_err(HnsDirectPeerError::Wallet)?;
@@ -935,7 +988,7 @@ pub fn open_wallet_direct_hns_peer_coordinator_with_floor(
         round_timeout_seconds: peer_config.connect_timeout.as_secs(),
         max_peer_failures: 3,
     };
-    let authority = EncryptedHnsLightAuthority::open_or_create(
+    let mut authority = EncryptedHnsLightAuthority::open_or_create(
         store.clone(),
         account.account_id,
         account.network,
@@ -946,6 +999,8 @@ pub fn open_wallet_direct_hns_peer_coordinator_with_floor(
         sync_config,
     )
     .map_err(|error| HnsDirectPeerError::LightAuthority(error.to_string()))?;
+    initialize_authority(&mut authority)
+        .map_err(|error| HnsDirectPeerError::LightAuthority(error.to_string()))?;
     let mut index = EncryptedHnsLightIndex::open_or_create(
         store,
         account.account_id,
