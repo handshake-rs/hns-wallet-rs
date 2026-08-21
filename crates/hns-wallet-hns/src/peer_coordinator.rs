@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs}
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use hns_covenants::{hash_name, validate_name};
 use hns_header_consensus::{Header, Network};
 use hns_light_chain::ChainLimits;
 use hns_light_p2p::{
@@ -655,6 +656,24 @@ impl HnsDirectPeerCoordinator {
             self.disconnect_peer(id)?;
         }
         verified.ok_or(HnsDirectPeerError::NoValidNameProof)
+    }
+
+    /// Fetch and locally verify one exact Handshake name proof from ordinary
+    /// peers. The textual name is validated and hashed inside the wallet
+    /// boundary so mobile callers cannot substitute a different proof key.
+    pub fn synchronize_name_proof_exact_text(
+        &self,
+        name: &str,
+        now_unix: u64,
+    ) -> Result<VerifiedHnsNameProof, HnsDirectPeerError> {
+        let name = name.as_bytes();
+        if !validate_name(name) {
+            return Err(HnsWalletError::InvalidName.into());
+        }
+        let name_hash = hash_name(name)
+            .map_err(|_| HnsWalletError::InvalidName)?
+            .into_bytes();
+        self.synchronize_name_proof(name_hash, now_unix)
     }
 
     /// Scan a bounded sequential header range using the same Bloom filter on
