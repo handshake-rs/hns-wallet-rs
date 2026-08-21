@@ -392,6 +392,35 @@ pub fn receive_address(
     encode_v0_address(network, &program)
 }
 
+/// Derive an ordinary payment receive target from authenticated wallet-local
+/// state. Callers fence the selected account before and after this helper; it
+/// never contacts a backend, mutates the store, or advances a derivation
+/// index.
+fn local_hns_payment_receive_target(
+    store: &SharedWalletStore,
+    account: &HnsAccountRecord,
+) -> Result<ReceiveTarget, HnsWalletError> {
+    let derivation = DerivationReference {
+        role: KeyRole::HnsCoin,
+        account: account_number(account),
+        change: 0,
+        index: account.next_receive_index,
+    };
+    store.try_with_store(|store| {
+        let public_key = derive_hns_public_key(store, account.config.wallet_id, derivation)?;
+        let target = ReceiveTarget {
+            module: ModuleId::Handshake,
+            account: account.config.account_id,
+            display: receive_address(account.config.network, &public_key)?,
+            derivation_index: derivation.index,
+        };
+        target
+            .validate()
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        Ok(target)
+    })
+}
+
 fn encode_v0_address(network: HnsNetwork, program: &[u8]) -> Result<String, HnsWalletError> {
     let hrp = Hrp::parse(network.hrp()).map_err(|_| HnsWalletError::Address)?;
     segwit::encode_v0(hrp, program).map_err(|_| HnsWalletError::Address)
@@ -2211,6 +2240,26 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
         self.selector.selected_account_with_revision()
     }
 
+    /// Derive the current ordinary HNS payment receive target using only the
+    /// authenticated local account and encrypted wallet seed.
+    ///
+    /// This deliberately performs no node, peer, mempool, clock, or store
+    /// mutation operation. It is therefore safe to expose immediately after a
+    /// successful local unlock, while balance, history, name ownership, and
+    /// spending remain synchronization-gated.
+    pub fn local_receive_target(&self) -> Result<ReceiveTarget, HnsWalletError> {
+        let _synchronization = self
+            .synchronization
+            .lock()
+            .map_err(|_| HnsWalletError::RuntimePoisoned)?;
+        let selected = self.selector.selected_account_with_revision()?;
+        let target = local_hns_payment_receive_target(&self.store, &selected.account)?;
+        if self.selector.selected_account_with_revision()? != selected {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        Ok(target)
+    }
+
     /// Return the configured account network without consulting caller input.
     pub const fn configured_network(&self) -> HnsNetwork {
         self.selector.expected.network
@@ -3198,6 +3247,19 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             account,
             revision: current_revision,
         })
+    }
+
+    /// Derive the current ordinary HNS payment receive target from the exact
+    /// authenticated local account. Unlike the `ChainModule` receive method,
+    /// this does not assert a synchronized chain view and does not contact a
+    /// backend. It is intended only for the trusted native receive UI.
+    pub fn local_receive_target(&self) -> Result<ReceiveTarget, HnsWalletError> {
+        let selected = self.selected_account_with_revision()?;
+        let target = local_hns_payment_receive_target(&self.store, &selected.account)?;
+        if self.selected_account_with_revision()? != selected {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        Ok(target)
     }
 
     /// Observe the exact full-runtime account, Shakedex network, and trusted
@@ -8017,24 +8079,8 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
     fn receive_target(&self) -> Result<ReceiveTarget, ChainError> {
         let cache = self.cache_read().map_err(map_chain_error)?;
         ensure_ready(&cache)?;
-        let account = cache.account.clone();
         drop(cache);
-        let derivation = DerivationReference {
-            role: KeyRole::HnsCoin,
-            account: account_number(&account),
-            change: 0,
-            index: account.next_receive_index,
-        };
-        let store = self.store_lock().map_err(map_chain_error)?;
-        let public_key = derive_hns_public_key(&store, account.config.wallet_id, derivation)
-            .map_err(map_chain_error)?;
-        Ok(ReceiveTarget {
-            module: ModuleId::Handshake,
-            account: account.config.account_id,
-            display: receive_address(account.config.network, &public_key)
-                .map_err(map_chain_error)?,
-            derivation_index: derivation.index,
-        })
+        self.local_receive_target().map_err(map_chain_error)
     }
 
     fn prepare_send(&self, request: SendRequest) -> Result<PreparedSend, ChainError> {

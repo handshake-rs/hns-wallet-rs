@@ -2406,6 +2406,26 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsR
         Ok(snapshot)
     }
 
+    /// Return the ordinary payment receive target derivable from the exact
+    /// unlocked local account. This is intentionally separate from the
+    /// synchronized read projection: it makes no backend request and conveys
+    /// no balance, history, name, or spend authority.
+    pub fn local_trusted_native_hns_receive_target(&self) -> Result<ReceiveTarget, ServiceFailure> {
+        let selected = self.runtime.exact_account()?;
+        let target = self
+            .runtime
+            .runtime
+            .local_receive_target()
+            .map_err(hns_read_failure)?;
+        if target.module != ModuleId::Handshake
+            || target.account != selected.account_id
+            || target.validate().is_err()
+        {
+            return Err(hns_read_failure(HnsWalletError::InvalidEvidence));
+        }
+        Ok(target)
+    }
+
     /// Import one exact canonical name through the trusted native boundary.
     /// This method is intentionally absent from `ServiceRuntime`, provider
     /// dispatch, the browser ABI, and the capability vocabulary. The runtime

@@ -1502,6 +1502,28 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         })
     }
 
+    /// Return the ordinary payment receive target derivable from the exact
+    /// unlocked local account. This performs no HNS reconciliation, Denuo
+    /// recovery, Bitcoin activation, peer exchange, or value operation.
+    /// Balances, history, and spending continue to require synchronization.
+    pub fn local_trusted_native_hns_value_receive_target(
+        &self,
+    ) -> Result<ReceiveTarget, ServiceFailure> {
+        let selected = self.runtime.exact_account()?;
+        let target = self
+            .runtime
+            .runtime
+            .local_receive_target()
+            .map_err(hns_runtime_failure)?;
+        if target.module != ModuleId::Handshake
+            || target.account != selected.account_id
+            || target.validate().is_err()
+        {
+            return Err(hns_runtime_failure(HnsWalletError::InvalidEvidence));
+        }
+        Ok(target)
+    }
+
     /// Return seconds from the exact clock authority retained by the signing
     /// runtime. Native approval expiry and execution therefore cannot be bound
     /// to a separately configurable UI clock.

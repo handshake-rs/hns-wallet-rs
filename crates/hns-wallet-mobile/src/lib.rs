@@ -1005,6 +1005,29 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
         Ok(self.synchronize()?.receive_target)
     }
 
+    /// Return the ordinary HNS payment receive target deterministically
+    /// derived from the unlocked local wallet. This deliberately does not
+    /// synchronize a node or peer and therefore must not be used as balance,
+    /// history, name, or spend evidence.
+    pub fn local_receive_target(&mut self) -> Result<ReceiveTarget, MobileWalletError> {
+        let result = (|| {
+            if self.session.failed {
+                return Err(MobileWalletError::ControllerFailed);
+            }
+            let target = self
+                .session
+                .service
+                .local_trusted_native_hns_receive_target()
+                .map_err(mobile_service_failure)?;
+            validate_mobile_hns_payment_receive_target(self.account_config.account_id, &target)?;
+            Ok(target)
+        })();
+        if result.is_err() {
+            self.session.lock_after_request_error();
+        }
+        result
+    }
+
     /// Return the dedicated `HnsName`, change-zero receive target from one new
     /// bounded synchronization. This target is never an ordinary HNS payment
     /// receive address.
@@ -1246,6 +1269,32 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             return Err(MobileWalletError::ValueActionPending);
         }
         let result = self.synchronize_inner();
+        if result.is_err() {
+            self.session.lock_after_request_error();
+        }
+        result
+    }
+
+    /// Return the ordinary HNS payment receive target deterministically
+    /// derived from the unlocked local wallet. No HNS, Bitcoin, Denuo, or
+    /// clock operation occurs here; fund state and value operations still
+    /// require a separately completed reconciliation.
+    pub fn local_receive_target(&mut self) -> Result<ReceiveTarget, MobileWalletError> {
+        if self.pending.is_some() {
+            return Err(MobileWalletError::ValueActionPending);
+        }
+        let result = (|| {
+            if self.session.failed {
+                return Err(MobileWalletError::ControllerFailed);
+            }
+            let target = self
+                .session
+                .service
+                .local_trusted_native_hns_value_receive_target()
+                .map_err(mobile_service_failure)?;
+            validate_mobile_hns_payment_receive_target(self.account_config.account_id, &target)?;
+            Ok(target)
+        })();
         if result.is_err() {
             self.session.lock_after_request_error();
         }
@@ -1711,17 +1760,28 @@ fn validate_mobile_hns_receive_targets(
     receive_target: &ReceiveTarget,
     name_receive_target: &HnsNameReceiveTarget,
 ) -> Result<(), MobileWalletError> {
-    if receive_target.module != ModuleId::Handshake
-        || receive_target.account != expected_account
-        || name_receive_target.module != ModuleId::Handshake
+    validate_mobile_hns_payment_receive_target(expected_account, receive_target)?;
+    if name_receive_target.module != ModuleId::Handshake
         || name_receive_target.account != expected_account
-        || receive_target.validate().is_err()
         || name_receive_target.validate().is_err()
-        || !receive_target
+        || !name_receive_target
             .display
             .bytes()
             .all(|byte| (0x20..=0x7e).contains(&byte))
-        || !name_receive_target
+    {
+        return Err(MobileWalletError::Hns(HnsWalletError::InvalidEvidence));
+    }
+    Ok(())
+}
+
+fn validate_mobile_hns_payment_receive_target(
+    expected_account: AccountId,
+    receive_target: &ReceiveTarget,
+) -> Result<(), MobileWalletError> {
+    if receive_target.module != ModuleId::Handshake
+        || receive_target.account != expected_account
+        || receive_target.validate().is_err()
+        || !receive_target
             .display
             .bytes()
             .all(|byte| (0x20..=0x7e).contains(&byte))
@@ -2499,6 +2559,12 @@ mod tests {
             .expect("compose direct value wallet");
 
         value.unlock(&key).expect("unlock must not synchronize");
+        let receive = value
+            .local_receive_target()
+            .expect("local value receive target after unlock");
+        assert_eq!(receive.module, ModuleId::Handshake);
+        assert_eq!(receive.account, value.account_config().account_id);
+        assert!(receive.display.starts_with("rs1"));
         assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 0);
         assert_eq!(probe.tip_calls.load(Ordering::SeqCst), 0);
         assert_eq!(probe.confirmed_calls.load(Ordering::SeqCst), 0);
@@ -2670,6 +2736,17 @@ mod tests {
         assert_eq!(accounts.len(), 1);
         assert_eq!(accounts[0].account_id, expected_account);
         assert_eq!(accounts[0].receive_display, None);
+
+        let local_receive = reads
+            .local_receive_target()
+            .expect("local payment receive target after unlock");
+        assert_eq!(local_receive.module, ModuleId::Handshake);
+        assert_eq!(local_receive.account, expected_account);
+        assert!(local_receive.display.starts_with("rs1"));
+        assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.tip_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.confirmed_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.mempool_calls.load(Ordering::SeqCst), 0);
 
         let before = probe.snapshot_calls.load(Ordering::SeqCst);
         let snapshot = reads.synchronize().expect("synchronized mobile snapshot");
