@@ -49,8 +49,9 @@ pub use native_read_profile::{
     provision_native_hns_read_profile, revoke_native_hns_read_profile,
 };
 pub use native_value_runtime::{
-    NativeHnsValueSnapshot, PersistentHnsValueConfig, PersistentHnsValueRuntime,
-    PersistentShakedexConfig, TRUSTED_NATIVE_HNS_VALUE_ORIGIN, TrustedNativeHnsValueAction,
+    NativeHnsValueSnapshot, PersistentDenuoTransport, PersistentHnsValueConfig,
+    PersistentHnsValueRuntime, PersistentShakedexConfig, TRUSTED_NATIVE_HNS_VALUE_ORIGIN,
+    TrustedNativeHnsValueAction,
 };
 
 pub const MAX_SEEN_REQUEST_IDS: usize = 4_096;

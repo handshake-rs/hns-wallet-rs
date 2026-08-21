@@ -114,7 +114,19 @@ pub struct PersistentHnsValueConfig<B, C> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistentShakedexConfig {
     pub seller_policy: ShakedexSellerPolicy,
-    pub acceptance_policy: DenuoPublicationAcceptancePolicy,
+    pub transport: PersistentDenuoTransport,
+}
+
+/// Transport policy for the native Denuo board.
+///
+/// `WalletPeers` keeps discovery, replication, and board admission in the
+/// participating wallets. It deliberately has no endpoint receipt or
+/// server-authority input. `RelayAcceptance` is retained only for existing
+/// explicit relay deployments; it is not selected by the direct wallet flow.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PersistentDenuoTransport {
+    WalletPeers,
+    RelayAcceptance(DenuoPublicationAcceptancePolicy),
 }
 
 /// Provider-capable HNS runtime with one exact account and one exact encrypted
@@ -363,14 +375,22 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
 
     fn sync_shakedex_transport(&self) -> Result<(), ServiceFailure> {
         let config = self.require_shakedex()?;
-        DenuoTransportRuntime::new(
-            &self.runtime,
-            self.store.clone(),
-            config.acceptance_policy.clone(),
-        )
-        .and_then(|transport| transport.sync())
-        .map(|_| ())
-        .map_err(shakedex_failure)
+        match &config.transport {
+            // Wallet-peer replication is driven by an owned, negotiated P2P
+            // session. A provider/UI call must never silently make an RPC or
+            // relay request in that mode.
+            PersistentDenuoTransport::WalletPeers => Ok(()),
+            PersistentDenuoTransport::RelayAcceptance(acceptance_policy) => {
+                DenuoTransportRuntime::new(
+                    &self.runtime,
+                    self.store.clone(),
+                    acceptance_policy.clone(),
+                )
+                .and_then(|transport| transport.sync())
+                .map(|_| ())
+                .map_err(shakedex_failure)
+            }
+        }
     }
 
     fn parse_market_params<T: DeserializeOwned>(
@@ -1563,8 +1583,12 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         if config.shakedex.as_ref().is_some_and(|shakedex| {
             !configured.settlement_enabled
                 || shakedex.seller_policy.validate().is_err()
-                || config.runtime.shakedex_network().ok()
-                    != Some(shakedex.acceptance_policy.network())
+                || matches!(
+                    &shakedex.transport,
+                    PersistentDenuoTransport::RelayAcceptance(acceptance_policy)
+                        if config.runtime.shakedex_network().ok()
+                            != Some(acceptance_policy.network())
+                )
         }) {
             return Err(ServiceError::InvalidPersistentHnsAccount);
         }
@@ -1669,6 +1693,7 @@ fn publication_state(state: hns_wallet_shakedex::DenuoOutboxState) -> &'static s
         DenuoOutboxState::HandoffPrepared { .. } => "handoffPrepared",
         DenuoOutboxState::RetryScheduled { .. } => "retryScheduled",
         DenuoOutboxState::RelayAccepted { .. } => "relayAccepted",
+        DenuoOutboxState::DirectAnnounced { .. } => "directAnnounced",
         DenuoOutboxState::Acknowledged { .. } => "acknowledged",
         DenuoOutboxState::Exhausted { .. } => "exhausted",
     }

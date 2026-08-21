@@ -16,9 +16,10 @@ use hns_wallet_ffi::{
 /// host can instead open the wallet-owned direct peer coordinator below and
 /// compose its [`EmbeddedHnsBackend`] without endpoint credentials.
 pub use hns_wallet_hns::{
-    EmbeddedHnsBackend, HnsBackend, HnsBootstrapPolicy, HnsClock, HnsDirectPeerConfig,
-    HnsDirectPeerCoordinator, HnsDirectPeerError, HnsHeaderRoundProgress, HnsLightFloor,
-    HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig, SystemClock as HnsReadSystemClock,
+    EmbeddedHnsBackend, HnsBackend, HnsBootstrapPolicy, HnsClock, HnsDirectDenuoListener,
+    HnsDirectDenuoPeer, HnsDirectPeerConfig, HnsDirectPeerCoordinator, HnsDirectPeerError,
+    HnsHeaderRoundProgress, HnsLightFloor, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
+    SystemClock as HnsReadSystemClock,
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountRecord, HnsExistingAccountSelector, HnsRuntimeConfig,
@@ -34,10 +35,11 @@ use hns_wallet_provider::{
 };
 use hns_wallet_service::{
     MAX_JAVASCRIPT_SAFE_INTEGER, NativeHnsNameOwnershipStatus, NativeHnsNameResourceStatus,
-    NativeHnsNameSummary, NativeHnsValueSnapshot, PersistentHnsAccountConfig,
-    PersistentHnsAccountRuntime, PersistentHnsReadConfig, PersistentHnsReadRuntime,
-    PersistentHnsValueConfig, PersistentHnsValueRuntime, PersistentShakedexConfig, ServiceError,
-    ServiceRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN, TrustedNativeHnsValueAction, WalletService,
+    NativeHnsNameSummary, NativeHnsValueSnapshot, PersistentDenuoTransport,
+    PersistentHnsAccountConfig, PersistentHnsAccountRuntime, PersistentHnsReadConfig,
+    PersistentHnsReadRuntime, PersistentHnsValueConfig, PersistentHnsValueRuntime,
+    PersistentShakedexConfig, ServiceError, ServiceRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN,
+    TrustedNativeHnsValueAction, WalletService,
 };
 use hns_wallet_shakedex::{
     DenuoHnsaEndpointBinding, DenuoHrmRootBinding, DenuoPublicationAcceptancePolicy,
@@ -741,8 +743,10 @@ impl MobileWalletController {
         self.into_hns_value_with_clock(database_key, backend, HnsReadSystemClock, shakedex)
     }
 
-    /// Activate the complete native HNS and Shakedex composition from the
-    /// exact public acceptance-policy file also installed in the Denuo relay.
+    /// Activate the complete native HNS and Shakedex composition from an
+    /// exact public relay-acceptance policy. This explicit legacy path is
+    /// retained for deployments that choose a relay; the wallet-owned direct
+    /// path below does not use or require it.
     /// Marketplace fees are disabled; neither Android nor iOS can supply a fee
     /// destination through this path.
     pub fn into_hns_value_with_shakedex_policy<B: HnsBackend>(
@@ -753,6 +757,27 @@ impl MobileWalletController {
     ) -> Result<MobileHnsValueController<B>, MobileWalletError> {
         let shakedex = mobile_shakedex_config(acceptance_policy_json)?;
         self.into_hns_value(database_key, backend, Some(shakedex))
+    }
+
+    /// Activate the complete native HNS and Shakedex composition with the
+    /// board replicated only over negotiated wallet-owned direct peers.
+    ///
+    /// No relay URL, endpoint key, HRM retrieval, HNSA delegation, or
+    /// acceptance receipt is an authority input in this mode. Listings remain
+    /// subject to the wallet's local chain and current-lock verification.
+    pub fn into_hns_value_with_wallet_owned_direct_shakedex<B: HnsBackend>(
+        self,
+        database_key: &MobileDatabaseKey,
+        backend: B,
+    ) -> Result<MobileHnsValueController<B>, MobileWalletError> {
+        self.into_hns_value(
+            database_key,
+            backend,
+            Some(PersistentShakedexConfig {
+                seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
+                transport: PersistentDenuoTransport::WalletPeers,
+            }),
+        )
     }
 
     /// Clock-injectable value activation for deterministic installed products
@@ -1754,7 +1779,7 @@ fn mobile_shakedex_config(json: &[u8]) -> Result<PersistentShakedexConfig, Mobil
     .map_err(|_| MobileWalletError::InvalidShakedexConfiguration)?;
     Ok(PersistentShakedexConfig {
         seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
-        acceptance_policy,
+        transport: PersistentDenuoTransport::RelayAcceptance(acceptance_policy),
     })
 }
 
