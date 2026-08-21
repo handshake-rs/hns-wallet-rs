@@ -6,6 +6,7 @@ mod board;
 mod board_read;
 mod board_runtime;
 mod canonical;
+mod native_transport;
 mod outbox;
 mod plans;
 mod seller_offer;
@@ -42,6 +43,9 @@ pub use canonical::{
     encode_denuo_offer, encode_denuo_request, verify_authenticated_fixed_price_listing,
     verify_authenticated_listing_cancellation, verify_fixed_price_listing,
     verify_listing_cancellation,
+};
+pub use native_transport::{
+    DirectDenuoBoardSyncReport, WalletNativeDenuoTransport, WalletNativeDenuoTransportError,
 };
 pub use outbox::{
     DenuoHandoffAcceptanceResult, DenuoHandoffFailureResult, DenuoHandoffPreparation,

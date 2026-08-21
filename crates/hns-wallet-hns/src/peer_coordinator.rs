@@ -247,13 +247,31 @@ impl HnsDirectDenuoPeer {
         message: &NameMarketMessage,
     ) -> Result<u64, HnsDirectPeerError> {
         let request_id = self.next_request_id;
+        self.send_name_market_with_request_id(request_id, message)?;
+        self.next_request_id = request_id.checked_add(1).unwrap_or(1);
+        Ok(request_id)
+    }
+
+    /// Respond to one peer request with the same nonzero correlation id.
+    /// This is intentionally separate from [`Self::send_name_market`]: callers
+    /// may use it only for protocol-defined response families after locally
+    /// validating the original request.
+    pub fn send_name_market_with_request_id(
+        &mut self,
+        request_id: u64,
+        message: &NameMarketMessage,
+    ) -> Result<(), HnsDirectPeerError> {
+        if request_id == 0 {
+            return Err(HnsDirectPeerError::Denuo(
+                "Denuo name-market request id must be nonzero".to_owned(),
+            ));
+        }
         let payload = message
             .encode_envelope(DenuoRegistryVersion::V2, request_id)
             .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
         self.connection
             .send_experimental_packet(DENUO_EXTENSION_PACKET.value(), payload)?;
-        self.next_request_id = request_id.checked_add(1).unwrap_or(1);
-        Ok(request_id)
+        Ok(())
     }
 
     /// Receive one canonical name-market message from this direct peer.
