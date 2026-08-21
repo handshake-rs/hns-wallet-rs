@@ -45,7 +45,8 @@ pub use canonical::{
     verify_listing_cancellation,
 };
 pub use native_transport::{
-    DirectDenuoBoardSyncReport, WalletNativeDenuoTransport, WalletNativeDenuoTransportError,
+    DirectDenuoBoardSyncReport, MAX_DIRECT_DENUO_MESSAGES_PER_SYNC, WalletNativeDenuoTransport,
+    WalletNativeDenuoTransportError,
 };
 pub use outbox::{
     DenuoHandoffAcceptanceResult, DenuoHandoffDirectAnnouncement, DenuoHandoffFailureResult,

@@ -18,19 +18,20 @@ use hns_wallet_ffi::{
 };
 use hns_wallet_hns::{
     HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED, HNS_VALUE_RUNTIME_RELEASE_QUALIFIED, HnsBackend,
-    HnsClock, HnsNetwork, HnsRuntimeConfig, HnsWalletError, HnsWalletRuntime, KnownName,
-    NameOperation, NameOperationState, PrepareNameFinalize, PrepareNameTransfer,
+    HnsClock, HnsDirectDenuoPeer, HnsNetwork, HnsRuntimeConfig, HnsWalletError, HnsWalletRuntime,
+    KnownName, NameOperation, NameOperationState, PrepareNameFinalize, PrepareNameTransfer,
 };
 use hns_wallet_provider::{
     APPROVAL_LIFETIME_SECONDS, ApprovedCall, PendingApproval, ProviderMethod, SelectedNamespace,
 };
 use hns_wallet_shakedex::{
-    DenuoPublicationAcceptancePolicy, DenuoTransportRuntime, MAX_SHAKEDEX_OFFER_PAGE_SIZE,
-    PrepareBuyerTrade, PrepareScriptFinalize, PrepareSellerOffer,
-    SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED, SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED,
-    SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, SellerOfferPreview, SellerOfferStage, ShakedexError,
-    ShakedexOfferPage, ShakedexSellerPolicy, ShakedexTradePreview, ShakedexTradeRuntime,
-    ShakedexValueAction, ShakedexValueStage,
+    DenuoPublicationAcceptancePolicy, DenuoTransportRuntime, DirectDenuoBoardSyncReport,
+    MAX_DIRECT_DENUO_MESSAGES_PER_SYNC, MAX_SHAKEDEX_OFFER_PAGE_SIZE, PrepareBuyerTrade,
+    PrepareScriptFinalize, PrepareSellerOffer, SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED,
+    SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED, SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED,
+    SellerOfferPreview, SellerOfferStage, ShakedexError, ShakedexOfferPage, ShakedexSellerPolicy,
+    ShakedexTradePreview, ShakedexTradeRuntime, ShakedexValueAction, ShakedexValueStage,
+    WalletNativeDenuoTransport,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::{
@@ -371,6 +372,20 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
     fn shakedex_runtime(&self) -> Result<ShakedexTradeRuntime<'_, B, C>, ServiceFailure> {
         self.require_shakedex()?;
         ShakedexTradeRuntime::new(&self.runtime, self.store.clone()).map_err(shakedex_failure)
+    }
+
+    fn direct_shakedex_transport(
+        &self,
+    ) -> Result<WalletNativeDenuoTransport<'_, B, C>, ServiceFailure> {
+        match &self.require_shakedex()?.transport {
+            PersistentDenuoTransport::WalletPeers => {
+                WalletNativeDenuoTransport::new(&self.runtime, self.store.clone())
+                    .map_err(direct_denuo_failure)
+            }
+            PersistentDenuoTransport::RelayAcceptance(_) => Err(ServiceFailure::unsupported(
+                ServiceCapability::DenuoShakedexV1,
+            )),
+        }
     }
 
     fn sync_shakedex_transport(&self) -> Result<(), ServiceFailure> {
@@ -1359,6 +1374,58 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
 }
 
 impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsValueRuntime<B, C>> {
+    /// Begin one wallet-owned direct Denuo board exchange. The supplied peer
+    /// has already completed the standard HNS and exact Denuo V2 handshake;
+    /// this method has no relay, RPC, indexer, or endpoint-receipt fallback.
+    pub fn begin_wallet_owned_direct_shakedex(
+        &self,
+        peer: &mut HnsDirectDenuoPeer,
+    ) -> Result<DirectDenuoBoardSyncReport, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .direct_shakedex_transport()?
+            .begin(peer)
+            .map_err(direct_denuo_failure)
+    }
+
+    /// Process a bounded set of messages received from one negotiated,
+    /// wallet-owned direct Denuo peer. The caller owns socket scheduling and
+    /// may call again later; one peer can never turn this into an unbounded
+    /// native/UI operation.
+    pub fn synchronize_wallet_owned_direct_shakedex(
+        &self,
+        peer: &mut HnsDirectDenuoPeer,
+        message_limit: usize,
+    ) -> Result<DirectDenuoBoardSyncReport, ServiceFailure> {
+        if message_limit == 0 || message_limit > MAX_DIRECT_DENUO_MESSAGES_PER_SYNC {
+            return Err(invalid_request("direct Denuo message limit is invalid"));
+        }
+        self.runtime.exact_account()?;
+        let now_unix = self
+            .runtime
+            .runtime
+            .trusted_now_unix()
+            .map_err(hns_runtime_failure)?;
+        self.runtime
+            .direct_shakedex_transport()?
+            .synchronize(peer, now_unix, message_limit)
+            .map_err(direct_denuo_failure)
+    }
+
+    /// Persist and write one due local listing/cancellation publication to a
+    /// negotiated direct wallet peer. The resulting local observation is not
+    /// a peer receipt or inclusion proof.
+    pub fn announce_wallet_owned_direct_shakedex(
+        &self,
+        peer: &mut HnsDirectDenuoPeer,
+    ) -> Result<Option<ObjectHash>, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .direct_shakedex_transport()?
+            .announce_next_local_publication(peer)
+            .map_err(direct_denuo_failure)
+    }
+
     /// Perform one full reconciliation and return the bounded native value
     /// projection. This bypasses website permissions, not wallet locking or any
     /// chain/store validation performed by the full runtime.
@@ -1829,6 +1896,26 @@ fn shakedex_failure(error: ShakedexError) -> ServiceFailure {
         _ => ServiceFailure {
             code: ServiceErrorCode::RuntimeFailure,
             message: "Shakedex runtime could not complete the requested operation".to_owned(),
+            unsupported_capability: None,
+        },
+    }
+}
+
+fn direct_denuo_failure(
+    error: hns_wallet_shakedex::WalletNativeDenuoTransportError,
+) -> ServiceFailure {
+    match error {
+        hns_wallet_shakedex::WalletNativeDenuoTransportError::Board(error) => {
+            shakedex_failure(error)
+        }
+        hns_wallet_shakedex::WalletNativeDenuoTransportError::Wallet(error) => {
+            hns_runtime_failure(error)
+        }
+        hns_wallet_shakedex::WalletNativeDenuoTransportError::DirectPeer(_)
+        | hns_wallet_shakedex::WalletNativeDenuoTransportError::InvalidMessageLimit
+        | hns_wallet_shakedex::WalletNativeDenuoTransportError::InvalidEnvelope => ServiceFailure {
+            code: ServiceErrorCode::RuntimeFailure,
+            message: "wallet-owned Denuo peer exchange could not complete".to_owned(),
             unsupported_capability: None,
         },
     }

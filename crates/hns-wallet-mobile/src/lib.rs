@@ -43,7 +43,7 @@ use hns_wallet_service::{
 };
 use hns_wallet_shakedex::{
     DenuoHnsaEndpointBinding, DenuoHrmRootBinding, DenuoPublicationAcceptancePolicy,
-    ShakedexSellerPolicy,
+    DirectDenuoBoardSyncReport, ShakedexSellerPolicy,
 };
 use hns_wallet_store::{SharedWalletStore, StoreError, WalletStore};
 use hns_wallet_types::{
@@ -1236,6 +1236,59 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
                 params,
                 request_nonce,
             })
+            .map_err(mobile_service_failure);
+        if result.is_err() {
+            self.session.lock_after_request_error();
+        }
+        result
+    }
+
+    /// Start one explicit wallet-owned direct board exchange. No hidden
+    /// relay/network request occurs: the caller supplies the already
+    /// negotiated direct peer and controls the socket lifetime.
+    pub fn begin_wallet_owned_direct_shakedex(
+        &mut self,
+        peer: &mut HnsDirectDenuoPeer,
+    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+        let result = self
+            .session
+            .service
+            .begin_wallet_owned_direct_shakedex(peer)
+            .map_err(mobile_service_failure);
+        if result.is_err() {
+            self.session.lock_after_request_error();
+        }
+        result
+    }
+
+    /// Process an explicitly bounded number of messages from a wallet-owned
+    /// direct board peer. The caller must schedule subsequent calls itself.
+    pub fn synchronize_wallet_owned_direct_shakedex(
+        &mut self,
+        peer: &mut HnsDirectDenuoPeer,
+        message_limit: usize,
+    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+        let result = self
+            .session
+            .service
+            .synchronize_wallet_owned_direct_shakedex(peer, message_limit)
+            .map_err(mobile_service_failure);
+        if result.is_err() {
+            self.session.lock_after_request_error();
+        }
+        result
+    }
+
+    /// Write one due local board publication to a negotiated wallet peer and
+    /// record the resulting local transport observation.
+    pub fn announce_wallet_owned_direct_shakedex(
+        &mut self,
+        peer: &mut HnsDirectDenuoPeer,
+    ) -> Result<Option<ObjectHash>, MobileWalletError> {
+        let result = self
+            .session
+            .service
+            .announce_wallet_owned_direct_shakedex(peer)
             .map_err(mobile_service_failure);
         if result.is_err() {
             self.session.lock_after_request_error();
