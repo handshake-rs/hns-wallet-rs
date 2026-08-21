@@ -22,7 +22,8 @@ use hns_light_wallet::{
     BloomUpdate, HsdBloomFilter, VerifiedWalletBlock, WalletBlockEvidence, WalletHeaderAnchor,
 };
 use hns_marketplace_protocol::{
-    DenuoRegistryVersion, MAX_DENUO_MARKET_PAYLOAD, NameMarketHello, NameMarketMessage,
+    CrossChainMessage, DenuoRegistryVersion, MAX_DENUO_MARKET_PAYLOAD, NameMarketHello,
+    NameMarketMessage,
 };
 use hns_p2p_experimental::{
     ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION, DENUO_EXTENSION_MAX_PACKET_PAYLOAD,
@@ -426,6 +427,51 @@ impl HnsDirectDenuoPeer {
         }
         Err(HnsDirectPeerError::ResponseEventLimit)
     }
+
+    /// Send one exact canonical Denuo HNS/BTC session envelope over the
+    /// already-negotiated direct socket. The peer remains transport only: the
+    /// mobile market controller admits the specific message, correlation, and
+    /// session state before any durable mutation or HTLC action.
+    pub fn send_cross_chain_envelope(&mut self, envelope: &[u8]) -> Result<(), HnsDirectPeerError> {
+        validate_cross_chain_envelope(envelope)?;
+        self.connection
+            .send_experimental_packet(DENUO_EXTENSION_PACKET.value(), envelope.to_vec())?;
+        Ok(())
+    }
+
+    /// Receive one canonical HNS/BTC Denuo envelope from the direct socket.
+    /// This never accepts a generic experimental payload or performs a market
+    /// state transition; callers must route it to the persisted market
+    /// handshake controller for its exact expected stage.
+    pub fn receive_cross_chain_envelope(
+        &mut self,
+        now_unix: u64,
+    ) -> Result<Vec<u8>, HnsDirectPeerError> {
+        for _ in 0..DENUO_MAX_RESPONSE_EVENTS {
+            match self.connection.receive_event(now_unix)? {
+                PeerEvent::Experimental {
+                    packet_type,
+                    payload,
+                } if packet_type == DENUO_EXTENSION_PACKET.value() => {
+                    validate_cross_chain_envelope(&payload)?;
+                    return Ok(payload);
+                }
+                PeerEvent::Experimental { .. }
+                | PeerEvent::Ignored(_)
+                | PeerEvent::Addresses(_)
+                | PeerEvent::Wallet(_) => {}
+                PeerEvent::Rejected(reject) => {
+                    return Err(HnsDirectPeerError::PeerRejected(format!("{reject:?}")));
+                }
+                PeerEvent::Ready(_)
+                | PeerEvent::Send(_)
+                | PeerEvent::Headers(_)
+                | PeerEvent::Proof(_)
+                | PeerEvent::Pong(_) => return Err(HnsDirectPeerError::UnexpectedPeerEvent),
+            }
+        }
+        Err(HnsDirectPeerError::ResponseEventLimit)
+    }
 }
 
 fn nonzero_denuo_request_id() -> Result<u64, HnsDirectPeerError> {
@@ -596,6 +642,25 @@ fn validate_denuo_market_hello(
     if *hns_magic != binding.magic || hns_genesis.as_bytes() != binding.genesis.as_bytes() {
         return Err(HnsDirectPeerError::Denuo(
             "Denuo name-market hello has wrong Handshake network binding".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_cross_chain_envelope(envelope: &[u8]) -> Result<(), HnsDirectPeerError> {
+    if envelope.is_empty() || envelope.len() > MAX_DENUO_MARKET_PAYLOAD {
+        return Err(HnsDirectPeerError::Denuo(
+            "Denuo cross-chain envelope exceeds its exact bound".to_owned(),
+        ));
+    }
+    let (request_id, message) = CrossChainMessage::decode_envelope(envelope)
+        .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+    let canonical = message
+        .encode_envelope(request_id)
+        .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+    if canonical != envelope {
+        return Err(HnsDirectPeerError::Denuo(
+            "Denuo cross-chain envelope is not canonical".to_owned(),
         ));
     }
     Ok(())
