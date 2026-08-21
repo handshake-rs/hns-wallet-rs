@@ -93,6 +93,7 @@ pub struct MobileBitcoinValueController {
     runtime: Option<Runtime>,
     wallet: Option<EncryptedPersistedBitcoinWallet>,
     supervisor: Option<KyotoSupervisor>,
+    receive_address: Option<String>,
 }
 
 impl MobileBitcoinValueController {
@@ -109,6 +110,7 @@ impl MobileBitcoinValueController {
             runtime: None,
             wallet: None,
             supervisor: None,
+            receive_address: None,
         })
     }
 
@@ -190,6 +192,7 @@ impl MobileBitcoinValueController {
             .address
             .to_string();
         wallet.persist(now_unix)?;
+        self.receive_address = Some(address.clone());
         Ok(address)
     }
 
@@ -226,10 +229,12 @@ impl MobileBitcoinValueController {
         let state = supervisor.state();
         Ok(MobileBitcoinSnapshot {
             network: bitcoin_network_name(self.config.network).to_owned(),
-            receive_address: wallet
-                .peek_address(KeychainKind::External, 0)
-                .address
-                .to_string(),
+            receive_address: self.receive_address.clone().unwrap_or_else(|| {
+                wallet
+                    .peek_address(KeychainKind::External, 0)
+                    .address
+                    .to_string()
+            }),
             confirmed_sats: balance.confirmed.to_sat(),
             trusted_pending_sats: balance.trusted_pending.to_sat(),
             untrusted_pending_sats: balance.untrusted_pending.to_sat(),
@@ -252,6 +257,7 @@ impl MobileBitcoinValueController {
             .transpose();
         self.wallet.take();
         self.runtime.take();
+        self.receive_address = None;
         shutdown.map_err(MobileWalletError::from)?;
         Ok(())
     }
