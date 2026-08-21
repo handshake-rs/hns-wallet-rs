@@ -226,6 +226,53 @@ impl HnsDirectDenuoPeer {
         })
     }
 
+    /// Bind one socket accepted by a wallet-hosted listener to the exact
+    /// Denuo V2 atomic-market profile.
+    ///
+    /// The accepted remote's source port is necessarily ephemeral, so inbound
+    /// admission applies the network's public/private-address policy but does
+    /// not require the ordinary Handshake listening port. The socket remains a
+    /// transport only: every received board record still crosses the wallet's
+    /// independent current-chain validation boundary.
+    pub fn accept(
+        config: &HnsDirectPeerConfig,
+        stream: TcpStream,
+        local_height: u32,
+        now_unix: u64,
+    ) -> Result<Self, HnsDirectPeerError> {
+        config.validate()?;
+        let address = stream
+            .peer_addr()
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        if !inbound_denuo_address_allowed(config, address) {
+            return Err(HnsDirectPeerError::AddressNotAllowed);
+        }
+        let request_id = nonzero_denuo_request_id()?;
+        let local_version =
+            direct_denuo_version(address, request_id.to_be_bytes(), local_height, now_unix);
+        let mut connection = PeerConnection::accept(
+            stream,
+            PeerConfig::for_network(network_magic(config.network)),
+            &local_version,
+            now_unix,
+        )
+        .map_err(|error| HnsDirectPeerError::Peer(error.to_string()))?;
+        let metadata = connection
+            .complete_handshake(|| now_unix_or(now_unix))
+            .map_err(|error| HnsDirectPeerError::Peer(error.to_string()))?;
+        if metadata.services & DENUO_EXTENSION_SERVICE.value() == 0 {
+            return Err(HnsDirectPeerError::DenuoPeerNotAdvertised);
+        }
+        let negotiated = respond_denuo_registry_hello(&mut connection, config.network, now_unix)?;
+        Ok(Self {
+            address,
+            network: config.network,
+            connection,
+            negotiated,
+            next_request_id: request_id.checked_add(1).unwrap_or(1),
+        })
+    }
+
     /// Direct socket peer address. It is a transport locator, never an
     /// authority identifier.
     #[must_use]
@@ -384,18 +431,53 @@ fn receive_denuo_hello_ack(
                         "Denuo registry hello acknowledgement correlation mismatch".to_owned(),
                     ));
                 }
-                let negotiated = NegotiatedRegistry::negotiate(&local, &remote)
-                    .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
-                if negotiated.registry_version != DENUO_V2_REGISTRY_VERSION
-                    || negotiated.fingerprint != DENUO_V2_REGISTRY_FINGERPRINT
-                    || !negotiated
-                        .protocols
-                        .contains(&(ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION))
-                {
+                return exact_denuo_v2_atomic_market(&local, &remote);
+            }
+            PeerEvent::Experimental { .. }
+            | PeerEvent::Ignored(_)
+            | PeerEvent::Addresses(_)
+            | PeerEvent::Wallet(_) => {}
+            PeerEvent::Rejected(reject) => {
+                return Err(HnsDirectPeerError::PeerRejected(format!("{reject:?}")));
+            }
+            PeerEvent::Ready(_)
+            | PeerEvent::Send(_)
+            | PeerEvent::Headers(_)
+            | PeerEvent::Proof(_)
+            | PeerEvent::Pong(_) => return Err(HnsDirectPeerError::UnexpectedPeerEvent),
+        }
+    }
+    Err(HnsDirectPeerError::ResponseEventLimit)
+}
+
+fn respond_denuo_registry_hello(
+    connection: &mut PeerConnection<TcpStream>,
+    network: HnsNetwork,
+    now_unix: u64,
+) -> Result<NegotiatedRegistry, HnsDirectPeerError> {
+    let local = denuo_registry_hello(network)?;
+    for _ in 0..DENUO_MAX_RESPONSE_EVENTS {
+        match connection.receive_event(now_unix)? {
+            PeerEvent::Experimental {
+                packet_type,
+                payload,
+            } if packet_type == DENUO_EXTENSION_PACKET.value() => {
+                let (request_id, remote) =
+                    DenuoExtensionEnvelope::decode_registry_hello_v2(&payload)
+                        .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+                if request_id == 0 {
                     return Err(HnsDirectPeerError::Denuo(
-                        "Denuo peer lacks exact V2 atomic-market admission".to_owned(),
+                        "Denuo registry hello request id must be nonzero".to_owned(),
                     ));
                 }
+                let negotiated = exact_denuo_v2_atomic_market(&local, &remote)?;
+                let ack = DenuoExtensionEnvelope::registry_hello_ack_v2(request_id, &local)
+                    .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?
+                    .encode_canonical()
+                    .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+                connection
+                    .send_experimental_packet(DENUO_EXTENSION_PACKET.value(), ack)
+                    .map_err(|error| HnsDirectPeerError::Peer(error.to_string()))?;
                 return Ok(negotiated);
             }
             PeerEvent::Experimental { .. }
@@ -413,6 +495,25 @@ fn receive_denuo_hello_ack(
         }
     }
     Err(HnsDirectPeerError::ResponseEventLimit)
+}
+
+fn exact_denuo_v2_atomic_market(
+    local: &RegistryHello,
+    remote: &RegistryHello,
+) -> Result<NegotiatedRegistry, HnsDirectPeerError> {
+    let negotiated = NegotiatedRegistry::negotiate(local, remote)
+        .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+    if negotiated.registry_version != DENUO_V2_REGISTRY_VERSION
+        || negotiated.fingerprint != DENUO_V2_REGISTRY_FINGERPRINT
+        || !negotiated
+            .protocols
+            .contains(&(ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION))
+    {
+        return Err(HnsDirectPeerError::Denuo(
+            "Denuo peer lacks exact V2 atomic-market admission".to_owned(),
+        ));
+    }
+    Ok(negotiated)
 }
 
 fn validate_denuo_market_hello(
@@ -453,6 +554,10 @@ fn direct_address_allowed(
     address.port() != 0
         && (explicit || address.port() == default_peer_port(config.network))
         && (config.allow_private_addresses || is_public_peer_ip(address.ip()))
+}
+
+fn inbound_denuo_address_allowed(config: &HnsDirectPeerConfig, address: SocketAddr) -> bool {
+    address.port() != 0 && (config.allow_private_addresses || is_public_peer_ip(address.ip()))
 }
 
 type PeerHandle = Arc<Mutex<NativePeer>>;
@@ -1860,6 +1965,10 @@ impl From<PeerError> for HnsDirectPeerError {
     reason = "tests fail immediately on invalid deterministic fixtures"
 )]
 mod tests {
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::thread;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
     use hns_wallet_store::{SecretKind, WalletStore};
     use hns_wallet_types::{AccountId, BaseUnits, WalletId};
@@ -1952,6 +2061,35 @@ mod tests {
         );
         assert_ne!(version.services & SERVICE_NETWORK, 0);
         assert_ne!(version.services & DENUO_EXTENSION_SERVICE.value(), 0);
+    }
+
+    #[test]
+    fn direct_denuo_wallet_accepts_and_negotiates_an_inbound_wallet_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            HnsDirectDenuoPeer::accept(
+                &HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+                stream,
+                42,
+                now,
+            )
+            .unwrap()
+        });
+
+        let mut client_config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
+        client_config.static_peers.push(address);
+        let client = HnsDirectDenuoPeer::connect(&client_config, address, 42, now).unwrap();
+        let server = server.join().unwrap();
+
+        assert_eq!(client.negotiated_registry(), server.negotiated_registry());
+        assert_eq!(client.address(), address);
+        assert!(server.address().ip().is_loopback());
     }
 
     #[test]
