@@ -130,6 +130,11 @@ impl EmbeddedHnsBackend {
         Ok(self.lock()?.authority.status())
     }
 
+    /// Latest local header floor for platform-owned anti-rollback storage.
+    pub fn rollback_floor(&self) -> Result<crate::HnsLightFloor, HnsWalletError> {
+        Ok(self.lock()?.authority.rollback_floor())
+    }
+
     /// Current durable filtered-block coverage for the installed watch set.
     pub fn light_scan_status(&self) -> Result<crate::HnsLightScanStatus, HnsWalletError> {
         Ok(self.lock()?.index.status())

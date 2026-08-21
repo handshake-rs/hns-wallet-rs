@@ -17,13 +17,13 @@ use hns_wallet_ffi::{
 /// compose its [`EmbeddedHnsBackend`] without endpoint credentials.
 pub use hns_wallet_hns::{
     EmbeddedHnsBackend, HnsBackend, HnsBootstrapPolicy, HnsClock, HnsDirectPeerConfig,
-    HnsDirectPeerCoordinator, HnsDirectPeerError, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
-    SystemClock as HnsReadSystemClock,
+    HnsDirectPeerCoordinator, HnsDirectPeerError, HnsLightFloor, HnsNetwork, HnsNodeRpcBackend,
+    HnsNodeRpcConfig, SystemClock as HnsReadSystemClock,
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountRecord, HnsExistingAccountSelector, HnsRuntimeConfig,
     HnsWalletBootstrap, HnsWalletError, HnsWalletRuntime, KnownName, NameOwnershipStatus,
-    NameResourceStatus, RecoveryPhrase, open_wallet_direct_hns_peer_coordinator,
+    NameResourceStatus, RecoveryPhrase, open_wallet_direct_hns_peer_coordinator_with_floor,
 };
 use hns_wallet_host::{
     Clock, ClockError, HostError, HostOutput, SystemClock, SystemEntropy, WalletHost,
@@ -617,16 +617,35 @@ impl MobileWalletController {
         database_key: &MobileDatabaseKey,
         peer_config: HnsDirectPeerConfig,
     ) -> Result<HnsDirectPeerCoordinator, MobileWalletError> {
+        self.open_direct_hns_peer_coordinator_with_floor(
+            database_key,
+            peer_config,
+            HnsLightFloor::default(),
+        )
+    }
+
+    /// Open the direct HNS coordinator with the platform-held monotonic
+    /// rollback floor. An installed shell persists this floor outside the
+    /// encrypted wallet database after header synchronization and provides it
+    /// again on reopen, preventing an older database backup from silently
+    /// becoming the wallet's chain authority.
+    pub fn open_direct_hns_peer_coordinator_with_floor(
+        &mut self,
+        database_key: &MobileDatabaseKey,
+        peer_config: HnsDirectPeerConfig,
+        rollback_floor: HnsLightFloor,
+    ) -> Result<HnsDirectPeerCoordinator, MobileWalletError> {
         self.lock()?;
         let store = self.session.store.clone();
         let account_config = self.account_config.clone();
         let passphrase = database_key.store_passphrase();
         store.unlock(passphrase.as_str())?;
         let now_unix = HnsReadSystemClock.now_unix()?;
-        let opened = open_wallet_direct_hns_peer_coordinator(
+        let opened = open_wallet_direct_hns_peer_coordinator_with_floor(
             store.clone(),
             &account_config,
             peer_config,
+            rollback_floor,
             now_unix,
         );
         let relocked = store.lock();

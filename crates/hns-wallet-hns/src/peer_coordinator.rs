@@ -425,6 +425,17 @@ impl HnsDirectPeerCoordinator {
         &self.backend
     }
 
+    /// Latest locally validated chain floor for platform-protected rollback
+    /// storage. A host persists this outside the encrypted wallet database
+    /// after a successful header round and supplies it on the next open, so an
+    /// authentic but older database backup cannot silently roll the wallet's
+    /// chain authority backwards.
+    pub fn rollback_floor(&self) -> Result<HnsLightFloor, HnsDirectPeerError> {
+        self.backend
+            .rollback_floor()
+            .map_err(HnsDirectPeerError::Wallet)
+    }
+
     /// Shared native peer pool used by the host/mobile runtime.
     #[must_use]
     pub const fn pool(&self) -> &Arc<NativeHnsPeerPool> {
@@ -887,6 +898,26 @@ pub fn open_wallet_direct_hns_peer_coordinator(
     peer_config: HnsDirectPeerConfig,
     now_unix: u64,
 ) -> Result<HnsDirectPeerCoordinator, HnsDirectPeerError> {
+    open_wallet_direct_hns_peer_coordinator_with_floor(
+        store,
+        account,
+        peer_config,
+        HnsLightFloor::default(),
+        now_unix,
+    )
+}
+
+/// Open the direct coordinator with the platform-held monotonic rollback
+/// floor. Installed wallets must use this constructor; the compatibility
+/// wrapper above remains for deterministic in-memory callers that have no
+/// platform storage boundary.
+pub fn open_wallet_direct_hns_peer_coordinator_with_floor(
+    store: SharedWalletStore,
+    account: &HnsRuntimeConfig,
+    peer_config: HnsDirectPeerConfig,
+    rollback_floor: HnsLightFloor,
+    now_unix: u64,
+) -> Result<HnsDirectPeerCoordinator, HnsDirectPeerError> {
     account
         .validate_structure()
         .map_err(HnsDirectPeerError::Wallet)?;
@@ -909,7 +940,7 @@ pub fn open_wallet_direct_hns_peer_coordinator(
         account.account_id,
         account.network,
         birthday_height,
-        HnsLightFloor::default(),
+        rollback_floor,
         BlockTime::new(now_unix),
         ChainLimits::default(),
         sync_config,
