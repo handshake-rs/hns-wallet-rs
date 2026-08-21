@@ -1040,11 +1040,13 @@ dependencies = [
 name = "hns-wallet-mobile"
 version = "0.1.0"
 dependencies = [
+ "bdk_wallet",
  "getrandom 0.3.4",
  "hns-header-consensus",
  "hns-primitives",
  "hns-swap",
  "hns-transaction",
+ "hns-wallet-bitcoin-kyoto",
  "hns-wallet-ffi",
  "hns-wallet-hns",
  "hns-wallet-host",
@@ -1057,6 +1059,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "zeroize",
 ]
 

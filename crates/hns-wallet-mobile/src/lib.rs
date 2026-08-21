@@ -1,8 +1,12 @@
 #![doc = "Platform-neutral native wallet control for Android and iOS applications."]
 #![forbid(unsafe_code)]
 
+mod bitcoin;
+
 use std::collections::BTreeSet;
 use std::path::Path;
+
+pub use bitcoin::{MobileBitcoinDirectConfig, MobileBitcoinSnapshot, MobileBitcoinValueController};
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
 use hns_swap::NetworkBinding;
@@ -1147,6 +1151,22 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         &self.account_config
     }
 
+    /// Construct the Bitcoin half of the installed direct wallet. The
+    /// returned controller uses this exact encrypted store and recovery seed;
+    /// it does not create a second mnemonic, node credential, or relay path.
+    /// The caller activates it only after this HNS controller unlocks the
+    /// shared store.
+    pub fn direct_bitcoin_value_controller(
+        &self,
+        config: MobileBitcoinDirectConfig,
+    ) -> Result<MobileBitcoinValueController, MobileWalletError> {
+        MobileBitcoinValueController::new(
+            self.session.store.clone(),
+            self.account_config.clone(),
+            config,
+        )
+    }
+
     pub fn status(&mut self) -> Result<WalletRuntimeStatus, MobileWalletError> {
         match self.session.wallet_request(WalletRequest::Status)? {
             WalletResponse::Status { status } => Ok(status),
@@ -1869,6 +1889,12 @@ pub enum MobileWalletError {
     InvalidAccountSet,
     #[error("mobile recovery phrase is empty or exceeds its native input bound")]
     InvalidRecoveryPhrase,
+    #[error("the system clock is unavailable for Bitcoin wallet state")]
+    BitcoinClockUnavailable,
+    #[error("the direct Bitcoin runtime is inactive")]
+    BitcoinRuntimeInactive,
+    #[error("the direct Bitcoin runtime could not be created")]
+    BitcoinRuntimeUnavailable,
     #[error("private wallet host/service response was unexpected")]
     UnexpectedResponse,
     #[error("private mobile wallet controller failed closed and must be reopened")]
@@ -1896,6 +1922,8 @@ pub enum MobileWalletError {
     Hns(#[from] HnsWalletError),
     #[error(transparent)]
     DirectHns(#[from] HnsDirectPeerError),
+    #[error(transparent)]
+    Bitcoin(#[from] hns_wallet_bitcoin_kyoto::BitcoinWalletError),
     #[error(transparent)]
     Host(#[from] HostError),
     #[error(transparent)]

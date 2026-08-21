@@ -13,10 +13,12 @@ readme = "README.md"
 publish = ["crates-io"]
 
 [dependencies]
+bdk_wallet.workspace = true
 getrandom.workspace = true
 hns-header-consensus.workspace = true
 hns-primitives.workspace = true
 hns-swap.workspace = true
+hns-wallet-bitcoin-kyoto.workspace = true
 hns-wallet-ffi.workspace = true
 hns-wallet-hns.workspace = true
 hns-wallet-host.workspace = true
@@ -28,6 +30,7 @@ hns-wallet-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
