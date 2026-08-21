@@ -17,7 +17,8 @@ use crate::{
 
 const LEGACY_DENUO_OUTBOX_SCHEMA_VERSION: u16 = 1;
 const HANDOFF_DENUO_OUTBOX_SCHEMA_VERSION: u16 = 2;
-const DENUO_OUTBOX_SCHEMA_VERSION: u16 = 3;
+const RELAY_DENUO_OUTBOX_SCHEMA_VERSION: u16 = 3;
+const DENUO_OUTBOX_SCHEMA_VERSION: u16 = 4;
 const DENUO_OUTBOX_ENVELOPE_ID_DOMAIN: &[u8] = b"hns-wallet-denuo-outbox-envelope-v1\0";
 const DENUO_OUTBOX_ATTEMPT_ID_DOMAIN: &[u8] = b"hns-wallet-denuo-handoff-attempt-v1\0";
 const DENUO_OUTBOX_RECORD_ID: &[u8] = b"canonical-name-market-outbox-v1";
@@ -57,6 +58,14 @@ pub enum DenuoOutboxState {
     RelayAccepted {
         receipt_id: ObjectHash,
         accepted_at_unix: u64,
+    },
+    /// The wallet durably admitted the exact record to its own board and
+    /// successfully wrote it to one negotiated direct wallet peer. This is a
+    /// local transport observation, never a peer receipt or inclusion proof.
+    DirectAnnounced {
+        attempt_id: ObjectHash,
+        prepared_at_unix: u64,
+        announced_at_unix: u64,
     },
     /// Immutable terminal state retained only for schema-v1 compatibility.
     /// Schemas v2/v3 expose no API that can create protocol acknowledgement.
@@ -267,6 +276,7 @@ impl DenuoPublicationOutbox {
                     } => next_attempt_at_unix,
                     DenuoOutboxState::HandoffPrepared { .. }
                     | DenuoOutboxState::RelayAccepted { .. }
+                    | DenuoOutboxState::DirectAnnounced { .. }
                     | DenuoOutboxState::Acknowledged { .. }
                     | DenuoOutboxState::Exhausted { .. } => return None,
                 };
@@ -472,6 +482,22 @@ pub enum DenuoHandoffAcceptanceResult {
     Existing(DenuoPublicationAcceptanceSnapshot),
 }
 
+/// Durable result of one exact direct-wallet transport write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DenuoHandoffDirectAnnouncement {
+    outbox_revision: u64,
+    envelope_id: ObjectHash,
+}
+
+impl DenuoHandoffDirectAnnouncement {
+    pub const fn outbox_revision(self) -> u64 {
+        self.outbox_revision
+    }
+    pub const fn envelope_id(self) -> ObjectHash {
+        self.envelope_id
+    }
+}
+
 impl DenuoHandoffAcceptanceResult {
     pub const fn snapshot(self) -> DenuoPublicationAcceptanceSnapshot {
         match self {
@@ -640,6 +666,68 @@ pub fn record_denuo_handoff_acceptance(
     )))
 }
 
+/// Record only the local fact that one exact prepared envelope was written to
+/// a negotiated direct wallet peer after admission to this wallet's own board.
+/// This is not a remote acknowledgement, inclusion proof, or authority grant.
+pub fn record_denuo_handoff_direct_announcement(
+    store: &mut WalletStore,
+    handoff: &DenuoPreparedHandoff,
+    announced_at_unix: u64,
+) -> Result<DenuoHandoffDirectAnnouncement, ShakedexError> {
+    let canonical = canonical_publication(handoff.envelope_bytes())?;
+    if canonical.envelope_id != handoff.envelope_id()
+        || canonical.content_id != handoff.content_id()
+        || canonical.message_kind != handoff.message_kind()
+        || canonical.request_id != handoff.request_id()
+    {
+        return Err(ShakedexError::DenuoOutboxHandoffMismatch);
+    }
+    let mut stored = load_denuo_publication_outbox(store)?;
+    let index = stored
+        .outbox
+        .entries
+        .iter()
+        .position(|entry| entry.envelope_id == handoff.envelope_id())
+        .ok_or(ShakedexError::DenuoOutboxHandoffMismatch)?;
+    if let DenuoOutboxState::DirectAnnounced {
+        attempt_id,
+        announced_at_unix: durable_at,
+        ..
+    } = stored.outbox.entries[index].state
+    {
+        let entry = &stored.outbox.entries[index];
+        if handoff.matches_identity(entry)
+            && attempt_id == handoff.attempt_id()
+            && durable_at == announced_at_unix
+        {
+            return Ok(DenuoHandoffDirectAnnouncement {
+                outbox_revision: stored.revision,
+                envelope_id: handoff.envelope_id(),
+            });
+        }
+        return Err(ShakedexError::DenuoOutboxHandoffMismatch);
+    }
+    if stored.revision != handoff.outbox_revision() {
+        return Err(ShakedexError::StaleRevision);
+    }
+    let entry = &mut stored.outbox.entries[index];
+    if !handoff.matches(stored.revision, entry) || announced_at_unix < handoff.prepared_at_unix() {
+        return Err(ShakedexError::DenuoOutboxHandoffMismatch);
+    }
+    entry.state = DenuoOutboxState::DirectAnnounced {
+        attempt_id: handoff.attempt_id(),
+        prepared_at_unix: handoff.prepared_at_unix(),
+        announced_at_unix,
+    };
+    entry.last_attempt_at_unix = Some(announced_at_unix);
+    let revision =
+        save_denuo_publication_outbox(store, stored.revision, &stored.outbox, announced_at_unix)?;
+    Ok(DenuoHandoffDirectAnnouncement {
+        outbox_revision: revision,
+        envelope_id: handoff.envelope_id(),
+    })
+}
+
 /// Persist a locally observed handoff failure. Consuming the exact artifact
 /// correlates the result to the bytes durably prepared before handoff.
 pub fn record_denuo_handoff_failure(
@@ -770,6 +858,7 @@ pub fn load_denuo_publication_outbox(
                 source_schema_version,
                 LEGACY_DENUO_OUTBOX_SCHEMA_VERSION
                     | HANDOFF_DENUO_OUTBOX_SCHEMA_VERSION
+                    | RELAY_DENUO_OUTBOX_SCHEMA_VERSION
                     | DENUO_OUTBOX_SCHEMA_VERSION
             ) || stored
                 .value
@@ -790,7 +879,7 @@ pub fn load_denuo_publication_outbox(
                                 | DenuoOutboxState::RelayAccepted { .. }
                         ) || entry.acceptance.is_some()
                     }
-                    DENUO_OUTBOX_SCHEMA_VERSION => false,
+                    RELAY_DENUO_OUTBOX_SCHEMA_VERSION | DENUO_OUTBOX_SCHEMA_VERSION => false,
                     _ => true,
                 })
             {
@@ -1166,6 +1255,9 @@ fn validate_entry_save_transition(
         (DenuoOutboxState::HandoffPrepared { .. }, DenuoOutboxState::RelayAccepted { .. }) => {
             validate_handoff_acceptance(current, next)?
         }
+        (DenuoOutboxState::HandoffPrepared { .. }, DenuoOutboxState::DirectAnnounced { .. }) => {
+            validate_handoff_direct_announcement(current, next)?
+        }
         _ => return Err(ShakedexError::InvalidDenuoOutboxTransition),
     }
     Ok(())
@@ -1277,6 +1369,38 @@ fn validate_handoff_acceptance(
     Ok(())
 }
 
+fn validate_handoff_direct_announcement(
+    current: &DenuoOutboxEntry,
+    next: &DenuoOutboxEntry,
+) -> Result<(), ShakedexError> {
+    let DenuoOutboxState::HandoffPrepared {
+        attempt_id,
+        prepared_at_unix,
+    } = current.state
+    else {
+        return Err(ShakedexError::InvalidDenuoOutboxTransition);
+    };
+    let DenuoOutboxState::DirectAnnounced {
+        attempt_id: announced_attempt,
+        prepared_at_unix: announced_prepared,
+        announced_at_unix,
+    } = next.state
+    else {
+        return Err(ShakedexError::InvalidDenuoOutboxTransition);
+    };
+    if attempt_id != announced_attempt
+        || current.acceptance.is_some()
+        || next.acceptance.is_some()
+        || current.retry_attempts != next.retry_attempts
+        || next.last_attempt_at_unix != Some(announced_at_unix)
+        || announced_prepared != prepared_at_unix
+        || announced_at_unix < prepared_at_unix
+    {
+        return Err(ShakedexError::InvalidDenuoOutboxTransition);
+    }
+    Ok(())
+}
+
 fn validate_record_time(
     outbox: &DenuoPublicationOutbox,
     updated_at_unix: u64,
@@ -1299,6 +1423,13 @@ fn validate_record_time(
                     accepted_at_unix,
                     ..
                 } if accepted_at_unix > updated_at_unix
+            )
+            || matches!(
+                entry.state,
+                DenuoOutboxState::DirectAnnounced {
+                    announced_at_unix,
+                    ..
+                } if announced_at_unix > updated_at_unix
             )
             || matches!(
                 entry.state,
@@ -1474,6 +1605,31 @@ fn validate_entry(entry: &DenuoOutboxEntry) -> Result<(), ShakedexError> {
                 || expected.content_id != entry.content_id
                 || expected.message_kind != entry.message_kind
                 || expected.request_id != entry.request_id
+            {
+                return Err(ShakedexError::CorruptDenuoOutbox);
+            }
+        }
+        DenuoOutboxState::DirectAnnounced {
+            attempt_id,
+            prepared_at_unix,
+            announced_at_unix,
+        } => {
+            let attempt_ordinal = entry
+                .retry_attempts
+                .checked_add(1)
+                .filter(|attempt| *attempt <= MAX_DENUO_OUTBOX_RETRY_ATTEMPTS)
+                .ok_or(ShakedexError::CorruptDenuoOutbox)?;
+            if entry.acceptance.is_some()
+                || entry.last_attempt_at_unix != Some(announced_at_unix)
+                || announced_at_unix < entry.created_at_unix
+                || announced_at_unix < prepared_at_unix
+                || attempt_id
+                    != denuo_handoff_attempt_id(
+                        entry.envelope_id,
+                        entry.request_id,
+                        attempt_ordinal,
+                        prepared_at_unix,
+                    )
             {
                 return Err(ShakedexError::CorruptDenuoOutbox);
             }
@@ -2349,6 +2505,47 @@ mod tests {
             ),
             Err(ShakedexError::InvalidDenuoOutboxEnvelope)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_announcement_is_durable_terminal_and_has_no_peer_receipt() {
+        let (offer, listing, _, _) = publication_fixtures();
+        let (_cleanup, mut store, _) = test_wallet_store();
+        let mut outbox = DenuoPublicationOutbox::default();
+        let envelope_id = outbox
+            .enqueue_offer(&offer, &listing, CREATED_AT)
+            .expect("enqueue")
+            .envelope_id();
+        let revision =
+            save_denuo_publication_outbox(&mut store, 0, &outbox, CREATED_AT).expect("save");
+        let handoff = match prepare_next_denuo_handoff(&mut store, revision, CREATED_AT + 1)
+            .expect("prepare")
+        {
+            DenuoHandoffPreparation::Prepared(handoff) => handoff,
+            _ => panic!("one pending envelope must prepare"),
+        };
+        let announced =
+            record_denuo_handoff_direct_announcement(&mut store, &handoff, CREATED_AT + 2)
+                .expect("record local direct write");
+        assert_eq!(announced.envelope_id(), envelope_id);
+        let stored = load_denuo_publication_outbox(&store).expect("load direct state");
+        assert_eq!(stored.revision, announced.outbox_revision());
+        assert!(matches!(
+            stored.outbox.state(envelope_id),
+            Some(DenuoOutboxState::DirectAnnounced {
+                attempt_id,
+                prepared_at_unix,
+                announced_at_unix,
+            }) if attempt_id == handoff.attempt_id()
+                && prepared_at_unix == CREATED_AT + 1
+                && announced_at_unix == CREATED_AT + 2
+        ));
+        assert!(
+            load_prepared_denuo_handoff(&store)
+                .expect("terminal direct state")
+                .is_none()
+        );
     }
 
     #[cfg(unix)]

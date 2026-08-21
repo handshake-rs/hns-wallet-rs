@@ -17,7 +17,11 @@ use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::ObjectHash;
 use thiserror::Error;
 
-use crate::{DenuoBoardRuntime, ShakedexError, board_runtime::CurrentDenuoBoardOffersResolution};
+use crate::{
+    DenuoBoardRuntime, DenuoHandoffPreparation, ShakedexError,
+    board_runtime::CurrentDenuoBoardOffersResolution, load_denuo_publication_outbox,
+    prepare_next_denuo_handoff, record_denuo_handoff_direct_announcement,
+};
 
 /// Hard upper bound for one caller-driven direct board exchange. A caller can
 /// invoke another exchange later; no peer can make one UI action unbounded.
@@ -56,6 +60,7 @@ pub enum WalletNativeDenuoTransportError {
 /// already negotiated [`HnsDirectDenuoPeer`] for the lifetime of one exchange.
 pub struct WalletNativeDenuoTransport<'a, B, C> {
     hns: &'a HnsWalletRuntime<B, C>,
+    store: SharedWalletStore,
     board: DenuoBoardRuntime<'a, B, C>,
 }
 
@@ -66,7 +71,8 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
     ) -> Result<Self, WalletNativeDenuoTransportError> {
         Ok(Self {
             hns,
-            board: DenuoBoardRuntime::new_value(hns, store)?,
+            board: DenuoBoardRuntime::new_value(hns, store.clone())?,
+            store,
         })
     }
 
@@ -82,6 +88,65 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
         peer.send_name_market(&NameMarketMessage::GetOfferInventory)?;
         report.messages_sent = report.messages_sent.saturating_add(1);
         Ok(report)
+    }
+
+    /// Admit and announce one due seller publication through a negotiated
+    /// wallet peer. The local board admission happens before the socket write,
+    /// so a successfully announced record remains available for later direct
+    /// inventory exchanges even if that specific peer disappears. The durable
+    /// outcome records only this wallet's write; it is not peer acceptance.
+    pub fn announce_next_local_publication(
+        &self,
+        peer: &mut HnsDirectDenuoPeer,
+    ) -> Result<Option<ObjectHash>, WalletNativeDenuoTransportError> {
+        let now_unix = self.hns.trusted_now_unix()?;
+        let revision = self
+            .store
+            .try_with_store(load_denuo_publication_outbox)?
+            .revision;
+        let preparation = self
+            .store
+            .try_with_store_mut(|store| prepare_next_denuo_handoff(store, revision, now_unix))?;
+        let handoff = match preparation {
+            DenuoHandoffPreparation::NoDue { .. } => return Ok(None),
+            DenuoHandoffPreparation::Prepared(handoff)
+            | DenuoHandoffPreparation::Existing(handoff) => handoff,
+        };
+        let (registry, request_id, message) =
+            NameMarketMessage::decode_envelope(handoff.envelope_bytes())
+                .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?;
+        if registry != DenuoRegistryVersion::V2 || request_id != handoff.request_id() {
+            return Err(WalletNativeDenuoTransportError::InvalidEnvelope);
+        }
+        match &message {
+            NameMarketMessage::Offer(listing) => {
+                let hash = ObjectHash::new(
+                    listing
+                        .listing_hash()
+                        .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?,
+                );
+                self.board.admit_offer(handoff.envelope_bytes(), hash)?;
+            }
+            NameMarketMessage::Cancel(cancellation) => {
+                let listing_hash = ObjectHash::new(cancellation.listing_hash);
+                let cancellation_hash = ObjectHash::new(
+                    cancellation
+                        .cancellation_hash()
+                        .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?,
+                );
+                self.board.admit_cancellation(
+                    handoff.envelope_bytes(),
+                    listing_hash,
+                    cancellation_hash,
+                )?;
+            }
+            _ => return Err(WalletNativeDenuoTransportError::InvalidEnvelope),
+        }
+        peer.send_name_market_with_request_id(request_id, &message)?;
+        let announced = self.store.try_with_store_mut(|store| {
+            record_denuo_handoff_direct_announcement(store, &handoff, now_unix)
+        })?;
+        Ok(Some(announced.envelope_id()))
     }
 
     /// Process up to `message_limit` direct messages. The caller controls when
