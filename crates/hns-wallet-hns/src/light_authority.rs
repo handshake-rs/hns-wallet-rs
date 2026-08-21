@@ -17,6 +17,11 @@ use crate::HnsNetwork;
 /// Version of the authenticated encrypted HNS light-chain record envelope.
 pub const HNS_LIGHT_CHAIN_FORMAT_VERSION: u16 = 1;
 
+/// Largest genesis-verified header acceleration stream accepted in one wallet
+/// bootstrap. Product shells pin their own reviewed checkpoint and may advance
+/// this bound in a later release alongside a new bundled checkpoint.
+pub const MAX_GENESIS_BOOTSTRAP_HEADERS: u32 = 500_000;
+
 const CHECKPOINT_SUFFIX: &[u8] = b"/hns-light/checkpoint";
 const HEADER_SUFFIX: &[u8] = b"/hns-light/header/";
 
@@ -137,6 +142,7 @@ pub struct EncryptedHnsLightAuthority {
     birthday_height: u32,
     checkpoint_revision: u64,
     archived_tip: Option<(u32, [u8; 32])>,
+    sync_config: SyncConfig,
     sync: HeaderSync,
 }
 
@@ -224,6 +230,7 @@ impl EncryptedHnsLightAuthority {
             birthday_height,
             checkpoint_revision: 1,
             archived_tip,
+            sync_config,
             sync,
         })
     }
@@ -278,6 +285,7 @@ impl EncryptedHnsLightAuthority {
             birthday_height,
             checkpoint_revision: stored.revision,
             archived_tip,
+            sync_config,
             sync: HeaderSync::from_chain(chain, sync_config)?,
         })
     }
@@ -437,6 +445,104 @@ impl EncryptedHnsLightAuthority {
             status: outcome.status,
             accepted,
         })
+    }
+
+    /// Replace a pristine genesis checkpoint with a locally verified header
+    /// acceleration stream.
+    ///
+    /// This is intentionally only a new-wallet path. Every supplied header is
+    /// appended from canonical genesis using the normal proof-of-work,
+    /// difficulty, and median-time checks; `expected_height` and
+    /// `expected_hash` are supplied by the product's reviewed, pinned
+    /// checkpoint rather than being taken from the stream. The resulting
+    /// synchronizer starts in `HeaderSyncing`, so ordinary direct peers must
+    /// still provide fresh agreement before the wallet treats the chain as
+    /// current or authorizes value operations.
+    ///
+    /// A recovery wallet must retain its genuine birthday and scan from there.
+    /// It must not use this narrow shortcut to discard historical discovery.
+    pub fn bootstrap_from_genesis_headers<I>(
+        &mut self,
+        headers: I,
+        expected_height: u32,
+        expected_hash: [u8; 32],
+        now: u64,
+    ) -> Result<SyncStatus, HnsLightError>
+    where
+        I: IntoIterator<Item = Header>,
+    {
+        if expected_height == 0 || expected_height > MAX_GENESIS_BOOTSTRAP_HEADERS {
+            return Err(HnsLightError::InvalidBootstrapTarget);
+        }
+        if self.birthday_height != expected_height {
+            return Err(HnsLightError::BootstrapBirthdayMismatch);
+        }
+        if self.checkpoint_revision != 1
+            || self.archived_tip.is_some()
+            || self.sync.chain().tip().height() != Height::new(0)
+        {
+            return Err(HnsLightError::BootstrapUnavailable);
+        }
+
+        let mut chain = self.sync.chain().clone();
+        let mut count = 0_u32;
+        let mut final_header = None;
+        for header in headers {
+            count = count
+                .checked_add(1)
+                .ok_or(HnsLightError::BootstrapHeaderCountMismatch)?;
+            if count > expected_height {
+                return Err(HnsLightError::BootstrapHeaderCountMismatch);
+            }
+            let entry = chain.append(&header, BlockTime::new(now))?;
+            final_header = Some((header, entry));
+        }
+        let Some((final_header, final_entry)) = final_header else {
+            return Err(HnsLightError::BootstrapHeaderCountMismatch);
+        };
+        if count != expected_height
+            || final_entry.height().get() != expected_height
+            || final_entry.hash().into_bytes() != expected_hash
+        {
+            return Err(HnsLightError::BootstrapTargetMismatch);
+        }
+
+        let next_archived_tip = Some((expected_height, expected_hash));
+        let checkpoint = checkpoint_record(
+            &chain,
+            self.network,
+            self.birthday_height,
+            next_archived_tip,
+        )?;
+        let saves = [
+            EntityBatchSave {
+                id: checkpoint_id(self.account_id),
+                expected_revision: self.checkpoint_revision,
+                value: StoredHnsLightRecord::Checkpoint(checkpoint),
+                updated_at_unix: now,
+            },
+            EntityBatchSave {
+                id: header_id(self.account_id, expected_height),
+                expected_revision: 0,
+                value: StoredHnsLightRecord::Header(StoredHnsHeader::new(
+                    self.network,
+                    expected_height,
+                    &final_header,
+                )),
+                updated_at_unix: now,
+            },
+        ];
+        self.store.with_store_mut(|wallet| {
+            wallet.apply_entity_batch(EntityKind::HnsLightChain, &saves, &[])
+        })?;
+
+        self.checkpoint_revision = self
+            .checkpoint_revision
+            .checked_add(1)
+            .ok_or(HnsLightError::RevisionOverflow)?;
+        self.archived_tip = next_archived_tip;
+        self.sync = HeaderSync::from_chain(chain, self.sync_config)?;
+        Ok(self.sync.status())
     }
 
     /// Issue current-chain proof authority only after fresh no-extension peer
@@ -604,6 +710,16 @@ pub enum HnsLightError {
     MissingArchivedHeader,
     #[error("HNS retained header archive has a gap")]
     HeaderArchiveGap,
+    #[error("HNS genesis bootstrap target is invalid")]
+    InvalidBootstrapTarget,
+    #[error("HNS genesis bootstrap is available only for a pristine wallet")]
+    BootstrapUnavailable,
+    #[error("HNS genesis bootstrap must match the wallet birthday")]
+    BootstrapBirthdayMismatch,
+    #[error("HNS genesis bootstrap header count does not match its target")]
+    BootstrapHeaderCountMismatch,
+    #[error("HNS genesis bootstrap does not match its pinned endpoint")]
+    BootstrapTargetMismatch,
     #[error("independent header validation disagreed with the selected sync candidate")]
     ConsensusStateMismatch,
     #[error("HNS light-chain persistence revision overflow")]
@@ -687,6 +803,64 @@ mod tests {
         assert_eq!(reopened.status().tip, created.status().tip);
         assert_eq!(reopened.status().state, SyncState::HeaderSyncing);
         assert!(!reopened.status().round_active);
+    }
+
+    #[test]
+    fn genesis_verified_bootstrap_persists_only_its_birthday_anchor() {
+        let store = store();
+        let account = AccountId::new([70; 16]);
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let mut authority = open(store.clone(), account, 3, HnsLightFloor::default(), now).unwrap();
+        let mut fixture_chain = authority.validated_chain().clone();
+        let mut headers = Vec::new();
+        for marker in 1..=3 {
+            let header = mine(fixture_chain.tip(), marker);
+            fixture_chain.append(&header, BlockTime::new(now)).unwrap();
+            headers.push(header);
+        }
+        let expected_hash = fixture_chain.tip().hash().into_bytes();
+
+        let status = authority
+            .bootstrap_from_genesis_headers(headers.clone(), 3, expected_hash, now)
+            .unwrap();
+        assert_eq!(status.state, SyncState::HeaderSyncing);
+        assert_eq!(status.tip.height(), Height::new(3));
+        assert_eq!(authority.chain_epoch(), 2);
+        assert_eq!(
+            authority.archived_header(3).unwrap().unwrap().block_hash(),
+            headers[2].block_hash()
+        );
+        assert!(authority.archived_header(2).unwrap().is_none());
+
+        let reopened = open(store, account, 3, authority.rollback_floor(), now).unwrap();
+        assert_eq!(reopened.status().tip.height(), Height::new(3));
+        assert_eq!(reopened.status().state, SyncState::HeaderSyncing);
+        assert_eq!(
+            reopened.archived_header(3).unwrap().unwrap().block_hash(),
+            headers[2].block_hash()
+        );
+    }
+
+    #[test]
+    fn genesis_bootstrap_rejects_unpinned_or_non_pristine_state_without_writing() {
+        let store = store();
+        let account = AccountId::new([71; 16]);
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let mut authority = open(store.clone(), account, 1, HnsLightFloor::default(), now).unwrap();
+        let header = mine(authority.status().tip, 1);
+
+        assert!(matches!(
+            authority.bootstrap_from_genesis_headers(vec![header.clone()], 1, [0x55; 32], now,),
+            Err(HnsLightError::BootstrapTargetMismatch)
+        ));
+        assert_eq!(authority.status().tip.height(), Height::new(0));
+        let reopened = open(store, account, 1, HnsLightFloor::default(), now).unwrap();
+        assert_eq!(reopened.status().tip.height(), Height::new(0));
+
+        assert!(matches!(
+            authority.bootstrap_from_genesis_headers(vec![header], 1, [0; 32], now,),
+            Err(HnsLightError::BootstrapTargetMismatch)
+        ));
     }
 
     #[test]
