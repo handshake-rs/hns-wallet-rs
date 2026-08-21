@@ -196,9 +196,8 @@ impl HnsDirectDenuoPeer {
             return Err(HnsDirectPeerError::AddressNotAllowed);
         }
         let request_id = nonzero_denuo_request_id()?;
-        let mut local_version =
-            light_wallet_version(address, request_id.to_be_bytes(), local_height, now_unix);
-        local_version.services = DENUO_EXTENSION_SERVICE.value();
+        let local_version =
+            direct_denuo_version(address, request_id.to_be_bytes(), local_height, now_unix);
         let mut connection = PeerConnection::connect(
             address,
             PeerConfig::for_network(network_magic(config.network)),
@@ -328,6 +327,22 @@ fn nonzero_denuo_request_id() -> Result<u64, HnsDirectPeerError> {
         }
     }
     Err(HnsDirectPeerError::Randomness)
+}
+
+/// Construct the standard Handshake peer advertisement for a wallet-hosted
+/// Denuo exchange. The extension service augments, rather than replaces, the
+/// mandatory standard `NETWORK` bit: a Denuo wallet remains a Handshake peer
+/// on the ordinary wire and interoperates with peers that enforce the normal
+/// service admission rule.
+fn direct_denuo_version(
+    remote: SocketAddr,
+    nonce: [u8; 8],
+    local_height: u32,
+    now_unix: u64,
+) -> hns_p2p_wire::VersionPacket {
+    let mut version = light_wallet_version(remote, nonce, local_height, now_unix);
+    version.services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
+    version
 }
 
 fn denuo_registry_hello(network: HnsNetwork) -> Result<RegistryHello, HnsDirectPeerError> {
@@ -1925,6 +1940,18 @@ mod tests {
             hello.maximum_receive_size as usize,
             MAX_DENUO_MARKET_PAYLOAD
         );
+    }
+
+    #[test]
+    fn direct_denuo_wallet_advertises_standard_network_and_extension_services() {
+        let version = direct_denuo_version(
+            "127.0.0.1:12038".parse().unwrap(),
+            [9; 8],
+            42,
+            Network::Regtest.parameters().genesis_time.get() + 1,
+        );
+        assert_ne!(version.services & SERVICE_NETWORK, 0);
+        assert_ne!(version.services & DENUO_EXTENSION_SERVICE.value(), 0);
     }
 
     #[test]
