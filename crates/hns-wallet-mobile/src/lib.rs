@@ -2473,6 +2473,45 @@ mod tests {
     }
 
     #[test]
+    fn value_unlock_defers_wallet_peer_market_recovery_until_explicit_sync() {
+        let directory = private_tempdir();
+        let path = directory.path().join("value-unlock-deferred-sync.sqlite3");
+        let key = MobileDatabaseKey::new([0x8b; MOBILE_DATABASE_KEY_BYTES]).expect("database key");
+        let creation = MobileWalletController::create(
+            &path,
+            &key,
+            MobilePlatform::Android,
+            HnsBootstrapPolicy::new(HnsNetwork::Regtest, 0),
+        )
+        .expect("create direct value wallet");
+        let (controller, _recovery) = creation.into_parts();
+        let probe = Arc::new(MockReadProbe::default());
+        let mut value = controller
+            .into_hns_value_with_clock(
+                &key,
+                MockReadBackend::new(probe.clone()),
+                MockReadClock,
+                Some(PersistentShakedexConfig {
+                    seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
+                    transport: PersistentDenuoTransport::WalletPeers,
+                }),
+            )
+            .expect("compose direct value wallet");
+
+        value.unlock(&key).expect("unlock must not synchronize");
+        assert_eq!(probe.snapshot_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.tip_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.confirmed_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.mempool_calls.load(Ordering::SeqCst), 0);
+
+        let snapshot = value.synchronize().expect("explicit sync");
+        assert_eq!(snapshot.balance, Amount::new(WalletAsset::Hns, 0));
+        assert!(probe.tip_calls.load(Ordering::SeqCst) > 0);
+        assert!(probe.confirmed_calls.load(Ordering::SeqCst) > 0);
+        assert!(probe.mempool_calls.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
     fn flagged_value_account_reopens_for_lifecycle_uses_value_composition() {
         let directory = private_tempdir();
         let path = directory.path().join("flagged-lifecycle.sqlite3");

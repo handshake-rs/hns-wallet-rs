@@ -290,21 +290,27 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         self.store
             .unlock(passphrase)
             .map_err(persistent_store_failure)?;
-        if let Err(error) = self
-            .exact_account()
-            .and_then(|_| self.recover_shakedex_startup())
-        {
+        // Unlocking proves possession of the encrypted local account; it is
+        // intentionally not a network operation. In particular, a newly
+        // installed direct wallet has not yet driven its bounded peer sync.
+        // Requiring Shakedex recovery here used that unsynchronized runtime
+        // and made a valid HNS receive wallet impossible to unlock. Recovery
+        // remains fail-closed, but runs only after an explicit reconciliation
+        // has established the exact current chain state.
+        if let Err(error) = self.exact_account() {
             self.store.lock().map_err(persistent_store_failure)?;
             return Err(error);
         }
         Ok(())
     }
 
-    fn recover_shakedex_startup(&self) -> Result<(), ServiceFailure> {
+    /// Recover durable marketplace state only after the caller has completed
+    /// a fresh, authenticated HNS reconciliation. This must not perform an
+    /// implicit network sync from the wallet-unlock boundary.
+    fn recover_shakedex_after_reconcile(&self) -> Result<(), ServiceFailure> {
         if !self.shakedex_available() {
             return Ok(());
         }
-        self.runtime.reconcile().map_err(hns_read_failure)?;
         let trade = self.shakedex_runtime()?;
         trade.recover_startup().map_err(shakedex_failure)?;
         trade
@@ -1451,6 +1457,10 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         &self,
     ) -> Result<NativeHnsValueSnapshot, ServiceFailure> {
         let selected = self.runtime.reconcile()?;
+        self.runtime.recover_shakedex_after_reconcile()?;
+        if self.runtime.exact_account()? != selected {
+            return Err(hns_read_failure(HnsWalletError::StaleAccountRead));
+        }
         let balance = self.runtime.runtime.balance().map_err(chain_failure)?;
         let receive_target = self
             .runtime
