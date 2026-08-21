@@ -6,7 +6,7 @@
 //! durable state.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -179,6 +179,70 @@ pub struct HnsDirectDenuoPeer {
     connection: PeerConnection<TcpStream>,
     negotiated: NegotiatedRegistry,
     next_request_id: u64,
+}
+
+/// A wallet-owned, nonblocking TCP admission point for direct Denuo peers.
+///
+/// This listener is deliberately narrower than a Handshake node listener. It
+/// accepts no chain, wallet-filter, RPC, indexing, or arbitrary experimental
+/// traffic. A caller obtains a negotiated [`HnsDirectDenuoPeer`] only after
+/// the standard Handshake handshake and the exact Denuo V2 registry agreement
+/// have both completed. The caller remains responsible for deciding when an
+/// unlocked wallet may service a bounded board exchange.
+pub struct HnsDirectDenuoListener {
+    listener: TcpListener,
+    config: HnsDirectPeerConfig,
+}
+
+impl HnsDirectDenuoListener {
+    /// Bind one explicit local socket for direct wallet-to-wallet Denuo
+    /// sessions. A port of zero is useful for deterministic local pairing
+    /// tests; an installed wallet supplies its user-visible listening port.
+    pub fn bind(
+        config: HnsDirectPeerConfig,
+        address: SocketAddr,
+    ) -> Result<Self, HnsDirectPeerError> {
+        config.validate()?;
+        let listener =
+            TcpListener::bind(address).map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        Ok(Self { listener, config })
+    }
+
+    /// The actual local address, including a kernel-selected port when zero
+    /// was supplied to [`Self::bind`]. This is a transport locator only.
+    pub fn local_addr(&self) -> Result<SocketAddr, HnsDirectPeerError> {
+        self.listener
+            .local_addr()
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))
+    }
+
+    /// Accept at most one pending TCP connection and bind it to the direct
+    /// Denuo protocol. `Ok(None)` means there is no pending connection.
+    ///
+    /// The accepted handshake is bounded by the peer configuration's socket
+    /// deadlines. Callers should invoke this from their owned I/O worker and
+    /// must not retain a peer after the associated wallet is locked.
+    pub fn accept_next(
+        &self,
+        local_height: u32,
+        now_unix: u64,
+    ) -> Result<Option<HnsDirectDenuoPeer>, HnsDirectPeerError> {
+        let (stream, _) = match self.listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(HnsDirectPeerError::Io(error.kind())),
+        };
+        stream
+            .set_read_timeout(Some(self.config.connect_timeout))
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        stream
+            .set_write_timeout(Some(self.config.connect_timeout))
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        HnsDirectDenuoPeer::accept(&self.config, stream, local_height, now_unix).map(Some)
+    }
 }
 
 impl HnsDirectDenuoPeer {
@@ -1965,9 +2029,9 @@ impl From<PeerError> for HnsDirectPeerError {
     reason = "tests fail immediately on invalid deterministic fixtures"
 )]
 mod tests {
-    use std::net::{Ipv4Addr, TcpListener};
+    use std::net::Ipv4Addr;
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
     use hns_wallet_store::{SecretKind, WalletStore};
@@ -2065,21 +2129,24 @@ mod tests {
 
     #[test]
     fn direct_denuo_wallet_accepts_and_negotiates_an_inbound_wallet_peer() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = HnsDirectDenuoListener::bind(
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+        )
+        .unwrap();
         let address = listener.local_addr().unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            HnsDirectDenuoPeer::accept(
-                &HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
-                stream,
-                42,
-                now,
-            )
-            .unwrap()
+            for _ in 0..100 {
+                if let Some(peer) = listener.accept_next(42, now).unwrap() {
+                    return peer;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            panic!("wallet-hosted Denuo listener did not receive the client")
         });
 
         let mut client_config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
