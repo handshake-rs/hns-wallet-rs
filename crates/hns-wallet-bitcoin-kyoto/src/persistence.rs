@@ -12,7 +12,7 @@ use hns_wallet_store::{MAX_RECORD_ID_BYTES, SharedWalletStore, StoreError, Store
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::BitcoinWalletError;
+use crate::{BIP39_SEED_BYTES, BitcoinWalletError};
 
 /// Version of the wallet-owned encrypted BDK snapshot envelope.
 pub const BDK_WALLET_STATE_FORMAT_VERSION: u16 = 1;
@@ -271,8 +271,31 @@ pub fn create_persisted_descriptor_wallet(
     now_unix: u64,
 ) -> Result<EncryptedPersistedBitcoinWallet, BitcoinWalletError> {
     let seed = Zeroizing::new(mnemonic.to_seed_normalized(""));
-    let root = Xpriv::new_master(network, seed.as_slice())
-        .map_err(|_| BitcoinWalletError::KeyDerivation)?;
+    create_persisted_descriptor_wallet_from_seed(
+        seed.as_slice(),
+        network,
+        store,
+        account_id,
+        now_unix,
+    )
+}
+
+/// Persist a BIP84 wallet derived from an existing encrypted BIP-39 seed.
+///
+/// Installed HNS wallets persist the seed, not the mnemonic text, after the
+/// recovery phrase has been shown. This keeps HNS and Bitcoin under the same
+/// wallet recovery authority without storing a duplicate phrase.
+pub fn create_persisted_descriptor_wallet_from_seed(
+    seed: &[u8],
+    network: Network,
+    store: SharedWalletStore,
+    account_id: &[u8],
+    now_unix: u64,
+) -> Result<EncryptedPersistedBitcoinWallet, BitcoinWalletError> {
+    if seed.len() != BIP39_SEED_BYTES {
+        return Err(BitcoinWalletError::KeyDerivation);
+    }
+    let root = Xpriv::new_master(network, seed).map_err(|_| BitcoinWalletError::KeyDerivation)?;
     let mut persister = BdkWalletStorePersister::new(store, account_id, now_unix)?;
     let wallet = Wallet::create(
         Bip84(root, KeychainKind::External),
@@ -297,8 +320,29 @@ pub fn load_persisted_descriptor_wallet(
     now_unix: u64,
 ) -> Result<EncryptedPersistedBitcoinWallet, BitcoinWalletError> {
     let seed = Zeroizing::new(mnemonic.to_seed_normalized(""));
-    let root = Xpriv::new_master(network, seed.as_slice())
-        .map_err(|_| BitcoinWalletError::KeyDerivation)?;
+    load_persisted_descriptor_wallet_from_seed(
+        seed.as_slice(),
+        network,
+        store,
+        account_id,
+        now_unix,
+    )
+}
+
+/// Load a BIP84 wallet from its encrypted BDK state and its exact protected
+/// BIP-39 seed. See [`create_persisted_descriptor_wallet_from_seed`] for why
+/// mobile compositions use this instead of retaining mnemonic text.
+pub fn load_persisted_descriptor_wallet_from_seed(
+    seed: &[u8],
+    network: Network,
+    store: SharedWalletStore,
+    account_id: &[u8],
+    now_unix: u64,
+) -> Result<EncryptedPersistedBitcoinWallet, BitcoinWalletError> {
+    if seed.len() != BIP39_SEED_BYTES {
+        return Err(BitcoinWalletError::KeyDerivation);
+    }
+    let root = Xpriv::new_master(network, seed).map_err(|_| BitcoinWalletError::KeyDerivation)?;
     let mut persister = BdkWalletStorePersister::new(store, account_id, now_unix)?;
     let wallet = Wallet::load()
         .descriptor(
@@ -393,6 +437,46 @@ mod tests {
                 .persist(5)
                 .expect("staged change survived failed persistence")
         );
+    }
+
+    #[test]
+    fn protected_bip39_seed_derives_and_reloads_the_same_bip84_wallet() {
+        let store = shared_store();
+        let phrase = mnemonic(PHRASE_A);
+        let seed = Zeroizing::new(phrase.to_seed_normalized(""));
+        let mut created = create_persisted_descriptor_wallet_from_seed(
+            seed.as_slice(),
+            Network::Regtest,
+            store.clone(),
+            b"seed-account",
+            1,
+        )
+        .expect("create from the protected BIP-39 seed");
+        let first = created.reveal_next_address(KeychainKind::External).address;
+        assert!(created.persist(2).expect("persist revealed address"));
+
+        let loaded = load_persisted_descriptor_wallet_from_seed(
+            seed.as_slice(),
+            Network::Regtest,
+            store,
+            b"seed-account",
+            3,
+        )
+        .expect("reload from the protected BIP-39 seed");
+        assert_eq!(
+            loaded.peek_address(KeychainKind::External, 0).address,
+            first
+        );
+        assert!(matches!(
+            create_persisted_descriptor_wallet_from_seed(
+                &[0; BIP39_SEED_BYTES - 1],
+                Network::Regtest,
+                shared_store(),
+                b"short-seed",
+                1,
+            ),
+            Err(BitcoinWalletError::KeyDerivation)
+        ));
     }
 
     #[test]

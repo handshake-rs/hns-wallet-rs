@@ -54,6 +54,11 @@ pub const MIN_HTLC_DUST_SATS: u64 = 330;
 pub const BITCOIN_TIMESTAMP_LOCKTIME_THRESHOLD: u64 = 500_000_000;
 pub const MAX_HTLC_SCRIPT_BYTES: usize = 256;
 pub const MAX_BITCOIN_TRANSACTION_BYTES: usize = 400_000;
+/// BIP-39 PBKDF2 output length. The mobile HNS wallet keeps this exact
+/// protected seed rather than retaining a recoverable copy of the displayed
+/// mnemonic, so the Kyoto wallet must be able to derive BIP84 keys directly
+/// from it.
+pub const BIP39_SEED_BYTES: usize = 64;
 pub const MAX_REQUIRED_PEERS: u8 = 8;
 pub const MAX_RECOVERY_SCRIPT_INDEX: u32 = 100_000;
 pub const BITCOIN_SWAP_KEY_SCHEME_VERSION: u16 = 1;
@@ -421,8 +426,24 @@ pub fn create_descriptor_wallet(
     network: Network,
 ) -> Result<Wallet, BitcoinWalletError> {
     let seed = Zeroizing::new(mnemonic.to_seed_normalized(""));
-    let root = Xpriv::new_master(network, seed.as_slice())
-        .map_err(|_| BitcoinWalletError::KeyDerivation)?;
+    create_descriptor_wallet_from_seed(seed.as_slice(), network)
+}
+
+/// Create an in-memory BIP84 wallet from the exact protected BIP-39 seed.
+///
+/// This is the counterpart to [`create_descriptor_wallet`] for installed
+/// HNS/mobile wallets: those wallets deliberately retain only the encrypted
+/// PBKDF2 output after displaying the recovery phrase. Accepting the seed
+/// avoids asking a user to re-enter the phrase or creating a second recovery
+/// authority merely to add Bitcoin.
+pub fn create_descriptor_wallet_from_seed(
+    seed: &[u8],
+    network: Network,
+) -> Result<Wallet, BitcoinWalletError> {
+    if seed.len() != BIP39_SEED_BYTES {
+        return Err(BitcoinWalletError::KeyDerivation);
+    }
+    let root = Xpriv::new_master(network, seed).map_err(|_| BitcoinWalletError::KeyDerivation)?;
     Wallet::create(
         Bip84(root, KeychainKind::External),
         Bip84(root, KeychainKind::Internal),
