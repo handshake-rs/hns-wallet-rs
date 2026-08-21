@@ -17,8 +17,8 @@ use hns_wallet_ffi::{
 /// compose its [`EmbeddedHnsBackend`] without endpoint credentials.
 pub use hns_wallet_hns::{
     EmbeddedHnsBackend, HnsBackend, HnsBootstrapPolicy, HnsClock, HnsDirectPeerConfig,
-    HnsDirectPeerCoordinator, HnsDirectPeerError, HnsLightFloor, HnsNetwork, HnsNodeRpcBackend,
-    HnsNodeRpcConfig, SystemClock as HnsReadSystemClock,
+    HnsDirectPeerCoordinator, HnsDirectPeerError, HnsHeaderRoundProgress, HnsLightFloor,
+    HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig, SystemClock as HnsReadSystemClock,
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountRecord, HnsExistingAccountSelector, HnsRuntimeConfig,
