@@ -7,7 +7,10 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hns_covenants::{hash_name, validate_name};
@@ -981,6 +984,13 @@ pub struct HnsDirectPeerCoordinator {
     backend: EmbeddedHnsBackend,
     pool: Arc<NativeHnsPeerPool>,
     pending_header: Arc<Mutex<Option<PendingHeaderRound>>>,
+    // The persistent peer pool is deliberately wider than a single header
+    // agreement round. `hns_light_sync` requires every selected response to
+    // complete a round, so selecting the entire pool would turn optional
+    // discovery/failover peers into a much stronger availability requirement.
+    // Advance this cursor only for new rounds, retaining the exact selected
+    // set while a pending round is still awaiting its deadline.
+    next_header_peer_offset: Arc<AtomicUsize>,
 }
 
 impl HnsDirectPeerCoordinator {
@@ -1002,6 +1012,7 @@ impl HnsDirectPeerCoordinator {
             backend,
             pool,
             pending_header: Arc::new(Mutex::new(None)),
+            next_header_peer_offset: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1123,7 +1134,7 @@ impl HnsDirectPeerCoordinator {
         if let Some(pending) = pending {
             return self.finish_or_report_header_round(pending, now_unix);
         }
-        let handles = self.pool.ready_handles()?;
+        let handles = self.header_round_handles()?;
         if handles.is_empty() {
             return Err(HnsDirectPeerError::NoReadyPeers);
         }
@@ -1457,6 +1468,35 @@ impl HnsDirectPeerCoordinator {
         Ok(())
     }
 
+    /// Select the exact independent quorum required for one header agreement
+    /// round. Extra ready peers remain connected for future rotated rounds,
+    /// block-view cross-checks, and replacement after a transport failure.
+    fn header_round_handles(&self) -> Result<Vec<(PeerId, PeerHandle)>, HnsDirectPeerError> {
+        let handles = self.pool.ready_handles()?;
+        let quorum = self.pool.config.minimum_block_views;
+        if handles.len() <= quorum {
+            return Ok(handles);
+        }
+        let mut ordered = handles
+            .into_iter()
+            .map(|(id, peer)| {
+                let address = peer
+                    .lock()
+                    .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                    .address;
+                Ok((address, id, peer))
+            })
+            .collect::<Result<Vec<_>, HnsDirectPeerError>>()?;
+        ordered.sort_unstable_by_key(|(address, _, _)| *address);
+        let offset = self
+            .next_header_peer_offset
+            .fetch_add(quorum, Ordering::Relaxed);
+        Ok(select_rotating_header_quorum(ordered, quorum, offset)
+            .into_iter()
+            .map(|(_, id, peer)| (id, peer))
+            .collect())
+    }
+
     fn finish_or_report_header_round(
         &self,
         pending: PendingHeaderRound,
@@ -1487,6 +1527,23 @@ impl HnsDirectPeerCoordinator {
             .lock()
             .map_err(|_| HnsDirectPeerError::RuntimePoisoned)
     }
+}
+
+/// Return one bounded quorum from a deterministically ordered ready-peer set,
+/// rotating the starting position between fresh header rounds. The caller owns
+/// the candidates, so this never mutates membership or connection state.
+fn select_rotating_header_quorum<T>(
+    mut candidates: Vec<T>,
+    quorum: usize,
+    offset: usize,
+) -> Vec<T> {
+    debug_assert!(quorum > 0);
+    if candidates.len() > quorum {
+        let start = offset % candidates.len();
+        candidates.rotate_left(start);
+        candidates.truncate(quorum);
+    }
+    candidates
 }
 
 /// Open the direct peer coordinator owned by one encrypted wallet account.
@@ -2179,6 +2236,26 @@ mod tests {
         assert!(
             !HnsDirectPeerError::Wallet(HnsWalletError::InvalidEvidence)
                 .is_temporary_header_agreement_unavailable()
+        );
+    }
+
+    #[test]
+    fn header_agreement_uses_a_rotating_exact_quorum() {
+        assert_eq!(
+            select_rotating_header_quorum(vec![0, 1, 2, 3, 4], 2, 0),
+            vec![0, 1]
+        );
+        assert_eq!(
+            select_rotating_header_quorum(vec![0, 1, 2, 3, 4], 2, 2),
+            vec![2, 3]
+        );
+        assert_eq!(
+            select_rotating_header_quorum(vec![0, 1, 2, 3, 4], 2, 4),
+            vec![4, 0]
+        );
+        assert_eq!(
+            select_rotating_header_quorum(vec![0, 1], 2, 1),
+            vec![0, 1]
         );
     }
 
