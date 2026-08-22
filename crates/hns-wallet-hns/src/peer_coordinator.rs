@@ -996,6 +996,11 @@ pub struct HnsDirectPeerCoordinator {
     // Advance this cursor only for new rounds, retaining the exact selected
     // set while a pending round is still awaiting its deadline.
     next_header_peer_offset: Arc<AtomicUsize>,
+    // A wallet scan needs the same exact independent quorum as a header
+    // round, not every connected failover peer. Keep a distinct cursor so
+    // scan batches rotate through the ready pool without perturbing header
+    // agreement selection.
+    next_block_peer_offset: Arc<AtomicUsize>,
 }
 
 impl HnsDirectPeerCoordinator {
@@ -1018,6 +1023,7 @@ impl HnsDirectPeerCoordinator {
             pool,
             pending_header: Arc::new(Mutex::new(None)),
             next_header_peer_offset: Arc::new(AtomicUsize::new(0)),
+            next_block_peer_offset: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1333,27 +1339,33 @@ impl HnsDirectPeerCoordinator {
                 peer_views_verified: 0,
             });
         }
-        let mut handles = self.pool.ready_handles()?;
-        if handles.len() < self.pool.config.minimum_block_views {
+        let mut available_handles = self.pool.ready_handles()?;
+        if available_handles.len() < self.pool.config.minimum_block_views {
             return Err(HnsDirectPeerError::InsufficientBlockViews {
                 required: self.pool.config.minimum_block_views,
-                actual: handles.len(),
+                actual: available_handles.len(),
             });
         }
         let elements = self.backend.light_bloom_elements()?;
         let filter = wallet_bloom_filter(&elements)?;
-        let original_ids = handles.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        handles = install_filter_on_peers(handles, &filter)?;
-        let installed_ids = handles.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
+        let original_ids = available_handles
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        available_handles = install_filter_on_peers(available_handles, &filter)?;
+        let installed_ids = available_handles
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<HashSet<_>>();
         for id in original_ids {
             if !installed_ids.contains(&id) {
                 self.disconnect_peer(id)?;
             }
         }
-        if handles.len() < self.pool.config.minimum_block_views {
+        if available_handles.len() < self.pool.config.minimum_block_views {
             return Err(HnsDirectPeerError::InsufficientBlockViews {
                 required: self.pool.config.minimum_block_views,
-                actual: handles.len(),
+                actual: available_handles.len(),
             });
         }
         let last_height = tip_height.min(
@@ -1370,29 +1382,42 @@ impl HnsDirectPeerCoordinator {
             let anchors = (first_unscanned..=batch_last)
                 .map(|height| self.backend.wallet_header_anchor(height))
                 .collect::<Result<Vec<_>, _>>()?;
-            let responses = request_block_view_batches(&handles, &anchors, now_unix);
             let mut views = Vec::new();
-            let mut survivors = Vec::new();
-            let mut failed_ids = Vec::new();
-            for ((id, handle), response) in handles.into_iter().zip(responses) {
-                match response {
-                    Ok(blocks) if blocks.len() == anchors.len() => {
-                        views.push(blocks);
-                        survivors.push((id, handle));
-                    }
-                    Ok(_) => failed_ids.push(id),
-                    Err(_) => failed_ids.push(id),
+            let mut attempted_ids = HashSet::new();
+            while views.len() < self.pool.config.minimum_block_views {
+                let required = self.pool.config.minimum_block_views - views.len();
+                let candidates = available_handles
+                    .iter()
+                    .filter(|(id, _)| !attempted_ids.contains(id))
+                    .map(|(id, peer)| (*id, Arc::clone(peer)))
+                    .collect::<Vec<_>>();
+                if candidates.len() < required {
+                    return Err(HnsDirectPeerError::InsufficientBlockViews {
+                        required: self.pool.config.minimum_block_views,
+                        actual: views.len(),
+                    });
                 }
-            }
-            for id in failed_ids {
-                self.disconnect_peer(id)?;
-            }
-            handles = survivors;
-            if views.len() < self.pool.config.minimum_block_views {
-                return Err(HnsDirectPeerError::InsufficientBlockViews {
-                    required: self.pool.config.minimum_block_views,
-                    actual: views.len(),
-                });
+
+                // Request exactly the proof quorum for the normal path. If a
+                // selected peer fails, query only the number of already-
+                // filtered reserve peers required to restore that quorum; an
+                // optional slow peer never delays this batch.
+                let selected = self.block_scan_quorum_handles(&candidates, required)?;
+                attempted_ids.extend(selected.iter().map(|(id, _)| *id));
+                let responses = request_block_view_batches(&selected, &anchors, now_unix);
+                let mut failed_ids = HashSet::new();
+                for ((id, _), response) in selected.into_iter().zip(responses) {
+                    match response {
+                        Ok(blocks) if blocks.len() == anchors.len() => views.push(blocks),
+                        Ok(_) | Err(_) => {
+                            failed_ids.insert(id);
+                        }
+                    }
+                }
+                for id in &failed_ids {
+                    self.disconnect_peer(*id)?;
+                }
+                available_handles.retain(|(id, _)| !failed_ids.contains(id));
             }
             for (index, height) in (first_unscanned..=batch_last).enumerate() {
                 let block_views = views
@@ -1532,7 +1557,35 @@ impl HnsDirectPeerCoordinator {
     fn header_round_handles(&self) -> Result<Vec<(PeerId, PeerHandle)>, HnsDirectPeerError> {
         let handles = self.pool.ready_handles()?;
         let quorum = self.pool.config.minimum_block_views;
-        if handles.len() <= quorum {
+        self.rotating_peer_quorum_handles(handles, quorum, &self.next_header_peer_offset)
+    }
+
+    /// Select a rotating exact proof quorum from the filter-installed peers
+    /// for one block scan batch. The caller retains every unselected handle as
+    /// a warm, already-filtered reserve for a later batch or immediate retry.
+    fn block_scan_quorum_handles(
+        &self,
+        handles: &[(PeerId, PeerHandle)],
+        requested: usize,
+    ) -> Result<Vec<(PeerId, PeerHandle)>, HnsDirectPeerError> {
+        debug_assert!(requested > 0);
+        self.rotating_peer_quorum_handles(
+            handles
+                .iter()
+                .map(|(id, peer)| (*id, Arc::clone(peer)))
+                .collect(),
+            requested,
+            &self.next_block_peer_offset,
+        )
+    }
+
+    fn rotating_peer_quorum_handles(
+        &self,
+        handles: Vec<(PeerId, PeerHandle)>,
+        requested: usize,
+        cursor: &AtomicUsize,
+    ) -> Result<Vec<(PeerId, PeerHandle)>, HnsDirectPeerError> {
+        if handles.len() <= requested {
             return Ok(handles);
         }
         let mut ordered = handles
@@ -1546,10 +1599,8 @@ impl HnsDirectPeerCoordinator {
             })
             .collect::<Result<Vec<_>, HnsDirectPeerError>>()?;
         ordered.sort_unstable_by_key(|(address, _, _)| *address);
-        let offset = self
-            .next_header_peer_offset
-            .fetch_add(quorum, Ordering::Relaxed);
-        Ok(select_rotating_header_quorum(ordered, quorum, offset)
+        let offset = cursor.fetch_add(requested, Ordering::Relaxed);
+        Ok(select_rotating_peer_quorum(ordered, requested, offset)
             .into_iter()
             .map(|(_, id, peer)| (id, peer))
             .collect())
@@ -1590,11 +1641,7 @@ impl HnsDirectPeerCoordinator {
 /// Return one bounded quorum from a deterministically ordered ready-peer set,
 /// rotating the starting position between fresh header rounds. The caller owns
 /// the candidates, so this never mutates membership or connection state.
-fn select_rotating_header_quorum<T>(
-    mut candidates: Vec<T>,
-    quorum: usize,
-    offset: usize,
-) -> Vec<T> {
+fn select_rotating_peer_quorum<T>(mut candidates: Vec<T>, quorum: usize, offset: usize) -> Vec<T> {
     debug_assert!(quorum > 0);
     if candidates.len() > quorum {
         let start = offset % candidates.len();
@@ -2448,20 +2495,24 @@ mod tests {
     }
 
     #[test]
-    fn header_agreement_uses_a_rotating_exact_quorum() {
+    fn peer_quorums_are_rotating_and_exact() {
         assert_eq!(
-            select_rotating_header_quorum(vec![0, 1, 2, 3, 4], 2, 0),
+            select_rotating_peer_quorum(vec![0, 1, 2, 3, 4], 2, 0),
             vec![0, 1]
         );
         assert_eq!(
-            select_rotating_header_quorum(vec![0, 1, 2, 3, 4], 2, 2),
+            select_rotating_peer_quorum(vec![0, 1, 2, 3, 4], 2, 2),
             vec![2, 3]
         );
         assert_eq!(
-            select_rotating_header_quorum(vec![0, 1, 2, 3, 4], 2, 4),
+            select_rotating_peer_quorum(vec![0, 1, 2, 3, 4], 2, 4),
             vec![4, 0]
         );
-        assert_eq!(select_rotating_header_quorum(vec![0, 1], 2, 1), vec![0, 1]);
+        assert_eq!(select_rotating_peer_quorum(vec![0, 1], 2, 1), vec![0, 1]);
+        assert_eq!(
+            select_rotating_peer_quorum(vec![0, 1, 2, 3, 4], 1, 3),
+            vec![3]
+        );
     }
 
     fn direct_wallet_config() -> HnsRuntimeConfig {
