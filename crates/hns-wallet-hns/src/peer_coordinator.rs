@@ -1140,6 +1140,13 @@ impl HnsDirectPeerCoordinator {
         }
         let ids = handles.iter().map(|(id, _)| *id).collect::<Vec<_>>();
         let request = self.backend.begin_header_round(&ids, now_unix)?;
+        // Some HSD peers do not emit an explicit empty `headers` packet when
+        // the first locator hash is already their tip.  Ask from the prior
+        // locator instead: a peer at our existing tip must then return the
+        // exact known tip before it can prove that no extension follows.  The
+        // response is normalized below, so the agreement engine still sees
+        // only headers extending its own authenticated base.
+        let locator = header_freshness_locator(&request.packet.locator);
         let mut pending = PendingHeaderRound {
             generation: request.generation,
             deadline: request.deadline,
@@ -1151,7 +1158,7 @@ impl HnsDirectPeerCoordinator {
             handles
                 .into_iter()
                 .map(|(id, peer)| {
-                    let locator = request.packet.locator.clone();
+                    let locator = locator.clone();
                     let stop = request.packet.stop;
                     scope.spawn(move || {
                         let response = peer
@@ -1170,6 +1177,7 @@ impl HnsDirectPeerCoordinator {
         for response in responses {
             match response {
                 Ok((id, Ok(headers))) => {
+                    let headers = normalize_header_freshness_response(headers, request.base_hash);
                     if self
                         .backend
                         .submit_header_response(
@@ -2157,6 +2165,33 @@ fn header_round_finished_at(
     }
 }
 
+/// Build a header locator that asks a peer to echo the locally authenticated
+/// tip before it supplies any extension.  This preserves an ordinary genesis
+/// request, whose locator has no predecessor.
+fn header_freshness_locator(locator: &[BlockHash]) -> Vec<BlockHash> {
+    if locator.len() > 1 {
+        locator[1..].to_vec()
+    } else {
+        locator.to_vec()
+    }
+}
+
+/// Strip the peer's echo of the already authenticated base header.  A reply
+/// that starts with any other header remains untouched and fails normal local
+/// chain validation rather than being mistaken for a current-chain proof.
+fn normalize_header_freshness_response(
+    mut headers: Vec<Header>,
+    base_hash: BlockHash,
+) -> Vec<Header> {
+    if headers
+        .first()
+        .is_some_and(|header| header.block_hash() == base_hash)
+    {
+        headers.remove(0);
+    }
+    headers
+}
+
 /// Direct-peer construction, transport, or locally verified data failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -2285,6 +2320,38 @@ mod tests {
         assert_eq!(
             header_round_finished_at(pending, 2, true, 900).expect("panicked round"),
             1_001
+        );
+    }
+
+    #[test]
+    fn header_freshness_locator_challenges_the_known_tip_through_its_predecessor() {
+        let tip = BlockHash::new([1; 32]);
+        let previous = BlockHash::new([2; 32]);
+        let older = BlockHash::new([3; 32]);
+        assert_eq!(
+            header_freshness_locator(&[tip, previous, older]),
+            vec![previous, older]
+        );
+        assert_eq!(header_freshness_locator(&[tip]), vec![tip]);
+    }
+
+    #[test]
+    fn header_freshness_response_strips_only_the_exact_known_tip() {
+        let known = Header::default();
+        let known_hash = known.block_hash();
+        let other = Header {
+            nonce: 1,
+            ..Header::default()
+        };
+
+        assert!(normalize_header_freshness_response(vec![known.clone()], known_hash).is_empty());
+        assert_eq!(
+            normalize_header_freshness_response(vec![known, other.clone()], known_hash),
+            vec![other.clone()]
+        );
+        assert_eq!(
+            normalize_header_freshness_response(vec![other.clone()], known_hash),
+            vec![other]
         );
     }
 
