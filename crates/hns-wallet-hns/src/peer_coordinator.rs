@@ -11,7 +11,7 @@ use std::sync::{
     Arc, Mutex, MutexGuard,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hns_covenants::{hash_name, validate_name};
 use hns_header_consensus::{Header, Network};
@@ -159,6 +159,30 @@ pub struct HnsBlockScanProgress {
     pub blocks_applied: u32,
     pub transactions_admitted: usize,
     pub peer_views_verified: usize,
+    /// Timing for the newly durable scan batch that ended at this progress
+    /// point. It contains no peer address or wallet information.
+    pub batch_telemetry: Option<HnsBlockScanBatchTelemetry>,
+}
+
+/// Local timing breakdown for one atomically persisted filtered-block batch.
+///
+/// The peer timings identify whether the scan is delivery-bound without
+/// exposing a peer address, account, watched script, or transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HnsBlockScanBatchTelemetry {
+    pub first_height: u32,
+    pub last_height: u32,
+    pub blocks: u32,
+    /// Wall time to obtain the independent quorum's full filtered-block views.
+    pub peer_fetch_millis: u64,
+    /// Fastest successful individual peer-view response in the quorum.
+    pub fastest_peer_fetch_millis: u64,
+    /// Slowest successful individual peer-view response in the quorum.
+    pub slowest_peer_fetch_millis: u64,
+    /// Time to merge every independent view into locally verified blocks.
+    pub merge_millis: u64,
+    /// Time to plan and atomically commit wallet observations and scan head.
+    pub commit_millis: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1337,6 +1361,7 @@ impl HnsDirectPeerCoordinator {
                 blocks_applied: 0,
                 transactions_admitted: 0,
                 peer_views_verified: 0,
+                batch_telemetry: None,
             });
         }
         let mut available_handles = self.pool.ready_handles()?;
@@ -1377,6 +1402,7 @@ impl HnsDirectPeerCoordinator {
         let mut transactions_admitted = 0usize;
         let mut peer_views_verified = 0usize;
         let mut first_unscanned = next_height;
+        let mut last_batch_telemetry = None;
         while first_unscanned <= last_height {
             let batch_last = filtered_block_batch_last(first_unscanned, last_height);
             let anchors = (first_unscanned..=batch_last)
@@ -1384,6 +1410,8 @@ impl HnsDirectPeerCoordinator {
                 .collect::<Result<Vec<_>, _>>()?;
             let mut views = Vec::new();
             let mut attempted_ids = HashSet::new();
+            let peer_fetch_started = Instant::now();
+            let mut successful_peer_fetches = Vec::new();
             while views.len() < self.pool.config.minimum_block_views {
                 let required = self.pool.config.minimum_block_views - views.len();
                 let candidates = available_handles
@@ -1407,8 +1435,11 @@ impl HnsDirectPeerCoordinator {
                 let responses = request_block_view_batches(&selected, &anchors, now_unix);
                 let mut failed_ids = HashSet::new();
                 for ((id, _), response) in selected.into_iter().zip(responses) {
-                    match response {
-                        Ok(blocks) if blocks.len() == anchors.len() => views.push(blocks),
+                    match response.result {
+                        Ok(blocks) if blocks.len() == anchors.len() => {
+                            successful_peer_fetches.push(response.elapsed);
+                            views.push(blocks);
+                        }
                         Ok(_) | Err(_) => {
                             failed_ids.insert(id);
                         }
@@ -1419,6 +1450,21 @@ impl HnsDirectPeerCoordinator {
                 }
                 available_handles.retain(|(id, _)| !failed_ids.contains(id));
             }
+            let peer_fetch_millis = duration_millis(peer_fetch_started.elapsed());
+            let fastest_peer_fetch_millis = successful_peer_fetches
+                .iter()
+                .copied()
+                .min()
+                .map(duration_millis)
+                .unwrap_or_default();
+            let slowest_peer_fetch_millis = successful_peer_fetches
+                .iter()
+                .copied()
+                .max()
+                .map(duration_millis)
+                .unwrap_or_default();
+
+            let merge_started = Instant::now();
             let mut merged_blocks = Vec::with_capacity(anchors.len());
             for index in 0..anchors.len() {
                 let block_views = views
@@ -1430,12 +1476,27 @@ impl HnsDirectPeerCoordinator {
                     .map_err(|error| HnsDirectPeerError::WalletEvidence(error.to_string()))?;
                 merged_blocks.push(merged);
             }
+            let merge_millis = duration_millis(merge_started.elapsed());
+
+            let commit_started = Instant::now();
             let admitted_per_block = self
                 .backend
                 .apply_verified_blocks(&merged_blocks, now_unix_or(now_unix))?;
+            let commit_millis = duration_millis(commit_started.elapsed());
             if admitted_per_block.len() != merged_blocks.len() {
                 return Err(HnsDirectPeerError::Arithmetic);
             }
+            let batch_telemetry = HnsBlockScanBatchTelemetry {
+                first_height: first_unscanned,
+                last_height: batch_last,
+                blocks: u32::try_from(anchors.len()).unwrap_or(u32::MAX),
+                peer_fetch_millis,
+                fastest_peer_fetch_millis,
+                slowest_peer_fetch_millis,
+                merge_millis,
+                commit_millis,
+            };
+            last_batch_telemetry = Some(batch_telemetry);
             for (height, admitted) in (first_unscanned..=batch_last).zip(admitted_per_block) {
                 transactions_admitted = transactions_admitted
                     .checked_add(admitted)
@@ -1450,6 +1511,7 @@ impl HnsDirectPeerCoordinator {
                     blocks_applied,
                     transactions_admitted,
                     peer_views_verified,
+                    batch_telemetry: (height == batch_last).then_some(batch_telemetry),
                 });
             }
             if batch_last == last_height {
@@ -1466,6 +1528,7 @@ impl HnsDirectPeerCoordinator {
             blocks_applied,
             transactions_admitted,
             peer_views_verified,
+            batch_telemetry: last_batch_telemetry,
         })
     }
 
@@ -2073,28 +2136,47 @@ fn install_filter_on_peers(
         .collect())
 }
 
+struct TimedBlockViewBatch {
+    elapsed: Duration,
+    result: Result<Vec<VerifiedWalletBlock>, HnsDirectPeerError>,
+}
+
 fn request_block_view_batches(
     handles: &[(PeerId, PeerHandle)],
     anchors: &[WalletHeaderAnchor],
     now_unix: u64,
-) -> Vec<Result<Vec<VerifiedWalletBlock>, HnsDirectPeerError>> {
+) -> Vec<TimedBlockViewBatch> {
     std::thread::scope(|scope| {
         handles
             .iter()
             .map(|(_, peer)| {
                 let peer = Arc::clone(peer);
                 scope.spawn(move || {
-                    peer.lock()
-                        .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
-                        .request_filtered_blocks(anchors, now_unix)
+                    let started = Instant::now();
+                    let result = (|| {
+                        let mut peer = peer
+                            .lock()
+                            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+                        peer.request_filtered_blocks(anchors, now_unix)
+                    })();
+                    TimedBlockViewBatch {
+                        elapsed: started.elapsed(),
+                        result,
+                    }
                 })
             })
             .map(|task| {
-                task.join()
-                    .unwrap_or(Err(HnsDirectPeerError::WorkerPanicked))
+                task.join().unwrap_or(TimedBlockViewBatch {
+                    elapsed: Duration::ZERO,
+                    result: Err(HnsDirectPeerError::WorkerPanicked),
+                })
             })
             .collect()
     })
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn filtered_block_inventory(anchors: &[WalletHeaderAnchor]) -> Vec<Inventory> {
