@@ -57,6 +57,11 @@ const MAX_DIRECT_PEERS: usize = 64;
 const MAX_RESPONSE_EVENTS: usize = 4_096;
 const MAX_DISCOVERED_ADDRESSES: usize = 1_024;
 const MAX_SCAN_BLOCKS_PER_CALL: u32 = 2_000;
+// Handshake permits large `getdata` vectors, but retaining a modest request
+// window bounds memory, a peer's outstanding work, and the amount that must
+// be retried after a transport failure. It also removes the per-height round
+// trip that made historical wallet scans progress at roughly one block/sec.
+const FILTERED_BLOCK_REQUEST_WINDOW: u32 = 64;
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 const BLOOM_GROWTH_RESERVE: usize = 1_024;
 const DENUO_MAX_RESPONSE_EVENTS: usize = 256;
@@ -1359,18 +1364,23 @@ impl HnsDirectPeerCoordinator {
         let mut blocks_applied = 0u32;
         let mut transactions_admitted = 0usize;
         let mut peer_views_verified = 0usize;
-        for height in next_height..=last_height {
-            let anchor = self.backend.wallet_header_anchor(height)?;
-            let responses = request_block_views(&handles, anchor, now_unix);
+        let mut first_unscanned = next_height;
+        while first_unscanned <= last_height {
+            let batch_last = filtered_block_batch_last(first_unscanned, last_height);
+            let anchors = (first_unscanned..=batch_last)
+                .map(|height| self.backend.wallet_header_anchor(height))
+                .collect::<Result<Vec<_>, _>>()?;
+            let responses = request_block_view_batches(&handles, &anchors, now_unix);
             let mut views = Vec::new();
             let mut survivors = Vec::new();
             let mut failed_ids = Vec::new();
             for ((id, handle), response) in handles.into_iter().zip(responses) {
                 match response {
-                    Ok(block) => {
-                        views.push(block);
+                    Ok(blocks) if blocks.len() == anchors.len() => {
+                        views.push(blocks);
                         survivors.push((id, handle));
                     }
+                    Ok(_) => failed_ids.push(id),
                     Err(_) => failed_ids.push(id),
                 }
             }
@@ -1384,26 +1394,38 @@ impl HnsDirectPeerCoordinator {
                     actual: views.len(),
                 });
             }
-            peer_views_verified = peer_views_verified.saturating_add(views.len());
-            let merged = VerifiedWalletBlock::merge_peer_views(&views)
-                .map_err(|error| HnsDirectPeerError::WalletEvidence(error.to_string()))?;
-            transactions_admitted = transactions_admitted
-                .checked_add(
-                    self.backend
-                        .apply_verified_block(&merged, now_unix_or(now_unix))?,
-                )
-                .ok_or(HnsDirectPeerError::Arithmetic)?;
-            blocks_applied = blocks_applied
+            for (index, height) in (first_unscanned..=batch_last).enumerate() {
+                let block_views = views
+                    .iter()
+                    .map(|peer_blocks| peer_blocks[index].clone())
+                    .collect::<Vec<_>>();
+                peer_views_verified = peer_views_verified.saturating_add(block_views.len());
+                let merged = VerifiedWalletBlock::merge_peer_views(&block_views)
+                    .map_err(|error| HnsDirectPeerError::WalletEvidence(error.to_string()))?;
+                transactions_admitted = transactions_admitted
+                    .checked_add(
+                        self.backend
+                            .apply_verified_block(&merged, now_unix_or(now_unix))?,
+                    )
+                    .ok_or(HnsDirectPeerError::Arithmetic)?;
+                blocks_applied = blocks_applied
+                    .checked_add(1)
+                    .ok_or(HnsDirectPeerError::Arithmetic)?;
+                on_progress(HnsBlockScanProgress {
+                    first_height: Some(next_height),
+                    last_height: Some(height),
+                    validated_tip_height: tip_height,
+                    blocks_applied,
+                    transactions_admitted,
+                    peer_views_verified,
+                });
+            }
+            if batch_last == last_height {
+                break;
+            }
+            first_unscanned = batch_last
                 .checked_add(1)
                 .ok_or(HnsDirectPeerError::Arithmetic)?;
-            on_progress(HnsBlockScanProgress {
-                first_height: Some(next_height),
-                last_height: Some(height),
-                validated_tip_height: tip_height,
-                blocks_applied,
-                transactions_admitted,
-                peer_views_verified,
-            });
         }
         Ok(HnsBlockScanProgress {
             first_height: Some(next_height),
@@ -1796,17 +1818,38 @@ impl NativePeer {
         Err(HnsDirectPeerError::ResponseEventLimit)
     }
 
-    fn request_filtered_block(
+    /// Request a bounded window of filtered blocks in one standard `getdata`
+    /// packet. HSD serializes the corresponding `merkleblock` and matched
+    /// transaction messages in inventory order. Consume that ordering
+    /// strictly: a response for the wrong authenticated anchor fails closed
+    /// rather than being reassociated or accepted speculatively.
+    fn request_filtered_blocks(
+        &mut self,
+        anchors: &[WalletHeaderAnchor],
+        now_unix: u64,
+    ) -> Result<Vec<VerifiedWalletBlock>, HnsDirectPeerError> {
+        if anchors.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.connection
+            .send_wallet_packet(&Packet::GetData(filtered_block_inventory(anchors)))?;
+        anchors
+            .iter()
+            .copied()
+            .map(|anchor| self.receive_filtered_block(anchor, now_unix))
+            .collect()
+    }
+
+    /// Receive precisely one filtered-block response already requested by
+    /// [`Self::request_filtered_blocks`]. The caller fixes the expected
+    /// anchor before reading the peer socket, preventing a peer from choosing
+    /// which local height its proof is evaluated against.
+    fn receive_filtered_block(
         &mut self,
         anchor: WalletHeaderAnchor,
         now_unix: u64,
     ) -> Result<VerifiedWalletBlock, HnsDirectPeerError> {
         let expected_hash = anchor.hash().into_bytes();
-        self.connection
-            .send_wallet_packet(&Packet::GetData(vec![Inventory {
-                kind: InventoryKind::FilteredBlock,
-                hash: expected_hash,
-            }]))?;
         let mut collector = None;
         let mut expected_transactions = HashSet::new();
         for _ in 0..MAX_RESPONSE_EVENTS {
@@ -1976,11 +2019,11 @@ fn install_filter_on_peers(
         .collect())
 }
 
-fn request_block_views(
+fn request_block_view_batches(
     handles: &[(PeerId, PeerHandle)],
-    anchor: WalletHeaderAnchor,
+    anchors: &[WalletHeaderAnchor],
     now_unix: u64,
-) -> Vec<Result<VerifiedWalletBlock, HnsDirectPeerError>> {
+) -> Vec<Result<Vec<VerifiedWalletBlock>, HnsDirectPeerError>> {
     std::thread::scope(|scope| {
         handles
             .iter()
@@ -1989,7 +2032,7 @@ fn request_block_views(
                 scope.spawn(move || {
                     peer.lock()
                         .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
-                        .request_filtered_block(anchor, now_unix)
+                        .request_filtered_blocks(anchors, now_unix)
                 })
             })
             .map(|task| {
@@ -1998,6 +2041,20 @@ fn request_block_views(
             })
             .collect()
     })
+}
+
+fn filtered_block_inventory(anchors: &[WalletHeaderAnchor]) -> Vec<Inventory> {
+    anchors
+        .iter()
+        .map(|anchor| Inventory {
+            kind: InventoryKind::FilteredBlock,
+            hash: anchor.hash().into_bytes(),
+        })
+        .collect()
+}
+
+fn filtered_block_batch_last(first_height: u32, tip_height: u32) -> u32 {
+    tip_height.min(first_height.saturating_add(FILTERED_BLOCK_REQUEST_WINDOW.saturating_sub(1)))
 }
 
 fn wallet_bloom_filter(elements: &[Vec<u8>]) -> Result<HsdBloomFilter, HnsDirectPeerError> {
@@ -2374,6 +2431,20 @@ mod tests {
             normalize_header_freshness_response(vec![other.clone()], known_hash),
             vec![other]
         );
+    }
+
+    #[test]
+    fn filtered_block_request_windows_are_bounded_contiguous_and_overflow_safe() {
+        assert_eq!(filtered_block_batch_last(100, 100), 100);
+        assert_eq!(
+            filtered_block_batch_last(100, 100 + FILTERED_BLOCK_REQUEST_WINDOW - 1),
+            100 + FILTERED_BLOCK_REQUEST_WINDOW - 1
+        );
+        assert_eq!(
+            filtered_block_batch_last(100, 100 + FILTERED_BLOCK_REQUEST_WINDOW),
+            100 + FILTERED_BLOCK_REQUEST_WINDOW - 1
+        );
+        assert_eq!(filtered_block_batch_last(u32::MAX, u32::MAX), u32::MAX);
     }
 
     #[test]
