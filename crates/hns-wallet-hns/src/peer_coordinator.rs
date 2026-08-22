@@ -1419,7 +1419,8 @@ impl HnsDirectPeerCoordinator {
                 }
                 available_handles.retain(|(id, _)| !failed_ids.contains(id));
             }
-            for (index, height) in (first_unscanned..=batch_last).enumerate() {
+            let mut merged_blocks = Vec::with_capacity(anchors.len());
+            for index in 0..anchors.len() {
                 let block_views = views
                     .iter()
                     .map(|peer_blocks| peer_blocks[index].clone())
@@ -1427,11 +1428,17 @@ impl HnsDirectPeerCoordinator {
                 peer_views_verified = peer_views_verified.saturating_add(block_views.len());
                 let merged = VerifiedWalletBlock::merge_peer_views(&block_views)
                     .map_err(|error| HnsDirectPeerError::WalletEvidence(error.to_string()))?;
+                merged_blocks.push(merged);
+            }
+            let admitted_per_block = self
+                .backend
+                .apply_verified_blocks(&merged_blocks, now_unix_or(now_unix))?;
+            if admitted_per_block.len() != merged_blocks.len() {
+                return Err(HnsDirectPeerError::Arithmetic);
+            }
+            for (height, admitted) in (first_unscanned..=batch_last).zip(admitted_per_block) {
                 transactions_admitted = transactions_admitted
-                    .checked_add(
-                        self.backend
-                            .apply_verified_block(&merged, now_unix_or(now_unix))?,
-                    )
+                    .checked_add(admitted)
                     .ok_or(HnsDirectPeerError::Arithmetic)?;
                 blocks_applied = blocks_applied
                     .checked_add(1)

@@ -310,6 +310,22 @@ impl EmbeddedHnsBackend {
         block: &VerifiedWalletBlock,
         now_unix: u64,
     ) -> Result<usize, HnsWalletError> {
+        let admitted = self.apply_verified_blocks(std::slice::from_ref(block), now_unix)?;
+        debug_assert_eq!(admitted.len(), 1);
+        Ok(admitted.into_iter().next().unwrap_or_default())
+    }
+
+    /// Commit a consecutive filtered-block batch in one durable wallet-store
+    /// transaction. The index verifies every block before it advances durable
+    /// coverage, so a failed batch is safely replayed on the next sync.
+    pub fn apply_verified_blocks(
+        &self,
+        blocks: &[VerifiedWalletBlock],
+        now_unix: u64,
+    ) -> Result<Vec<usize>, HnsWalletError> {
+        if blocks.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut state = self.lock()?;
         let EmbeddedState {
             authority,
@@ -318,15 +334,17 @@ impl EmbeddedHnsBackend {
             ..
         } = &mut *state;
         let admitted = index
-            .apply_verified_block(authority, block, now_unix)
+            .apply_verified_block_batch(authority, blocks, now_unix)
             .map_err(map_index_error)?;
         let mut changed = false;
-        for transaction in block.transactions() {
-            let txid = transaction
-                .transaction_hash()
-                .map_err(|_| HnsWalletError::InvalidEvidence)?
-                .into_bytes();
-            changed |= mempool.transactions.remove(&txid).is_some();
+        for block in blocks {
+            for transaction in block.transactions() {
+                let txid = transaction
+                    .transaction_hash()
+                    .map_err(|_| HnsWalletError::InvalidEvidence)?
+                    .into_bytes();
+                changed |= mempool.transactions.remove(&txid).is_some();
+            }
         }
         if changed {
             advance_mempool_generation(mempool)?;

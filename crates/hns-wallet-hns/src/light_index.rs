@@ -435,39 +435,37 @@ impl EncryptedHnsLightIndex {
         block: &VerifiedWalletBlock,
         now_unix: u64,
     ) -> Result<usize, HnsLightIndexError> {
+        let admitted =
+            self.apply_verified_block_batch(authority, std::slice::from_ref(block), now_unix)?;
+        debug_assert_eq!(admitted.len(), 1);
+        Ok(admitted.into_iter().next().unwrap_or_default())
+    }
+
+    /// Validate a consecutive sequence of verified filtered blocks, then
+    /// commit its complete derived history and final scan head atomically.
+    ///
+    /// Validation remains sequential: outputs observed in an earlier block of
+    /// the batch are available when deciding whether a later in-batch spend is
+    /// relevant. If validation or persistence fails, durable coverage does not
+    /// move at all, so the next sync safely replays the complete batch.
+    pub fn apply_verified_block_batch(
+        &mut self,
+        authority: &EncryptedHnsLightAuthority,
+        blocks: &[VerifiedWalletBlock],
+        now_unix: u64,
+    ) -> Result<Vec<usize>, HnsLightIndexError> {
+        if blocks.is_empty() {
+            return Ok(Vec::new());
+        }
         if self.scan.watch_set.scripts.is_empty() && self.scan.watch_set.name_hashes.is_empty() {
             return Err(HnsLightIndexError::EmptyWatchSet);
         }
-        let entry = block.evidence().header();
-        let height = entry.height().get();
         if authority.account_id() != self.account_id
             || authority.consensus_network() != self.network
             || authority.birthday_height() > self.scan.birthday_height
-            || height > authority.validated_chain().tip().height().get()
         {
             return Err(HnsLightIndexError::AuthorityMismatch);
         }
-        let archived = authority
-            .archived_header(height)?
-            .ok_or(HnsLightIndexError::MissingAuthorityHeader)?;
-        if archived.block_hash() != entry.hash() {
-            return Err(HnsLightIndexError::AuthorityMismatch);
-        }
-        let expected_height = match self.scan.scanned_height {
-            Some(previous) => previous
-                .checked_add(1)
-                .ok_or(HnsLightIndexError::HeightOverflow)?,
-            None => self.scan.birthday_height,
-        };
-        if height != expected_height
-            || self
-                .scan
-                .scanned_hash
-                .is_some_and(|previous| entry.previous_block().into_bytes() != previous)
-        {
-            return Err(HnsLightIndexError::NonContiguousBlock);
-        }
-
         let existing = self.decoded_transactions()?;
         if existing.len() > crate::MAX_HISTORY_RESULTS {
             return Err(HnsLightIndexError::HistoryCapacity);
@@ -487,73 +485,105 @@ impl EncryptedHnsLightIndex {
             .copied()
             .collect::<BTreeSet<_>>();
         let mut watched_outpoints = watched_outputs(&existing, &watched_scripts)?;
-        let existing_txids = existing
+        let mut existing_txids = existing
             .iter()
             .map(|observation| observation.txid.into_bytes())
             .collect::<BTreeSet<_>>();
-        let match_positions = block
-            .evidence()
-            .matches()
-            .iter()
-            .map(|matched| (matched.hash().into_bytes(), matched.index()))
-            .collect::<BTreeMap<_, _>>();
         let mut saves = Vec::new();
-        let mut admitted = 0usize;
-        for transaction in block.transactions() {
-            let canonical_txid = transaction.transaction_hash()?;
-            let txid_bytes = canonical_txid.into_bytes();
-            let transaction_index = match_positions
-                .get(&txid_bytes)
-                .copied()
-                .ok_or(HnsLightIndexError::EvidenceMismatch)?;
-            if existing_txids.contains(&txid_bytes) {
-                return Err(HnsLightIndexError::DuplicateConfirmedTransaction);
+        let mut admitted_total = 0usize;
+        let mut admitted_per_block = Vec::with_capacity(blocks.len());
+        let mut next_scan = self.scan.clone();
+        for block in blocks {
+            let entry = block.evidence().header();
+            let height = entry.height().get();
+            if height > authority.validated_chain().tip().height().get() {
+                return Err(HnsLightIndexError::AuthorityMismatch);
             }
-            let relevant = transaction_relevant(
-                transaction,
-                &watched_scripts,
-                &watched_names,
-                &watched_outpoints,
-            );
-            add_watched_outputs(
-                transaction,
-                canonical_txid,
-                &watched_scripts,
-                &mut watched_outpoints,
-            )?;
-            if !relevant {
-                continue;
+            let archived = authority
+                .archived_header(height)?
+                .ok_or(HnsLightIndexError::MissingAuthorityHeader)?;
+            if archived.block_hash() != entry.hash() {
+                return Err(HnsLightIndexError::AuthorityMismatch);
             }
-            let raw = transaction.encode()?;
-            let stored = StoredHnsLightTransaction {
-                format_version: HNS_LIGHT_INDEX_FORMAT_VERSION,
-                network: self.network.id(),
-                txid: txid_bytes,
-                raw,
-                height,
-                block_hash: entry.hash().into_bytes(),
-                transaction_index,
-                block_time: entry.time().get(),
-                coinbase: transaction.is_coinbase(),
+            let expected_height = match next_scan.scanned_height {
+                Some(previous) => previous
+                    .checked_add(1)
+                    .ok_or(HnsLightIndexError::HeightOverflow)?,
+                None => next_scan.birthday_height,
             };
-            saves.push(EntityBatchSave {
-                id: transaction_id(self.account_id, txid_bytes),
-                expected_revision: 0,
-                value: StoredHnsLightWalletRecord::Transaction(stored),
-                updated_at_unix: now_unix,
-            });
-            admitted = admitted
-                .checked_add(1)
+            if height != expected_height
+                || next_scan
+                    .scanned_hash
+                    .is_some_and(|previous| entry.previous_block().into_bytes() != previous)
+            {
+                return Err(HnsLightIndexError::NonContiguousBlock);
+            }
+
+            let match_positions = block
+                .evidence()
+                .matches()
+                .iter()
+                .map(|matched| (matched.hash().into_bytes(), matched.index()))
+                .collect::<BTreeMap<_, _>>();
+            let mut admitted = 0usize;
+            for transaction in block.transactions() {
+                let canonical_txid = transaction.transaction_hash()?;
+                let txid_bytes = canonical_txid.into_bytes();
+                let transaction_index = match_positions
+                    .get(&txid_bytes)
+                    .copied()
+                    .ok_or(HnsLightIndexError::EvidenceMismatch)?;
+                if existing_txids.contains(&txid_bytes) {
+                    return Err(HnsLightIndexError::DuplicateConfirmedTransaction);
+                }
+                let relevant = transaction_relevant(
+                    transaction,
+                    &watched_scripts,
+                    &watched_names,
+                    &watched_outpoints,
+                );
+                add_watched_outputs(
+                    transaction,
+                    canonical_txid,
+                    &watched_scripts,
+                    &mut watched_outpoints,
+                )?;
+                if !relevant {
+                    continue;
+                }
+                existing_txids.insert(txid_bytes);
+                let raw = transaction.encode()?;
+                let stored = StoredHnsLightTransaction {
+                    format_version: HNS_LIGHT_INDEX_FORMAT_VERSION,
+                    network: self.network.id(),
+                    txid: txid_bytes,
+                    raw,
+                    height,
+                    block_hash: entry.hash().into_bytes(),
+                    transaction_index,
+                    block_time: entry.time().get(),
+                    coinbase: transaction.is_coinbase(),
+                };
+                saves.push(EntityBatchSave {
+                    id: transaction_id(self.account_id, txid_bytes),
+                    expected_revision: 0,
+                    value: StoredHnsLightWalletRecord::Transaction(stored),
+                    updated_at_unix: now_unix,
+                });
+                admitted = admitted
+                    .checked_add(1)
+                    .ok_or(HnsLightIndexError::HistoryCapacity)?;
+            }
+            admitted_total = admitted_total
+                .checked_add(admitted)
                 .ok_or(HnsLightIndexError::HistoryCapacity)?;
+            admitted_per_block.push(admitted);
+            next_scan.scanned_height = Some(height);
+            next_scan.scanned_hash = Some(entry.hash().into_bytes());
         }
-        if existing.len().saturating_add(admitted) > crate::MAX_HISTORY_RESULTS {
+        if existing.len().saturating_add(admitted_total) > crate::MAX_HISTORY_RESULTS {
             return Err(HnsLightIndexError::HistoryCapacity);
         }
-        let next_scan = StoredHnsLightScan {
-            scanned_height: Some(height),
-            scanned_hash: Some(entry.hash().into_bytes()),
-            ..self.scan.clone()
-        };
         saves.insert(
             0,
             EntityBatchSave {
@@ -571,7 +601,7 @@ impl EncryptedHnsLightIndex {
             .checked_add(1)
             .ok_or(HnsLightIndexError::RevisionOverflow)?;
         self.scan = next_scan;
-        Ok(admitted)
+        Ok(admitted_per_block)
     }
 
     /// Strictly verify and persist one standard-peer Urkel proof against the
@@ -935,7 +965,7 @@ mod tests {
     use hns_light_chain::{ChainLimits, LightChain};
     use hns_light_wallet::WalletBlockEvidence;
     use hns_primitives::{BlockTime, Dollarydoos, MerkleRoot, TreeRoot};
-    use hns_transaction::{Address, Output};
+    use hns_transaction::{Address, Input, Output, Witness};
     use hns_wallet_store::WalletStore;
 
     use super::*;
@@ -990,10 +1020,61 @@ mod tests {
         (collector.finish().unwrap(), header)
     }
 
+    fn verified_block_on_chain(
+        chain: &mut LightChain,
+        transaction: Transaction,
+        matched: bool,
+        now: BlockTime,
+    ) -> (VerifiedWalletBlock, Header) {
+        let txid = transaction.transaction_hash().unwrap();
+        let mut leaf = Blake2b::<U32>::new();
+        BlakeDigest::update(&mut leaf, [0]);
+        BlakeDigest::update(&mut leaf, txid.as_bytes());
+        let merkle_root = MerkleRoot::new(leaf.finalize().into());
+        let height_byte = u8::try_from(chain.tip().height().get().saturating_add(1)).unwrap();
+        let mut header = Header {
+            time: BlockTime::new(chain.tip().time().get() + 1),
+            previous_block: chain.tip().hash(),
+            tree_root: TreeRoot::new([height_byte; 32]),
+            merkle_root,
+            bits: Network::Regtest.parameters().pow.bits,
+            ..Header::default()
+        };
+        while !header.verify_pow() {
+            header.nonce = header.nonce.checked_add(1).unwrap();
+        }
+        let entry = chain.append(&header, now).unwrap();
+        let mut payload = header.encode().to_vec();
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.push(1);
+        if matched {
+            payload.extend_from_slice(txid.as_bytes());
+        } else {
+            payload.extend_from_slice(merkle_root.as_bytes());
+        }
+        payload.extend_from_slice(&[1, u8::from(matched)]);
+        let mut collector = WalletBlockEvidence::decode_for_header(&payload, entry)
+            .unwrap()
+            .collect()
+            .unwrap();
+        if matched {
+            collector.admit(transaction).unwrap();
+        }
+        (collector.finish().unwrap(), header)
+    }
+
     fn authority_for_header(
         store: SharedWalletStore,
         account: AccountId,
         header: Header,
+    ) -> EncryptedHnsLightAuthority {
+        authority_for_headers(store, account, vec![header])
+    }
+
+    fn authority_for_headers(
+        store: SharedWalletStore,
+        account: AccountId,
+        headers: Vec<Header>,
     ) -> EncryptedHnsLightAuthority {
         let now = Network::Regtest.parameters().genesis_time.get() + 100;
         let mut authority = EncryptedHnsLightAuthority::open_or_create(
@@ -1016,7 +1097,7 @@ mod tests {
         authority.add_peer(peer, 1).unwrap();
         let request = authority.begin_header_round(&[peer], now).unwrap();
         authority
-            .submit_header_response(request.generation, peer, vec![header], now)
+            .submit_header_response(request.generation, peer, headers, now)
             .unwrap();
         authority.finish_header_round_and_persist(now).unwrap();
         let current = authority.begin_header_round(&[peer], now).unwrap();
@@ -1066,6 +1147,99 @@ mod tests {
 
         let reopened =
             EncryptedHnsLightIndex::open_or_create(store, account, HnsNetwork::Regtest, 1, 4)
+                .unwrap();
+        assert_eq!(reopened.status(), index.status());
+        assert_eq!(
+            reopened.transactions().unwrap(),
+            index.transactions().unwrap()
+        );
+    }
+
+    #[test]
+    fn verified_filtered_block_batch_is_atomic_and_tracks_in_batch_spends() {
+        let store = store();
+        let account = AccountId::new([30; 16]);
+        let program = vec![31; 20];
+        let mut index = EncryptedHnsLightIndex::open_or_create(
+            store.clone(),
+            account,
+            HnsNetwork::Regtest,
+            1,
+            1,
+        )
+        .unwrap();
+        index
+            .install_watch_set(
+                HnsLightWatchSet::new(
+                    vec![WalletAddressKey {
+                        version: 0,
+                        hash: program.clone(),
+                    }],
+                    Vec::new(),
+                )
+                .unwrap(),
+                2,
+            )
+            .unwrap();
+        let funding = Transaction {
+            version: 0,
+            inputs: Vec::new(),
+            outputs: vec![Output {
+                value: Dollarydoos::new(42),
+                address: Address::new(0, program).unwrap(),
+                covenant: Covenant::default(),
+            }],
+            locktime: 0,
+        };
+        let funding_txid = funding.transaction_hash().unwrap();
+        let spend = Transaction {
+            version: 0,
+            inputs: vec![Input {
+                previous_output: Outpoint {
+                    transaction_hash: funding_txid,
+                    index: 0,
+                },
+                sequence: u32::MAX,
+                witness: Witness::default(),
+            }],
+            outputs: vec![Output {
+                value: Dollarydoos::new(40),
+                address: Address::new(0, vec![32; 20]).unwrap(),
+                covenant: Covenant::default(),
+            }],
+            locktime: 0,
+        };
+        let now = BlockTime::new(Network::Regtest.parameters().genesis_time.get() + 100);
+        let mut chain =
+            LightChain::from_genesis(Network::Regtest, now, ChainLimits::default()).unwrap();
+        let (funding_block, funding_header) =
+            verified_block_on_chain(&mut chain, funding, true, now);
+        let (spend_block, spend_header) = verified_block_on_chain(&mut chain, spend, true, now);
+        let authority =
+            authority_for_headers(store.clone(), account, vec![funding_header, spend_header]);
+
+        assert!(matches!(
+            index.apply_verified_block_batch(
+                &authority,
+                &[funding_block.clone(), funding_block.clone()],
+                3,
+            ),
+            Err(HnsLightIndexError::NonContiguousBlock)
+        ));
+        assert_eq!(index.status().scanned_height, None);
+        assert!(index.transactions().unwrap().is_empty());
+
+        assert_eq!(
+            index
+                .apply_verified_block_batch(&authority, &[funding_block, spend_block], 4)
+                .unwrap(),
+            vec![1, 1]
+        );
+        assert_eq!(index.status().scanned_height, Some(2));
+        assert_eq!(index.transactions().unwrap().len(), 2);
+
+        let reopened =
+            EncryptedHnsLightIndex::open_or_create(store, account, HnsNetwork::Regtest, 1, 5)
                 .unwrap();
         assert_eq!(reopened.status(), index.status());
         assert_eq!(
