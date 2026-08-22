@@ -2131,6 +2131,22 @@ pub enum HnsDirectPeerError {
     Arithmetic,
 }
 
+impl HnsDirectPeerError {
+    /// Whether the header quorum was temporarily unavailable over otherwise
+    /// ordinary standard Handshake peer connections.
+    ///
+    /// This condition must not be treated as a local wallet or chain-validity
+    /// error: callers should keep the persisted state fail-closed and retry a
+    /// later peer round.
+    #[must_use]
+    pub fn is_temporary_header_agreement_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Wallet(HnsWalletError::HeaderRoundInsufficientResponses)
+        )
+    }
+}
+
 impl From<PeerError> for HnsDirectPeerError {
     fn from(error: PeerError) -> Self {
         match error {
@@ -2153,6 +2169,18 @@ mod tests {
     use super::*;
     use hns_wallet_store::{SecretKind, WalletStore};
     use hns_wallet_types::{AccountId, BaseUnits, WalletId};
+
+    #[test]
+    fn timed_out_header_agreement_remains_distinguishable_from_wallet_faults() {
+        assert!(
+            HnsDirectPeerError::Wallet(HnsWalletError::HeaderRoundInsufficientResponses)
+                .is_temporary_header_agreement_unavailable()
+        );
+        assert!(
+            !HnsDirectPeerError::Wallet(HnsWalletError::InvalidEvidence)
+                .is_temporary_header_agreement_unavailable()
+        );
+    }
 
     fn direct_wallet_config() -> HnsRuntimeConfig {
         HnsRuntimeConfig {

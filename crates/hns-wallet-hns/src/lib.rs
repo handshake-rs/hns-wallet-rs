@@ -9966,6 +9966,8 @@ pub enum HnsWalletError {
     NameFinalizeNotMature { eligible_height: u64 },
     #[error("wallet state encoding failed")]
     Encoding,
+    #[error("HNS header round timed out before enough independent peers responded")]
+    HeaderRoundInsufficientResponses,
     #[error("Handshake backend failed: {0}")]
     Backend(String),
 }

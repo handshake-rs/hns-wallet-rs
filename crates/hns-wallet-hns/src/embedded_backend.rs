@@ -254,6 +254,13 @@ impl EmbeddedHnsBackend {
         {
             Ok(round) => Ok(Some(round)),
             Err(crate::HnsLightError::Sync(SyncError::RoundIncomplete)) => Ok(None),
+            // A deadline with too few independent replies is a normal remote
+            // availability condition. Preserve it as a typed wallet result so
+            // the mobile runtime can retain its verified catch-up state and
+            // retry without confusing it with a local backend failure.
+            Err(crate::HnsLightError::Sync(SyncError::InsufficientResponses)) => {
+                Err(HnsWalletError::HeaderRoundInsufficientResponses)
+            }
             Err(error) => Err(map_authority_error(error)),
         }
     }
