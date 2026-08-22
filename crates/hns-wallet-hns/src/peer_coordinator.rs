@@ -1296,6 +1296,19 @@ impl HnsDirectPeerCoordinator {
         max_blocks: u32,
         now_unix: u64,
     ) -> Result<HnsBlockScanProgress, HnsDirectPeerError> {
+        self.scan_wallet_blocks_with_progress(max_blocks, now_unix, |_| {})
+    }
+
+    /// Scan a bounded sequential header range and publish only verified,
+    /// persisted progress after each applied block. The callback carries no
+    /// wallet projection, so hosts can render live catch-up without exposing
+    /// balances, history, addresses, names, or spend authority.
+    pub fn scan_wallet_blocks_with_progress(
+        &self,
+        max_blocks: u32,
+        now_unix: u64,
+        mut on_progress: impl FnMut(HnsBlockScanProgress),
+    ) -> Result<HnsBlockScanProgress, HnsDirectPeerError> {
         if max_blocks == 0 || max_blocks > MAX_SCAN_BLOCKS_PER_CALL {
             return Err(HnsDirectPeerError::InvalidScanLimit);
         }
@@ -1383,6 +1396,14 @@ impl HnsDirectPeerCoordinator {
             blocks_applied = blocks_applied
                 .checked_add(1)
                 .ok_or(HnsDirectPeerError::Arithmetic)?;
+            on_progress(HnsBlockScanProgress {
+                first_height: Some(next_height),
+                last_height: Some(height),
+                validated_tip_height: tip_height,
+                blocks_applied,
+                transactions_admitted,
+                peer_views_verified,
+            });
         }
         Ok(HnsBlockScanProgress {
             first_height: Some(next_height),
