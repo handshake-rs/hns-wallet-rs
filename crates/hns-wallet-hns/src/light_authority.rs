@@ -383,7 +383,20 @@ impl EncryptedHnsLightAuthority {
         now: u64,
     ) -> Result<PersistedHeaderRound, HnsLightError> {
         let mut candidate = self.sync.clone();
-        let outcome = candidate.finish_round_with_headers(now)?;
+        let outcome = match candidate.finish_round_with_headers(now) {
+            Ok(outcome) => outcome,
+            // `finish_round_with_headers` consumes the active round before it
+            // reports an expired quorum. Preserve that candidate so the
+            // authority records its degraded state *and* releases the expired
+            // in-memory generation for a later independent retry. Retaining
+            // `self.sync` here would leave its old round active even though
+            // the coordinator has already reported the timeout.
+            Err(SyncError::InsufficientResponses) => {
+                self.sync = candidate;
+                return Err(HnsLightError::Sync(SyncError::InsufficientResponses));
+            }
+            Err(error) => return Err(HnsLightError::Sync(error)),
+        };
         let mut entry_chain = self.sync.chain().clone();
         let mut accepted = Vec::with_capacity(outcome.accepted_headers.len());
         for header in &outcome.accepted_headers {
@@ -900,6 +913,30 @@ mod tests {
             reopened.archived_header(1).unwrap().unwrap().block_hash(),
             extension.block_hash()
         );
+    }
+
+    #[test]
+    fn expired_insufficient_header_round_releases_its_generation_for_retry() {
+        let store = store();
+        let account = AccountId::new([80; 16]);
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let mut authority = open(store, account, 0, HnsLightFloor::default(), now).unwrap();
+        let peer = peer(80);
+        authority.add_peer(peer, 1).unwrap();
+
+        let first = authority.begin_header_round(&[peer], now).unwrap();
+        let after_deadline = first.deadline.checked_add(1).unwrap();
+        assert!(matches!(
+            authority.finish_header_round_and_persist(after_deadline),
+            Err(HnsLightError::Sync(SyncError::InsufficientResponses))
+        ));
+        assert_eq!(authority.status().state, SyncState::Degraded);
+        assert!(!authority.status().round_active);
+
+        let replacement = authority
+            .begin_header_round(&[peer], after_deadline)
+            .unwrap();
+        assert!(replacement.generation > first.generation);
     }
 
     #[test]
