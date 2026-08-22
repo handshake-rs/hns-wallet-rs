@@ -1194,11 +1194,18 @@ impl HnsDirectPeerCoordinator {
         for id in failed {
             self.disconnect_peer(id)?;
         }
-        let progress = self.finish_or_report_header_round(pending, now_unix_or(now_unix))?;
-        if worker_panicked && matches!(progress, HnsHeaderRoundProgress::AwaitingResponses { .. }) {
-            return Err(HnsDirectPeerError::WorkerPanicked);
-        }
-        Ok(progress)
+        // Each selected peer request above is synchronous: every worker has
+        // either yielded one bounded header response or failed before this
+        // point. Keeping an under-filled round open until its wall-clock
+        // deadline cannot produce another response; it only stalls mobile
+        // recovery for the full I/O timeout before it may rotate to the next
+        // independent peer pair. Close that terminal round immediately so
+        // the caller can refill and retry while its synchronization lease is
+        // still active. A completed quorum retains its actual completion
+        // time for normal validation and persistence.
+        let finished_at =
+            header_round_finished_at(pending, submitted, worker_panicked, now_unix_or(now_unix))?;
+        self.finish_or_report_header_round(pending, finished_at)
     }
 
     /// Fetch the same exact-root/key proof from every available peer in
@@ -2130,6 +2137,26 @@ fn now_unix_or(fallback: u64) -> u64 {
         .map_or(fallback, |duration| duration.as_secs())
 }
 
+/// Return the only meaningful completion time after one synchronous direct
+/// header fan-out. An under-filled round has no outstanding network work, so
+/// use its bounded deadline to release the generation for immediate peer
+/// replacement instead of making the UI wait for the same deadline again.
+fn header_round_finished_at(
+    pending: PendingHeaderRound,
+    submitted: usize,
+    worker_panicked: bool,
+    completed_at: u64,
+) -> Result<u64, HnsDirectPeerError> {
+    if submitted < pending.requested || worker_panicked {
+        pending
+            .deadline
+            .checked_add(1)
+            .ok_or(HnsDirectPeerError::Arithmetic)
+    } else {
+        Ok(completed_at)
+    }
+}
+
 /// Direct-peer construction, transport, or locally verified data failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -2240,6 +2267,28 @@ mod tests {
     }
 
     #[test]
+    fn completed_header_fanout_releases_an_underfilled_round_immediately() {
+        let pending = PendingHeaderRound {
+            generation: 7,
+            deadline: 1_000,
+            requested: 2,
+            submitted: 0,
+        };
+        assert_eq!(
+            header_round_finished_at(pending, 1, false, 900).expect("underfilled round"),
+            1_001
+        );
+        assert_eq!(
+            header_round_finished_at(pending, 2, false, 900).expect("complete round"),
+            900
+        );
+        assert_eq!(
+            header_round_finished_at(pending, 2, true, 900).expect("panicked round"),
+            1_001
+        );
+    }
+
+    #[test]
     fn header_agreement_uses_a_rotating_exact_quorum() {
         assert_eq!(
             select_rotating_header_quorum(vec![0, 1, 2, 3, 4], 2, 0),
@@ -2253,10 +2302,7 @@ mod tests {
             select_rotating_header_quorum(vec![0, 1, 2, 3, 4], 2, 4),
             vec![4, 0]
         );
-        assert_eq!(
-            select_rotating_header_quorum(vec![0, 1], 2, 1),
-            vec![0, 1]
-        );
+        assert_eq!(select_rotating_header_quorum(vec![0, 1], 2, 1), vec![0, 1]);
     }
 
     fn direct_wallet_config() -> HnsRuntimeConfig {
