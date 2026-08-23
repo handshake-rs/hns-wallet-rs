@@ -1032,7 +1032,7 @@ impl HnsLightNetwork for NativeHnsPeerPool {
             .ready_handles()
             .map_err(|error| HnsWalletError::Backend(error.to_string()))?;
         let written = std::thread::scope(|scope| {
-            handles
+            let tasks = handles
                 .into_iter()
                 .map(|(_, peer)| {
                     let transaction = transaction.clone();
@@ -1044,6 +1044,9 @@ impl HnsLightNetwork for NativeHnsPeerPool {
                         Ok::<_, HnsDirectPeerError>(())
                     })
                 })
+                .collect::<Vec<_>>();
+            tasks
+                .into_iter()
                 .map(|task| usize::from(task.join().is_ok_and(|result| result.is_ok())))
                 .sum::<usize>()
         });
@@ -1225,9 +1228,12 @@ impl HnsDirectPeerCoordinator {
             return Err(dns_error.unwrap_or(HnsDirectPeerError::NoReadyPeers));
         }
         let attempts = std::thread::scope(|scope| {
-            candidates
+            let tasks = candidates
                 .into_iter()
                 .map(|address| scope.spawn(move || self.connect_peer(address, now_unix)))
+                .collect::<Vec<_>>();
+            tasks
+                .into_iter()
                 .map(|task| task.join())
                 .collect::<Vec<_>>()
         });
@@ -1254,7 +1260,7 @@ impl HnsDirectPeerCoordinator {
     pub fn discover_from_connected(&self, now_unix: u64) -> Result<usize, HnsDirectPeerError> {
         let handles = self.pool.ready_handles()?;
         let results = std::thread::scope(|scope| {
-            handles
+            let tasks = handles
                 .into_iter()
                 .map(|(_, peer)| {
                     scope.spawn(move || {
@@ -1263,6 +1269,9 @@ impl HnsDirectPeerCoordinator {
                             .request_addresses(now_unix)
                     })
                 })
+                .collect::<Vec<_>>();
+            tasks
+                .into_iter()
                 .map(|task| task.join())
                 .collect::<Vec<_>>()
         });
@@ -1309,7 +1318,7 @@ impl HnsDirectPeerCoordinator {
         };
         *self.lock_pending_header()? = Some(pending);
         let responses = std::thread::scope(|scope| {
-            handles
+            let tasks = handles
                 .into_iter()
                 .map(|(id, peer)| {
                     let locator = locator.clone();
@@ -1322,6 +1331,9 @@ impl HnsDirectPeerCoordinator {
                         (id, response)
                     })
                 })
+                .collect::<Vec<_>>();
+            tasks
+                .into_iter()
                 .map(|task| task.join())
                 .collect::<Vec<_>>()
         });
@@ -1384,7 +1396,7 @@ impl HnsDirectPeerCoordinator {
             return Err(HnsDirectPeerError::NoReadyPeers);
         }
         let responses = std::thread::scope(|scope| {
-            handles
+            let tasks = handles
                 .into_iter()
                 .map(|(id, peer)| {
                     scope.spawn(move || {
@@ -1397,6 +1409,9 @@ impl HnsDirectPeerCoordinator {
                         (id, response)
                     })
                 })
+                .collect::<Vec<_>>();
+            tasks
+                .into_iter()
                 .map(|task| task.join())
                 .collect::<Vec<_>>()
         });
@@ -1674,7 +1689,7 @@ impl HnsDirectPeerCoordinator {
         let handles = self.fastest_block_scan_quorum_handles(handles, required)?;
         let wait = self.pool.config.event_poll_timeout;
         let results = std::thread::scope(|scope| {
-            handles
+            let tasks = handles
                 .iter()
                 .map(|(id, peer)| {
                     let id = *id;
@@ -1688,6 +1703,9 @@ impl HnsDirectPeerCoordinator {
                         Ok::<_, HnsDirectPeerError>((id, events))
                     })
                 })
+                .collect::<Vec<_>>();
+            tasks
+                .into_iter()
                 .map(|task| task.join())
                 .collect::<Vec<_>>()
         });
@@ -2387,7 +2405,7 @@ fn install_filter_on_peers(
     filter: &HsdBloomFilter,
 ) -> Result<Vec<(PeerId, PeerHandle)>, HnsDirectPeerError> {
     let results = std::thread::scope(|scope| {
-        handles
+        let tasks = handles
             .iter()
             .map(|(id, peer)| {
                 let id = *id;
@@ -2401,6 +2419,9 @@ fn install_filter_on_peers(
                     Ok::<_, HnsDirectPeerError>(id)
                 })
             })
+            .collect::<Vec<_>>();
+        tasks
+            .into_iter()
             .map(|task| task.join())
             .collect::<Vec<_>>()
     });
@@ -2425,7 +2446,7 @@ fn request_block_view_batches(
     now_unix: u64,
 ) -> Vec<TimedBlockViewBatch> {
     std::thread::scope(|scope| {
-        handles
+        let tasks = handles
             .iter()
             .map(|(_, peer)| {
                 let peer = Arc::clone(peer);
@@ -2443,6 +2464,9 @@ fn request_block_view_batches(
                     }
                 })
             })
+            .collect::<Vec<_>>();
+        tasks
+            .into_iter()
             .map(|task| {
                 task.join().unwrap_or(TimedBlockViewBatch {
                     elapsed: Duration::ZERO,
