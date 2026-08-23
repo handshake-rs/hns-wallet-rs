@@ -1575,13 +1575,23 @@ impl HnsDirectPeerCoordinator {
         })
     }
 
-    /// Request standard mempool inventory and admit bounded relevant
-    /// transactions plus peer fee floors into the local backend.
+    /// Request standard mempool inventory from the responsive exact peer
+    /// quorum and admit bounded relevant transactions plus peer fee floors.
+    ///
+    /// This follows the same availability rule as the historical block scan:
+    /// an optional warm reserve must not keep a completed verified chain scan
+    /// from publishing its final read snapshot. Every selected response stays
+    /// independently transported and locally validated before admission.
     pub fn refresh_mempool(&self, now_unix: u64) -> Result<usize, HnsDirectPeerError> {
         let handles = self.pool.ready_handles()?;
-        if handles.is_empty() {
-            return Err(HnsDirectPeerError::NoReadyPeers);
+        let required = self.pool.config.minimum_block_views;
+        if handles.len() < required {
+            return Err(HnsDirectPeerError::InsufficientBlockViews {
+                required,
+                actual: handles.len(),
+            });
         }
+        let handles = self.fastest_block_scan_quorum_handles(handles, required)?;
         let wait = self.pool.config.event_poll_timeout;
         let results = std::thread::scope(|scope| {
             handles
