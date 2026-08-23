@@ -47,6 +47,7 @@ use crate::{
     EmbeddedHnsBackend, EncryptedHnsLightAuthority, EncryptedHnsLightIndex, HnsLightFloor,
     HnsLightNetwork, HnsNetwork, HnsRuntimeConfig, HnsWalletError, PersistedHeaderRound,
     VerifiedHnsNameProof, derive_hns_light_watch_set,
+    derive_hns_light_watch_set_with_restore_extension,
 };
 use hns_wallet_store::SharedWalletStore;
 
@@ -74,6 +75,12 @@ const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 const BLOOM_GROWTH_RESERVE: usize = 1_024;
 const DENUO_MAX_RESPONSE_EVENTS: usize = 256;
 const DENUO_MAXIMUM_LIVE_REQUESTS: u16 = 64;
+/// A direct index only grows after it has authenticated a trailing-gap
+/// discovery. Eight complete extra gaps fit comfortably under the direct
+/// watch-set bound for reviewed wallet defaults while preventing an unbounded
+/// recovery loop if a corrupted or adversarial account repeatedly lands on a
+/// boundary.
+const MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS: u32 = 8;
 
 /// Native direct-peer policy for one wallet runtime.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1044,6 +1051,7 @@ impl HnsLightNetwork for NativeHnsPeerPool {
 pub struct HnsDirectPeerCoordinator {
     backend: EmbeddedHnsBackend,
     pool: Arc<NativeHnsPeerPool>,
+    wallet_watch_set_source: Option<WalletWatchSetSource>,
     pending_header: Arc<Mutex<Option<PendingHeaderRound>>>,
     // The persistent peer pool is deliberately wider than a single header
     // agreement round. `hns_light_sync` requires every selected response to
@@ -1067,6 +1075,16 @@ pub struct HnsDirectPeerCoordinator {
     block_scan_peer_latencies: Arc<Mutex<HashMap<PeerId, ScanPeerLatency>>>,
 }
 
+/// Private recovery authority retained only by coordinators created from one
+/// unlocked wallet. It lets that coordinator deterministically extend its own
+/// public Bloom-filter set after an authenticated trailing-gap discovery.
+/// Generic coordinators never receive this capability.
+#[derive(Clone)]
+struct WalletWatchSetSource {
+    store: SharedWalletStore,
+    account: HnsRuntimeConfig,
+}
+
 impl HnsDirectPeerCoordinator {
     /// Assemble the encrypted authority, wallet-only index, and native peer
     /// pool without any RPC node or trusted relay dependency.
@@ -1085,6 +1103,7 @@ impl HnsDirectPeerCoordinator {
         Ok(Self {
             backend,
             pool,
+            wallet_watch_set_source: None,
             pending_header: Arc::new(Mutex::new(None)),
             next_header_peer_offset: Arc::new(AtomicUsize::new(0)),
             next_block_peer_offset: Arc::new(AtomicUsize::new(0)),
@@ -1097,6 +1116,58 @@ impl HnsDirectPeerCoordinator {
     #[must_use]
     pub const fn backend(&self) -> &EmbeddedHnsBackend {
         &self.backend
+    }
+
+    /// Extend the wallet-owned direct watch set by the next complete restore
+    /// gap and atomically rewind the filtered-block index if it changed.
+    ///
+    /// This is valid only for coordinators opened through the wallet factory.
+    /// The caller invokes it after the native read path has refused to expose
+    /// a projection because a newly discovered trailing script was outside
+    /// the existing exact filter. The method does not accept scripts from the
+    /// host and does not publish any wallet data.
+    pub fn extend_wallet_restore_watch_set(
+        &self,
+        now_unix: u64,
+    ) -> Result<bool, HnsDirectPeerError> {
+        let source = self
+            .wallet_watch_set_source
+            .as_ref()
+            .ok_or(HnsDirectPeerError::InvalidConfiguration)?;
+        let installed = self
+            .backend
+            .light_watch_set()
+            .map_err(HnsDirectPeerError::Wallet)?;
+        for extension in 1..=MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS {
+            let candidate = source
+                .store
+                .try_with_store(|wallet| {
+                    derive_hns_light_watch_set_with_restore_extension(
+                        wallet,
+                        &source.account,
+                        extension,
+                    )
+                })
+                .map_err(HnsDirectPeerError::Wallet)?;
+            if candidate != installed {
+                return self
+                    .backend
+                    .install_watch_set(candidate, now_unix)
+                    .map_err(HnsDirectPeerError::Wallet);
+            }
+        }
+        Err(HnsDirectPeerError::Wallet(
+            HnsWalletError::ScanCapacityExhausted,
+        ))
+    }
+
+    fn with_wallet_watch_set_source(
+        mut self,
+        store: SharedWalletStore,
+        account: HnsRuntimeConfig,
+    ) -> Self {
+        self.wallet_watch_set_source = Some(WalletWatchSetSource { store, account });
+        self
     }
 
     /// Latest locally validated chain floor for platform-protected rollback
@@ -1961,9 +2032,6 @@ where
     }
     let birthday_height = u32::try_from(account.birthday_height)
         .map_err(|_| HnsDirectPeerError::InvalidConfiguration)?;
-    let watch_set = store
-        .try_with_store(|wallet| derive_hns_light_watch_set(wallet, account))
-        .map_err(HnsDirectPeerError::Wallet)?;
     let sync_config = SyncConfig {
         max_peers: peer_config.target_peers,
         minimum_peer_agreement: peer_config.minimum_block_views,
@@ -1984,17 +2052,48 @@ where
     initialize_authority(&mut authority)
         .map_err(|error| HnsDirectPeerError::LightAuthority(error.to_string()))?;
     let mut index = EncryptedHnsLightIndex::open_or_create(
-        store,
+        store.clone(),
         account.account_id,
         account.network,
         birthday_height,
         now_unix,
     )
     .map_err(|error| HnsDirectPeerError::LightIndex(error.to_string()))?;
+    let base_watch_set = store
+        .try_with_store(|wallet| derive_hns_light_watch_set(wallet, account))
+        .map_err(HnsDirectPeerError::Wallet)?;
+    let watch_set = reusable_wallet_watch_set(&store, account, index.watch_set(), base_watch_set)?;
     index
         .install_watch_set(watch_set, now_unix)
         .map_err(|error| HnsDirectPeerError::LightIndex(error.to_string()))?;
     HnsDirectPeerCoordinator::new(authority, index, peer_config)
+        .map(|coordinator| coordinator.with_wallet_watch_set_source(store, account.clone()))
+}
+
+/// Preserve a complete prior direct watch set across a process restart only if
+/// it is exactly a deterministic extension of the selected wallet's current
+/// restoration frontier. This allows a started recovery re-scan to survive an
+/// Activity/process recreation without trusting an arbitrary persisted filter.
+fn reusable_wallet_watch_set(
+    store: &SharedWalletStore,
+    account: &HnsRuntimeConfig,
+    installed: &crate::HnsLightWatchSet,
+    base: crate::HnsLightWatchSet,
+) -> Result<crate::HnsLightWatchSet, HnsDirectPeerError> {
+    if installed == &base {
+        return Ok(base);
+    }
+    for extension in 1..=MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS {
+        let candidate = store
+            .try_with_store(|wallet| {
+                derive_hns_light_watch_set_with_restore_extension(wallet, account, extension)
+            })
+            .map_err(HnsDirectPeerError::Wallet)?;
+        if installed == &candidate {
+            return Ok(candidate);
+        }
+    }
+    Ok(base)
 }
 
 impl NativePeer {
@@ -2840,8 +2939,9 @@ mod tests {
             .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
             .unwrap();
         let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let store = hns_wallet_store::SharedWalletStore::new(wallet);
         let coordinator = open_wallet_direct_hns_peer_coordinator(
-            hns_wallet_store::SharedWalletStore::new(wallet),
+            store,
             &config,
             HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
             now,
@@ -2851,6 +2951,58 @@ mod tests {
         assert_eq!(scan.watched_scripts, 4);
         assert_eq!(scan.watched_names, 0);
         assert_eq!(scan.birthday_height, 0);
+    }
+
+    #[test]
+    fn direct_wallet_trailing_restore_extension_survives_reopen() {
+        let config = direct_wallet_config();
+        let mut wallet =
+            WalletStore::create(":memory:", "direct wallet extension passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[74; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let now = Network::Regtest.parameters().genesis_time.get() + 101;
+        let store = hns_wallet_store::SharedWalletStore::new(wallet);
+        let coordinator = open_wallet_direct_hns_peer_coordinator(
+            store.clone(),
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now,
+        )
+        .unwrap();
+        assert!(
+            coordinator
+                .extend_wallet_restore_watch_set(now + 1)
+                .expect("extend direct wallet restoration watch set")
+        );
+        let expanded = coordinator.backend().light_watch_set().unwrap();
+        assert_eq!(expanded.scripts.len(), 8);
+
+        let reopened = open_wallet_direct_hns_peer_coordinator(
+            store,
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now + 2,
+        )
+        .unwrap();
+        assert_eq!(reopened.backend().light_watch_set().unwrap(), expanded);
+        assert_eq!(
+            reopened
+                .backend()
+                .light_scan_status()
+                .unwrap()
+                .watched_scripts,
+            8
+        );
     }
 
     #[test]

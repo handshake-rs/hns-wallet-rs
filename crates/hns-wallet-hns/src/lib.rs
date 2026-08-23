@@ -137,6 +137,13 @@ pub const MAX_OUTPOINT_SPEND_BATCH: usize = 256;
 pub const MAX_CURRENT_SHAKEDEX_LOCK_BATCH: usize = 64;
 pub const MAX_SCAN_CURSOR_BYTES: usize = 4_096;
 pub const MAX_SCAN_PAGES: usize = 128;
+/// Stable diagnostic marker for the one recoverable case where a direct
+/// filtered-block index has reached its tip but a newly discovered trailing
+/// restoration window has not been watched yet. Hosts must expand and rewind
+/// the public watch set before retrying; they must never publish a projection
+/// from the incomplete index.
+pub const DIRECT_WALLET_INDEX_WATCH_SET_INCOMPLETE_MESSAGE: &str =
+    "direct wallet index watch set does not cover the requested derivation scripts";
 /// Incoming TRANSFER pages can return after the first nonempty script, so one
 /// candidate on each supported name derivation can require one page per row.
 /// The additive term covers pages that consume only the endpoint's bounded
@@ -6758,6 +6765,23 @@ pub fn derive_hns_light_watch_set(
     store: &WalletStore,
     config: &HnsRuntimeConfig,
 ) -> Result<HnsLightWatchSet, HnsWalletError> {
+    derive_hns_light_watch_set_with_restore_extension(store, config, 0)
+}
+
+/// Derive the public direct-wallet watch set with complete additional restore
+/// windows. This is used only after an authenticated direct scan discovers
+/// activity at the current trailing gap: the expanded set is installed before
+/// the index is rewound and re-scanned, so no unscanned script can enter a
+/// read projection.
+///
+/// `additional_restore_windows` is a count of the account's configured
+/// restore gap, rather than a caller-supplied script count. The encrypted
+/// wallet store remains the sole source of derivation material.
+pub fn derive_hns_light_watch_set_with_restore_extension(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+    additional_restore_windows: u32,
+) -> Result<HnsLightWatchSet, HnsWalletError> {
     if store.is_locked() {
         return Err(HnsWalletError::StoreLocked);
     }
@@ -6783,6 +6807,7 @@ pub fn derive_hns_light_watch_set(
     )
     .map_err(map_shakedex_restore_error)?;
     normalize_restore_scan_account(&mut scan_account, allocated_next)?;
+    extend_restore_scan_account(&mut scan_account, additional_restore_windows)?;
     let coin_addresses = derive_restore_addresses(store, &scan_account, KeyRole::HnsCoin)?;
     let name_addresses = derive_restore_addresses(store, &scan_account, KeyRole::HnsName)?;
     let shakedex_addresses = derive_restore_addresses(store, &scan_account, KeyRole::HnsShakedex)?;
@@ -6813,6 +6838,33 @@ pub fn derive_hns_light_watch_set(
         name_hashes.push(stored.value.name_hash);
     }
     HnsLightWatchSet::new(scripts, name_hashes).map_err(|_| HnsWalletError::InvalidEvidence)
+}
+
+fn extend_restore_scan_account(
+    account: &mut HnsAccountRecord,
+    additional_restore_windows: u32,
+) -> Result<(), HnsWalletError> {
+    if additional_restore_windows == 0 {
+        return Ok(());
+    }
+    let extension = account
+        .config
+        .restore_lookahead
+        .checked_mul(additional_restore_windows)
+        .ok_or(HnsWalletError::ScanCapacityExhausted)?;
+    let extend = |end: u32| {
+        end.checked_add(extension)
+            .filter(|candidate| *candidate < MAX_RESTORE_LOOKAHEAD)
+            .ok_or(HnsWalletError::ScanCapacityExhausted)
+    };
+    account.external_scan_end = extend(account.external_scan_end)?;
+    account.internal_scan_end = extend(account.internal_scan_end)?;
+    account.name_scan_end = extend(account.name_scan_end)?;
+    account.shakedex_scan_end = extend(account.shakedex_scan_end)?;
+    checked_scan_address_count(&[account.external_scan_end, account.internal_scan_end])?;
+    checked_scan_address_count(&[account.name_scan_end])?;
+    checked_scan_address_count(&[account.shakedex_scan_end])?;
+    Ok(())
 }
 
 fn validate_disjoint_restore_programs(

@@ -17,17 +17,18 @@ use crate::light_index::{add_watched_outputs, transaction_relevant};
 use crate::{
     ActiveNameOwnerCoinEvidence, ActiveNameOwnerCoinSourceBinding, BlockHashEvidence, ChainTip,
     ConfirmedWalletPage, ConfirmedWalletPageRequest, DEFAULT_FEE_TARGET_BLOCKS,
-    EncryptedHnsLightAuthority, EncryptedHnsLightIndex, HistoryEntry, HnsBackend, HnsFeeRateSource,
-    HnsInputCoinEvidence, HnsLightWatchSet, HnsNameAction, HnsNameLifecycle, HnsNetwork,
-    HnsTransactionFeeQuote, HnsWalletError, IncomingTransferCandidate,
-    IncomingTransferSourceBinding, IncomingTransfersPage, IncomingTransfersPageRequest,
-    IndexedWalletCoin, MAX_HISTORY_RESULTS, MAX_MEMPOOL_SCAN_RESULTS, MAX_OUTPOINT_SPEND_BATCH,
-    MAX_SCAN_PAGE_RESULTS, MempoolSnapshotBinding, MempoolWalletPage, MempoolWalletPageRequest,
-    NameActionContextEvidence, NameActionIneligibility, NameEvidence, NameProofResponse,
-    OutpointSpendEntry, OutpointSpendEvidence, PersistedHeaderRound, SnapshotBinding,
-    SpendingTransactionEvidence, TransactionEvidence, TransactionInclusion, TransactionStatus,
-    VerifiedHnsNameProof, VerifiedHnsTransactionObservation, WalletAddressKey, WalletCoin,
-    actual_transaction_fee, local_fee_policy_evidence,
+    DIRECT_WALLET_INDEX_WATCH_SET_INCOMPLETE_MESSAGE, EncryptedHnsLightAuthority,
+    EncryptedHnsLightIndex, HistoryEntry, HnsBackend, HnsFeeRateSource, HnsInputCoinEvidence,
+    HnsLightWatchSet, HnsNameAction, HnsNameLifecycle, HnsNetwork, HnsTransactionFeeQuote,
+    HnsWalletError, IncomingTransferCandidate, IncomingTransferSourceBinding,
+    IncomingTransfersPage, IncomingTransfersPageRequest, IndexedWalletCoin, MAX_HISTORY_RESULTS,
+    MAX_MEMPOOL_SCAN_RESULTS, MAX_OUTPOINT_SPEND_BATCH, MAX_SCAN_PAGE_RESULTS,
+    MempoolSnapshotBinding, MempoolWalletPage, MempoolWalletPageRequest, NameActionContextEvidence,
+    NameActionIneligibility, NameEvidence, NameProofResponse, OutpointSpendEntry,
+    OutpointSpendEvidence, PersistedHeaderRound, SnapshotBinding, SpendingTransactionEvidence,
+    TransactionEvidence, TransactionInclusion, TransactionStatus, VerifiedHnsNameProof,
+    VerifiedHnsTransactionObservation, WalletAddressKey, WalletCoin, actual_transaction_fee,
+    local_fee_policy_evidence,
 };
 
 const MINIMUM_RELAY_FEE_RATE: u64 = 1_000;
@@ -884,8 +885,7 @@ fn require_watched_scripts(
     let watched = index.watch_set().scripts.iter().collect::<BTreeSet<_>>();
     if requested.iter().any(|script| !watched.contains(script)) {
         return Err(HnsWalletError::Backend(
-            "direct wallet index watch set does not cover the requested derivation scripts"
-                .to_owned(),
+            DIRECT_WALLET_INDEX_WATCH_SET_INCOMPLETE_MESSAGE.to_owned(),
         ));
     }
     Ok(())
