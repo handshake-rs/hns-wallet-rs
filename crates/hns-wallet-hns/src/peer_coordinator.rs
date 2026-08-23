@@ -62,6 +62,14 @@ const MAX_SCAN_BLOCKS_PER_CALL: u32 = 2_000;
 // be retried after a transport failure. It also removes the per-height round
 // trip that made historical wallet scans progress at roughly one block/sec.
 const FILTERED_BLOCK_REQUEST_WINDOW: u32 = 64;
+// A scan must obtain two full, independently verified views. Prefer peers
+// that have recently returned those views quickly, but periodically rotate a
+// request through the warm reserve so a changed network path can be measured
+// and selected later. This only changes availability/performance selection;
+// every accepted block still requires the configured exact proof quorum.
+const BLOCK_SCAN_PEER_EXPLORATION_INTERVAL: usize = 8;
+const BLOCK_SCAN_PEER_LATENCY_OLD_WEIGHT: u64 = 3;
+const BLOCK_SCAN_PEER_LATENCY_WEIGHT: u64 = BLOCK_SCAN_PEER_LATENCY_OLD_WEIGHT + 1;
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 const BLOOM_GROWTH_RESERVE: usize = 1_024;
 const DENUO_MAX_RESPONSE_EVENTS: usize = 256;
@@ -775,6 +783,30 @@ fn inbound_denuo_address_allowed(config: &HnsDirectPeerConfig, address: SocketAd
 
 type PeerHandle = Arc<Mutex<NativePeer>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScanPeerLatency {
+    /// A small exponentially weighted moving average. It responds to recent
+    /// mobile-network changes without allowing one exceptional request to
+    /// permanently exile a peer from future quorum probes.
+    ewma_millis: u64,
+}
+
+impl ScanPeerLatency {
+    const fn initial(sample_millis: u64) -> Self {
+        Self {
+            ewma_millis: sample_millis,
+        }
+    }
+
+    fn observe(&mut self, sample_millis: u64) {
+        self.ewma_millis = self
+            .ewma_millis
+            .saturating_mul(BLOCK_SCAN_PEER_LATENCY_OLD_WEIGHT)
+            .saturating_add(sample_millis)
+            / BLOCK_SCAN_PEER_LATENCY_WEIGHT;
+    }
+}
+
 /// Persistent native standard-peer pool. This is also the embedded backend's
 /// transaction broadcast boundary.
 pub struct NativeHnsPeerPool {
@@ -1025,6 +1057,14 @@ pub struct HnsDirectPeerCoordinator {
     // scan batches rotate through the ready pool without perturbing header
     // agreement selection.
     next_block_peer_offset: Arc<AtomicUsize>,
+    // Counts scan-quorum selections independently of the rotating offset.
+    // This permits a latency-preferred normal path while retaining a regular
+    // deterministic reserve probe.
+    block_scan_selection_count: Arc<AtomicUsize>,
+    // Ephemeral performance data only: a connection-scoped peer identifier
+    // maps to its recent filtered-block response time. It is deliberately not
+    // wallet state and is discarded when this coordinator is dropped.
+    block_scan_peer_latencies: Arc<Mutex<HashMap<PeerId, ScanPeerLatency>>>,
 }
 
 impl HnsDirectPeerCoordinator {
@@ -1048,6 +1088,8 @@ impl HnsDirectPeerCoordinator {
             pending_header: Arc::new(Mutex::new(None)),
             next_header_peer_offset: Arc::new(AtomicUsize::new(0)),
             next_block_peer_offset: Arc::new(AtomicUsize::new(0)),
+            block_scan_selection_count: Arc::new(AtomicUsize::new(0)),
+            block_scan_peer_latencies: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -1437,6 +1479,7 @@ impl HnsDirectPeerCoordinator {
                 for ((id, _), response) in selected.into_iter().zip(responses) {
                     match response.result {
                         Ok(blocks) if blocks.len() == anchors.len() => {
+                            self.record_block_scan_peer_latency(id, response.elapsed)?;
                             successful_peer_fetches.push(response.elapsed);
                             views.push(blocks);
                         }
@@ -1616,6 +1659,10 @@ impl HnsDirectPeerCoordinator {
     }
 
     fn disconnect_peer(&self, id: PeerId) -> Result<(), HnsDirectPeerError> {
+        self.block_scan_peer_latencies
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .remove(&id);
         let _ = self.pool.disconnect(id)?;
         let _ = self.backend.remove_header_peer(id)?;
         Ok(())
@@ -1630,23 +1677,82 @@ impl HnsDirectPeerCoordinator {
         self.rotating_peer_quorum_handles(handles, quorum, &self.next_header_peer_offset)
     }
 
-    /// Select a rotating exact proof quorum from the filter-installed peers
-    /// for one block scan batch. The caller retains every unselected handle as
-    /// a warm, already-filtered reserve for a later batch or immediate retry.
+    /// Select an exact proof quorum from the filter-installed peers for one
+    /// block scan batch. Recent response time decides the normal selection;
+    /// every eighth selection rotates through the reserve to keep performance
+    /// observations fresh. The caller retains every unselected handle as a
+    /// warm, already-filtered reserve for a later batch or immediate retry.
     fn block_scan_quorum_handles(
         &self,
         handles: &[(PeerId, PeerHandle)],
         requested: usize,
     ) -> Result<Vec<(PeerId, PeerHandle)>, HnsDirectPeerError> {
         debug_assert!(requested > 0);
-        self.rotating_peer_quorum_handles(
-            handles
-                .iter()
-                .map(|(id, peer)| (*id, Arc::clone(peer)))
-                .collect(),
-            requested,
-            &self.next_block_peer_offset,
-        )
+        let selection = self
+            .block_scan_selection_count
+            .fetch_add(1, Ordering::Relaxed);
+        let candidates = handles
+            .iter()
+            .map(|(id, peer)| (*id, Arc::clone(peer)))
+            .collect();
+        if selection % BLOCK_SCAN_PEER_EXPLORATION_INTERVAL == 0 {
+            return self.rotating_peer_quorum_handles(
+                candidates,
+                requested,
+                &self.next_block_peer_offset,
+            );
+        }
+        self.fastest_block_scan_quorum_handles(candidates, requested)
+    }
+
+    fn fastest_block_scan_quorum_handles(
+        &self,
+        handles: Vec<(PeerId, PeerHandle)>,
+        requested: usize,
+    ) -> Result<Vec<(PeerId, PeerHandle)>, HnsDirectPeerError> {
+        if handles.len() <= requested {
+            return Ok(handles);
+        }
+        let latencies = self
+            .block_scan_peer_latencies
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .clone();
+        let candidates = handles
+            .into_iter()
+            .map(|(id, peer)| {
+                let address = peer
+                    .lock()
+                    .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                    .address;
+                Ok((
+                    latencies.get(&id).map(|latency| latency.ewma_millis),
+                    address,
+                    (id, peer),
+                ))
+            })
+            .collect::<Result<Vec<_>, HnsDirectPeerError>>()?;
+        Ok(select_fastest_diverse_peer_quorum(candidates, requested)
+            .into_iter()
+            .map(|(_, _, (id, peer))| (id, peer))
+            .collect())
+    }
+
+    fn record_block_scan_peer_latency(
+        &self,
+        id: PeerId,
+        elapsed: Duration,
+    ) -> Result<(), HnsDirectPeerError> {
+        let sample_millis = duration_millis(elapsed);
+        let mut latencies = self
+            .block_scan_peer_latencies
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        latencies
+            .entry(id)
+            .and_modify(|latency| latency.observe(sample_millis))
+            .or_insert_with(|| ScanPeerLatency::initial(sample_millis));
+        Ok(())
     }
 
     fn rotating_peer_quorum_handles(
@@ -1719,6 +1825,36 @@ fn select_rotating_peer_quorum<T>(mut candidates: Vec<T>, quorum: usize, offset:
         candidates.truncate(quorum);
     }
     candidates
+}
+
+/// Select an exact quorum with the lowest recent response times while
+/// preferring distinct coarse address groups. A score of `None` means that a
+/// connected reserve has not yet completed a request and is explored on the
+/// regular rotating selections above. The second pass maintains availability
+/// when the ready pool cannot provide enough distinct groups.
+fn select_fastest_diverse_peer_quorum<T>(
+    mut candidates: Vec<(Option<u64>, SocketAddr, T)>,
+    quorum: usize,
+) -> Vec<(Option<u64>, SocketAddr, T)> {
+    debug_assert!(quorum > 0);
+    candidates
+        .sort_unstable_by_key(|(latency, address, _)| (latency.unwrap_or(u64::MAX), *address));
+    let mut selected = Vec::with_capacity(quorum.min(candidates.len()));
+    let mut deferred = Vec::new();
+    let mut groups = HashSet::new();
+    for candidate @ (_, address, _) in candidates {
+        if selected.len() < quorum && groups.insert(address_group(address)) {
+            selected.push(candidate);
+        } else {
+            deferred.push(candidate);
+        }
+    }
+    selected.extend(
+        deferred
+            .into_iter()
+            .take(quorum.saturating_sub(selected.len())),
+    );
+    selected
 }
 
 /// Open the direct peer coordinator owned by one encrypted wallet account.
@@ -2602,6 +2738,40 @@ mod tests {
             select_rotating_peer_quorum(vec![0, 1, 2, 3, 4], 1, 3),
             vec![3]
         );
+    }
+
+    #[test]
+    fn fastest_peer_quorum_prefers_recent_latency_and_address_diversity() {
+        let selected = select_fastest_diverse_peer_quorum(
+            vec![
+                (Some(120), "1.1.1.1:12038".parse().unwrap(), "fast-a"),
+                (Some(160), "1.1.1.2:12038".parse().unwrap(), "fast-b"),
+                (Some(900), "8.8.8.8:12038".parse().unwrap(), "other-group"),
+                (None, "9.9.9.9:12038".parse().unwrap(), "unmeasured"),
+            ],
+            2,
+        );
+        let labels = selected
+            .into_iter()
+            .map(|(_, _, label)| label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["fast-a", "other-group"]);
+    }
+
+    #[test]
+    fn fastest_peer_quorum_falls_back_when_address_groups_are_not_available() {
+        let selected = select_fastest_diverse_peer_quorum(
+            vec![
+                (Some(120), "1.1.1.1:12038".parse().unwrap(), "fast-a"),
+                (Some(160), "1.1.1.2:12038".parse().unwrap(), "fast-b"),
+            ],
+            2,
+        );
+        let labels = selected
+            .into_iter()
+            .map(|(_, _, label)| label)
+            .collect::<Vec<_>>();
+        assert_eq!(labels, vec!["fast-a", "fast-b"]);
     }
 
     fn direct_wallet_config() -> HnsRuntimeConfig {
