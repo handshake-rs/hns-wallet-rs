@@ -4400,6 +4400,215 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         })
     }
 
+    /// Reconcile the exact persisted value account into a read-only snapshot.
+    ///
+    /// The full legacy reconciliation path above still owns workflow state for
+    /// signing and settlement.  Native balance exposure, however, only needs a
+    /// bounded authenticated account projection.  Keeping that projection on
+    /// the same lock discipline as [`HnsAccountReadRuntime`] is essential for
+    /// direct-peer wallets: an [`EmbeddedHnsBackend`] consults its encrypted
+    /// light index during page reads, and that index shares this wallet store.
+    /// Holding a `SharedWalletStoreGuard` while invoking the backend would make
+    /// the thread wait on its own non-reentrant store mutex forever.
+    ///
+    /// This method therefore fences and stages local state under short store
+    /// closures, performs every backend query after the closure has returned,
+    /// then commits the complete projection only after re-authenticating the
+    /// exact account/entity revisions.  It supports only an existing value
+    /// account and exposes no signing or workflow capability.
+    pub fn synchronize_persisted_value_read(
+        &self,
+    ) -> Result<HnsAccountReadSnapshot, HnsWalletError> {
+        let now = self.clock.now_unix()?;
+        self.set_sync_phase(SyncPhase::Headers, None)?;
+
+        let selected = {
+            let cache = self.cache_read()?;
+            cache.account.clone()
+        };
+        let preparation = self
+            .store
+            .with_store_mut(|store| {
+                Ok(prepare_hns_account_read(
+                    store,
+                    &selected,
+                    HnsAccountReadMode::PersistedRecoveryReadOnly,
+                    now,
+                ))
+            })
+            .map_err(map_shared_store_error)??;
+
+        // `prepare_hns_account_read` durably records a crash-safe discovery
+        // fence before any direct-peer request. Keep the full runtime cache at
+        // that exact fence immediately: a temporary read failure must leave a
+        // retryable unlocked session rather than a stale in-memory revision
+        // that can only be repaired by reopening the wallet.
+        {
+            let mut cache = self.cache_write()?;
+            validate_authoritative_reconcile_account(
+                &cache.account,
+                cache.account_revision,
+                &preparation.fenced_account,
+                preparation.account_revision,
+            )?;
+            cache.account = preparation.fenced_account.clone();
+            cache.account_revision = preparation.account_revision;
+        }
+
+        let binding = annotate_persisted_value_read_unavailable(
+            "obtaining the direct chain snapshot",
+            self.backend.get_chain_snapshot(),
+        )?;
+        annotate_persisted_value_read_unavailable(
+            "verifying the direct chain identity",
+            verify_hns_read_chain_identity(
+                &self.backend,
+                preparation.fenced_account.config.network,
+                binding,
+            ),
+        )?;
+        self.set_sync_phase(SyncPhase::WalletScan, None)?;
+        let scan = annotate_persisted_value_read_unavailable(
+            "reading the direct wallet index",
+            scan_hns_account_read(&self.backend, &self.store, &preparation, binding),
+        )?;
+        let common_ancestor = annotate_persisted_value_read_unavailable(
+            "checking the wallet recovery checkpoints",
+            hns_read_common_ancestor(
+                &self.backend,
+                &preparation.recovery,
+                scan.binding,
+                preparation.fenced_account.config.birthday_height,
+            ),
+        )?;
+        let previous_transactions = preparation
+            .transactions
+            .iter()
+            .map(|stored| stored.value.clone())
+            .collect::<Vec<_>>();
+        let transactions = annotate_persisted_value_read_unavailable(
+            "reconciling the direct wallet history",
+            reconcile_hns_read_transactions(
+                &self.backend,
+                &scan.history,
+                &scan.addresses,
+                scan.binding,
+                scan.mempool,
+                common_ancestor,
+                &previous_transactions,
+            ),
+        )?;
+        let coins = reconcile_coins(scan.indexed_coins, &scan.addresses, scan.binding.tip.height)?;
+        let names = annotate_persisted_value_read_unavailable(
+            "reconciling wallet-owned names",
+            reconcile_hns_read_names(
+                &self.backend,
+                &preparation.names,
+                &scan.addresses,
+                &coins,
+                scan.binding,
+            ),
+        )?;
+        let balance = coins.iter().try_fold(BaseUnits::ZERO, |total, coin| {
+            if is_ordinary_hns_spend_candidate(coin) {
+                total
+                    .checked_add(coin.coin.value)
+                    .map_err(|_| HnsWalletError::Arithmetic)
+            } else {
+                Ok(total)
+            }
+        })?;
+        let receive_target = hns_read_receive_target(&scan.account, &scan.addresses)?;
+        let name_receive_target = hns_read_name_receive_target(&scan.account, &scan.addresses)?;
+        let recovery = HnsRecoveryState {
+            checkpoints: annotate_persisted_value_read_unavailable(
+                "recording direct chain checkpoints",
+                hns_read_checkpoints(
+                    &self.backend,
+                    scan.binding,
+                    scan.account.config.birthday_height,
+                ),
+            )?,
+            last_tip: Some(scan.binding.tip),
+            last_common_ancestor: common_ancestor,
+            last_reconciled_unix: now,
+        };
+        annotate_persisted_value_read_unavailable(
+            "revalidating the direct wallet snapshot",
+            verify_hns_read_snapshot_current(
+                &self.backend,
+                &scan.branch_scripts,
+                scan.binding,
+                scan.mempool,
+            ),
+        )?;
+        self.store
+            .with_store_mut(|store| {
+                Ok(commit_hns_account_read(
+                    store,
+                    &preparation,
+                    &scan.account,
+                    &scan.addresses,
+                    &coins,
+                    &transactions,
+                    &names,
+                    &recovery,
+                    now,
+                ))
+            })
+            .map_err(map_shared_store_error)??;
+        let persisted_account = self.store.try_with_store(|store| {
+            store
+                .wallet_account::<HnsAccountRecord>(&account_entity_id(&scan.account.config))?
+                .ok_or(HnsWalletError::StaleAccountRead)
+        })?;
+        if persisted_account.value != scan.account {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+
+        {
+            let mut cache = self.cache_write()?;
+            validate_authoritative_reconcile_account(
+                &cache.account,
+                cache.account_revision,
+                &persisted_account.value,
+                persisted_account.revision,
+            )?;
+            cache.account = persisted_account.value;
+            cache.account_revision = persisted_account.revision;
+            cache.sync = SyncStatus {
+                phase: SyncPhase::Ready,
+                validated_height: scan.binding.tip.height,
+                scanned_height: scan.binding.tip.height,
+                target_height: Some(scan.binding.tip.height),
+                last_error: None,
+            };
+            cache.coins = coins;
+            cache.transactions = transactions.clone();
+            cache.binding = Some(scan.binding);
+            cache.mempool_binding = Some(scan.mempool);
+        }
+
+        Ok(HnsAccountReadSnapshot {
+            account_id: scan.account.config.account_id,
+            binding: HnsAccountReadBinding {
+                chain: scan.binding,
+                mempool: scan.mempool,
+            },
+            balance: Amount {
+                asset: WalletAsset::Hns,
+                base_units: balance,
+            },
+            transactions: transactions
+                .into_iter()
+                .map(|transaction| transaction.summary)
+                .collect(),
+            receive_target,
+            name_receive_target,
+            known_names: names,
+        })
+    }
+
     fn find_common_ancestor(
         &self,
         recovery: &HnsRecoveryState,
@@ -6629,6 +6838,24 @@ fn validate_same_restore_snapshot(
         Err(HnsWalletError::StaleNodeSnapshot)
     } else {
         Ok(())
+    }
+}
+
+/// The embedded direct backend historically used
+/// [`HnsWalletError::RuntimeIntegrationUnavailable`] both for an intentionally
+/// disabled value capability and for a temporarily incomplete authenticated
+/// read projection. A persisted value read cannot use the former capability,
+/// so retain the latter's stage in the trusted-native diagnostic without
+/// exposing script, key, transaction, or peer data.
+fn annotate_persisted_value_read_unavailable<T>(
+    stage: &'static str,
+    result: Result<T, HnsWalletError>,
+) -> Result<T, HnsWalletError> {
+    match result {
+        Err(HnsWalletError::RuntimeIntegrationUnavailable) => Err(HnsWalletError::Backend(
+            format!("direct wallet read unavailable while {stage}"),
+        )),
+        result => result,
     }
 }
 

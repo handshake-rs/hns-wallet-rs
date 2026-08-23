@@ -855,7 +855,9 @@ fn current_binding(state: &EmbeddedState) -> Result<SnapshotBinding, HnsWalletEr
         || scan.scanned_height != Some(status.tip.height().get())
         || scan.scanned_hash != Some(status.tip.hash().into_bytes())
     {
-        return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+        return Err(HnsWalletError::Backend(
+            "direct wallet index is not aligned with the authenticated header tip".to_owned(),
+        ));
     }
     Ok(SnapshotBinding {
         tip: ChainTip {
@@ -881,7 +883,10 @@ fn require_watched_scripts(
 ) -> Result<(), HnsWalletError> {
     let watched = index.watch_set().scripts.iter().collect::<BTreeSet<_>>();
     if requested.iter().any(|script| !watched.contains(script)) {
-        return Err(HnsWalletError::RuntimeIntegrationUnavailable);
+        return Err(HnsWalletError::Backend(
+            "direct wallet index watch set does not cover the requested derivation scripts"
+                .to_owned(),
+        ));
     }
     Ok(())
 }
@@ -2433,7 +2438,8 @@ mod tests {
         backend.finish_header_round(now).unwrap();
         assert!(matches!(
             backend.get_chain_snapshot(),
-            Err(HnsWalletError::RuntimeIntegrationUnavailable)
+            Err(HnsWalletError::Backend(message))
+                if message == "direct wallet index is not aligned with the authenticated header tip"
         ));
 
         assert_eq!(backend.apply_verified_block(&block, now).unwrap(), 1);

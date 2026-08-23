@@ -1456,47 +1456,41 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
     pub fn synchronize_trusted_native_hns_value(
         &self,
     ) -> Result<NativeHnsValueSnapshot, ServiceFailure> {
-        let selected = self.runtime.reconcile()?;
+        let selected = self.runtime.exact_account()?;
+        let snapshot = self
+            .runtime
+            .runtime
+            .synchronize_persisted_value_read()
+            .map_err(|error| {
+                // This is a trusted-native diagnostic only.  The Android FFI
+                // records the service failure locally, which lets the wallet
+                // surface a bounded recovery state without exposing a node,
+                // wallet script, or key to a web caller.
+                let detail = error.to_string();
+                let mut failure = hns_read_failure(error);
+                failure.message = format!("{}: {detail}", failure.message);
+                failure
+            })?;
         self.runtime.recover_shakedex_after_reconcile()?;
         if self.runtime.exact_account()? != selected {
             return Err(hns_read_failure(HnsWalletError::StaleAccountRead));
         }
-        let balance = self.runtime.runtime.balance().map_err(chain_failure)?;
-        let receive_target = self
-            .runtime
-            .runtime
-            .receive_target()
-            .map_err(chain_failure)?;
-        let name_receive_target = self
-            .runtime
-            .runtime
-            .name_receive_target()
-            .map_err(hns_read_failure)?;
-        let transactions = self
-            .runtime
-            .runtime
-            .transaction_history()
-            .map_err(chain_failure)?;
-        let names = self
-            .runtime
-            .runtime
-            .list_names()
-            .map_err(hns_read_failure)?;
-        if transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS
-            || names.len() > MAX_PROVIDER_HNS_READ_ITEMS
+        if snapshot.transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS
+            || snapshot.known_names.len() > MAX_PROVIDER_HNS_READ_ITEMS
         {
             return Err(hns_read_result_bound());
         }
-        let known_names = names
+        let known_names = snapshot
+            .known_names
             .iter()
             .map(native_hns_name_summary)
             .collect::<Result<Vec<_>, _>>()?;
         Ok(NativeHnsValueSnapshot {
             account_id: selected.account_id,
-            balance,
-            receive_target,
-            name_receive_target,
-            transactions,
+            balance: snapshot.balance,
+            receive_target: snapshot.receive_target,
+            name_receive_target: snapshot.name_receive_target,
+            transactions: snapshot.transactions,
             known_names,
             module_status: self.runtime.runtime.sync_status(),
         })

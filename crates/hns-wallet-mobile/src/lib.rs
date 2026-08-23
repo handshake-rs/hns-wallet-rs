@@ -987,12 +987,13 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
 
     /// Perform one fresh bounded reconciliation and return only the minimized
     /// native read projection. The chain/mempool binding remains internal.
+    ///
+    /// A rejected read does not create a signing artifact, alter wallet value,
+    /// or expose a partial projection. It therefore leaves the already
+    /// unlocked session intact so the host can retry a transient direct-peer
+    /// or snapshot-availability failure.
     pub fn synchronize(&mut self) -> Result<MobileHnsReadSnapshot, MobileWalletError> {
-        let result = self.synchronize_inner();
-        if result.is_err() {
-            self.session.lock_after_request_error();
-        }
-        result
+        self.synchronize_inner()
     }
 
     /// Return balance from one new bounded synchronization.
@@ -1264,15 +1265,16 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
 
     /// Perform one full reconciliation and return only the same minimized
     /// native projection used by the read controller.
+    ///
+    /// Reconciliation is a read-only operation. A failed synchronization does
+    /// not grant a balance or authorization, and must not invalidate an
+    /// otherwise valid unlocked session that may later prepare an explicit
+    /// user-approved send.
     pub fn synchronize(&mut self) -> Result<MobileHnsReadSnapshot, MobileWalletError> {
         if self.pending.is_some() {
             return Err(MobileWalletError::ValueActionPending);
         }
-        let result = self.synchronize_inner();
-        if result.is_err() {
-            self.session.lock_after_request_error();
-        }
-        result
+        self.synchronize_inner()
     }
 
     /// Return the ordinary HNS payment receive target deterministically
@@ -2570,9 +2572,25 @@ mod tests {
         assert_eq!(probe.confirmed_calls.load(Ordering::SeqCst), 0);
         assert_eq!(probe.mempool_calls.load(Ordering::SeqCst), 0);
 
+        probe.fail_synchronization.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            value.synchronize(),
+            Err(MobileWalletError::ServiceFailure {
+                code: ServiceErrorCode::RuntimeFailure,
+                ..
+            })
+        ));
+        assert!(
+            !value
+                .status()
+                .expect("status after a rejected value read")
+                .locked
+        );
+
+        probe.fail_synchronization.store(false, Ordering::SeqCst);
         let snapshot = value.synchronize().expect("explicit sync");
         assert_eq!(snapshot.balance, Amount::new(WalletAsset::Hns, 0));
-        assert!(probe.tip_calls.load(Ordering::SeqCst) > 0);
+        assert!(probe.snapshot_calls.load(Ordering::SeqCst) > 1);
         assert!(probe.confirmed_calls.load(Ordering::SeqCst) > 0);
         assert!(probe.mempool_calls.load(Ordering::SeqCst) > 0);
     }
@@ -2877,7 +2895,7 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_read_error_locks_before_a_retry() {
+    fn synchronized_read_error_remains_unlocked_for_a_retry() {
         let directory = private_tempdir();
         let path = directory.path().join("read-failure.sqlite3");
         let key = MobileDatabaseKey::new([0x92; MOBILE_DATABASE_KEY_BYTES]).expect("database key");
@@ -2903,12 +2921,11 @@ mod tests {
                 ..
             })
         ));
-        assert!(reads.status().expect("status after read error").locked);
+        assert!(!reads.status().expect("status after read error").locked);
         assert_eq!(probe.evidence_calls.load(Ordering::SeqCst), 0);
         assert_eq!(probe.forbidden_calls.load(Ordering::SeqCst), 0);
 
         probe.fail_synchronization.store(false, Ordering::SeqCst);
-        reads.unlock(&key).expect("unlock after backend recovery");
         assert_eq!(
             reads.balance().expect("balance after backend recovery"),
             Amount::new(WalletAsset::Hns, 0)
