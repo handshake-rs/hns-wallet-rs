@@ -257,6 +257,54 @@ pub struct EncryptedHnsLightIndex {
     network: Network,
     scan_revision: u64,
     scan: StoredHnsLightScan,
+    // Compact, process-local derivation used by sequential scans. The
+    // encrypted records remain authoritative for public history reads.
+    scan_projection: HnsLightScanProjection,
+}
+
+/// Public scan-state derived from authenticated persisted observations. It
+/// deliberately contains no signing material. The projection is changed only
+/// after the matching entity batch commits, so it stays aligned with durable
+/// coverage when validation or persistence fails.
+struct HnsLightScanProjection {
+    watched_scripts: BTreeSet<WalletAddressKey>,
+    watched_names: BTreeSet<[u8; 32]>,
+    watched_outpoints: HashSet<Outpoint>,
+    transaction_ids: BTreeSet<[u8; 32]>,
+    transaction_count: usize,
+}
+
+impl HnsLightScanProjection {
+    fn empty(watch_set: &HnsLightWatchSet) -> Self {
+        Self {
+            watched_scripts: watch_set.scripts.iter().cloned().collect(),
+            watched_names: watch_set.name_hashes.iter().copied().collect(),
+            watched_outpoints: HashSet::new(),
+            transaction_ids: BTreeSet::new(),
+            transaction_count: 0,
+        }
+    }
+
+    fn from_observations(
+        watch_set: &HnsLightWatchSet,
+        observations: &[VerifiedHnsTransactionObservation],
+    ) -> Result<Self, HnsLightIndexError> {
+        let mut projection = Self::empty(watch_set);
+        for observation in observations {
+            let txid = observation.txid.into_bytes();
+            if !projection.transaction_ids.insert(txid) {
+                return Err(HnsLightIndexError::DuplicateConfirmedTransaction);
+            }
+            add_watched_outputs(
+                &observation.transaction,
+                CanonicalTransactionHash::new(txid),
+                &projection.watched_scripts,
+                &mut projection.watched_outpoints,
+            )?;
+        }
+        projection.transaction_count = observations.len();
+        Ok(projection)
+    }
 }
 
 impl EncryptedHnsLightIndex {
@@ -278,13 +326,17 @@ impl EncryptedHnsLightIndex {
                 return Err(HnsLightIndexError::WrongRecordKind);
             };
             validate_scan(&scan, network, birthday_height)?;
-            return Ok(Self {
+            let projection = HnsLightScanProjection::empty(&scan.watch_set);
+            let mut index = Self {
                 store,
                 account_id,
                 network,
                 scan_revision: stored.revision,
                 scan,
-            });
+                scan_projection: projection,
+            };
+            index.refresh_scan_projection()?;
+            return Ok(index);
         }
         let watch_set = HnsLightWatchSet::new(Vec::new(), Vec::new())?;
         let scan = StoredHnsLightScan {
@@ -309,6 +361,7 @@ impl EncryptedHnsLightIndex {
             account_id,
             network,
             scan_revision: 1,
+            scan_projection: HnsLightScanProjection::empty(&scan.watch_set),
             scan,
         })
     }
@@ -356,6 +409,7 @@ impl EncryptedHnsLightIndex {
             .checked_add(1)
             .ok_or(HnsLightIndexError::RevisionOverflow)?;
         self.scan = next_scan;
+        self.scan_projection = HnsLightScanProjection::empty(&self.scan.watch_set);
         Ok(true)
     }
 
@@ -395,30 +449,28 @@ impl EncryptedHnsLightIndex {
     /// conservative and lets a restarted scan detect spends without relying
     /// on connection-local BIP37 auto-update state.
     pub fn bloom_elements(&self) -> Result<Vec<Vec<u8>>, HnsLightIndexError> {
-        let scripts = self
-            .scan
-            .watch_set
-            .scripts
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let observations = self.decoded_transactions()?;
-        let mut elements = self
-            .scan
-            .watch_set
-            .scripts
-            .iter()
-            .map(|script| script.hash.clone())
-            .chain(
-                self.scan
-                    .watch_set
-                    .name_hashes
-                    .iter()
-                    .map(|name| name.to_vec()),
-            )
-            .collect::<Vec<_>>();
+        let mut elements = Vec::with_capacity(
+            self.scan_projection.watched_scripts.len()
+                + self.scan_projection.watched_names.len()
+                + self.scan_projection.watched_outpoints.len(),
+        );
         elements.extend(
-            watched_outputs(&observations, &scripts)?
+            self.scan_projection
+                .watched_scripts
+                .iter()
+                .map(|script| script.hash.clone()),
+        );
+        elements.extend(
+            self.scan_projection
+                .watched_names
+                .iter()
+                .map(|name| name.to_vec()),
+        );
+        elements.extend(
+            self.scan_projection
+                .watched_outpoints
+                .iter()
+                .copied()
                 .into_iter()
                 .map(|outpoint| outpoint.encode().to_vec()),
         );
@@ -466,29 +518,16 @@ impl EncryptedHnsLightIndex {
         {
             return Err(HnsLightIndexError::AuthorityMismatch);
         }
-        let existing = self.decoded_transactions()?;
-        if existing.len() > crate::MAX_HISTORY_RESULTS {
+        if self.scan_projection.transaction_count > crate::MAX_HISTORY_RESULTS {
             return Err(HnsLightIndexError::HistoryCapacity);
         }
-        let watched_scripts = self
-            .scan
-            .watch_set
-            .scripts
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        let watched_names = self
-            .scan
-            .watch_set
-            .name_hashes
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        let mut watched_outpoints = watched_outputs(&existing, &watched_scripts)?;
-        let mut existing_txids = existing
-            .iter()
-            .map(|observation| observation.txid.into_bytes())
-            .collect::<BTreeSet<_>>();
+        let watched_scripts = &self.scan_projection.watched_scripts;
+        let watched_names = &self.scan_projection.watched_names;
+        // Keep candidate state separate until the single atomic entity batch
+        // succeeds. This makes a later in-batch spend visible while preserving
+        // fail-closed replay behavior after any error.
+        let mut added_watched_outpoints = HashSet::new();
+        let mut admitted_txids = BTreeSet::new();
         let mut saves = Vec::new();
         let mut admitted_total = 0usize;
         let mut admitted_per_block = Vec::with_capacity(blocks.len());
@@ -533,25 +572,28 @@ impl EncryptedHnsLightIndex {
                     .get(&txid_bytes)
                     .copied()
                     .ok_or(HnsLightIndexError::EvidenceMismatch)?;
-                if existing_txids.contains(&txid_bytes) {
+                if self.scan_projection.transaction_ids.contains(&txid_bytes)
+                    || admitted_txids.contains(&txid_bytes)
+                {
                     return Err(HnsLightIndexError::DuplicateConfirmedTransaction);
                 }
-                let relevant = transaction_relevant(
+                let relevant = transaction_relevant_with_pending_outpoints(
                     transaction,
-                    &watched_scripts,
-                    &watched_names,
-                    &watched_outpoints,
+                    watched_scripts,
+                    watched_names,
+                    &self.scan_projection.watched_outpoints,
+                    &added_watched_outpoints,
                 );
                 add_watched_outputs(
                     transaction,
                     canonical_txid,
-                    &watched_scripts,
-                    &mut watched_outpoints,
+                    watched_scripts,
+                    &mut added_watched_outpoints,
                 )?;
                 if !relevant {
                     continue;
                 }
-                existing_txids.insert(txid_bytes);
+                admitted_txids.insert(txid_bytes);
                 let raw = transaction.encode()?;
                 let stored = StoredHnsLightTransaction {
                     format_version: HNS_LIGHT_INDEX_FORMAT_VERSION,
@@ -581,7 +623,12 @@ impl EncryptedHnsLightIndex {
             next_scan.scanned_height = Some(height);
             next_scan.scanned_hash = Some(entry.hash().into_bytes());
         }
-        if existing.len().saturating_add(admitted_total) > crate::MAX_HISTORY_RESULTS {
+        if self
+            .scan_projection
+            .transaction_count
+            .saturating_add(admitted_total)
+            > crate::MAX_HISTORY_RESULTS
+        {
             return Err(HnsLightIndexError::HistoryCapacity);
         }
         saves.insert(
@@ -601,6 +648,15 @@ impl EncryptedHnsLightIndex {
             .checked_add(1)
             .ok_or(HnsLightIndexError::RevisionOverflow)?;
         self.scan = next_scan;
+        self.scan_projection
+            .watched_outpoints
+            .extend(added_watched_outpoints);
+        self.scan_projection.transaction_ids.extend(admitted_txids);
+        self.scan_projection.transaction_count = self
+            .scan_projection
+            .transaction_count
+            .checked_add(admitted_total)
+            .ok_or(HnsLightIndexError::HistoryCapacity)?;
         Ok(admitted_per_block)
     }
 
@@ -767,6 +823,16 @@ impl EncryptedHnsLightIndex {
         observations.sort_by_key(|observation| (observation.height, observation.transaction_index));
         Ok(observations)
     }
+
+    fn refresh_scan_projection(&mut self) -> Result<(), HnsLightIndexError> {
+        let observations = self.decoded_transactions()?;
+        if observations.len() > crate::MAX_HISTORY_RESULTS {
+            return Err(HnsLightIndexError::HistoryCapacity);
+        }
+        self.scan_projection =
+            HnsLightScanProjection::from_observations(&self.scan.watch_set, &observations)?;
+        Ok(())
+    }
 }
 
 fn validate_scan(
@@ -795,16 +861,17 @@ fn validate_scan(
     Ok(())
 }
 
-fn watched_outputs(
-    observations: &[VerifiedHnsTransactionObservation],
+fn transaction_relevant_with_pending_outpoints(
+    transaction: &Transaction,
     scripts: &BTreeSet<WalletAddressKey>,
-) -> Result<HashSet<Outpoint>, HnsLightIndexError> {
-    let mut outpoints = HashSet::new();
-    for observation in observations {
-        let txid = CanonicalTransactionHash::new(observation.txid.into_bytes());
-        add_watched_outputs(&observation.transaction, txid, scripts, &mut outpoints)?;
-    }
-    Ok(outpoints)
+    names: &BTreeSet<[u8; 32]>,
+    watched_outpoints: &HashSet<Outpoint>,
+    pending_watched_outpoints: &HashSet<Outpoint>,
+) -> bool {
+    transaction.inputs.iter().any(|input| {
+        watched_outpoints.contains(&input.previous_output)
+            || pending_watched_outpoints.contains(&input.previous_output)
+    }) || transaction_outputs_relevant(transaction, scripts, names)
 }
 
 pub(crate) fn add_watched_outputs(
@@ -838,22 +905,30 @@ pub(crate) fn transaction_relevant(
         .inputs
         .iter()
         .any(|input| watched_outpoints.contains(&input.previous_output))
-        || transaction.outputs.iter().any(|output| {
-            scripts.contains(&WalletAddressKey {
-                version: output.address.version,
-                hash: output.address.hash.clone(),
-            }) || output.covenant.items.iter().any(|item| {
-                item.as_slice()
-                    .try_into()
-                    .is_ok_and(|value: [u8; 32]| names.contains(&value))
-            }) || (output.covenant.kind == CovenantKind::Transfer
-                && TransferCovenant::try_from(&output.covenant).is_ok_and(|transfer| {
-                    scripts.contains(&WalletAddressKey {
-                        version: transfer.recipient_version,
-                        hash: transfer.recipient_hash,
-                    })
-                }))
-        })
+        || transaction_outputs_relevant(transaction, scripts, names)
+}
+
+fn transaction_outputs_relevant(
+    transaction: &Transaction,
+    scripts: &BTreeSet<WalletAddressKey>,
+    names: &BTreeSet<[u8; 32]>,
+) -> bool {
+    transaction.outputs.iter().any(|output| {
+        scripts.contains(&WalletAddressKey {
+            version: output.address.version,
+            hash: output.address.hash.clone(),
+        }) || output.covenant.items.iter().any(|item| {
+            item.as_slice()
+                .try_into()
+                .is_ok_and(|value: [u8; 32]| names.contains(&value))
+        }) || (output.covenant.kind == CovenantKind::Transfer
+            && TransferCovenant::try_from(&output.covenant).is_ok_and(|transfer| {
+                scripts.contains(&WalletAddressKey {
+                    version: transfer.recipient_version,
+                    hash: transfer.recipient_hash,
+                })
+            }))
+    })
 }
 
 fn scan_id(account_id: AccountId) -> Vec<u8> {
@@ -1144,6 +1219,10 @@ mod tests {
         let transactions = index.transactions().unwrap();
         assert_eq!(transactions.len(), 1);
         assert_eq!(transactions[0].transaction.outputs[0].value.get(), 42);
+        let observed_outpoint = Outpoint {
+            transaction_hash: CanonicalTransactionHash::new(transactions[0].txid.into_bytes()),
+            index: 0,
+        };
 
         let reopened =
             EncryptedHnsLightIndex::open_or_create(store, account, HnsNetwork::Regtest, 1, 4)
@@ -1152,6 +1231,12 @@ mod tests {
         assert_eq!(
             reopened.transactions().unwrap(),
             index.transactions().unwrap()
+        );
+        assert!(
+            reopened
+                .bloom_elements()
+                .unwrap()
+                .contains(&observed_outpoint.encode().to_vec())
         );
     }
 

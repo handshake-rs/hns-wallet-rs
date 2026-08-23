@@ -66,9 +66,11 @@ const FILTERED_BLOCK_REQUEST_WINDOW: u32 = 64;
 // A scan must obtain two full, independently verified views. Prefer peers
 // that have recently returned those views quickly, but periodically rotate a
 // request through the warm reserve so a changed network path can be measured
-// and selected later. This only changes availability/performance selection;
-// every accepted block still requires the configured exact proof quorum.
-const BLOCK_SCAN_PEER_EXPLORATION_INTERVAL: usize = 8;
+// and selected later. A 16-batch cadence limits a known slow reserve's impact
+// on a mobile backfill while still refreshing it every 1,024 headers. This
+// only changes availability/performance selection; every accepted block still
+// requires the configured exact proof quorum.
+const BLOCK_SCAN_PEER_EXPLORATION_INTERVAL: usize = 16;
 const BLOCK_SCAN_PEER_LATENCY_OLD_WEIGHT: u64 = 3;
 const BLOCK_SCAN_PEER_LATENCY_WEIGHT: u64 = BLOCK_SCAN_PEER_LATENCY_OLD_WEIGHT + 1;
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
@@ -194,6 +196,10 @@ pub struct HnsBlockScanBatchTelemetry {
     pub fastest_peer_fetch_millis: u64,
     /// Slowest successful individual peer-view response in the quorum.
     pub slowest_peer_fetch_millis: u64,
+    /// Time outside successful peer socket reads, including quorum selection,
+    /// worker scheduling, and any failover request. This lets mobile hosts
+    /// distinguish device contention from normal peer-delivery latency.
+    pub peer_coordination_millis: u64,
     /// Time to merge every independent view into locally verified blocks.
     pub merge_millis: u64,
     /// Time to plan and atomically commit wallet observations and scan head.
@@ -1577,6 +1583,8 @@ impl HnsDirectPeerCoordinator {
                 .max()
                 .map(duration_millis)
                 .unwrap_or_default();
+            let peer_coordination_millis =
+                peer_fetch_millis.saturating_sub(slowest_peer_fetch_millis);
 
             let merge_started = Instant::now();
             let mut merged_blocks = Vec::with_capacity(anchors.len());
@@ -1607,6 +1615,7 @@ impl HnsDirectPeerCoordinator {
                 peer_fetch_millis,
                 fastest_peer_fetch_millis,
                 slowest_peer_fetch_millis,
+                peer_coordination_millis,
                 merge_millis,
                 commit_millis,
             };
@@ -1760,8 +1769,8 @@ impl HnsDirectPeerCoordinator {
 
     /// Select an exact proof quorum from the filter-installed peers for one
     /// block scan batch. Recent response time decides the normal selection;
-    /// every eighth selection rotates through the reserve to keep performance
-    /// observations fresh. The caller retains every unselected handle as a
+    /// every sixteenth selection rotates through the reserve to keep
+    /// performance observations fresh. The caller retains every unselected handle as a
     /// warm, already-filtered reserve for a later batch or immediate retry.
     fn block_scan_quorum_handles(
         &self,
