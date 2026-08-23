@@ -2743,6 +2743,17 @@ mod tests {
                 .account_config()
                 .settlement_enabled
         );
+        let listener = direct
+            .coordinator()
+            .bind_denuo_listener((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .expect("bind Denuo listener from the coordinator's peer policy");
+        assert!(
+            listener
+                .local_addr()
+                .expect("direct Denuo listener address")
+                .port()
+                != 0
+        );
         direct
             .value_controller()
             .unlock(&key)

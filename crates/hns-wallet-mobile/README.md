@@ -77,5 +77,11 @@ mempool, fee, ownership, approval, and persistence evidence. Browser/provider
 integration, HNSA/HNSR product wiring, installed mobile transport, and release
 qualification remain separate work.
 
+`MobileDirectHnsValueController` retains the direct-peer coordinator beside the
+value runtime. Direct Denuo listeners and outbound peers are constructed by
+that coordinator, so they inherit the exact network, address-policy, deadline,
+and explicit-peer constraints already used for the wallet's chain, fee, and
+broadcast transport.
+
 See the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)
 for generated-binding progress, target qualification, and release status.

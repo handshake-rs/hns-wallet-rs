@@ -1064,6 +1064,7 @@ impl HnsLightNetwork for NativeHnsPeerPool {
 pub struct HnsDirectPeerCoordinator {
     backend: EmbeddedHnsBackend,
     pool: Arc<NativeHnsPeerPool>,
+    config: HnsDirectPeerConfig,
     wallet_watch_set_source: Option<WalletWatchSetSource>,
     pending_header: Arc<Mutex<Option<PendingHeaderRound>>>,
     // The persistent peer pool is deliberately wider than a single header
@@ -1135,11 +1136,12 @@ impl HnsDirectPeerCoordinator {
         {
             return Err(HnsDirectPeerError::InvalidConfiguration);
         }
-        let pool = Arc::new(NativeHnsPeerPool::new(config)?);
+        let pool = Arc::new(NativeHnsPeerPool::new(config.clone())?);
         let backend = EmbeddedHnsBackend::new(authority, index, pool.clone())?;
         Ok(Self {
             backend,
             pool,
+            config,
             wallet_watch_set_source: None,
             pending_header: Arc::new(Mutex::new(None)),
             next_header_peer_offset: Arc::new(AtomicUsize::new(0)),
@@ -1153,6 +1155,35 @@ impl HnsDirectPeerCoordinator {
     #[must_use]
     pub const fn backend(&self) -> &EmbeddedHnsBackend {
         &self.backend
+    }
+
+    /// Bind one wallet-owned direct Denuo listener with the exact validated
+    /// peer policy already used by this coordinator.
+    ///
+    /// The listener inherits the selected Handshake network, private-address
+    /// policy, deadlines, and peer policy. A caller cannot accidentally bind
+    /// a Denuo transport on a network or policy that differs from the direct
+    /// backend providing this wallet's chain and value evidence.
+    pub fn bind_denuo_listener(
+        &self,
+        address: SocketAddr,
+    ) -> Result<HnsDirectDenuoListener, HnsDirectPeerError> {
+        HnsDirectDenuoListener::bind(self.config.clone(), address)
+    }
+
+    /// Connect one direct Denuo peer with the exact validated peer policy
+    /// already used by this coordinator.
+    ///
+    /// The socket remains an untrusted, explicitly scheduled transport. This
+    /// method does not synchronize the wallet, service a board exchange, or
+    /// authorize any value operation.
+    pub fn connect_denuo_peer(
+        &self,
+        address: SocketAddr,
+        local_height: u32,
+        now_unix: u64,
+    ) -> Result<HnsDirectDenuoPeer, HnsDirectPeerError> {
+        HnsDirectDenuoPeer::connect(&self.config, address, local_height, now_unix)
     }
 
     /// Extend the wallet-owned direct watch set by the next complete restore
