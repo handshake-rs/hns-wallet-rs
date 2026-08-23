@@ -5,9 +5,9 @@ hns-wallet-chain-api
 hns-wallet-ffi
 hns-wallet-provider
 hns-wallet-hns
+hns-wallet-bitcoin-kyoto
 hns-wallet-market
 hns-wallet-shakedex
-hns-wallet-bitcoin-kyoto
 hns-wallet-ethereum
 hns-wallet-host
 hns-wallet-service

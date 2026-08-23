@@ -3,11 +3,10 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
-## 0.1.0 - 2026-08-10
+## 0.1.1 - 2026-08-23
 
-<!-- hns-wallet-release-state: 0.1.0 candidate -->
-Unpublished initial release candidate for the independent Handshake wallet
-boundary:
+<!-- hns-wallet-release-state: 0.1.1 release -->
+Initial release source for the independent Handshake wallet boundary:
 
 - wallet-local identifiers, summaries, and capability-separated chain APIs;
 - authenticated encrypted SQLite persistence with one shared lock and key
@@ -124,18 +123,17 @@ before exact resume checksum verification. A source archive or successful test
 is not authorization to enable provider, value, settlement, or marketplace
 product gates.
 
-Version `0.1.0` is the initial shared release line. Historical release evidence
-remains recorded: on 2026-08-14, all 17 required `hns-rs` `0.2.0` archives were
-published to crates.io and verified to identify the exact protocol release
-commit `b24b66c382de53330ec21dd3137e056a2bea3e2d`.
-
-The current dependency tranche instead pins every protocol dependency to exact
-unpublished `hns-rs` `0.3.0` Git revision
-`88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`. The wallet crates remain release
-candidates, and irreversible wallet publication must fail closed until all 19
-current upstream archives are published and each registry archive proves that
-exact revision. The dependency update does not enable any provider, value,
-settlement, or marketplace gate.
+Version `0.1.1` is the current shared release line. Its complete resolved
+Handshake protocol cohort is the published registry `hns-rs` `0.3.1` release
+source `0e99addca59778b7b7c6fc56291333a97c4c8815`, pinned by
+`release/hns-rs-0.3.1-crates.sha256`. Its light-wallet cohort is the published
+registry `hns-dane-engine` `0.2.2` release source
+`b7fdf8826c81b77650a0f740d1f05314b74969f9`, pinned by
+`release/hns-dane-engine-0.2.2-crates.sha256`. Execute mode downloads and
+verifies every upstream archive, API checksum, VCS source path, revision, and
+non-yanked status immediately before a wallet upload. These registry pins keep
+the direct HNS value composition on reviewed released sources; they do not
+introduce a mainnet-value disablement.
 
 Exact source `bc5901f794450d29fa9f5630bab4fbf91e37bedf` passed complete locked
 CI `31812028843`, including Wallet qualification and RustSec, and CodeQL

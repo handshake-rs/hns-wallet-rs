@@ -18,7 +18,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -27,19 +27,19 @@ keywords = ["handshake", "wallet", "bitcoin", "ethereum"]
 categories = ["cryptography::cryptocurrencies"]
 
 [workspace.dependencies]
-hns-wallet-types = { version = "0.1.0", path = "crates/hns-wallet-types" }
-hns-wallet-store = { version = "0.1.0", path = "crates/hns-wallet-store" }
-hns-wallet-chain-api = { version = "0.1.0", path = "crates/hns-wallet-chain-api" }
-hns-wallet-hns = { version = "0.1.0", path = "crates/hns-wallet-hns" }
-hns-wallet-provider = { version = "0.1.0", path = "crates/hns-wallet-provider" }
-hns-wallet-shakedex = { version = "0.1.0", path = "crates/hns-wallet-shakedex" }
-hns-wallet-market = { version = "0.1.0", path = "crates/hns-wallet-market" }
-hns-wallet-mobile = { version = "0.1.0", path = "crates/hns-wallet-mobile" }
-hns-wallet-bitcoin-kyoto = { version = "0.1.0", path = "crates/hns-wallet-bitcoin-kyoto" }
-hns-wallet-ethereum = { version = "0.1.0", path = "crates/hns-wallet-ethereum" }
-hns-wallet-ffi = { version = "0.1.0", path = "crates/hns-wallet-ffi" }
-hns-wallet-service = { version = "0.1.0", path = "crates/hns-wallet-service" }
-hns-wallet-host = { version = "0.1.0", path = "crates/hns-wallet-host" }
+hns-wallet-types = { version = "0.1.1", path = "crates/hns-wallet-types" }
+hns-wallet-store = { version = "0.1.1", path = "crates/hns-wallet-store" }
+hns-wallet-chain-api = { version = "0.1.1", path = "crates/hns-wallet-chain-api" }
+hns-wallet-hns = { version = "0.1.1", path = "crates/hns-wallet-hns" }
+hns-wallet-provider = { version = "0.1.1", path = "crates/hns-wallet-provider" }
+hns-wallet-shakedex = { version = "0.1.1", path = "crates/hns-wallet-shakedex" }
+hns-wallet-market = { version = "0.1.1", path = "crates/hns-wallet-market" }
+hns-wallet-mobile = { version = "0.1.1", path = "crates/hns-wallet-mobile" }
+hns-wallet-bitcoin-kyoto = { version = "0.1.1", path = "crates/hns-wallet-bitcoin-kyoto" }
+hns-wallet-ethereum = { version = "0.1.1", path = "crates/hns-wallet-ethereum" }
+hns-wallet-ffi = { version = "0.1.1", path = "crates/hns-wallet-ffi" }
+hns-wallet-service = { version = "0.1.1", path = "crates/hns-wallet-service" }
+hns-wallet-host = { version = "0.1.1", path = "crates/hns-wallet-host" }
 
 argon2 = "0.5.3"
 bech32 = "0.11.0"
@@ -66,23 +66,23 @@ thiserror = "2.0.12"
 url = { version = "2.5.4", features = ["serde"] }
 zeroize = { version = "1.8.1", features = ["derive"] }
 
-# Reviewed canonical Handshake protocol source. Every protocol crate is pinned
-# to one immutable revision; no mutable branch, tag, or sibling checkout is
-# allowed. This source adoption does not imply downstream release qualification.
-hns-covenants = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-header-consensus = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-marketplace-protocol = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-p2p-experimental = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-light-chain = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "4a6dc2c8402f3593483d2e554347a3694b811f5e" }
-hns-light-p2p = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "4a6dc2c8402f3593483d2e554347a3694b811f5e" }
-hns-light-sync = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "4a6dc2c8402f3593483d2e554347a3694b811f5e" }
-hns-light-wallet = { version = "=0.2.1", git = "https://github.com/handshake-rs/hns-dane-engine.git", rev = "4a6dc2c8402f3593483d2e554347a3694b811f5e" }
-hns-p2p-wire = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-primitives = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-script = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-swap = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-transaction = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-urkel-proof = { version = "=0.3.0", git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
+# Published canonical Handshake and light-engine sources. Every dependency is
+# exact, registry-resolved, and bound by the release validators to published
+# archives from the reviewed upstream release commits.
+hns-covenants = { version = "=0.3.1" }
+hns-header-consensus = { version = "=0.3.1" }
+hns-marketplace-protocol = { version = "=0.3.1" }
+hns-p2p-experimental = { version = "=0.3.1" }
+hns-light-chain = { version = "=0.2.2" }
+hns-light-p2p = { version = "=0.2.2" }
+hns-light-sync = { version = "=0.2.2" }
+hns-light-wallet = { version = "=0.2.2" }
+hns-p2p-wire = { version = "=0.3.1" }
+hns-primitives = { version = "=0.3.1" }
+hns-script = { version = "=0.3.1" }
+hns-swap = { version = "=0.3.1" }
+hns-transaction = { version = "=0.3.1" }
+hns-urkel-proof = { version = "=0.3.1" }
 
 # The only Bitcoin production synchronization implementation. The exact BDK
 # release is part of the encrypted changeset format contract.
@@ -97,16 +97,3 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
-
-# The light-engine repositories intentionally depend on the published 0.3
-# protocol line. Patch that registry line to the wallet's exact reviewed
-# hns-rs revision so canonical headers, transactions, and primitive types have
-# one Cargo source identity across the embedded runtime.
-[patch.crates-io]
-hns-covenants = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-encoding = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-header-consensus = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-p2p-wire = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-primitives = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-transaction = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }
-hns-urkel-proof = { git = "https://github.com/handshake-rs/hns-rs.git", rev = "42b0efe14e2a54d4a4a8e0c8633e021c2531a3e8" }

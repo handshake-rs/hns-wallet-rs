@@ -18,14 +18,16 @@ hostile website
 
 Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
 proofs, signed fixed-price listings/cancellations, Denuo name-market envelopes,
-and Denuo V2 direct HNS/BTC offer/session envelopes remain in `hns-rs`. This workspace consumes the
-required protocol crates as exact `hns-rs` `0.3.0` from reviewed immutable Git
-revision `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`; its exact source and lock
-coherence are checked before the workspace gate. That source is not yet
-published, so irreversible wallet publication must also fail closed until all
-19 current upstream archives are published and provenance-verified at that
-revision. The wallet owns protocol verification, encrypted replay/tombstone
-board state, direct-offer cancellation state, and a direct-session journal.
+and Denuo V2 direct HNS/BTC offer/session envelopes remain in `hns-rs`. This
+workspace consumes the required protocol crates as exact published registry
+`hns-rs` `0.3.1`, whose reviewed release source is
+`0e99addca59778b7b7c6fc56291333a97c4c8815`. The full 19-crate archive cohort is
+recorded in `release/hns-rs-0.3.1-crates.sha256`; the direct light-wallet
+dependencies similarly use published registry `hns-dane-engine` `0.2.2` source
+`b7fdf8826c81b77650a0f740d1f05314b74969f9`, recorded in
+`release/hns-dane-engine-0.2.2-crates.sha256`. The wallet owns protocol
+verification, encrypted replay/tombstone board state, direct-offer cancellation
+state, and a direct-session journal.
 Node indexes
 and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
 remains in `hns-dane-engine`. Browser JavaScript and platform UI remain in the
@@ -174,9 +176,10 @@ refreshed quote with `RequiresRebroadcast` before submission, and allows at most
 one full reconciliation and one retry for stale or unavailable quote evidence.
 Confirmed wallet coins retain exact inclusion height and canonical covenant
 bytes through encrypted persistence. Final transactions are checked against
-the ordered reconstructed consensus coins: immutable `hns-script` `0.3.0`
-computes sigops, policy virtual size, minimum fee, and standard weight/sigop
-bounds, while exact input/output sums independently reproduce actual fee.
+the ordered reconstructed consensus coins: published registry `hns-script`
+`0.3.1` source `0e99addca59778b7b7c6fc56291333a97c4c8815` computes sigops,
+policy virtual size, minimum fee, and standard weight/sigop bounds, while exact
+input/output sums independently reproduce actual fee.
 Legacy or mismatched evidence fails closed. The source gate
 `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` is enabled: the wallet uses the
 reviewed immutable `hns-script` implementation and never a local copy of the

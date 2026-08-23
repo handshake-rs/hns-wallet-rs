@@ -57,7 +57,7 @@ def expect_publish_script_mutation(
             expect_failure(
                 failure,
                 lambda: verify_release_document(
-                    repo, release_order(REPO), "0.1.0"
+                    repo, release_order(REPO), "0.1.1"
                 ),
             )
         else:
@@ -176,7 +176,7 @@ expect_failure(
 # The executable release path must preserve the registry-backed reconstruction,
 # exact crate-name classification endpoint, both independent cooldown buckets,
 # and a catch-all error for an indeterminate registry response.
-verify_release_document(REPO, release_order(REPO), "0.1.0")
+verify_release_document(REPO, release_order(REPO), "0.1.1")
 verify_publish_script_safety(REPO)
 
 expect_publish_script_mutation(

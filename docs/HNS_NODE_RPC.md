@@ -144,12 +144,14 @@ refreshed quote and `RequiresRebroadcast` state, and then submits those same
 bytes. A stale snapshot or temporarily unavailable quote input permits exactly
 one complete reconciliation and one quote retry; there is no polling loop.
 
-The reviewed immutable `hns-script` `0.3.0` Git source now supplies transaction
-sigops, sigop-adjusted policy size, minimum-fee construction, and standard
-weight/sigop bounds directly to the wallet. No local formula is copied. The
-exact current wallet source `bc5901f` passed its complete locked CI gate and
-CodeQL; multi-process node/wallet, restart/reorg, adversarial, product, and
-resource qualification remain open. The source-level
+The reviewed published registry `hns-script` `0.3.1` source
+`0e99addca59778b7b7c6fc56291333a97c4c8815` supplies transaction sigops,
+sigop-adjusted policy size, minimum-fee construction, and standard weight/sigop
+bounds directly to the wallet. No local formula is copied. Its archive checksum
+is bound by `release/hns-rs-0.3.1-crates.sha256`. The exact current wallet
+release source must pass its complete locked CI gate and CodeQL; multi-process
+node/wallet, restart/reorg, adversarial, product, and resource qualification
+remain open. The source-level
 `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` gate is enabled: the wired quote path
 can authorize value only after it has validated the required live evidence.
 The remaining qualification work is not modeled as a permanent disabled path.
