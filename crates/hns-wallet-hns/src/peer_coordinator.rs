@@ -2198,7 +2198,14 @@ impl NativePeer {
             .transport_mut()
             .set_read_timeout(Some(timeout))
             .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
-        let result = self.poll_wallet_events_inner(now_unix);
+        // A socket read deadline only bounds an *idle* peer. A peer that
+        // continuously sends irrelevant protocol messages can otherwise keep
+        // resetting that deadline and retain the final wallet snapshot
+        // forever. Bound the complete explicit mempool drain as well. The
+        // caller can safely retry on a later synchronization round; mempool
+        // data is never required to advance the already verified chain tip.
+        let deadline = Instant::now() + timeout;
+        let result = self.poll_wallet_events_inner(now_unix, deadline);
         let restore = self
             .connection
             .transport_mut()
@@ -2213,11 +2220,31 @@ impl NativePeer {
     fn poll_wallet_events_inner(
         &mut self,
         now_unix: u64,
+        deadline: Instant,
     ) -> Result<Vec<WalletPeerEvent>, HnsDirectPeerError> {
         let mut events = self.deferred_wallet.drain(..).collect::<Vec<_>>();
-        for _ in events.len()..MAX_RESPONSE_EVENTS {
+        if events.len() >= MAX_RESPONSE_EVENTS {
+            return Err(HnsDirectPeerError::ResponseEventLimit);
+        }
+        // Count every received wire event, not only wallet messages. Peers
+        // are allowed to send ordinary traffic while connected, but it must
+        // not turn a bounded wallet refresh into an unbounded drain.
+        for _ in 0..MAX_RESPONSE_EVENTS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(events);
+            }
+            self.connection
+                .transport_mut()
+                .set_read_timeout(Some(remaining))
+                .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
             match self.connection.receive_event(now_unix_or(now_unix)) {
-                Ok(PeerEvent::Wallet(event)) => events.push(event),
+                Ok(PeerEvent::Wallet(event)) => {
+                    events.push(event);
+                    if events.len() >= MAX_RESPONSE_EVENTS {
+                        return Err(HnsDirectPeerError::ResponseEventLimit);
+                    }
+                }
                 Ok(
                     PeerEvent::Addresses(_)
                     | PeerEvent::Ignored(_)
@@ -2234,9 +2261,6 @@ impl NativePeer {
                 )) => return Ok(events),
                 Err(error) => return Err(error.into()),
             }
-        }
-        if events.len() >= MAX_RESPONSE_EVENTS {
-            return Err(HnsDirectPeerError::ResponseEventLimit);
         }
         Ok(events)
     }
