@@ -5,6 +5,7 @@ mod bitcoin;
 mod market;
 
 use std::collections::BTreeSet;
+use std::net::SocketAddr;
 use std::path::Path;
 
 pub use bitcoin::{
@@ -242,6 +243,24 @@ pub struct MobileHnsValueController<B: HnsBackend, C: HnsClock = HnsReadSystemCl
 pub struct MobileDirectHnsValueController<C: HnsClock = HnsReadSystemClock> {
     value: MobileHnsValueController<EmbeddedHnsBackend, C>,
     coordinator: HnsDirectPeerCoordinator,
+}
+
+/// A direct Denuo listener created by one [`MobileDirectHnsValueController`].
+///
+/// The underlying listener stays private so accepting a peer has to cross the
+/// same controller that owns the value runtime's trusted clock.  It is still
+/// an ordinary socket resource: the embedding application must drop it when
+/// its native I/O worker stops, including when the wallet is locked.
+pub struct MobileDirectDenuoListener {
+    listener: HnsDirectDenuoListener,
+}
+
+impl MobileDirectDenuoListener {
+    /// Return the concrete local socket locator, including a kernel-selected
+    /// port when the listener was bound with port zero.
+    pub fn local_addr(&self) -> Result<SocketAddr, MobileWalletError> {
+        self.listener.local_addr().map_err(Into::into)
+    }
 }
 
 struct PendingMobileHnsValueAction {
@@ -1404,6 +1423,36 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         mobile_hns_value_snapshot(self.account_config.account_id, snapshot)
     }
 
+    /// Return the exact clock authority used by the native HNS runtime after
+    /// confirming that the same persisted account remains unlocked. Direct
+    /// Denuo handshakes carry a timestamp, but an embedding application must
+    /// never get to substitute its own clock for the value runtime's clock.
+    fn trusted_wallet_peer_now_unix(&mut self) -> Result<u64, MobileWalletError> {
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        let result = (|| {
+            if self.session.store.is_locked()? {
+                return Err(MobileWalletError::Store(StoreError::Locked));
+            }
+            // This exact-account lookup also detects a separately changed
+            // persisted account configuration before a peer sees a direct
+            // Denuo handshake for the value controller.
+            self.session
+                .service
+                .local_trusted_native_hns_value_receive_target()
+                .map_err(mobile_service_failure)?;
+            self.session
+                .service
+                .trusted_native_hns_value_now_unix()
+                .map_err(mobile_service_failure)
+        })();
+        if result.is_err() {
+            self.session.lock_after_request_error();
+        }
+        result
+    }
+
     /// Query the synchronized Denuo/Shakedex board or one local trade session
     /// without exposing generic provider JSON as an input surface.
     pub fn query_shakedex(
@@ -1630,6 +1679,96 @@ impl<C: HnsClock> MobileDirectHnsValueController<C> {
     #[must_use]
     pub const fn coordinator(&self) -> &HnsDirectPeerCoordinator {
         &self.coordinator
+    }
+
+    /// Bind one wallet-owned direct Denuo listener with the same network,
+    /// address policy, socket deadlines, and explicit peer configuration as
+    /// the embedded HNS backend.  Binding the socket does not unlock the
+    /// wallet or service a board exchange.
+    pub fn bind_wallet_owned_direct_denuo_listener(
+        &self,
+        address: SocketAddr,
+    ) -> Result<MobileDirectDenuoListener, MobileWalletError> {
+        self.coordinator
+            .bind_denuo_listener(address)
+            .map(|listener| MobileDirectDenuoListener { listener })
+            .map_err(Into::into)
+    }
+
+    /// Establish a direct Denuo peer using the exact policy retained by this
+    /// controller and the trusted clock of its unlocked value runtime.
+    ///
+    /// `local_height` is only the standard peer-handshake height hint. It is
+    /// not chain evidence and cannot authorize a wallet action; all value
+    /// operations continue to require a later synchronized runtime view.
+    pub fn connect_wallet_owned_direct_denuo_peer(
+        &mut self,
+        address: SocketAddr,
+        local_height: u32,
+    ) -> Result<HnsDirectDenuoPeer, MobileWalletError> {
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        self.coordinator
+            .connect_denuo_peer(address, local_height, now_unix)
+            .map_err(Into::into)
+    }
+
+    /// Accept at most one Denuo peer from a listener created by this direct
+    /// controller.  A return value of `Ok(None)` means no TCP connection is
+    /// pending.  Handshake time comes from the value runtime rather than a
+    /// caller-provided wall clock.
+    pub fn accept_wallet_owned_direct_denuo_peer(
+        &mut self,
+        listener: &MobileDirectDenuoListener,
+        local_height: u32,
+    ) -> Result<Option<HnsDirectDenuoPeer>, MobileWalletError> {
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        listener
+            .listener
+            .accept_next(local_height, now_unix)
+            .map_err(Into::into)
+    }
+
+    /// Start one explicitly scheduled wallet-peer Shakedex board exchange.
+    /// The supplied peer must have been obtained through this controller's
+    /// connect/accept path; the board remains independently authenticated and
+    /// no relay or provider transport is involved.
+    pub fn begin_wallet_owned_direct_shakedex(
+        &mut self,
+        peer: &mut HnsDirectDenuoPeer,
+    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+        self.value.begin_wallet_owned_direct_shakedex(peer)
+    }
+
+    /// Process one bounded batch from an already negotiated wallet peer.
+    pub fn synchronize_wallet_owned_direct_shakedex(
+        &mut self,
+        peer: &mut HnsDirectDenuoPeer,
+        message_limit: usize,
+    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+        self.value
+            .synchronize_wallet_owned_direct_shakedex(peer, message_limit)
+    }
+
+    /// Service one already classified name-market message from a negotiated
+    /// wallet peer. Cross-chain direct-session messages remain owned by the
+    /// adjacent direct HNS/BTC session controller.
+    pub fn service_wallet_owned_direct_shakedex_message(
+        &mut self,
+        peer: &mut HnsDirectDenuoPeer,
+        request_id: u64,
+        message: hns_marketplace_protocol::NameMarketMessage,
+    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+        self.value
+            .service_wallet_owned_direct_shakedex_message(peer, request_id, message)
+    }
+
+    /// Write one due local board publication to an already negotiated wallet
+    /// peer and persist its local transport observation.
+    pub fn announce_wallet_owned_direct_shakedex(
+        &mut self,
+        peer: &mut HnsDirectDenuoPeer,
+    ) -> Result<Option<ObjectHash>, MobileWalletError> {
+        self.value.announce_wallet_owned_direct_shakedex(peer)
     }
 
     /// The native value controller sharing the coordinator's exact embedded
@@ -2744,9 +2883,8 @@ mod tests {
                 .settlement_enabled
         );
         let listener = direct
-            .coordinator()
-            .bind_denuo_listener((std::net::Ipv4Addr::LOCALHOST, 0).into())
-            .expect("bind Denuo listener from the coordinator's peer policy");
+            .bind_wallet_owned_direct_denuo_listener((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .expect("bind Denuo listener from the direct value controller");
         assert!(
             listener
                 .local_addr()
@@ -2754,10 +2892,23 @@ mod tests {
                 .port()
                 != 0
         );
+        assert!(matches!(
+            direct.connect_wallet_owned_direct_denuo_peer(
+                (std::net::Ipv4Addr::LOCALHOST, 1).into(),
+                0,
+            ),
+            Err(MobileWalletError::Store(StoreError::Locked))
+        ));
         direct
             .value_controller()
             .unlock(&key)
             .expect("unlock direct value and Shakedex controller");
+        assert!(
+            direct
+                .accept_wallet_owned_direct_denuo_peer(&listener, 0)
+                .expect("poll direct Denuo listener with the value runtime clock")
+                .is_none()
+        );
         direct
             .value_controller()
             .lock()

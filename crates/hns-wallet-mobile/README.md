@@ -81,7 +81,12 @@ qualification remain separate work.
 value runtime. Direct Denuo listeners and outbound peers are constructed by
 that coordinator, so they inherit the exact network, address-policy, deadline,
 and explicit-peer constraints already used for the wallet's chain, fee, and
-broadcast transport.
+broadcast transport. Its native Denuo façade binds listeners, connects, and
+accepts with the exact value-runtime clock; an embedding app cannot substitute
+an arbitrary handshake time. The listener wrapper intentionally exposes only
+its local socket locator, so peer admission must return through the same direct
+value controller. Binding a listener does not unlock the wallet, and the host
+must drop it when its native I/O worker stops.
 
 See the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)
 for generated-binding progress, target qualification, and release status.

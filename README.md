@@ -213,9 +213,9 @@ gate stays false.
   release-gated Helios/HTLC policy.
 - `hns-wallet-ffi`: ABI v2 framing, canonical service IDs, approval prompts, and events.
 - `hns-wallet-service`: private session/authority registry plus locked,
-  existing-database control, exact-account, and synchronized non-value HNS read
-  library compositions. Its trusted-native snapshot carries the dedicated name
-  target, while website-provider projection remains limited to the ordinary
+  existing-database control, exact-account read/value, and wallet-peer
+  Shakedex library compositions. Trusted-native value actions stay closed and
+  process-local; website-provider projection remains limited to the ordinary
   coin receive target.
 - `hns-wallet-host`: caller-side negotiation, correlation, authority, approval,
   binding, and event-replay state for trusted browser/mobile adapters.
