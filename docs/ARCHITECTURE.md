@@ -260,7 +260,8 @@ terminal evidence without recreating reservations or rolling the workflow back;
 loss or change of terminal finality returns a recovery-required error. Source
 FINALIZE regressions passed the exact `bc5901f` workspace gate; product/startup,
 live-node, and multi-process restart/reorg qualification remain pending, and
-every release gate remains `false`.
+that pending product evidence does not disable the enabled HNS/Shakedex source
+gates.
 
 Approval bytes encode the exact prepared aggregate and CAS revision. The HNS
 runtime owns time. Buyer fulfillment and seller recovery can enter only the

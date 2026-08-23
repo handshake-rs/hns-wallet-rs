@@ -56,8 +56,8 @@ transactions unless the authenticated wallet already cached them. A
 deadline-enforced, archive-capable (or durably indexed) device backend,
 backend credential/index provisioning, and installed-device network/resource/
 restart qualification therefore remain downstream release requirements rather
-than authorities supplied by this crate, and no value/provider release gate is
-enabled.
+than authorities supplied by this crate. Native HNS value and Shakedex source
+gates are enabled; no browser/provider value release path is implied.
 
 ABI wallet status/unlock/lock and a narrow provider
 control surface are implemented. One library composition can bind an exact
@@ -121,16 +121,13 @@ serialization, and trusted-UI adoption before presenting `nameReceiveTarget`;
 the producer source may land first, but that does not make the pinned consumer
 compatible or available.
 
-Current safety status: the production-hardening source boundary is implemented,
-but executable HNS, Bitcoin, and Ethereum value operations and all mainnet
-settlement remain release-gated. The HNS runtime rejects configurations that
-enable send or settlement, and the Bitcoin and Ethereum modules cannot issue
-their value permits, until the adapter-qualification and persistence gates
-recorded in [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and
-[`docs/QUALIFICATION.md`](docs/QUALIFICATION.md) are complete. Test success is
-never a mainnet authorization signal. Shakedex creation, discovery, and state
-transitions are likewise fail-closed behind canonical V2, Denuo V2, and value
-runtime release gates. HNS name-role keys are scanned and persisted separately,
+Current safety status: the production-hardening source boundary is implemented.
+Native HNS send, settlement, and Shakedex paths are source-enabled but require
+the exact authenticated runtime evidence and account configuration recorded in
+[`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and
+[`docs/QUALIFICATION.md`](docs/QUALIFICATION.md). Bitcoin and Ethereum value
+operations remain disabled by their own source gates. Test success is never a
+mainnet authorization signal. HNS name-role keys are scanned and persisted separately,
 and the protected `HnsShakedex` allocation high-water feeds an independent
 32-byte lock-script restore scan. A durable scan fence and atomic account/key
 CAS prevent another process from allocating through an incomplete mnemonic
@@ -164,8 +161,8 @@ state. Save, signing, and submission reacquire the non-serializable current
 TRANSFER authority; a harmless live binding advance is accepted only when the
 stable transfer/owner/state/renewal identity is unchanged, while the HNS
 runtime requires exact bindings within each immediate live fence. Persisted
-evidence never recreates authority. Every Shakedex and dependent HNS
-funding/value/fee gate remains `false`. Exact qualified implementation source
+evidence never recreates authority. Shakedex and dependent HNS
+funding/value/fee source gates are enabled. Exact qualified implementation source
 `2229be849557d58a8eb723bcc03349f0f2df9796` passed its complete
 [CI](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31420628974),
 [CodeQL](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31420627924),

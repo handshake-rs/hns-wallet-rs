@@ -298,7 +298,8 @@ raw-transaction index.
 This boundary reuses the canonical HNS scanner and reconciliation helpers. The
 legacy value runtime's full reconciliation still spans backend work while its
 private store mutex is held, so it is not an eligible provider/product read
-composition. Both value gates remain false.
+composition. The HNS value source gates are enabled, but this legacy runtime is
+not the product composition that may exercise them.
 
 This is authenticated record encryption, not whole-file encryption. Table
 names, row counts, indexes, selected authenticated metadata, filenames, SQLite

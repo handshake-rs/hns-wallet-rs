@@ -8,10 +8,11 @@ and session checks.
 
 `MobileWalletController` remains the lifecycle-only first slice: trusted native
 status, unlock, lock, and single-account controls. Its existing API is
-unchanged. It has no WebView/provider entry point, chain backend, value action,
-marketplace transport, or release-gate authority. Android Keystore and iOS
-Keychain integration remain responsibilities of the embedding applications;
-raw database keys must never enter website content.
+unchanged. It has no WebView/provider entry point or release-gate authority.
+It can be consumed into a native HNS value controller backed by an injected
+backend, or into a full wallet-owned direct-peer value composition. Android
+Keystore and iOS Keychain integration remain responsibilities of the embedding
+applications; raw database keys must never enter website content.
 
 The optional `MobileHnsReadController<B, C>` is the next architecture-neutral
 source tranche. A lifecycle controller can be consumed with `into_hns_reads`
@@ -70,8 +71,11 @@ retained in authenticated wallet state. Production must use an archive-capable
 companion or a durable wallet-relevant raw-transaction index. Missing evidence
 remains a fail-closed read error.
 
-Value movement, signing, provider/browser integration, HNSA/HNSR, settlement,
-Shakedex, and every P2P marketplace gate remain unavailable.
+Native HNS value and wallet-peer Shakedex compositions are source-enabled. They
+still require their exact account configuration plus authenticated chain,
+mempool, fee, ownership, approval, and persistence evidence. Browser/provider
+integration, HNSA/HNSR product wiring, installed mobile transport, and release
+qualification remain separate work.
 
 See the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)
 for generated-binding progress, target qualification, and release status.

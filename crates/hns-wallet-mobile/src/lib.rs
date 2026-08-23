@@ -808,6 +808,45 @@ impl MobileWalletController {
         Ok(MobileDirectHnsValueController { value, coordinator })
     }
 
+    /// Consume this lifecycle controller into native HNS value and Shakedex
+    /// runtimes that both use wallet-owned direct peers.
+    ///
+    /// This is the direct counterpart to
+    /// [`Self::into_hns_value_with_wallet_owned_direct_shakedex`]. It fixes
+    /// the marketplace policy to no marketplace fee and wallet-peer board
+    /// transport, while retaining the same direct HNS coordinator for chain
+    /// evidence, fee evidence, broadcasts, and later direct synchronization.
+    pub fn into_wallet_owned_direct_hns_value_with_wallet_owned_direct_shakedex(
+        self,
+        database_key: &MobileDatabaseKey,
+        coordinator: HnsDirectPeerCoordinator,
+    ) -> Result<MobileDirectHnsValueController, MobileWalletError> {
+        self.into_wallet_owned_direct_hns_value_with_wallet_owned_direct_shakedex_with_clock(
+            database_key,
+            coordinator,
+            HnsReadSystemClock,
+        )
+    }
+
+    /// Clock-injectable form of
+    /// [`Self::into_wallet_owned_direct_hns_value_with_wallet_owned_direct_shakedex`]
+    /// for deterministic qualification fixtures.
+    pub fn into_wallet_owned_direct_hns_value_with_wallet_owned_direct_shakedex_with_clock<
+        C: HnsClock,
+    >(
+        self,
+        database_key: &MobileDatabaseKey,
+        coordinator: HnsDirectPeerCoordinator,
+        clock: C,
+    ) -> Result<MobileDirectHnsValueController<C>, MobileWalletError> {
+        self.into_wallet_owned_direct_hns_value_with_clock(
+            database_key,
+            coordinator,
+            clock,
+            Some(wallet_owned_direct_shakedex_config()),
+        )
+    }
+
     /// Activate the complete native HNS and Shakedex composition from an
     /// exact public relay-acceptance policy. This explicit legacy path is
     /// retained for deployments that choose a relay; the wallet-owned direct
@@ -838,10 +877,7 @@ impl MobileWalletController {
         self.into_hns_value(
             database_key,
             backend,
-            Some(PersistentShakedexConfig {
-                seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
-                transport: PersistentDenuoTransport::WalletPeers,
-            }),
+            Some(wallet_owned_direct_shakedex_config()),
         )
     }
 
@@ -2025,6 +2061,13 @@ fn mobile_shakedex_config(json: &[u8]) -> Result<PersistentShakedexConfig, Mobil
     })
 }
 
+fn wallet_owned_direct_shakedex_config() -> PersistentShakedexConfig {
+    PersistentShakedexConfig {
+        seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
+        transport: PersistentDenuoTransport::WalletPeers,
+    }
+}
+
 fn mobile_policy_hex<const N: usize>(encoded: &str) -> Result<[u8; N], MobileWalletError> {
     if encoded.len() != N * 2 {
         return Err(MobileWalletError::InvalidShakedexConfiguration);
@@ -2657,6 +2700,57 @@ mod tests {
             .value_controller()
             .lock()
             .expect("relock direct value controller");
+    }
+
+    #[test]
+    fn direct_value_and_shakedex_composition_enables_wallet_peer_settlement() {
+        let directory = private_tempdir();
+        let path = directory
+            .path()
+            .join("direct-value-shakedex-wallet.sqlite3");
+        let key = MobileDatabaseKey::new([0x7c; MOBILE_DATABASE_KEY_BYTES]).expect("database key");
+        let creation = MobileWalletController::create(
+            &path,
+            &key,
+            MobilePlatform::Android,
+            HnsBootstrapPolicy::new(HnsNetwork::Regtest, 0),
+        )
+        .expect("create direct Shakedex wallet");
+        let (mut controller, _recovery) = creation.into_parts();
+        let coordinator = controller
+            .open_direct_hns_peer_coordinator(
+                &key,
+                HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            )
+            .expect("open wallet-owned coordinator");
+
+        let mut direct = controller
+            .into_wallet_owned_direct_hns_value_with_wallet_owned_direct_shakedex_with_clock(
+                &key,
+                coordinator,
+                MockReadClock,
+            )
+            .expect("compose direct value and Shakedex controller");
+        assert!(
+            direct
+                .value_controller()
+                .account_config()
+                .value_operations_enabled
+        );
+        assert!(
+            direct
+                .value_controller()
+                .account_config()
+                .settlement_enabled
+        );
+        direct
+            .value_controller()
+            .unlock(&key)
+            .expect("unlock direct value and Shakedex controller");
+        direct
+            .value_controller()
+            .lock()
+            .expect("relock direct value and Shakedex controller");
     }
 
     #[test]
