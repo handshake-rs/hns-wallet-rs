@@ -238,6 +238,10 @@ pub struct HnsDirectDenuoPeer {
 /// One canonical Denuo application message received on a negotiated direct
 /// peer. Name-market replication and direct HNS/BTC offers share only the
 /// socket; they retain separate protocol identities and validation paths.
+// `NameMarketMessage` is intentionally carried by value: this is a public
+// direct-peer boundary and boxing it would create an unnecessary allocation
+// and API change on the hot receive path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HnsDirectDenuoMessage {
     NameMarket {
@@ -1094,6 +1098,30 @@ struct WalletWatchSetSource {
     account: HnsRuntimeConfig,
 }
 
+impl WalletWatchSetSource {
+    /// Re-read the exact account configuration that owns this coordinator's
+    /// derivation source. Account policy flags can change when the native
+    /// value controller is activated, but the wallet/account/network/birthday
+    /// identity must never change underneath a live direct coordinator.
+    fn current_account_config(&self) -> Result<HnsRuntimeConfig, HnsDirectPeerError> {
+        let expected_id = crate::account_entity_id(&self.account);
+        self.store
+            .try_with_store(|wallet| {
+                let account = wallet
+                    .wallet_account::<crate::HnsAccountRecord>(&expected_id)?
+                    .ok_or(HnsWalletError::AccountConfigurationMismatch)?;
+                if account.id != expected_id
+                    || !crate::same_account_identity(&account.value.config, &self.account)
+                {
+                    return Err(HnsWalletError::AccountConfigurationMismatch);
+                }
+                account.value.config.validate_structure()?;
+                Ok(account.value.config)
+            })
+            .map_err(HnsDirectPeerError::Wallet)
+    }
+}
+
 impl HnsDirectPeerCoordinator {
     /// Assemble the encrypted authority, wallet-only index, and native peer
     /// pool without any RPC node or trusted relay dependency.
@@ -1143,6 +1171,16 @@ impl HnsDirectPeerCoordinator {
             .wallet_watch_set_source
             .as_ref()
             .ok_or(HnsDirectPeerError::InvalidConfiguration)?;
+        // Value activation updates the authenticated account record with its
+        // current capability policy. The direct coordinator must not retain a
+        // pre-activation copy of that whole record: doing so would turn a
+        // legitimate value-runtime transition into an account mismatch and
+        // strand a restore scan just when it needs to grow its trailing gap.
+        // Re-read the exact same account identity from the shared encrypted
+        // store for every extension. The store remains the only derivation
+        // authority; this method still accepts neither a host-supplied script
+        // nor a replacement account configuration.
+        let account = source.current_account_config()?;
         let installed = self
             .backend
             .light_watch_set()
@@ -1151,11 +1189,7 @@ impl HnsDirectPeerCoordinator {
             let candidate = source
                 .store
                 .try_with_store(|wallet| {
-                    derive_hns_light_watch_set_with_restore_extension(
-                        wallet,
-                        &source.account,
-                        extension,
-                    )
+                    derive_hns_light_watch_set_with_restore_extension(wallet, &account, extension)
                 })
                 .map_err(HnsDirectPeerError::Wallet)?;
             if candidate != installed {
@@ -1177,6 +1211,47 @@ impl HnsDirectPeerCoordinator {
     ) -> Self {
         self.wallet_watch_set_source = Some(WalletWatchSetSource { store, account });
         self
+    }
+
+    /// Clone the embedded backend that shares this coordinator's direct peer,
+    /// header, filtered-block, and broadcast authority.
+    ///
+    /// The clone shares one encrypted light index and header authority with
+    /// this coordinator. A product that needs later direct synchronization
+    /// must retain the coordinator rather than silently substituting an RPC
+    /// backend after handing this clone to the value runtime.
+    #[must_use]
+    pub fn embedded_backend(&self) -> EmbeddedHnsBackend {
+        self.backend.clone()
+    }
+
+    /// Confirm that this wallet-factory coordinator was opened for the exact
+    /// account configuration expected by an adjacent product controller.
+    ///
+    /// Generic coordinators created with [`Self::new`] deliberately have no
+    /// wallet-account source and cannot pass this check. This prevents a
+    /// caller from composing a direct backend opened for another account into
+    /// a mobile value controller merely because both use the same network.
+    pub fn require_wallet_account_config(
+        &self,
+        expected: &HnsRuntimeConfig,
+    ) -> Result<(), HnsDirectPeerError> {
+        let source = self
+            .wallet_watch_set_source
+            .as_ref()
+            .ok_or(HnsDirectPeerError::InvalidConfiguration)?;
+        // A mobile lifecycle controller deliberately locks the shared store
+        // after opening its coordinator. Comparing the immutable factory
+        // binding here proves the composition before that controller consumes
+        // itself, without attempting a second store read while it is locked.
+        // Subsequent restore extensions run only while the value controller is
+        // unlocked and re-read the persisted current policy there.
+        if source.account != *expected {
+            return Err(HnsDirectPeerError::Wallet(
+                HnsWalletError::AccountConfigurationMismatch,
+            ));
+        }
+        Ok(())
     }
 
     /// Latest locally validated chain floor for platform-protected rollback
@@ -2013,6 +2088,10 @@ pub fn open_wallet_direct_hns_peer_coordinator_with_floor(
 /// stream. The stream is never peer authority: after it is committed the
 /// coordinator remains in header-syncing state and requires fresh direct-peer
 /// agreement before it can issue current-chain evidence.
+// These independently authenticated bootstrap inputs are deliberately
+// explicit at the public boundary; bundling them would obscure which values a
+// product must pin and preserve across restart.
+#[allow(clippy::too_many_arguments)]
 pub fn open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap<I>(
     store: SharedWalletStore,
     account: &HnsRuntimeConfig,

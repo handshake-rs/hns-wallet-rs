@@ -231,6 +231,19 @@ pub struct MobileHnsValueController<B: HnsBackend, C: HnsClock = HnsReadSystemCl
     pending: Option<PendingMobileHnsValueAction>,
 }
 
+/// Full native HNS value controller composed with the wallet-owned direct
+/// standard-peer coordinator.
+///
+/// The inner [`MobileHnsValueController`] and the coordinator share one
+/// `EmbeddedHnsBackend`, encrypted light index, header authority, store/key
+/// authority, and direct broadcast pool. Keeping them in one value preserves
+/// the direct synchronization authority alongside the value runtime rather
+/// than requiring an endpoint-backed fallback after activation.
+pub struct MobileDirectHnsValueController<C: HnsClock = HnsReadSystemClock> {
+    value: MobileHnsValueController<EmbeddedHnsBackend, C>,
+    coordinator: HnsDirectPeerCoordinator,
+}
+
 struct PendingMobileHnsValueAction {
     action_token: [u8; MOBILE_ACTION_TOKEN_BYTES],
     action: TrustedNativeHnsValueAction,
@@ -753,6 +766,46 @@ impl MobileWalletController {
         shakedex: Option<PersistentShakedexConfig>,
     ) -> Result<MobileHnsValueController<B>, MobileWalletError> {
         self.into_hns_value_with_clock(database_key, backend, HnsReadSystemClock, shakedex)
+    }
+
+    /// Consume this lifecycle controller into the full HNS value composition
+    /// backed only by its already-opened wallet-owned direct peer coordinator.
+    ///
+    /// This path accepts no RPC URL, node credential, relay, or indexer. The
+    /// coordinator must have been opened from this exact controller before it
+    /// is consumed; the account check rejects a generic coordinator or one for
+    /// another wallet even when its network happens to match. The returned
+    /// wrapper retains that coordinator for the complete value-controller
+    /// lifetime, so the embedded backend's header, filtered-block, mempool,
+    /// fee, and broadcast boundaries cannot outlive their direct transport.
+    pub fn into_wallet_owned_direct_hns_value(
+        self,
+        database_key: &MobileDatabaseKey,
+        coordinator: HnsDirectPeerCoordinator,
+        shakedex: Option<PersistentShakedexConfig>,
+    ) -> Result<MobileDirectHnsValueController, MobileWalletError> {
+        self.into_wallet_owned_direct_hns_value_with_clock(
+            database_key,
+            coordinator,
+            HnsReadSystemClock,
+            shakedex,
+        )
+    }
+
+    /// Clock-injectable form of
+    /// [`Self::into_wallet_owned_direct_hns_value`] for deterministic
+    /// qualification fixtures.
+    pub fn into_wallet_owned_direct_hns_value_with_clock<C: HnsClock>(
+        self,
+        database_key: &MobileDatabaseKey,
+        coordinator: HnsDirectPeerCoordinator,
+        clock: C,
+        shakedex: Option<PersistentShakedexConfig>,
+    ) -> Result<MobileDirectHnsValueController<C>, MobileWalletError> {
+        coordinator.require_wallet_account_config(&self.account_config)?;
+        let backend = coordinator.embedded_backend();
+        let value = self.into_hns_value_with_clock(database_key, backend, clock, shakedex)?;
+        Ok(MobileDirectHnsValueController { value, coordinator })
     }
 
     /// Activate the complete native HNS and Shakedex composition from an
@@ -1531,6 +1584,23 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .service
             .discard_trusted_native_hns_value_action(pending.action)
             .map_err(mobile_service_failure)
+    }
+}
+
+impl<C: HnsClock> MobileDirectHnsValueController<C> {
+    /// The retained direct-peer coordinator. Callers schedule its bounded
+    /// connection, header, filtered-block, proof, and mempool operations only
+    /// while the adjacent value controller is unlocked.
+    #[must_use]
+    pub const fn coordinator(&self) -> &HnsDirectPeerCoordinator {
+        &self.coordinator
+    }
+
+    /// The native value controller sharing the coordinator's exact embedded
+    /// backend. It retains the existing closed approval and value-action
+    /// vocabulary; no raw key, seed, or generic provider interface is added.
+    pub fn value_controller(&mut self) -> &mut MobileHnsValueController<EmbeddedHnsBackend, C> {
+        &mut self.value
     }
 }
 
@@ -2532,6 +2602,61 @@ mod tests {
         );
         assert_eq!(scan.watched_names, 0);
         assert!(controller.status().expect("controller relocked").locked);
+    }
+
+    #[test]
+    fn direct_value_composition_retains_the_coordinator_and_refreshes_its_account_policy() {
+        let directory = private_tempdir();
+        let path = directory.path().join("direct-value-wallet.sqlite3");
+        let key = MobileDatabaseKey::new([0x7b; MOBILE_DATABASE_KEY_BYTES]).expect("database key");
+        let creation = MobileWalletController::create(
+            &path,
+            &key,
+            MobilePlatform::Android,
+            HnsBootstrapPolicy::new(HnsNetwork::Regtest, 0),
+        )
+        .expect("create direct value wallet");
+        let (mut controller, _recovery) = creation.into_parts();
+        let coordinator = controller
+            .open_direct_hns_peer_coordinator(
+                &key,
+                HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            )
+            .expect("open wallet-owned coordinator");
+
+        let mut direct = controller
+            .into_wallet_owned_direct_hns_value_with_clock(&key, coordinator, MockReadClock, None)
+            .expect("compose direct value controller");
+        assert!(
+            direct
+                .value_controller()
+                .account_config()
+                .value_operations_enabled
+        );
+        assert!(
+            !direct
+                .value_controller()
+                .account_config()
+                .settlement_enabled
+        );
+
+        direct
+            .value_controller()
+            .unlock(&key)
+            .expect("unlock direct value controller");
+        // Value activation updates the persisted policy record. A coordinator
+        // that retained the original non-value configuration would now reject
+        // its own account instead of growing the direct restore frontier.
+        assert!(
+            direct
+                .coordinator()
+                .extend_wallet_restore_watch_set(1_800_000_000)
+                .expect("extend direct restore watch set after value activation")
+        );
+        direct
+            .value_controller()
+            .lock()
+            .expect("relock direct value controller");
     }
 
     #[test]

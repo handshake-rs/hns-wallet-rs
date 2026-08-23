@@ -149,9 +149,10 @@ sigops, sigop-adjusted policy size, minimum-fee construction, and standard
 weight/sigop bounds directly to the wallet. No local formula is copied. The
 exact current wallet source `bc5901f` passed its complete locked CI gate and
 CodeQL; multi-process node/wallet, restart/reorg, adversarial, product, and
-resource qualification remain open.
-`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` therefore remains `false` and the
-wired quote path still cannot authorize value.
+resource qualification remain open. The source-level
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` gate is enabled: the wired quote path
+can authorize value only after it has validated the required live evidence.
+The remaining qualification work is not modeled as a permanent disabled path.
 
 Confirmed coinbase identity is preserved exactly, but coinbase outputs are
 conservatively excluded from selection. No local maturity constant is invented;
@@ -222,10 +223,11 @@ invent it.
 
 ## Release policy
 
-This adapter removes the missing source boundary; it does not by itself enable
-value movement. `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` remains `false`, runtime
-configuration rejects HNS send and settlement on every network. Imported names
-now retain authoritative decoded metadata and account-bound ownership status,
+This adapter is one evidence source for value movement, not a substitute for
+the required live chain, mempool, fee, and name evidence. The source-level
+`HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` gate is enabled; an activated HNS value
+controller may authorize a supported operation only after those checks pass.
+Imported names now retain authoritative decoded metadata and account-bound ownership status,
 while the context-free library import reports ownership as explicitly
 unevaluated instead of claiming `NotWalletOwned`. That persisted status cannot
 authorize value. `verify_name_ownership`

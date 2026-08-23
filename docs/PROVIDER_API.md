@@ -36,10 +36,11 @@ composition now dispatches the non-value account, balance, transaction,
 receive-target, and scoped known-name methods from fresh synchronized wallet
 state. It is not selected by the checked-in executable or an installed browser
 product. `hns_transferName` and
-`hns_finalizeName` remain unavailable even though typed wallet-owned P2PKH
-TRANSFER/direct-FINALIZE workflows now exist in the wallet source. Provider
-value dispatch, trusted product approval UI, adapter qualification, and both
-HNS value gates are incomplete. Persisted status, incoming-recipient
+`hns_finalizeName` have no provider dispatcher wired even though typed
+wallet-owned P2PKH TRANSFER/direct-FINALIZE workflows now exist in the wallet
+source. Provider value dispatch, trusted product approval UI, and adapter
+qualification remain incomplete; the two HNS value source gates are enabled.
+Persisted status, incoming-recipient
 classification, or a node projection never authorize signing.
 
 External assets:

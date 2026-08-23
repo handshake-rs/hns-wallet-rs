@@ -58,14 +58,14 @@ release preflight is recorded for this wallet source.
 | --- | --- | --- | --- | --- |
 | Types and chain traits | complete locked workspace CI passed at `2229be8` | n/a | no product dependency | exact source recorded; API review remains |
 | Encrypted store/schema v3 | exact `2229be8` CI passed, including atomic bootstrap, rollback, migrations, encrypted CRUD/CAS, and Unix filesystem regressions | source reopen/restart tests; no installed Android/iOS secure-store runtime evidence in this package boundary | downstream mobile candidate source contains Keystore/Keychain wrapping, but device filesystem/runtime qualification remains external | platform qualification pending |
-| HNS wallet and names | exact historical `bc5901f` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, dedicated name targets, trusted exact-text import, name workflows, and fail-closed value gates | source restart/reorg paths; no multi-process regtest | script-free wallet RPC remains compatible with node `2b267ffe`; pruning-safe wallet-owned name actions pair with selected node main `4275b4e`; current wallet v2 source has local focused and full-crate evidence but exact hosted qualification remains pending; current protocol source pins exact `hns-rs` `0.3.0` revision `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e` | HNS funding, value, and fee gates remain `false` |
+| HNS wallet and names | exact historical `bc5901f` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, dedicated name targets, trusted exact-text import, name workflows, and fail-closed value-evidence checks | source restart/reorg paths; no multi-process regtest | script-free wallet RPC remains compatible with node `2b267ffe`; pruning-safe wallet-owned name actions pair with selected node main `4275b4e`; current wallet v2 source has local focused and full-crate evidence but exact hosted qualification remains pending; current protocol source pins exact `hns-rs` `0.3.0` revision `88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e` | HNS funding, value, and fee source gates enabled; live product qualification pending |
 | Provider core | exact `2229be8` CI passed, including account binding, scoped reads, exact Names consent, and unavailable-method ordering | grants persist; pending approval/UI authority remains process-local | no installed-browser wallet consent or backend E2E | browser and value exposure unavailable |
-| Fixed-price Shakedex | exact `2229be8` CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Denuo, provider, trusted UI, or product coin selection | every Shakedex and dependent HNS value gate remains `false` |
+| Fixed-price Shakedex | exact `2229be8` CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Denuo, provider, trusted UI, or product coin selection | Shakedex and dependent HNS value source gates enabled; live product integration pending |
 | Market sessions | exact `2229be8` workspace CI passed | CAS journal source; recovery evidence incomplete | no pair E2E, rendezvous, or relay transport | unavailable |
 | Bitcoin Kyoto | exact `2229be8` CI passed, including encrypted BDK persistence, allocation regressions, and the ahead-tip crash edge | exact source restart resume; no multi-process rollback run | no regtest/P2P/broadcast run | send and settlement hard-disabled; normalized or chunked backend pending |
 | Ethereum | exact `2229be8` CI and deterministic contract check passed | offline derivation and dormant primitives only | no embedded Helios/local-chain run; no contract audit | synchronization, history, send, signing, settlement, and mainnet unavailable |
 | ABI, service, and host | exact `2229be8` CI passed, including canonical framed projections, approval-v3, session handling, and host retention | private process session/authority state; no installed restart E2E | downstream browser/future-mobile-provider adoption and rendering pending; trusted-native reads are a separate non-provider surface | private control only; browser/value unavailable |
-| Mobile controller | exact historical `bc5901f` CI passed the lifecycle, synchronized-read, same-authority, fresh-read, script-free snapshot, zero-script-query wrong-network, trusted import, and failure-lock/retry regressions | atomic seed/account bootstrap and source reopen coverage; installed platform restart remains downstream | downstream Android/iOS 0.5.9 candidate source still requires exact import-binding/UI adoption; no archive-capable production device wallet-index backend, installed-device synchronization, resource benchmark, or production network qualification; the loopback adapter is not device transport | `bc5901f` supplies only the library projection; no device import UI is qualified, product backend availability remains false, and provider/value/HNSA/HNSR/settlement/market remain unavailable |
+| Mobile controller | exact historical `bc5901f` CI passed the lifecycle, synchronized-read, same-authority, fresh-read, script-free snapshot, zero-script-query wrong-network, trusted import, and failure-lock/retry regressions | atomic seed/account bootstrap and source reopen coverage; installed platform restart remains downstream | downstream Android/iOS 0.5.9 candidate source still requires exact import-binding/UI adoption; no archive-capable production device wallet-index backend, installed-device synchronization, resource benchmark, or production network qualification; the loopback adapter is not device transport | `bc5901f` supplies the library projection, including native direct-value composition; no device import UI is qualified, provider/market integration remains unimplemented, and installed-product qualification is pending |
 | Browser products | separate repositories | platform integration pending | no installed/signed E2E | unavailable |
 
 The later native-HNS-read profile/bootstrap tranche adds local source regressions
@@ -238,14 +238,15 @@ publication credentials, and cannot execute an upload.
 
 The following compile-time release gates remain `false`:
 
-- `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED`;
-- `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED`;
-- `HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED`;
-- `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`;
-- `SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`;
-- `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`;
 - `BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED`;
 - every Ethereum synchronization, value, settlement, and mainnet gate.
+
+The HNS value, HNS fee-quote, HNS Shakedex-funding, and three Shakedex source
+gates are enabled. Their live operation remains conditional on the applicable
+wallet configuration and its exact chain, mempool, ownership, fee, approval,
+and persistence evidence. Product and installed-runtime qualification are
+separate deliverables, not reasons to retain an intentionally disabled HNS
+value path.
 
 Changing any gate requires new exact-commit evidence for its complete adapter,
 persistence, restart/reorg, negative, installed-product, resource, and review

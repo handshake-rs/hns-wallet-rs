@@ -125,6 +125,10 @@ pub struct PersistentShakedexConfig {
 /// participating wallets. It deliberately has no endpoint receipt or
 /// server-authority input. `RelayAcceptance` is retained only for existing
 /// explicit relay deployments; it is not selected by the direct wallet flow.
+// Keep the accepted relay policy by value to preserve this public product
+// configuration boundary and avoid a needless allocation for the direct
+// wallet mode's explicit alternative.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PersistentDenuoTransport {
     WalletPeers,

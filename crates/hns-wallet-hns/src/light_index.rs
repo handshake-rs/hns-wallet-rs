@@ -471,7 +471,6 @@ impl EncryptedHnsLightIndex {
                 .watched_outpoints
                 .iter()
                 .copied()
-                .into_iter()
                 .map(|outpoint| outpoint.encode().to_vec()),
         );
         elements.sort_unstable();

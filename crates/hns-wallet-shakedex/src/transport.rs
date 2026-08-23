@@ -444,14 +444,14 @@ fn save_transport_cursor(
     if instance_nonce == [0; 32] {
         return Err(ShakedexError::InvalidEvidence);
     }
-    if let Some(current) = current {
-        if current.instance_nonce == instance_nonce {
-            if relay_revision < current.relay_revision {
-                return Err(ShakedexError::StaleRevision);
-            }
-            if relay_revision == current.relay_revision {
-                return Ok(current);
-            }
+    if let Some(current) = current
+        && current.instance_nonce == instance_nonce
+    {
+        if relay_revision < current.relay_revision {
+            return Err(ShakedexError::StaleRevision);
+        }
+        if relay_revision == current.relay_revision {
+            return Ok(current);
         }
     }
     let expected_revision = current.map_or(0, |current| current.store_revision);

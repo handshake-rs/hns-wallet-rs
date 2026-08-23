@@ -150,8 +150,8 @@ wallet-owned P2PKH TRANSFER and old-owner direct FINALIZE workflows with
 canonical index-zero construction, typed name/fee reservations, single-use
 approval, ordered signing, exact final-byte fee quoting, durable rebroadcast,
 maturity tracking, and reorg recovery. They remain unavailable through the
-product while the HNS value/fee gates are false and provider integration and
-qualification are incomplete.
+browser/provider surface because provider integration and product qualification
+are incomplete; the HNS value and fee source gates themselves are enabled.
 
 The encrypted Shakedex value aggregate also has a source-level
 seller-script-FINALIZE variant. It binds an exact signed buyer-fulfillment or

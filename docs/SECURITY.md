@@ -616,7 +616,10 @@ pending. The focused FINALIZE tests are included in exact `2229be8` source CI.
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`,
 `HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED`,
 `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED`, and
-`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remain `false`.
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` are enabled source gates. They do
+not waive the per-operation authenticated evidence, persistence, approval, or
+reconciliation requirements above; installed-product and independent security
+qualification remain to be recorded.
 
 Ethereum has no embedded Helios proof producer in this revision. Its exact
 synchronization, value-runtime, settlement-runtime, and mainnet gates are

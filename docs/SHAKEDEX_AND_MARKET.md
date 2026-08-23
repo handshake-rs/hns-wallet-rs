@@ -392,22 +392,23 @@ transport adapter must construct the policy from retained current HRM/HNSA
 authority, preserve the exact stored bytes, and reacquire fresh current
 listing/lock/network/time authority before any dependent use.
 
-Three compile-time gates are immutable and `false`:
+Three Shakedex source gates are enabled:
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
 `SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`, and
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`. `SellerSession::new`,
 `SellerSession::apply`, `BuyerSession::discover`, and `BuyerSession::apply`
-check these gates before validation or mutation. Existing sessions restored
-from legacy persisted records therefore cannot bypass the boundary.
+still validate the complete canonical, evidence, and persistence boundary
+before mutation. Existing sessions restored from legacy persisted records
+therefore cannot bypass the boundary.
 Aggregate authorization and submission also require
 `HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED`,
 `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` and
-`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED`; all three remain `false`.
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED`; all three source gates are enabled.
 The Denuo gate governs live transport, relay publication, and product
 discovery. Offline canonical envelope parsing and encrypted cache reduction do
-not enable those runtime paths or advertise the feature. Typed transaction
-planning, encrypted plan CAS, and the durable aggregate do not bypass any
-release gate.
+not bypass required runtime evidence or advertise a browser/provider product.
+Typed transaction planning, encrypted plan CAS, and the durable aggregate do
+not bypass any of those checks.
 
 The wallet now has coherent canonical V2 source plus exact NameState/resource/
 owner-output validation. Wallet-owned P2PKH TRANSFER/direct FINALIZE remains a

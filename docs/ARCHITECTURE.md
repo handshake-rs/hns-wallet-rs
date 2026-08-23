@@ -177,11 +177,12 @@ bytes through encrypted persistence. Final transactions are checked against
 the ordered reconstructed consensus coins: immutable `hns-script` `0.3.0`
 computes sigops, policy virtual size, minimum fee, and standard weight/sigop
 bounds, while exact input/output sums independently reproduce actual fee.
-Legacy or mismatched evidence fails closed. Exact source `bc5901f` passed the
-consolidated locked wallet source gate, but product and network qualification
-remain absent, so
-`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` remains false; no local copy of the
-node formula is used.
+Legacy or mismatched evidence fails closed. The source gate
+`HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` is enabled: the wallet uses the
+reviewed immutable `hns-script` implementation and never a local copy of the
+node formula. Multi-process, installed-product, resource, and independent
+review qualification remain work to record; they are not represented by
+artificially disabling this value path in source.
 
 Name evidence deliberately preserves the interval-committed Urkel proof/state/
 owner view separately from the node's current state/owner view. The proof root
@@ -288,8 +289,9 @@ Persisted quote bindings are historical evidence only, and no caller-authored
 clock or chain status restores authority after restart. Product coin selection,
 live Denuo/provider/trusted-UI integration, and full
 restart/reorg/regtest qualification remain pending. All Shakedex and dependent
-HNS Shakedex-funding/value/fee release gates remain `false`, so preparation,
-authorization, and submission cannot execute in a released product.
+HNS Shakedex-funding/value/fee source gates are enabled. Preparation,
+authorization, and submission still require their complete fresh-evidence,
+approval, persistence, and product-integration boundaries.
 
 Wallet-owned name actions consume the node's pruning-safe version-2
 `name_action_context_v2` for the exact chain epoch, tip, mempool instance and

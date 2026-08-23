@@ -805,6 +805,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         )
     }
 
+    // These six independently authenticated values are consumed immediately
+    // by funding selection; a public-looking aggregate would blur their
+    // distinct account, coin, derivation, recipient, and timestamp roles.
+    #[allow(clippy::type_complexity)]
     fn prepare_shakedex_funding_selection(
         &self,
     ) -> Result<
