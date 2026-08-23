@@ -28,10 +28,11 @@ use hns_wallet_ffi::{
 /// host can instead open the wallet-owned direct peer coordinator below and
 /// compose its [`EmbeddedHnsBackend`] without endpoint credentials.
 pub use hns_wallet_hns::{
-    EmbeddedHnsBackend, HnsBackend, HnsBootstrapPolicy, HnsClock, HnsDirectDenuoListener,
-    HnsDirectDenuoMessage, HnsDirectDenuoPeer, HnsDirectPeerConfig, HnsDirectPeerCoordinator,
-    HnsDirectPeerError, HnsHeaderRoundProgress, HnsLightFloor, HnsNetwork, HnsNodeRpcBackend,
-    HnsNodeRpcConfig, SystemClock as HnsReadSystemClock,
+    ConnectedHnsPeer, EmbeddedHnsBackend, HnsBackend, HnsBlockScanProgress, HnsBootstrapPolicy,
+    HnsClock, HnsDirectDenuoListener, HnsDirectDenuoMessage, HnsDirectDenuoPeer,
+    HnsDirectPeerConfig, HnsDirectPeerCoordinator, HnsDirectPeerError, HnsHeaderRoundProgress,
+    HnsLightFloor, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
+    SystemClock as HnsReadSystemClock,
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountRecord, HnsExistingAccountSelector, HnsRuntimeConfig,
@@ -1681,6 +1682,67 @@ impl<C: HnsClock> MobileDirectHnsValueController<C> {
         &self.coordinator
     }
 
+    /// Resolve configured peers and establish as many bounded direct HNS
+    /// connections as are presently available. The peer handshakes use the
+    /// value runtime's trusted clock; caller code retains control over when to
+    /// retry after a temporary network failure.
+    pub fn connect_wallet_owned_direct_hns_peers(
+        &mut self,
+    ) -> Result<Vec<ConnectedHnsPeer>, MobileWalletError> {
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        self.coordinator
+            .connect_available(now_unix)
+            .map_err(Into::into)
+    }
+
+    /// Run one bounded, multi-peer direct HNS header round with the exact
+    /// runtime clock. A pending/underfilled result is retained by the
+    /// coordinator for the caller's next scheduled tick; it never becomes a
+    /// wallet value authorization.
+    pub fn synchronize_wallet_owned_direct_hns_headers(
+        &mut self,
+    ) -> Result<HnsHeaderRoundProgress, MobileWalletError> {
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        self.coordinator
+            .synchronize_headers_once(now_unix)
+            .map_err(Into::into)
+    }
+
+    /// Scan at most `max_blocks` authenticated direct-peer block heights with
+    /// the wallet's current encrypted watch set. The host cannot substitute a
+    /// timestamp, script set, or block evidence through this façade.
+    pub fn scan_wallet_owned_direct_hns_blocks(
+        &mut self,
+        max_blocks: u32,
+    ) -> Result<HnsBlockScanProgress, MobileWalletError> {
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        self.coordinator
+            .scan_wallet_blocks(max_blocks, now_unix)
+            .map_err(Into::into)
+    }
+
+    /// Refresh the bounded relevant-mempool view from the direct-peer quorum
+    /// using the value runtime's clock. The return value counts only locally
+    /// admitted transactions; it is not a confirmation or broadcast receipt.
+    pub fn refresh_wallet_owned_direct_hns_mempool(&mut self) -> Result<usize, MobileWalletError> {
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        self.coordinator
+            .refresh_mempool(now_unix)
+            .map_err(Into::into)
+    }
+
+    /// Extend the authenticated direct restore watch set by one bounded
+    /// frontier. The active account configuration and time are both obtained
+    /// from the exact unlocked value runtime rather than caller input.
+    pub fn extend_wallet_owned_direct_hns_restore_watch_set(
+        &mut self,
+    ) -> Result<bool, MobileWalletError> {
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        self.coordinator
+            .extend_wallet_restore_watch_set(now_unix)
+            .map_err(Into::into)
+    }
+
     /// Bind one wallet-owned direct Denuo listener with the same network,
     /// address policy, socket deadlines, and explicit peer configuration as
     /// the embedded HNS backend.  Binding the socket does not unlock the
@@ -2831,9 +2893,8 @@ mod tests {
         // its own account instead of growing the direct restore frontier.
         assert!(
             direct
-                .coordinator()
-                .extend_wallet_restore_watch_set(1_800_000_000)
-                .expect("extend direct restore watch set after value activation")
+                .extend_wallet_owned_direct_hns_restore_watch_set()
+                .expect("extend direct restore watch set with the value runtime clock")
         );
         direct
             .value_controller()

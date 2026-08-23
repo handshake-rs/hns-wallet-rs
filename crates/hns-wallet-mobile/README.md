@@ -78,15 +78,17 @@ integration, HNSA/HNSR product wiring, installed mobile transport, and release
 qualification remain separate work.
 
 `MobileDirectHnsValueController` retains the direct-peer coordinator beside the
-value runtime. Direct Denuo listeners and outbound peers are constructed by
-that coordinator, so they inherit the exact network, address-policy, deadline,
-and explicit-peer constraints already used for the wallet's chain, fee, and
-broadcast transport. Its native Denuo façade binds listeners, connects, and
-accepts with the exact value-runtime clock; an embedding app cannot substitute
-an arbitrary handshake time. The listener wrapper intentionally exposes only
-its local socket locator, so peer admission must return through the same direct
-value controller. Binding a listener does not unlock the wallet, and the host
-must drop it when its native I/O worker stops.
+value runtime. Its native façade schedules configured-peer connection, one
+header round, a bounded filtered-block scan, mempool refresh, and restore-gap
+growth with the exact value-runtime clock; a host cannot substitute a timestamp
+or watch set. Direct Denuo listeners and outbound peers use that same retained
+coordinator, so they inherit the exact network, address-policy, deadline, and
+explicit-peer constraints already used for the wallet's chain, fee, and
+broadcast transport. The Denuo façade likewise binds listeners, connects, and
+accepts with the value-runtime clock. Its listener wrapper intentionally
+exposes only the local socket locator, so peer admission must return through
+the same direct value controller. Binding a listener does not unlock the
+wallet, and the host must drop it when its native I/O worker stops.
 
 See the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)
 for generated-binding progress, target qualification, and release status.
