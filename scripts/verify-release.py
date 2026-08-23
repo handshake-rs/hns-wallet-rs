@@ -15,8 +15,10 @@ from pathlib import Path
 
 REPOSITORY = "https://github.com/handshake-rs/hns-wallet-rs"
 PROTOCOL_REPOSITORY = "https://github.com/handshake-rs/hns-rs.git"
-PROTOCOL_REVISION = "88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
-PROTOCOL_VERSION = "=0.3.0"
+PROTOCOL_REVISION = "0e99addca59778b7b7c6fc56291333a97c4c8815"
+PROTOCOL_VERSION = "=0.3.1"
+REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+PROTOCOL_CHECKSUM_MANIFEST = "release/hns-rs-0.3.1-crates.sha256"
 PROTOCOL_PUBLIC_PACKAGES = (
     "hns-encoding",
     "hns-rollback-journal",
@@ -40,12 +42,47 @@ PROTOCOL_PUBLIC_PACKAGES = (
 )
 PROTOCOL_PACKAGES = {
     "hns-covenants",
+    "hns-header-consensus",
     "hns-marketplace-protocol",
+    "hns-p2p-experimental",
+    "hns-p2p-wire",
     "hns-primitives",
     "hns-script",
     "hns-swap",
     "hns-transaction",
     "hns-urkel-proof",
+}
+ENGINE_REPOSITORY = "https://github.com/handshake-rs/hns-dane-engine.git"
+ENGINE_REVISION = "b7fdf8826c81b77650a0f740d1f05314b74969f9"
+ENGINE_VERSION = "=0.2.2"
+ENGINE_CHECKSUM_MANIFEST = "release/hns-dane-engine-0.2.2-crates.sha256"
+ENGINE_PUBLIC_PACKAGES = (
+    "hns-dns-wire",
+    "hns-browser-runtime",
+    "hns-icann-dane",
+    "hns-namespace-resolution",
+    "hns-resolution-policy",
+    "hns-light-chain",
+    "hns-light-wallet",
+    "hns-dane",
+    "hns-dnssec",
+    "hns-gateway",
+    "hns-cache",
+    "hns-light-p2p",
+    "hns-light-sync",
+    "hns-transport",
+    "hns-resolver",
+    "hns-browser-observability",
+    "hns-p2p-transport",
+    "hns-dane-engine",
+    "hns-dane-engine-ffi",
+    "hns-loopback-proxy",
+)
+ENGINE_PACKAGES = {
+    "hns-light-chain",
+    "hns-light-p2p",
+    "hns-light-sync",
+    "hns-light-wallet",
 }
 ROOT_RELEASE_STATE_WORDING = {
     "candidate": (
@@ -75,7 +112,7 @@ def changelog_release_state(
     heading = re.search(
         rf"^## {re.escape(version)} - (?:unreleased|\d{{4}}-\d{{2}}-\d{{2}})$",
         document,
-        re.MULTILINE,
+        re.MULTILINE | re.IGNORECASE,
     )
     if heading is None:
         fail(f"{path} has no release section for {version}")
@@ -224,20 +261,31 @@ def verify_release_document(repo: Path, order: list[str], version: str) -> None:
         "./scripts/publish.sh --archive-only",
         ".github/workflows/release-preflight.yml",
         PROTOCOL_REVISION,
+        ENGINE_REVISION,
+        PROTOCOL_CHECKSUM_MANIFEST,
+        ENGINE_CHECKSUM_MANIFEST,
     )
     for required in required_release_text:
         if required not in document:
             fail(f"docs/releasing.md omits {required!r}")
     if re.search(
-        r"all 17 required\s+`hns-rs` `0\.2\.0` archives were published",
+        r"all 19\s+required\s+`hns-rs` `0\.3\.1` archives were published",
         document,
+        flags=re.IGNORECASE,
     ) is None:
-        fail("docs/releasing.md omits the published protocol prerequisite record")
+        fail("docs/releasing.md omits the current published protocol prerequisite record")
+    if re.search(
+        r"all 20\s+required\s+`hns-dane-engine` `0\.2\.2` archives were published",
+        document,
+        flags=re.IGNORECASE,
+    ) is None:
+        fail("docs/releasing.md omits the current published engine prerequisite record")
 
     self_expiring_claims = (
         "packages are unpublished",
         "package or tag has been published",
         "No `hns-wallet-rs`",
+        "are not yet published",
     )
     for claim in self_expiring_claims:
         if claim in document:
@@ -284,11 +332,17 @@ def verify_publish_script_safety(repo: Path) -> None:
         "create_registry_source_package()",
         "published_crate_status()",
         "verify_protocol_packages_published()",
+        "verify_engine_packages_published()",
+        "verify_published_cohort()",
+        "protocol_checksum_manifest=release/hns-rs-0.3.1-crates.sha256",
+        "engine_checksum_manifest=release/hns-dane-engine-0.2.2-crates.sha256",
         "require_clean_archive_vcs=yes",
         '*\\"dirty\\":true*',
-        'protocol_vcs_info="$release_tmp/$package-$protocol_version.cargo_vcs_info.json"',
-        '> "$protocol_vcs_info"',
+        'cohort_vcs_info="$release_tmp/$package-$version.cargo_vcs_info.json"',
+        '> "$cohort_vcs_info"',
         'json.load(open(sys.argv[1], encoding="utf-8"))["git"]["sha1"]',
+        'sha256sum "$cohort_archive"',
+        "verify_release_source_unchanged()",
         'crate_status=$(published_crate_status "$package" "$version")',
         "publish_interval_seconds=$publish_update_interval_seconds",
         "publish_kind=existing-crate-update",
@@ -300,8 +354,8 @@ def verify_publish_script_safety(repo: Path) -> None:
         if fragment not in script:
             fail(f"scripts/publish.sh omits execute safety fragment {fragment!r}")
     if (
-        "protocol_vcs_sha=$(tar -xOf" in script
-        or "protocol_vcs_dirty=$(tar -xOf" in script
+        "cohort_vcs_sha=$(tar -xOf" in script
+        or "cohort_vcs_dirty=$(tar -xOf" in script
     ):
         fail("execute-mode protocol VCS reads must materialize tar output")
 
@@ -334,6 +388,8 @@ def verify_publish_script_safety(repo: Path) -> None:
     try:
         execute = script.split("    --execute)", 1)[1]
         protocol_position = execute.index("verify_protocol_packages_published")
+        engine_position = execute.index("verify_engine_packages_published")
+        source_guard_position = execute.index("verify_release_source_unchanged")
         version_status_position = execute.index(
             'status=$(published_package_status "$package" "$version")'
         )
@@ -354,6 +410,8 @@ def verify_publish_script_safety(repo: Path) -> None:
         fail(f"scripts/publish.sh execute path is incomplete: {error}")
     if not (
         protocol_position
+        < engine_position
+        < source_guard_position
         < version_status_position
         < resume_package_position
         < resume_position
@@ -362,7 +420,7 @@ def verify_publish_script_safety(repo: Path) -> None:
         < upload_position
     ):
         fail(
-            "protocol and path-specific wallet archive checks must precede "
+            "prerequisite cohorts and path-specific wallet archive checks must precede "
             "resume verification and execute upload"
         )
     classification = execute[classification_position:new_package_position]
@@ -376,21 +434,51 @@ def verify_publish_script_safety(repo: Path) -> None:
         fail("scripts/publish.sh execute path must never allow dirty packaging")
 
 
+def checksum_manifest(
+    repo: Path, relative_path: str, packages: tuple[str, ...], version: str
+) -> dict[str, str]:
+    path = repo / relative_path
+    expected_filenames = {f"{package}-{version.removeprefix('=')}.crate" for package in packages}
+    observed: dict[str, str] = {}
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        match = re.fullmatch(r"([0-9a-f]{64})  ([a-z0-9-]+-[0-9]+\.[0-9]+\.[0-9]+\.crate)", line)
+        if match is None:
+            fail(f"{relative_path}:{line_number} is not a canonical SHA-256 entry")
+        checksum, filename = match.groups()
+        if filename not in expected_filenames:
+            fail(f"{relative_path}:{line_number} has unexpected archive {filename}")
+        if filename in observed:
+            fail(f"{relative_path} has duplicate archive {filename}")
+        observed[filename] = checksum
+    if set(observed) != expected_filenames:
+        fail(
+            f"{relative_path} does not cover its exact release cohort: "
+            f"missing={sorted(expected_filenames - set(observed))}, "
+            f"unexpected={sorted(set(observed) - expected_filenames)}"
+        )
+    return observed
+
+
 def verify_protocol_source(repo: Path) -> None:
     manifest = tomllib.loads((repo / "Cargo.toml").read_text(encoding="utf-8"))
     dependencies = manifest["workspace"]["dependencies"]
-    for package in sorted(PROTOCOL_PACKAGES):
+    if "patch" in manifest:
+        fail("Cargo.toml must not override registry dependencies through [patch]")
+    for package, version in (
+        *((package, PROTOCOL_VERSION) for package in sorted(PROTOCOL_PACKAGES)),
+        *((package, ENGINE_VERSION) for package in sorted(ENGINE_PACKAGES)),
+    ):
         dependency = dependencies.get(package)
-        if not isinstance(dependency, dict):
-            fail(f"workspace dependency {package} must use an explicit source table")
-        expected = {
-            "version": PROTOCOL_VERSION,
-            "git": PROTOCOL_REPOSITORY,
-            "rev": PROTOCOL_REVISION,
-        }
-        actual = {field: dependency.get(field) for field in expected}
-        if actual != expected:
-            fail(f"workspace dependency {package} differs from {expected}")
+        expected = {"version": version}
+        if dependency != expected:
+            fail(f"workspace dependency {package} differs from registry policy {expected}")
+
+    protocol_checksums = checksum_manifest(
+        repo, PROTOCOL_CHECKSUM_MANIFEST, PROTOCOL_PUBLIC_PACKAGES, PROTOCOL_VERSION
+    )
+    engine_checksums = checksum_manifest(
+        repo, ENGINE_CHECKSUM_MANIFEST, ENGINE_PUBLIC_PACKAGES, ENGINE_VERSION
+    )
 
     publish_script = (repo / "scripts/publish.sh").read_text(encoding="utf-8")
     required_script_lines = {
@@ -398,37 +486,68 @@ def verify_protocol_source(repo: Path) -> None:
         f"protocol_revision={PROTOCOL_REVISION}",
         f"protocol_version={PROTOCOL_VERSION.removeprefix('=')}",
         f"protocol_crates='{' '.join(PROTOCOL_PUBLIC_PACKAGES)}'",
+        f"protocol_checksum_manifest={PROTOCOL_CHECKSUM_MANIFEST}",
+        f"engine_repository={ENGINE_REPOSITORY}",
+        f"engine_revision={ENGINE_REVISION}",
+        f"engine_version={ENGINE_VERSION.removeprefix('=')}",
+        f"engine_crates='{' '.join(ENGINE_PUBLIC_PACKAGES)}'",
+        f"engine_checksum_manifest={ENGINE_CHECKSUM_MANIFEST}",
     }
     script_lines = set(publish_script.splitlines())
     missing_lines = required_script_lines - script_lines
     if missing_lines:
         fail(
-            "scripts/publish.sh protocol source differs from the workspace: "
+            "scripts/publish.sh prerequisite cohort differs from the workspace: "
             f"missing={sorted(missing_lines)}"
         )
+    if re.search(r"patch\.crates-io\.hns-[^ ]+\.(?:git|rev)", publish_script):
+        fail("scripts/publish.sh must not restore Git overrides for registry cohorts")
 
     release_document = (repo / "docs/releasing.md").read_text(encoding="utf-8")
-    if PROTOCOL_REVISION not in release_document:
-        fail("docs/releasing.md omits the pinned protocol revision")
-    if f"`hns-rs` `{PROTOCOL_VERSION.removeprefix('=')}`" not in release_document:
-        fail("docs/releasing.md omits the required protocol package version")
+    required_document_text = (
+        PROTOCOL_REVISION,
+        ENGINE_REVISION,
+        PROTOCOL_CHECKSUM_MANIFEST,
+        ENGINE_CHECKSUM_MANIFEST,
+        f"`hns-rs` `{PROTOCOL_VERSION.removeprefix('=')}`",
+        f"`hns-dane-engine` `{ENGINE_VERSION.removeprefix('=')}`",
+    )
+    for required in required_document_text:
+        if required not in release_document:
+            fail(f"docs/releasing.md omits prerequisite release evidence {required!r}")
 
     lock = tomllib.loads((repo / "Cargo.lock").read_text(encoding="utf-8"))
-    expected_lock_source = (
-        f"git+{PROTOCOL_REPOSITORY}?rev={PROTOCOL_REVISION}#{PROTOCOL_REVISION}"
-    )
-    observed_lock_packages: set[str] = set()
+    observed_protocol_packages: set[str] = set()
+    observed_engine_packages: set[str] = set()
     for package in lock["package"]:
         name = package["name"]
-        if name not in PROTOCOL_PUBLIC_PACKAGES:
+        if name in PROTOCOL_PUBLIC_PACKAGES:
+            observed_protocol_packages.add(name)
+            expected_version = PROTOCOL_VERSION.removeprefix("=")
+            expected_checksum = protocol_checksums[f"{name}-{expected_version}.crate"]
+            cohort = "protocol"
+        elif name in ENGINE_PUBLIC_PACKAGES:
+            observed_engine_packages.add(name)
+            expected_version = ENGINE_VERSION.removeprefix("=")
+            expected_checksum = engine_checksums[f"{name}-{expected_version}.crate"]
+            cohort = "engine"
+        else:
             continue
-        observed_lock_packages.add(name)
-        if package.get("source") != expected_lock_source:
-            fail(f"Cargo.lock has an unreviewed source for protocol package {name}")
-    if not PROTOCOL_PACKAGES.issubset(observed_lock_packages):
+        if package.get("version") != expected_version:
+            fail(f"Cargo.lock has wrong {cohort} version for {name}")
+        if package.get("source") != REGISTRY_SOURCE:
+            fail(f"Cargo.lock has a non-registry {cohort} source for {name}")
+        if package.get("checksum") != expected_checksum:
+            fail(f"Cargo.lock checksum for {name} differs from its release manifest")
+    if not PROTOCOL_PACKAGES.issubset(observed_protocol_packages):
         fail(
             "Cargo.lock omits direct protocol packages: "
-            f"{sorted(PROTOCOL_PACKAGES - observed_lock_packages)}"
+            f"{sorted(PROTOCOL_PACKAGES - observed_protocol_packages)}"
+        )
+    if not ENGINE_PACKAGES.issubset(observed_engine_packages):
+        fail(
+            "Cargo.lock omits direct engine packages: "
+            f"{sorted(ENGINE_PACKAGES - observed_engine_packages)}"
         )
 
 
@@ -540,10 +659,8 @@ def verify_workspace(
         fail("release/CRATE-CHANGELOG.md must not link a tag before it exists")
 
     positions = {package: index for index, package in enumerate(order)}
-    expected_protocol_source = (
-        f"git+{PROTOCOL_REPOSITORY}?rev={PROTOCOL_REVISION}"
-    )
     observed_protocol_dependencies: set[str] = set()
+    observed_engine_dependencies: set[str] = set()
 
     for name in order:
         package = packages[name]
@@ -618,13 +735,27 @@ def verify_workspace(
                         f"{name} requires protocol {dependency_name} at "
                         f"{dependency['req']}, expected {PROTOCOL_VERSION}"
                     )
-                if dependency.get("source") != expected_protocol_source:
-                    fail(f"{name} has an unreviewed source for {dependency_name}")
+                if dependency.get("source") != REGISTRY_SOURCE:
+                    fail(f"{name} has a non-registry source for {dependency_name}")
+            elif dependency_name in ENGINE_PACKAGES:
+                observed_engine_dependencies.add(dependency_name)
+                if dependency["req"] != ENGINE_VERSION:
+                    fail(
+                        f"{name} requires engine {dependency_name} at "
+                        f"{dependency['req']}, expected {ENGINE_VERSION}"
+                    )
+                if dependency.get("source") != REGISTRY_SOURCE:
+                    fail(f"{name} has a non-registry source for {dependency_name}")
 
     if observed_protocol_dependencies != PROTOCOL_PACKAGES:
         fail(
             "wallet packages do not exercise the complete declared protocol set: "
             f"observed={sorted(observed_protocol_dependencies)}"
+        )
+    if observed_engine_dependencies != ENGINE_PACKAGES:
+        fail(
+            "wallet packages do not exercise the complete declared engine set: "
+            f"observed={sorted(observed_engine_dependencies)}"
         )
 
     return version, release_label, release_state

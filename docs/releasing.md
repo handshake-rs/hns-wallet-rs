@@ -15,9 +15,9 @@ The release script publishes only these packages, in dependency order:
 4. `hns-wallet-ffi`
 5. `hns-wallet-provider`
 6. `hns-wallet-hns`
-7. `hns-wallet-market`
-8. `hns-wallet-shakedex`
-9. `hns-wallet-bitcoin-kyoto`
+7. `hns-wallet-bitcoin-kyoto`
+8. `hns-wallet-market`
+9. `hns-wallet-shakedex`
 10. `hns-wallet-ethereum`
 11. `hns-wallet-host`
 12. `hns-wallet-service`
@@ -40,52 +40,49 @@ Normalized archive inspection materializes complete tar listings and selected
 files before comparison so a successful match cannot hide an upstream tar read
 failure or emit a benign broken-pipe warning.
 
-## 0.1.0 release source
+## 0.1.1 release source
 
-Version `0.1.0` is the initial `hns-wallet-rs` release line. The
+Version `0.1.1` is the current `hns-wallet-rs` release line. The
 canonical feature inventory is in `CHANGELOG.md`; source packaging, publication,
 or test success does not enable provider, value, settlement, or marketplace
 product gates. Registry and tag state are external facts and must be checked at
 release time rather than embedded as a claim in the source snapshot.
 
-The selected `0.1.0` heading and package-local changelogs use one
-version-scoped canonical release-state declaration. Candidate form describes an
-unpublished candidate and deliberately uses a plain `CHANGELOG.md` reference
-instead of a tag link. Before an authorized upload, replace the canonical
-`candidate` marker and its adjacent statement in both changelog authorities
-with the canonical `release` forms below, synchronize every package copy, and
-let the execute-mode validator reject any stale, missing, malformed, or
-mismatched declaration.
+The selected `0.1.1` heading and package-local changelogs use one
+version-scoped canonical `release` declaration. It describes prepared source,
+not an existing crates.io package or tag; execution requires this exact dated
+state and rejects a stale, missing, malformed, mismatched, or candidate
+declaration.
 
 Root `CHANGELOG.md` release form:
 
 ```markdown
-<!-- hns-wallet-release-state: 0.1.0 release -->
+<!-- hns-wallet-release-state: 0.1.1 release -->
 Initial release source for the independent Handshake wallet boundary:
 ```
 
 `release/CRATE-CHANGELOG.md` release form:
 
 ```markdown
-<!-- hns-wallet-release-state: 0.1.0 release -->
+<!-- hns-wallet-release-state: 0.1.1 release -->
 This crate changelog describes the prepared `hns-wallet-rs` release source.
 ```
 
-The previous dependency baseline used immutable `hns-rs` revision
-`b24b66c382de53330ec21dd3137e056a2bea3e2d`. On 2026-08-14, all 17 required
-`hns-rs` `0.2.0` archives were published to crates.io and verified to identify
-that exact revision in `.cargo_vcs_info.json`. That evidence is historical and
-does not satisfy the current release prerequisite.
+Wallet source consumes the published registry `hns-rs` `0.3.1` cohort from
+immutable release source `0e99addca59778b7b7c6fc56291333a97c4c8815`. All 19
+required `hns-rs` `0.3.1` archives were published to crates.io and are recorded
+in `release/hns-rs-0.3.1-crates.sha256`. It also consumes the published registry
+`hns-dane-engine` `0.2.2` cohort from immutable release source
+`b7fdf8826c81b77650a0f740d1f05314b74969f9`. All 20 required
+`hns-dane-engine` `0.2.2` archives were published to crates.io and are recorded
+in `release/hns-dane-engine-0.2.2-crates.sha256`.
 
-Wallet source now consumes exact immutable `hns-rs` `0.3.0` Git revision
-`88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e`. Its 19 current upstream archives
-are not yet published and provenance-verified. Execution must download and
-revalidate every prerequisite immediately before any wallet upload; if one is
-missing, dirty, or identifies any other source commit, it stops before the
-irreversible sequence. Dry-run preflight preserves the exact Git-source policy
-by patching protocol dependencies to that revision and wallet dependencies to
-local workspace paths. Those patches are verification aids only; they are never
-used during an actual upload.
+Execution downloads and revalidates each prerequisite immediately before any
+wallet upload. It checks the API checksum and non-yanked status, downloaded
+archive SHA-256, clean VCS identity, and `crates/<package>` VCS path. Dry-run
+preflight uses only local workspace-path patches needed before the dependency
+order has reached crates.io; it never restores a Git override for an upstream
+registry cohort.
 
 The `hns-wallet-ffi` package archive must contain byte-identical copies of
 `abi/contracts-v2.schema.json` and `abi/golden-vectors-v2.json`. The
@@ -100,10 +97,9 @@ document and verify boundaries; they grant no runtime or deployment authority.
    version in `[workspace.dependencies]`, `CHANGELOG.md`, and
    `release/CRATE-CHANGELOG.md`. Use one version-specific `unreleased` heading
    while developing; do not add a generic `## Unreleased` section outside the
-   selected shared version. Before an upload, date that heading, move every
-   included change under it, and replace the root and package-template
-   canonical candidate markers/statements with the documented release forms.
-   Synchronize the package copies:
+   selected shared version. Before an upload, date that heading, set the root
+   and package-template canonical release declarations, and synchronize the
+   package copies:
 
    ```bash
    ./scripts/sync-release-files.sh
@@ -112,7 +108,7 @@ document and verify boundaries; they grant no runtime or deployment authority.
    The validator rejects an execution attempt whose version heading remains
    `unreleased`, whose root changelog retains a generic Unreleased section, or
    whose canonical root/template release-state marker is absent, malformed,
-   mismatched, still `candidate`, or separated from its exact wording.
+   mismatched, candidate, or separated from its exact wording.
 
 2. Run the cheap metadata, argument, and archive-inventory checks while
    preparing the release source. Archive-only mode uses `cargo package
@@ -176,12 +172,13 @@ document and verify boundaries; they grant no runtime or deployment authority.
    confirmation must equal the workspace version:
 
    ```bash
-   ./scripts/publish.sh --execute --confirm-publish 0.1.0
+   ./scripts/publish.sh --execute --confirm-publish 0.1.1
    ```
 
-Execution mode first downloads all 19 required protocol archives and rejects
-any package whose `.cargo_vcs_info.json` does not identify the exact pinned
-`hns-rs` revision. For a new wallet version, it creates and runs the custom
+Execution mode first downloads all 19 required `hns-rs` and all 20 required
+`hns-dane-engine` archives and rejects any package whose API record, checksum,
+or `.cargo_vcs_info.json` does not identify the exact pinned release source.
+For a new wallet version, it creates and runs the custom
 inventory verifier over the normalized source package before any possible
 upload. Execute-mode archive validation rejects a `.cargo_vcs_info.json`
 record with `"dirty": true`, even if the worktree became dirty after the
@@ -208,7 +205,7 @@ limit:
 ```bash
 PUBLISH_NEW_INTERVAL_SECONDS=605 \
 PUBLISH_UPDATE_INTERVAL_SECONDS=65 \
-  ./scripts/publish.sh --execute --confirm-publish 0.1.0
+  ./scripts/publish.sh --execute --confirm-publish 0.1.1
 ```
 
 After each applicable cooldown, the script downloads the new archive and

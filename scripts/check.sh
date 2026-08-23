@@ -4,6 +4,8 @@ set -euo pipefail
 wallet_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$wallet_root"
 
+python3 scripts/verify-release.py --toolchain 1.89.0
+python3 scripts/test-verify-release.py
 ./scripts/check-publish-arguments.sh
 ./scripts/publish.sh --archive-only
 
@@ -11,33 +13,6 @@ if rg -n 'path\s*=\s*"\.\./' --glob Cargo.toml .; then
   echo "sibling path dependency is forbidden" >&2
   exit 1
 fi
-
-hns_revision="88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e"
-hns_version="0.3.0"
-hns_repository="https://github.com/handshake-rs/hns-rs.git"
-hns_lock_source="git+${hns_repository}?rev=${hns_revision}#${hns_revision}"
-for package in hns-covenants hns-encoding hns-marketplace-protocol hns-p2p-experimental hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
-  if ! awk -v package="$package" -v version="$hns_version" -v source="$hns_lock_source" '
-    BEGIN { RS = ""; found = 0 }
-    index($0, "name = \"" package "\"") {
-      found += 1
-      if (!index($0, "version = \"" version "\"") ||
-          !index($0, "source = \"" source "\"")) bad = 1
-    }
-    END { exit found != 1 || bad }
-  ' Cargo.lock; then
-    echo "$package must resolve exactly once at $hns_version from immutable hns-rs revision $hns_revision" >&2
-    exit 1
-  fi
-done
-
-for package in hns-covenants hns-marketplace-protocol hns-primitives hns-script hns-swap hns-transaction hns-urkel-proof; do
-  declaration="$package = { version = \"=$hns_version\", git = \"$hns_repository\", rev = \"$hns_revision\" }"
-  if ! rg --fixed-strings --line-regexp --quiet "$declaration" Cargo.toml; then
-    echo "$package must use the reviewed immutable hns-rs source" >&2
-    exit 1
-  fi
-done
 
 if rg -n 'name = "(electrum-client|esplora-client|bitcoincore-rpc)"' Cargo.lock; then
   echo "alternate Bitcoin production backend found" >&2

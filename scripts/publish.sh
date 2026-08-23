@@ -17,9 +17,15 @@ require_clean_archive_vcs=no
 package_operation="publish-dry-run"
 release_manifest=release/public-crates.txt
 protocol_repository=https://github.com/handshake-rs/hns-rs.git
-protocol_revision=88ed7c64db52a6fcfce4146a8fc17b1377dfcc8e
-protocol_version=0.3.0
+protocol_revision=0e99addca59778b7b7c6fc56291333a97c4c8815
+protocol_version=0.3.1
 protocol_crates='hns-encoding hns-rollback-journal hns-hrm hns-primitives hns-covenants hns-dns-relay-protocol hns-header-consensus hns-service-authority hns-odoh-protocol hns-p2p-experimental hns-urkel-proof hns-transaction hns-chat-protocol hns-hnsr-protocol hns-script hns-mining hns-swap hns-marketplace-protocol hns-p2p-wire'
+protocol_checksum_manifest=release/hns-rs-0.3.1-crates.sha256
+engine_repository=https://github.com/handshake-rs/hns-dane-engine.git
+engine_revision=b7fdf8826c81b77650a0f740d1f05314b74969f9
+engine_version=0.2.2
+engine_crates='hns-dns-wire hns-browser-runtime hns-icann-dane hns-namespace-resolution hns-resolution-policy hns-light-chain hns-light-wallet hns-dane hns-dnssec hns-gateway hns-cache hns-light-p2p hns-light-sync hns-transport hns-resolver hns-browser-observability hns-p2p-transport hns-dane-engine hns-dane-engine-ffi hns-loopback-proxy'
+engine_checksum_manifest=release/hns-dane-engine-0.2.2-crates.sha256
 
 cleanup_release_tmp() {
     if [ -n "$release_tmp" ] && [ -d "$release_tmp" ]
@@ -98,8 +104,6 @@ dry_run_with_local_dependencies() {
             ;;
         hns-wallet-ffi)
             dry_run_package "$package" \
-                --config "patch.crates-io.hns-covenants.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-covenants.rev=\"$protocol_revision\"" \
                 --config 'patch.crates-io.hns-wallet-types.path="crates/hns-wallet-types"'
             ;;
         hns-wallet-provider)
@@ -109,45 +113,20 @@ dry_run_with_local_dependencies() {
             ;;
         hns-wallet-hns)
             dry_run_package "$package" \
-                --config "patch.crates-io.hns-covenants.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-covenants.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-primitives.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-primitives.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-script.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-script.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-swap.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-swap.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-transaction.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-transaction.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-urkel-proof.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-urkel-proof.rev=\"$protocol_revision\"" \
                 --config 'patch.crates-io.hns-wallet-chain-api.path="crates/hns-wallet-chain-api"' \
                 --config 'patch.crates-io.hns-wallet-store.path="crates/hns-wallet-store"' \
                 --config 'patch.crates-io.hns-wallet-types.path="crates/hns-wallet-types"'
             ;;
         hns-wallet-market)
             dry_run_package "$package" \
-                --config "patch.crates-io.hns-marketplace-protocol.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-marketplace-protocol.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-primitives.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-primitives.rev=\"$protocol_revision\"" \
+                --config 'patch.crates-io.hns-wallet-bitcoin-kyoto.path="crates/hns-wallet-bitcoin-kyoto"' \
+                --config 'patch.crates-io.hns-wallet-chain-api.path="crates/hns-wallet-chain-api"' \
+                --config 'patch.crates-io.hns-wallet-hns.path="crates/hns-wallet-hns"' \
                 --config 'patch.crates-io.hns-wallet-store.path="crates/hns-wallet-store"' \
                 --config 'patch.crates-io.hns-wallet-types.path="crates/hns-wallet-types"'
             ;;
         hns-wallet-shakedex)
             dry_run_package "$package" \
-                --config "patch.crates-io.hns-covenants.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-covenants.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-marketplace-protocol.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-marketplace-protocol.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-primitives.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-primitives.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-script.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-script.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-swap.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-swap.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-transaction.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-transaction.rev=\"$protocol_revision\"" \
                 --config 'patch.crates-io.hns-wallet-chain-api.path="crates/hns-wallet-chain-api"' \
                 --config 'patch.crates-io.hns-wallet-hns.path="crates/hns-wallet-hns"' \
                 --config 'patch.crates-io.hns-wallet-store.path="crates/hns-wallet-store"' \
@@ -166,48 +145,21 @@ dry_run_with_local_dependencies() {
             ;;
         hns-wallet-host)
             dry_run_package "$package" \
-                --config "patch.crates-io.hns-covenants.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-covenants.rev=\"$protocol_revision\"" \
                 --config 'patch.crates-io.hns-wallet-ffi.path="crates/hns-wallet-ffi"' \
                 --config 'patch.crates-io.hns-wallet-types.path="crates/hns-wallet-types"'
             ;;
         hns-wallet-service)
             dry_run_package "$package" \
-                --config "patch.crates-io.hns-covenants.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-covenants.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-primitives.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-primitives.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-script.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-script.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-swap.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-swap.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-transaction.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-transaction.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-urkel-proof.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-urkel-proof.rev=\"$protocol_revision\"" \
                 --config 'patch.crates-io.hns-wallet-chain-api.path="crates/hns-wallet-chain-api"' \
                 --config 'patch.crates-io.hns-wallet-ffi.path="crates/hns-wallet-ffi"' \
                 --config 'patch.crates-io.hns-wallet-hns.path="crates/hns-wallet-hns"' \
                 --config 'patch.crates-io.hns-wallet-provider.path="crates/hns-wallet-provider"' \
+                --config 'patch.crates-io.hns-wallet-shakedex.path="crates/hns-wallet-shakedex"' \
                 --config 'patch.crates-io.hns-wallet-store.path="crates/hns-wallet-store"' \
                 --config 'patch.crates-io.hns-wallet-types.path="crates/hns-wallet-types"'
             ;;
         hns-wallet-testkit)
             dry_run_package "$package" \
-                --config "patch.crates-io.hns-covenants.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-covenants.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-marketplace-protocol.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-marketplace-protocol.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-primitives.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-primitives.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-script.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-script.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-swap.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-swap.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-transaction.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-transaction.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-urkel-proof.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-urkel-proof.rev=\"$protocol_revision\"" \
                 --config 'patch.crates-io.hns-wallet-bitcoin-kyoto.path="crates/hns-wallet-bitcoin-kyoto"' \
                 --config 'patch.crates-io.hns-wallet-chain-api.path="crates/hns-wallet-chain-api"' \
                 --config 'patch.crates-io.hns-wallet-ethereum.path="crates/hns-wallet-ethereum"' \
@@ -220,23 +172,14 @@ dry_run_with_local_dependencies() {
             ;;
         hns-wallet-mobile)
             dry_run_package "$package" \
-                --config "patch.crates-io.hns-covenants.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-covenants.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-primitives.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-primitives.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-script.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-script.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-swap.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-swap.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-transaction.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-transaction.rev=\"$protocol_revision\"" \
-                --config "patch.crates-io.hns-urkel-proof.git=\"$protocol_repository\"" \
-                --config "patch.crates-io.hns-urkel-proof.rev=\"$protocol_revision\"" \
+                --config 'patch.crates-io.hns-wallet-bitcoin-kyoto.path="crates/hns-wallet-bitcoin-kyoto"' \
                 --config 'patch.crates-io.hns-wallet-chain-api.path="crates/hns-wallet-chain-api"' \
                 --config 'patch.crates-io.hns-wallet-ffi.path="crates/hns-wallet-ffi"' \
                 --config 'patch.crates-io.hns-wallet-hns.path="crates/hns-wallet-hns"' \
                 --config 'patch.crates-io.hns-wallet-host.path="crates/hns-wallet-host"' \
+                --config 'patch.crates-io.hns-wallet-market.path="crates/hns-wallet-market"' \
                 --config 'patch.crates-io.hns-wallet-provider.path="crates/hns-wallet-provider"' \
+                --config 'patch.crates-io.hns-wallet-shakedex.path="crates/hns-wallet-shakedex"' \
                 --config 'patch.crates-io.hns-wallet-service.path="crates/hns-wallet-service"' \
                 --config 'patch.crates-io.hns-wallet-store.path="crates/hns-wallet-store"' \
                 --config 'patch.crates-io.hns-wallet-types.path="crates/hns-wallet-types"'
@@ -529,53 +472,150 @@ published_package_status() {
         "https://crates.io/api/v1/crates/$package/$version"
 }
 
-verify_protocol_packages_published() {
+manifest_checksum() {
+    manifest=$1
+    filename=$2
+    checksum=$(awk -v filename="$filename" '$2 == filename { count += 1; value = $1 } END { if (count == 1 && value ~ /^[0-9a-f]{64}$/) print value; else exit 1 }' "$manifest")
+    if [ -z "$checksum" ]
+    then
+        echo "error: $manifest has no unique SHA-256 for $filename" >&2
+        exit 1
+    fi
+    printf '%s\n' "$checksum"
+}
+
+verify_published_cohort() {
+    cohort=$1
+    repository=$2
+    revision=$3
+    version=$4
+    crates=$5
+    checksum_manifest=$6
+
+    if [ ! -f "$checksum_manifest" ]
+    then
+        echo "error: $cohort checksum manifest $checksum_manifest is missing" >&2
+        exit 1
+    fi
+
     ensure_release_tmp
-    for package in $protocol_crates
+    for package in $crates
     do
-        status=$(published_package_status "$package" "$protocol_version")
+        filename="$package-$version.crate"
+        expected_checksum=$(manifest_checksum "$checksum_manifest" "$filename")
+        status=$(published_package_status "$package" "$version")
         if [ "$status" != "200" ]
         then
-            echo "error: required protocol package $package $protocol_version is not published (HTTP $status)" >&2
+            echo "error: required $cohort package $package $version is not published (HTTP $status)" >&2
             exit 1
         fi
 
-        protocol_archive="$release_tmp/$package-$protocol_version.crate"
+        cohort_metadata="$release_tmp/$package-$version.metadata.json"
         curl \
             --fail \
             --location \
             --silent \
             --show-error \
-            --user-agent "hns-wallet-rs-release/$protocol_version (https://github.com/handshake-rs/hns-wallet-rs)" \
-            --output "$protocol_archive" \
-            "https://crates.io/api/v1/crates/$package/$protocol_version/download"
-        protocol_vcs_info="$release_tmp/$package-$protocol_version.cargo_vcs_info.json"
+            --user-agent "hns-wallet-rs-release/$version (https://github.com/handshake-rs/hns-wallet-rs)" \
+            --output "$cohort_metadata" \
+            "https://crates.io/api/v1/crates/$package/$version"
+        cohort_api_checksum=$(python3 -c \
+            'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"]["checksum"])' \
+            "$cohort_metadata")
+        cohort_yanked=$(python3 -c \
+            'import json, sys; print(str(json.load(open(sys.argv[1], encoding="utf-8"))["version"]["yanked"]).lower())' \
+            "$cohort_metadata")
+        if [ "$cohort_api_checksum" != "$expected_checksum" ]
+        then
+            echo "error: required $cohort package $package $version API checksum differs from $checksum_manifest" >&2
+            exit 1
+        fi
+        if [ "$cohort_yanked" != "false" ]
+        then
+            echo "error: required $cohort package $package $version is yanked" >&2
+            exit 1
+        fi
+
+        cohort_archive="$release_tmp/$filename"
+        curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --user-agent "hns-wallet-rs-release/$version (https://github.com/handshake-rs/hns-wallet-rs)" \
+            --output "$cohort_archive" \
+            "https://crates.io/api/v1/crates/$package/$version/download"
+        observed_checksum=$(sha256sum "$cohort_archive" | awk '{print $1}')
+        if [ "$observed_checksum" != "$expected_checksum" ]
+        then
+            echo "error: required $cohort package $package $version archive checksum differs from $checksum_manifest" >&2
+            exit 1
+        fi
+
+        cohort_vcs_info="$release_tmp/$package-$version.cargo_vcs_info.json"
         if ! tar -xOf \
-            "$protocol_archive" \
-            "$package-$protocol_version/.cargo_vcs_info.json" \
-            > "$protocol_vcs_info"
+            "$cohort_archive" \
+            "$package-$version/.cargo_vcs_info.json" \
+            > "$cohort_vcs_info"
         then
-            echo "error: required protocol package $package $protocol_version has no readable VCS identity" >&2
+            echo "error: required $cohort package $package $version has no readable VCS identity" >&2
             exit 1
         fi
-        protocol_vcs_sha=$(python3 -c \
+        cohort_vcs_sha=$(python3 -c \
             'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["git"]["sha1"])' \
-            "$protocol_vcs_info")
-        if [ "$protocol_vcs_sha" != "$protocol_revision" ]
+            "$cohort_vcs_info")
+        cohort_vcs_dirty=$(python3 -c \
+            'import json, sys; print(str(json.load(open(sys.argv[1], encoding="utf-8"))["git"].get("dirty", False)).lower())' \
+            "$cohort_vcs_info")
+        cohort_vcs_path=$(python3 -c \
+            'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8")).get("path_in_vcs", ""))' \
+            "$cohort_vcs_info")
+        if [ "$cohort_vcs_sha" != "$revision" ]
         then
-            echo "error: required protocol package $package $protocol_version identifies source $protocol_vcs_sha, expected $protocol_revision" >&2
+            echo "error: required $cohort package $package $version identifies source $cohort_vcs_sha, expected $revision from $repository" >&2
             exit 1
         fi
-        protocol_vcs_dirty=$(python3 -c \
-            'import json, sys; print(str(json.load(open(sys.argv[1], encoding="utf-8"))["git"].get("dirty", False)).lower())' \
-            "$protocol_vcs_info")
-        if [ "$protocol_vcs_dirty" = "true" ]
+        if [ "$cohort_vcs_dirty" = "true" ]
         then
-            echo "error: required protocol package $package $protocol_version records a dirty source tree" >&2
+            echo "error: required $cohort package $package $version records a dirty source tree" >&2
+            exit 1
+        fi
+        if [ "$cohort_vcs_path" != "crates/$package" ]
+        then
+            echo "error: required $cohort package $package $version VCS path $cohort_vcs_path is not crates/$package" >&2
             exit 1
         fi
     done
-    echo "verified all 19 hns-rs $protocol_version archives at source $protocol_revision"
+    echo "verified published $cohort $version archives at source $revision"
+}
+
+verify_protocol_packages_published() {
+    verify_published_cohort \
+        hns-rs \
+        "$protocol_repository" \
+        "$protocol_revision" \
+        "$protocol_version" \
+        "$protocol_crates" \
+        "$protocol_checksum_manifest"
+}
+
+verify_engine_packages_published() {
+    verify_published_cohort \
+        hns-dane-engine \
+        "$engine_repository" \
+        "$engine_revision" \
+        "$engine_version" \
+        "$engine_crates" \
+        "$engine_checksum_manifest"
+}
+
+verify_release_source_unchanged() {
+    if [ "$(git rev-parse HEAD)" != "$release_commit" ] ||
+        [ -n "$(git status --porcelain)" ]
+    then
+        echo "error: release source changed after execute preflight" >&2
+        exit 1
+    fi
 }
 
 verify_new_upload() {
@@ -680,6 +720,8 @@ case "$mode" in
             --expected-version "$confirmed_version"
         require_clean_archive_vcs=yes
         verify_protocol_packages_published
+        verify_engine_packages_published
+        verify_release_source_unchanged
 
         cargo_home=${CARGO_HOME:-"$HOME/.cargo"}
         if [ -z "${CARGO_REGISTRY_TOKEN:-}" ] &&
@@ -691,6 +733,7 @@ case "$mode" in
 
         for package in $public_crates
         do
+            verify_release_source_unchanged
             version=$(package_version "$package")
             status=$(published_package_status "$package" "$version")
             case "$status" in
@@ -723,6 +766,7 @@ case "$mode" in
                     # irreversible upload. cargo publish then replaces it with
                     # the registry-backed archive used for exact verification.
                     create_source_package "$package" no
+                    verify_release_source_unchanged
                     cargo +"$rust_toolchain" publish --locked -p "$package"
                     verify_new_upload \
                         "$package" \
