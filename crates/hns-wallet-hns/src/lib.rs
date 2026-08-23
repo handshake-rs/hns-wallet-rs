@@ -6769,9 +6769,23 @@ pub fn derive_hns_light_watch_set(
     if account.id.as_slice() != account_id.as_slice() || account.value.config != *config {
         return Err(HnsWalletError::AccountConfigurationMismatch);
     }
-    let coin_addresses = derive_restore_addresses(store, &account.value, KeyRole::HnsCoin)?;
-    let name_addresses = derive_restore_addresses(store, &account.value, KeyRole::HnsName)?;
-    let shakedex_addresses = derive_restore_addresses(store, &account.value, KeyRole::HnsShakedex)?;
+    // The direct index must cover exactly the same recovery frontier as the
+    // authenticated read path. In particular, a durable Shakedex allocation
+    // high-water can require one or more restoration scripts before the
+    // account record itself is reconciled again. Deriving the light watch set
+    // from the un-normalized record would let peers finish a filtered scan and
+    // then reject the native snapshot for a script the local index never
+    // watched.
+    let mut scan_account = account.value;
+    let allocated_next = shakedex_key::allocation_next_index_for_persisted_recovery_read(
+        store,
+        &scan_account.config,
+    )
+    .map_err(map_shakedex_restore_error)?;
+    normalize_restore_scan_account(&mut scan_account, allocated_next)?;
+    let coin_addresses = derive_restore_addresses(store, &scan_account, KeyRole::HnsCoin)?;
+    let name_addresses = derive_restore_addresses(store, &scan_account, KeyRole::HnsName)?;
+    let shakedex_addresses = derive_restore_addresses(store, &scan_account, KeyRole::HnsShakedex)?;
     validate_disjoint_restore_programs(&coin_addresses, &name_addresses, &shakedex_addresses)?;
     let scripts = coin_addresses
         .iter()
@@ -12730,6 +12744,64 @@ mod tests {
             store.try_with_store(|wallet| derive_hns_light_watch_set(wallet, &other)),
             Err(HnsWalletError::AccountConfigurationMismatch)
         ));
+    }
+
+    #[test]
+    fn direct_light_watch_set_covers_the_normalized_recovery_frontier() {
+        let (store, config) = production_followup_read_store();
+        store
+            .with_store_mut(|wallet| {
+                let stored = wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .ok_or(StoreError::CorruptMetadata)?;
+                let mut account = stored.value;
+                // Model a durable recovery frontier that has advanced beyond
+                // the last persisted scan end. The direct index must include
+                // the normalized successor script before peer scanning starts.
+                account.next_shakedex_index = 1;
+                account.shakedex_scan_end = 0;
+                wallet.save_wallet_account(
+                    &account_entity_id(&config),
+                    stored.revision,
+                    &account,
+                    100,
+                )?;
+                Ok(())
+            })
+            .expect("persist normalized direct-light fixture");
+
+        let watch_set = store
+            .try_with_store(|wallet| derive_hns_light_watch_set(wallet, &config))
+            .expect("derive normalized direct-light watch set");
+        let expected_scripts = store
+            .try_with_store(|wallet| {
+                let stored = wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))?
+                    .ok_or(HnsWalletError::StaleAccountRead)?;
+                let mut scan_account = stored.value;
+                let allocated_next = scan_account.next_shakedex_index;
+                normalize_restore_scan_account(&mut scan_account, allocated_next)?;
+                Ok::<BTreeSet<WalletAddressKey>, HnsWalletError>(
+                    [
+                        derive_restore_addresses(wallet, &scan_account, KeyRole::HnsCoin)?,
+                        derive_restore_addresses(wallet, &scan_account, KeyRole::HnsName)?,
+                        derive_restore_addresses(wallet, &scan_account, KeyRole::HnsShakedex)?,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|address| WalletAddressKey {
+                        version: 0,
+                        hash: address.program,
+                    })
+                    .collect::<BTreeSet<_>>(),
+                )
+            })
+            .expect("derive normalized recovery scripts");
+        assert_eq!(
+            watch_set.scripts.iter().cloned().collect::<BTreeSet<_>>(),
+            expected_scripts
+        );
+        assert_eq!(watch_set.scripts.len(), 5);
     }
 
     #[test]
