@@ -239,7 +239,7 @@ impl EmbeddedHnsBackend {
         self.lock()?
             .authority
             .finish_header_round_and_persist(now_unix)
-            .map_err(map_authority_error)
+            .map_err(map_header_round_error)
     }
 
     /// Finish a header round when agreement is already sufficient, preserving
@@ -255,14 +255,12 @@ impl EmbeddedHnsBackend {
         {
             Ok(round) => Ok(Some(round)),
             Err(crate::HnsLightError::Sync(SyncError::RoundIncomplete)) => Ok(None),
-            // A deadline with too few independent replies is a normal remote
-            // availability condition. Preserve it as a typed wallet result so
-            // the mobile runtime can retain its verified catch-up state and
-            // retry without confusing it with a local backend failure.
-            Err(crate::HnsLightError::Sync(SyncError::InsufficientResponses)) => {
-                Err(HnsWalletError::HeaderRoundInsufficientResponses)
-            }
-            Err(error) => Err(map_authority_error(error)),
+            // Remote peer availability and agreement failures are typed rather
+            // than flattened to `Backend`. The mobile direct-peer coordinator
+            // can retain its verified checkpoint, replace the sampled peers,
+            // and retry without treating a local wallet or chain validation
+            // failure as recoverable.
+            Err(error) => Err(map_header_round_error(error)),
         }
     }
 
@@ -2212,6 +2210,22 @@ fn map_authority_error(error: impl std::fmt::Display) -> HnsWalletError {
     HnsWalletError::Backend(format!("embedded HNS header authority failed: {error}"))
 }
 
+/// Preserve bounded header-quorum availability states across the embedded
+/// authority boundary. These are not evidence failures: no unagreed header is
+/// persisted, and callers must continue to withhold wallet projections until a
+/// later independent peer round succeeds.
+fn map_header_round_error(error: crate::HnsLightError) -> HnsWalletError {
+    match error {
+        crate::HnsLightError::Sync(SyncError::InsufficientResponses) => {
+            HnsWalletError::HeaderRoundInsufficientResponses
+        }
+        crate::HnsLightError::Sync(SyncError::InsufficientAgreement) => {
+            HnsWalletError::HeaderRoundInsufficientAgreement
+        }
+        error => map_authority_error(error),
+    }
+}
+
 fn map_index_error(error: impl std::fmt::Display) -> HnsWalletError {
     HnsWalletError::Backend(format!("embedded HNS wallet index failed: {error}"))
 }
@@ -2255,6 +2269,18 @@ mod tests {
 
     fn store() -> SharedWalletStore {
         SharedWalletStore::new(WalletStore::create(":memory:", PASSPHRASE).unwrap())
+    }
+
+    #[test]
+    fn header_round_peer_agreement_failure_remains_typed() {
+        assert!(matches!(
+            map_header_round_error(crate::HnsLightError::Sync(SyncError::InsufficientAgreement)),
+            HnsWalletError::HeaderRoundInsufficientAgreement
+        ));
+        assert!(matches!(
+            map_header_round_error(crate::HnsLightError::Sync(SyncError::InsufficientResponses)),
+            HnsWalletError::HeaderRoundInsufficientResponses
+        ));
     }
 
     fn transaction(previous_output: Outpoint, program: Vec<u8>, value: u64) -> Transaction {

@@ -10261,6 +10261,8 @@ pub enum HnsWalletError {
     Encoding,
     #[error("HNS header round timed out before enough independent peers responded")]
     HeaderRoundInsufficientResponses,
+    #[error("HNS header round received a highest-work chain without independent peer agreement")]
+    HeaderRoundInsufficientAgreement,
     #[error("Handshake backend failed: {0}")]
     Backend(String),
 }

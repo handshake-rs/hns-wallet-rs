@@ -2894,7 +2894,10 @@ impl HnsDirectPeerError {
     pub fn is_temporary_header_agreement_unavailable(&self) -> bool {
         matches!(
             self,
-            Self::Wallet(HnsWalletError::HeaderRoundInsufficientResponses)
+            Self::Wallet(
+                HnsWalletError::HeaderRoundInsufficientResponses
+                    | HnsWalletError::HeaderRoundInsufficientAgreement
+            )
         )
     }
 }
@@ -2923,9 +2926,13 @@ mod tests {
     use hns_wallet_types::{AccountId, BaseUnits, WalletId};
 
     #[test]
-    fn timed_out_header_agreement_remains_distinguishable_from_wallet_faults() {
+    fn temporary_header_agreement_failures_remain_distinguishable_from_wallet_faults() {
         assert!(
             HnsDirectPeerError::Wallet(HnsWalletError::HeaderRoundInsufficientResponses)
+                .is_temporary_header_agreement_unavailable()
+        );
+        assert!(
+            HnsDirectPeerError::Wallet(HnsWalletError::HeaderRoundInsufficientAgreement)
                 .is_temporary_header_agreement_unavailable()
         );
         assert!(
