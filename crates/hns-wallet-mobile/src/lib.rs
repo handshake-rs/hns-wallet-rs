@@ -48,12 +48,12 @@ use hns_wallet_provider::{
     APPROVAL_LIFETIME_SECONDS, ApprovedCall, Origin, ProviderMethod, SelectedNamespace,
 };
 use hns_wallet_service::{
-    MAX_JAVASCRIPT_SAFE_INTEGER, NativeHnsNameOwnershipStatus, NativeHnsNameResourceStatus,
-    NativeHnsNameSummary, NativeHnsValueSnapshot, PersistentDenuoTransport,
-    PersistentHnsAccountConfig, PersistentHnsAccountRuntime, PersistentHnsReadConfig,
-    PersistentHnsReadRuntime, PersistentHnsValueConfig, PersistentHnsValueRuntime,
-    PersistentShakedexConfig, ServiceError, ServiceRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN,
-    TrustedNativeHnsValueAction, WalletService,
+    MAX_JAVASCRIPT_SAFE_INTEGER, NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE,
+    NativeHnsNameOwnershipStatus, NativeHnsNameResourceStatus, NativeHnsNameSummary,
+    NativeHnsValueSnapshot, PersistentDenuoTransport, PersistentHnsAccountConfig,
+    PersistentHnsAccountRuntime, PersistentHnsReadConfig, PersistentHnsReadRuntime,
+    PersistentHnsValueConfig, PersistentHnsValueRuntime, PersistentShakedexConfig, ServiceError,
+    ServiceRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN, TrustedNativeHnsValueAction, WalletService,
 };
 use hns_wallet_shakedex::{
     DenuoHnsaEndpointBinding, DenuoHrmRootBinding, DenuoPublicationAcceptancePolicy,
@@ -1635,7 +1635,11 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .service
             .execute_trusted_native_hns_value_action(pending.action)
             .map_err(mobile_service_failure);
-        if result.is_err() {
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| !hns_send_pre_broadcast_retry_required(error))
+        {
             self.session.lock_after_request_error();
         }
         result
@@ -2306,6 +2310,20 @@ fn mobile_service_failure(failure: ServiceFailure) -> MobileWalletError {
     }
 }
 
+/// The service emits this exact error only from the final re-preparation step
+/// of an HNS send, before signing or broadcasting begins. The pending approval
+/// has already been discarded, so keeping the session unlocked cannot retain
+/// executable authority. A fresh sync and review are still mandatory.
+fn hns_send_pre_broadcast_retry_required(error: &MobileWalletError) -> bool {
+    matches!(
+        error,
+        MobileWalletError::ServiceFailure {
+            code: ServiceErrorCode::RuntimeFailure,
+            message,
+        } if message == NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum MobileWalletError {
     #[error("wallet database key must be exactly 32 nonzero bytes")]
@@ -2391,6 +2409,29 @@ mod tests {
     use hns_wallet_types::{BaseUnits, TransactionHash};
 
     const MOCK_READ_HEIGHT: u64 = 7;
+
+    #[test]
+    fn only_the_exact_pre_broadcast_send_retry_keeps_the_session_unlocked() {
+        let safe_retry = MobileWalletError::ServiceFailure {
+            code: ServiceErrorCode::RuntimeFailure,
+            message: NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE.to_owned(),
+        };
+        assert!(hns_send_pre_broadcast_retry_required(&safe_retry));
+
+        for error in [
+            MobileWalletError::ServiceFailure {
+                code: ServiceErrorCode::RuntimeFailure,
+                message: "HNS value runtime failed".to_owned(),
+            },
+            MobileWalletError::ServiceFailure {
+                code: ServiceErrorCode::InvalidRequest,
+                message: NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE.to_owned(),
+            },
+            MobileWalletError::InvalidActionToken,
+        ] {
+            assert!(!hns_send_pre_broadcast_retry_required(&error));
+        }
+    }
 
     fn denuo_acceptance_policy_json() -> Vec<u8> {
         serde_json::to_vec(&json!({

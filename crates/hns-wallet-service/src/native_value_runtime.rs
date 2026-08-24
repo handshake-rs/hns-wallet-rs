@@ -61,6 +61,16 @@ use super::{
 /// or stands in for browser-engine authority.
 pub const TRUSTED_NATIVE_HNS_VALUE_ORIGIN: &str = "http://localhost";
 
+/// A native HNS send failed before it could be authorized, signed, or handed
+/// to the peer broadcaster. The approval is discarded and the caller must
+/// obtain a fresh authenticated snapshot before preparing another send.
+///
+/// This deliberately has a stable, narrow value: the mobile controller can
+/// keep the wallet unlocked only for this proven pre-broadcast outcome. Every
+/// other execution failure remains ambiguous and therefore fails closed.
+pub const NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE: &str =
+    "HNS send requires a refreshed authenticated wallet snapshot before retrying";
+
 /// One coherent, minimized full-runtime projection for trusted native UI.
 /// Chain/mempool bindings, coins, scripts, raw transactions, and keys remain
 /// inside the HNS runtime.
@@ -891,7 +901,16 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         approval_id: ApprovalId,
         approved_at_unix: u64,
     ) -> Result<Value, ServiceFailure> {
-        let (_, prepared) = self.prepare_send(call)?;
+        // Re-preparation is the final pre-broadcast check. It can consult the
+        // locally authenticated direct index, but it has not authorized,
+        // signed, persisted, or broadcast a transaction yet. Surface this
+        // distinct retry state so the mobile controller can discard the
+        // approval and catch up without needlessly locking signing authority.
+        let (_, prepared) = self.prepare_send(call).map_err(|_| ServiceFailure {
+            code: ServiceErrorCode::RuntimeFailure,
+            message: NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE.to_owned(),
+            unsupported_capability: None,
+        })?;
         let authorized = self
             .runtime
             .authorize_send(AuthorizeSend {
