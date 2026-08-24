@@ -3038,6 +3038,53 @@ mod tests {
     }
 
     #[test]
+    fn value_send_preparation_uses_the_staged_verified_snapshot() {
+        let directory = private_tempdir();
+        let path = directory.path().join("value-send-staged-snapshot.sqlite3");
+        let key = MobileDatabaseKey::new([0x8c; MOBILE_DATABASE_KEY_BYTES]).expect("database key");
+        let creation = MobileWalletController::create(
+            &path,
+            &key,
+            MobilePlatform::Android,
+            HnsBootstrapPolicy::new(HnsNetwork::Regtest, 0),
+        )
+        .expect("create value wallet");
+        let (controller, _recovery) = creation.into_parts();
+        let probe = Arc::new(MockReadProbe::default());
+        let mut value = controller
+            .into_hns_value_with_clock(
+                &key,
+                MockReadBackend::new(probe.clone()),
+                MockReadClock,
+                None,
+            )
+            .expect("compose value wallet");
+        value.unlock(&key).expect("unlock value wallet");
+        let recipient = value
+            .local_receive_target()
+            .expect("derive exact local payment target")
+            .display;
+
+        // This empty fixture cannot fund a transaction, but preparation must
+        // first complete the staged verified read.  The old legacy
+        // reconciliation queried `get_chain_tip`; that path can self-deadlock
+        // when the backend is the wallet-owned embedded light index.
+        assert!(
+            value
+                .prepare_value_action(MobileHnsValueIntent::Send {
+                    recipient,
+                    amount: BaseUnits::new(1),
+                    maximum_fee: BaseUnits::new(1),
+                })
+                .is_err()
+        );
+        assert!(probe.snapshot_calls.load(Ordering::SeqCst) > 0);
+        assert_eq!(probe.tip_calls.load(Ordering::SeqCst), 0);
+        assert!(probe.confirmed_calls.load(Ordering::SeqCst) > 0);
+        assert!(probe.mempool_calls.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
     fn flagged_value_account_reopens_for_lifecycle_uses_value_composition() {
         let directory = private_tempdir();
         let path = directory.path().join("flagged-lifecycle.sqlite3");

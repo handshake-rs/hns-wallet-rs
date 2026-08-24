@@ -326,7 +326,20 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
 
     fn reconcile(&self) -> Result<AccountSummary, ServiceFailure> {
         let before = self.exact_account()?;
-        self.runtime.reconcile().map_err(hns_read_failure)?;
+        // Direct wallets keep their verified light index in the same encrypted
+        // store as this value runtime.  The legacy reconciliation path holds
+        // that store while it asks the backend for wallet pages; an embedded
+        // backend must acquire the same non-reentrant store lock to read its
+        // index, so a send preflight can wait on itself indefinitely.
+        //
+        // The staged persisted-value read establishes the same authenticated
+        // chain, mempool, account, coin, and cache fence without calling a
+        // backend while holding the store.  It is therefore the required
+        // reconciliation boundary for all native value reads and preparations
+        // (and remains fail-closed if the verified snapshot changed).
+        self.runtime
+            .synchronize_persisted_value_read()
+            .map_err(hns_read_failure)?;
         let after = self.exact_account()?;
         if after != before {
             return Err(hns_read_failure(HnsWalletError::StaleAccountRead));
