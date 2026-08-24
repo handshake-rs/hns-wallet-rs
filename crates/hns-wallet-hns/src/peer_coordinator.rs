@@ -79,9 +79,12 @@ const DENUO_MAX_RESPONSE_EVENTS: usize = 256;
 const DENUO_MAXIMUM_LIVE_REQUESTS: u16 = 64;
 /// A direct index only grows after it has authenticated a trailing-gap
 /// discovery. Eight complete extra gaps fit comfortably under the direct
-/// watch-set bound for reviewed wallet defaults while preventing an unbounded
-/// recovery loop if a corrupted or adversarial account repeatedly lands on a
-/// boundary.
+/// watch-set bound for reviewed wallet defaults while preventing unbounded
+/// recovery if a corrupted or adversarial account repeatedly lands on a
+/// boundary. When recovery is required, the coordinator installs the largest
+/// of these bounded frontiers at once: advancing by one gap per historical
+/// re-scan makes a legitimate wallet at successive boundaries re-scan the
+/// same chain repeatedly.
 const MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS: u32 = 8;
 
 /// Native direct-peer policy for one wallet runtime.
@@ -1186,8 +1189,8 @@ impl HnsDirectPeerCoordinator {
         HnsDirectDenuoPeer::connect(&self.config, address, local_height, now_unix)
     }
 
-    /// Extend the wallet-owned direct watch set by the next complete restore
-    /// gap and atomically rewind the filtered-block index if it changed.
+    /// Extend the wallet-owned direct watch set to the largest bounded restore
+    /// frontier and atomically rewind the filtered-block index if it changed.
     ///
     /// This is valid only for coordinators opened through the wallet factory.
     /// The caller invokes it after the native read path has refused to expose
@@ -1216,6 +1219,7 @@ impl HnsDirectPeerCoordinator {
             .backend
             .light_watch_set()
             .map_err(HnsDirectPeerError::Wallet)?;
+        let mut largest_candidate = None;
         for extension in 1..=MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS {
             let candidate = source
                 .store
@@ -1223,16 +1227,19 @@ impl HnsDirectPeerCoordinator {
                     derive_hns_light_watch_set_with_restore_extension(wallet, &account, extension)
                 })
                 .map_err(HnsDirectPeerError::Wallet)?;
-            if candidate != installed {
-                return self
-                    .backend
-                    .install_watch_set(candidate, now_unix)
-                    .map_err(HnsDirectPeerError::Wallet);
-            }
+            largest_candidate = Some(candidate);
         }
-        Err(HnsDirectPeerError::Wallet(
+        let candidate = largest_candidate.ok_or(HnsDirectPeerError::Wallet(
             HnsWalletError::ScanCapacityExhausted,
-        ))
+        ))?;
+        if candidate == installed {
+            return Err(HnsDirectPeerError::Wallet(
+                HnsWalletError::ScanCapacityExhausted,
+            ));
+        }
+        self.backend
+            .install_watch_set(candidate, now_unix)
+            .map_err(HnsDirectPeerError::Wallet)
     }
 
     fn with_wallet_watch_set_source(
@@ -3097,7 +3104,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_wallet_trailing_restore_extension_survives_reopen() {
+    fn direct_wallet_trailing_restore_extension_uses_largest_frontier_and_survives_reopen() {
         let config = direct_wallet_config();
         let mut wallet =
             WalletStore::create(":memory:", "direct wallet extension passphrase").unwrap();
@@ -3128,7 +3135,10 @@ mod tests {
                 .expect("extend direct wallet restoration watch set")
         );
         let expanded = coordinator.backend().light_watch_set().unwrap();
-        assert_eq!(expanded.scripts.len(), 8);
+        // Four derivation branches each include their initial script plus all
+        // eight bounded restoration gaps. This turns a boundary recovery into
+        // one re-scan rather than one complete re-scan per gap.
+        assert_eq!(expanded.scripts.len(), 36);
 
         let reopened = open_wallet_direct_hns_peer_coordinator(
             store,
@@ -3144,7 +3154,7 @@ mod tests {
                 .light_scan_status()
                 .unwrap()
                 .watched_scripts,
-            8
+            36
         );
     }
 
