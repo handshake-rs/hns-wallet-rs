@@ -887,6 +887,8 @@ pub struct MempoolSnapshotBinding {
 #[serde(rename_all = "snake_case")]
 pub enum HnsFeeRateSource {
     MinimumRelay,
+    /// Canonical HSD normal wallet fee floor for the selected network.
+    NetworkDefault,
     Mempool,
     /// Lower-median relay floor advertised by connected untrusted peers.
     PeerRelay,
@@ -9763,7 +9765,8 @@ fn validate_final_fee_quote_evidence(
         return Err(HnsWalletError::InvalidFeeQuote);
     }
     match quote.rate_source {
-        HnsFeeRateSource::MinimumRelay if quote.rate_sample_count == 0 => {}
+        HnsFeeRateSource::MinimumRelay | HnsFeeRateSource::NetworkDefault
+            if quote.rate_sample_count == 0 => {}
         HnsFeeRateSource::Mempool | HnsFeeRateSource::PeerRelay if quote.rate_sample_count > 0 => {}
         _ => return Err(HnsWalletError::InvalidFeeQuote),
     }

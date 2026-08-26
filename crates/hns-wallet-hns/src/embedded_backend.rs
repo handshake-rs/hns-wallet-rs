@@ -32,6 +32,11 @@ use crate::{
 };
 
 const MINIMUM_RELAY_FEE_RATE: u64 = 1_000;
+// Canonical HSD network wallet defaults. These are deliberately higher than
+// the protocol relay floor: a relayable transaction is not necessarily a
+// normal miner-targeted wallet transaction.
+const MAINNET_NORMAL_FEE_RATE: u64 = 100_000;
+const TEST_NETWORK_NORMAL_FEE_RATE: u64 = 20_000;
 const MAX_EMBEDDED_FEE_RATE: u64 = u32::MAX as u64;
 const CURSOR_BYTES: usize = 36;
 const CURSOR_DOMAIN: &[u8] = b"hns-wallet-rs/embedded-backend-cursor/v1";
@@ -714,7 +719,7 @@ impl HnsBackend for EmbeddedHnsBackend {
         {
             return Err(HnsWalletError::InvalidFeeQuoteTransaction);
         }
-        let (fee_rate, fee_rate_samples) = peer_fee_rate(&state);
+        let (fee_rate, fee_rate_samples) = wallet_fee_rate(&state);
         let local = local_fee_policy_evidence(
             &transaction,
             input_coins,
@@ -733,7 +738,7 @@ impl HnsBackend for EmbeddedHnsBackend {
             rate_atomic_units_per_1000_policy_vbytes: fee_rate,
             rate_sample_count: fee_rate_samples,
             rate_source: if fee_rate_samples == 0 {
-                HnsFeeRateSource::MinimumRelay
+                HnsFeeRateSource::NetworkDefault
             } else {
                 HnsFeeRateSource::PeerRelay
             },
@@ -752,7 +757,7 @@ impl HnsBackend for EmbeddedHnsBackend {
             return Err(HnsWalletError::InvalidFeeQuote);
         }
         let state = self.lock()?;
-        Ok(BaseUnits::new(u128::from(peer_fee_rate(&state).0)))
+        Ok(BaseUnits::new(u128::from(wallet_fee_rate(&state).0)))
     }
 
     fn get_name_evidence(
@@ -1704,14 +1709,29 @@ fn embedded_block_hash(state: &EmbeddedState, height: u32) -> Result<[u8; 32], H
         .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)
 }
 
-fn peer_fee_rate(state: &EmbeddedState) -> (u64, usize) {
+fn wallet_fee_rate(state: &EmbeddedState) -> (u64, usize) {
     let mut rates = state.peer_fee_rates.values().copied().collect::<Vec<_>>();
+    let network_default = normal_wallet_fee_rate(state.authority.consensus_network());
     if rates.is_empty() {
-        return (MINIMUM_RELAY_FEE_RATE, 0);
+        return (network_default, 0);
     }
     rates.sort_unstable();
     let lower_median = rates[(rates.len() - 1) / 2];
-    (lower_median.max(MINIMUM_RELAY_FEE_RATE), rates.len())
+    (
+        lower_median
+            .max(MINIMUM_RELAY_FEE_RATE)
+            .max(network_default),
+        rates.len(),
+    )
+}
+
+const fn normal_wallet_fee_rate(network: hns_header_consensus::Network) -> u64 {
+    match network {
+        hns_header_consensus::Network::Mainnet => MAINNET_NORMAL_FEE_RATE,
+        hns_header_consensus::Network::Testnet
+        | hns_header_consensus::Network::Regtest
+        | hns_header_consensus::Network::Simnet => TEST_NETWORK_NORMAL_FEE_RATE,
+    }
 }
 
 fn mempool_transaction_relevant(
@@ -2631,7 +2651,7 @@ mod tests {
                 mempool.mempool,
             )
             .unwrap();
-        assert_eq!(quote.rate_atomic_units_per_1000_policy_vbytes, 2_000);
+        assert_eq!(quote.rate_atomic_units_per_1000_policy_vbytes, 20_000);
         assert_eq!(quote.rate_sample_count, 2);
         assert_eq!(quote.rate_source, HnsFeeRateSource::PeerRelay);
         assert_eq!(quote.actual_fee, BaseUnits::new(2_000));
@@ -2641,8 +2661,16 @@ mod tests {
             backend
                 .estimate_fee_rate(DEFAULT_FEE_TARGET_BLOCKS)
                 .unwrap(),
-            BaseUnits::new(9_000)
+            BaseUnits::new(20_000)
         );
+    }
+
+    #[test]
+    fn direct_wallet_fee_floor_matches_canonical_hsd_network_defaults() {
+        assert_eq!(normal_wallet_fee_rate(Network::Mainnet), 100_000);
+        assert_eq!(normal_wallet_fee_rate(Network::Testnet), 20_000);
+        assert_eq!(normal_wallet_fee_rate(Network::Regtest), 20_000);
+        assert_eq!(normal_wallet_fee_rate(Network::Simnet), 20_000);
     }
 
     #[test]
