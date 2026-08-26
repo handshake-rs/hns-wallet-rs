@@ -3543,10 +3543,20 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .collect::<Vec<_>>();
         candidates.sort();
 
-        candidates
-            .into_iter()
-            .map(|workflow_id| self.rebroadcast_pending_send(workflow_id))
-            .collect()
+        let mut receipts = Vec::with_capacity(candidates.len());
+        for workflow_id in candidates {
+            match self.rebroadcast_pending_send(workflow_id) {
+                Ok(receipt) => receipts.push(receipt),
+                // Exact approved bytes cannot be fee-bumped. A transaction
+                // prepared under an older, lower wallet fee policy remains
+                // visibly dropped and may be replaced by a newly reviewed
+                // send after its short input reservation expires; it must not
+                // make otherwise valid synchronization fail forever.
+                Err(HnsWalletError::InvalidFeeQuote) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(receipts)
     }
 
     pub fn import_name(&self, name: &[u8]) -> Result<KnownName, HnsWalletError> {
