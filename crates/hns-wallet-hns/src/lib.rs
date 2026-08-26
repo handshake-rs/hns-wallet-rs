@@ -4816,18 +4816,24 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 return Err(HnsWalletError::StaleAddressReservation);
             }
         }
-        self.backend
-            .extend_locally_allocated_change_watch_set(&next_account, now_unix)?;
+        // The account row is already durably committed by the caller. Even if
+        // backend filter maintenance fails, advance the in-memory projection
+        // to that durable truth before returning the error. Synchronization or
+        // reopen can then repair the watch set without this live runtime
+        // continuing from a stale change index.
+        let watch_extension = self
+            .backend
+            .extend_locally_allocated_change_watch_set(&next_account, now_unix);
         let mut cache = self.cache_write()?;
         if cache.account_revision != expected_revision {
             if cache.account_revision == next_revision && cache.account == next_account {
-                return Ok(());
+                return watch_extension.map(|_| ());
             }
             return Err(HnsWalletError::StaleAddressReservation);
         }
         cache.account = next_account;
         cache.account_revision = next_revision;
-        Ok(())
+        watch_extension.map(|_| ())
     }
 
     fn install_loaded_account(
@@ -10599,6 +10605,8 @@ mod tests {
         tip_calls: AtomicUsize,
         confirmed_calls: AtomicUsize,
         mempool_calls: AtomicUsize,
+        change_watch_calls: AtomicUsize,
+        change_watch_fails: AtomicBool,
     }
 
     impl ProductionFollowupReadBackend {
@@ -10620,6 +10628,8 @@ mod tests {
                 tip_calls: AtomicUsize::new(0),
                 confirmed_calls: AtomicUsize::new(0),
                 mempool_calls: AtomicUsize::new(0),
+                change_watch_calls: AtomicUsize::new(0),
+                change_watch_fails: AtomicBool::new(false),
             }
         }
 
@@ -10695,6 +10705,21 @@ mod tests {
     }
 
     impl HnsBackend for ProductionFollowupReadBackend {
+        fn extend_locally_allocated_change_watch_set(
+            &self,
+            _account: &HnsAccountRecord,
+            _now_unix: u64,
+        ) -> Result<bool, HnsWalletError> {
+            self.prove_store_mutex_is_released()?;
+            self.change_watch_calls.fetch_add(1, Ordering::SeqCst);
+            if self.change_watch_fails.load(Ordering::SeqCst) {
+                return Err(HnsWalletError::Backend(
+                    "injected change watch extension failure".to_owned(),
+                ));
+            }
+            Ok(true)
+        }
+
         fn get_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError> {
             self.prove_store_mutex_is_released()?;
             if self.snapshot_calls.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -11283,6 +11308,92 @@ mod tests {
                 .expect("runtime observes shared unlock")
                 .is_locked()
         );
+    }
+
+    #[test]
+    fn committed_change_updates_backend_after_releasing_store_authority() {
+        let (store, config) = production_followup_read_store();
+        let runtime = HnsWalletRuntime::open_shared(
+            ProductionFollowupReadBackend::new(
+                store.clone(),
+                &config,
+                ProductionFollowupReadFault::Healthy,
+            ),
+            store.clone(),
+            config.clone(),
+            ProductionFollowupClock,
+        )
+        .expect("open full runtime over shared authority");
+        let mut next_account = store
+            .try_with_store(|wallet| {
+                wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))
+                    .map_err(HnsWalletError::from)
+            })
+            .expect("read current account")
+            .expect("current account exists")
+            .value;
+        next_account.next_change_index = 1;
+        next_account.internal_scan_end = 1;
+        let next_revision = store
+            .with_store_mut(|wallet| {
+                wallet.save_wallet_account(&account_entity_id(&config), 1, &next_account, 101)
+            })
+            .expect("commit local change allocation");
+
+        runtime
+            .install_committed_account(1, next_revision, next_account.clone(), 101)
+            .expect("install committed change without holding the store mutex");
+
+        assert_eq!(runtime.backend.change_watch_calls.load(Ordering::SeqCst), 1);
+        let cache = runtime.cache_read().expect("read updated runtime cache");
+        assert_eq!(cache.account_revision, next_revision);
+        assert_eq!(cache.account, next_account);
+    }
+
+    #[test]
+    fn committed_change_cache_advances_when_watch_extension_requires_recovery() {
+        let (store, config) = production_followup_read_store();
+        let runtime = HnsWalletRuntime::open_shared(
+            ProductionFollowupReadBackend::new(
+                store.clone(),
+                &config,
+                ProductionFollowupReadFault::Healthy,
+            ),
+            store.clone(),
+            config.clone(),
+            ProductionFollowupClock,
+        )
+        .expect("open full runtime over shared authority");
+        runtime
+            .backend
+            .change_watch_fails
+            .store(true, Ordering::SeqCst);
+        let mut next_account = store
+            .try_with_store(|wallet| {
+                wallet
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))
+                    .map_err(HnsWalletError::from)
+            })
+            .expect("read current account")
+            .expect("current account exists")
+            .value;
+        next_account.next_change_index = 1;
+        next_account.internal_scan_end = 1;
+        let next_revision = store
+            .with_store_mut(|wallet| {
+                wallet.save_wallet_account(&account_entity_id(&config), 1, &next_account, 101)
+            })
+            .expect("commit local change allocation");
+
+        assert!(matches!(
+            runtime.install_committed_account(1, next_revision, next_account.clone(), 101),
+            Err(HnsWalletError::Backend(_))
+        ));
+        assert_eq!(runtime.backend.change_watch_calls.load(Ordering::SeqCst), 1);
+        let cache = runtime.cache_read().expect("read recovered runtime cache");
+        assert_eq!(cache.account_revision, next_revision);
+        assert_eq!(cache.account, next_account);
     }
 
     fn zero_value_incoming_candidate(recipient: &DerivedHnsAddress) -> IncomingTransferCandidate {
