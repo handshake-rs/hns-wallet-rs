@@ -3359,10 +3359,24 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         &self,
         workflow_id: WorkflowId,
     ) -> Result<BroadcastReceipt, HnsWalletError> {
+        let account = {
+            let cache = self.cache_read()?;
+            if cache.sync.phase != SyncPhase::Ready
+                || cache.sync.validated_height != cache.sync.scanned_height
+            {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            cache.account.config.clone()
+        };
         let stored = self
             .store_lock()?
             .load_workflow::<HnsSendWorkflow>(workflow_id)?
             .ok_or(HnsWalletError::InvalidWorkflow)?;
+        if stored.state.plan.wallet_id != account.wallet_id
+            || stored.state.plan.account_id != account.account_id
+        {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
         if !matches!(
             stored.state.stage,
             HnsSendStage::Authorized
@@ -3451,6 +3465,70 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             txid: actual,
             accepted_at_unix: accepted_at,
         })
+    }
+
+    /// Re-submit exact, previously approved send bytes that disappeared from
+    /// the current authenticated chain and mempool view.
+    ///
+    /// Direct-peer backends cannot treat a successful socket write as remote
+    /// mempool admission. Their process-local mempool also intentionally does
+    /// not survive controller replacement. A fresh persisted-value read can
+    /// therefore classify a formerly broadcast transaction as dropped even
+    /// though its encrypted send workflow still contains the exact signed
+    /// bytes the user approved. This bounded recovery path selects only those
+    /// dropped transactions, reuses [`Self::rebroadcast_pending_send`] for all
+    /// fee/transaction/workflow validation, and never prepares or signs a new
+    /// payment.
+    pub fn rebroadcast_dropped_pending_sends(
+        &self,
+    ) -> Result<Vec<BroadcastReceipt>, HnsWalletError> {
+        let (account, dropped) = {
+            let cache = self.cache_read()?;
+            if cache.sync.phase != SyncPhase::Ready
+                || cache.sync.validated_height != cache.sync.scanned_height
+            {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            let dropped = cache
+                .transactions
+                .iter()
+                .filter(|record| record.summary.status == LocalTransactionStatus::Dropped)
+                .map(|record| record.summary.txid)
+                .collect::<BTreeSet<_>>();
+            (cache.account.config.clone(), dropped)
+        };
+        if dropped.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut candidates = self
+            .store_lock()?
+            .list_workflows_complete::<HnsSendWorkflow>(WorkflowKind::HnsSend, MAX_HISTORY_RESULTS)?
+            .into_iter()
+            .filter(|stored| {
+                stored.state.plan.wallet_id == account.wallet_id
+                    && stored.state.plan.account_id == account.account_id
+                    && matches!(
+                        stored.state.stage,
+                        HnsSendStage::Authorized
+                            | HnsSendStage::Broadcast
+                            | HnsSendStage::Mempool
+                            | HnsSendStage::RequiresRebroadcast
+                    )
+                    && stored
+                        .state
+                        .transaction
+                        .is_some_and(|txid| dropped.contains(&txid))
+                    && stored.state.signed_transaction.is_some()
+            })
+            .map(|stored| stored.id)
+            .collect::<Vec<_>>();
+        candidates.sort();
+
+        candidates
+            .into_iter()
+            .map(|workflow_id| self.rebroadcast_pending_send(workflow_id))
+            .collect()
     }
 
     pub fn import_name(&self, name: &[u8]) -> Result<KnownName, HnsWalletError> {

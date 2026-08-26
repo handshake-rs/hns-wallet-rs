@@ -357,6 +357,14 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         Ok(after)
     }
 
+    fn rebroadcast_dropped_pending_sends(&self) -> Result<usize, ServiceFailure> {
+        self.exact_account()?;
+        self.runtime
+            .rebroadcast_dropped_pending_sends()
+            .map(|receipts| receipts.len())
+            .map_err(hns_runtime_failure)
+    }
+
     fn assert_hns_call(&self, call: &ApprovedCall) -> Result<AccountSummary, ServiceFailure> {
         if call.namespace != SelectedNamespace::Hns || call.request_nonce == 0 {
             return Err(invalid_request(
@@ -1417,6 +1425,13 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
 }
 
 impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsValueRuntime<B, C>> {
+    /// Re-submit exact signed sends that a fresh authenticated wallet snapshot
+    /// classifies as dropped. No caller-provided workflow, transaction bytes,
+    /// destination, amount, fee, or signing authority crosses this boundary.
+    pub fn rebroadcast_trusted_native_dropped_hns_sends(&self) -> Result<usize, ServiceFailure> {
+        self.runtime.rebroadcast_dropped_pending_sends()
+    }
+
     /// Begin one wallet-owned direct Denuo board exchange. The supplied peer
     /// has already completed the standard HNS and exact Denuo V2 handshake;
     /// this method has no relay, RPC, indexer, or endpoint-receipt fallback.

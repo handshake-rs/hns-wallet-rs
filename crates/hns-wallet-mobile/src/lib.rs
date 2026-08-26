@@ -1386,6 +1386,22 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         self.synchronize_inner()
     }
 
+    /// Re-submit exact, already approved HNS sends that the most recent
+    /// authenticated snapshot classified as dropped. This never accepts raw
+    /// transaction bytes or creates a replacement payment.
+    pub fn rebroadcast_dropped_hns_sends(&mut self) -> Result<usize, MobileWalletError> {
+        if self.pending.is_some() {
+            return Err(MobileWalletError::ValueActionPending);
+        }
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        self.session
+            .service
+            .rebroadcast_trusted_native_dropped_hns_sends()
+            .map_err(mobile_service_failure)
+    }
+
     /// Return the ordinary HNS payment receive target deterministically
     /// derived from the unlocked local wallet. No HNS, Bitcoin, Denuo, or
     /// clock operation occurs here; fund state and value operations still
