@@ -5502,36 +5502,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 }
                 continue;
             }
-            let raw = stored
-                .state
-                .signed_transaction
-                .clone()
-                .ok_or(HnsWalletError::InvalidWorkflow)?;
-            decode_transaction_for_id(&raw, txid)?;
-            let magnitude = stored
-                .state
-                .plan
-                .amount
-                .get()
-                .checked_add(stored.state.plan.fee.get())
-                .ok_or(HnsWalletError::Arithmetic)?;
-            transactions.push(HnsTransactionRecord {
-                summary: TransactionSummary {
-                    module: ModuleId::Handshake,
-                    txid,
-                    status: LocalTransactionStatus::Broadcast,
-                    net_amount: SignedBaseUnits {
-                        negative: true,
-                        magnitude: BaseUnits::new(magnitude),
-                    },
-                    fee: Some(stored.state.plan.fee),
-                    block_height: None,
-                    first_seen_unix: Some(stored.updated_at_unix),
-                    confirmation_count: 0,
-                },
-                raw,
-                inclusion: None,
-            });
+            transactions.push(propagating_send_record(&stored)?);
         }
         transactions.sort_by(|left, right| {
             right
@@ -6337,6 +6308,45 @@ fn send_is_within_propagation_grace(
 ) -> bool {
     stage == HnsSendStage::Broadcast
         && now_unix.saturating_sub(updated_at_unix) < SEND_PROPAGATION_GRACE_SECONDS
+}
+
+fn propagating_send_record(
+    stored: &StoredWorkflow<HnsSendWorkflow>,
+) -> Result<HnsTransactionRecord, HnsWalletError> {
+    let txid = stored
+        .state
+        .transaction
+        .ok_or(HnsWalletError::InvalidWorkflow)?;
+    let raw = stored
+        .state
+        .signed_transaction
+        .clone()
+        .ok_or(HnsWalletError::InvalidWorkflow)?;
+    decode_transaction_for_id(&raw, txid)?;
+    let magnitude = stored
+        .state
+        .plan
+        .amount
+        .get()
+        .checked_add(stored.state.plan.fee.get())
+        .ok_or(HnsWalletError::Arithmetic)?;
+    Ok(HnsTransactionRecord {
+        summary: TransactionSummary {
+            module: ModuleId::Handshake,
+            txid,
+            status: LocalTransactionStatus::Broadcast,
+            net_amount: SignedBaseUnits {
+                negative: true,
+                magnitude: BaseUnits::new(magnitude),
+            },
+            fee: Some(stored.state.plan.fee),
+            block_height: None,
+            first_seen_unix: Some(stored.updated_at_unix),
+            confirmation_count: 0,
+        },
+        raw,
+        inclusion: None,
+    })
 }
 
 fn reconcile_hns_read_transactions<B: HnsBackend>(
@@ -10527,6 +10537,70 @@ mod tests {
             HnsSendStage::Broadcast,
             1_001,
             1_000,
+        ));
+    }
+
+    #[test]
+    fn propagating_send_activity_comes_from_exact_durable_bytes() {
+        let config = test_runtime_config();
+        let transaction = Transaction {
+            version: 0,
+            inputs: Vec::new(),
+            outputs: vec![Output {
+                value: Dollarydoos::new(90),
+                address: Address::new(0, vec![3; 20]).expect("payment address"),
+                covenant: Covenant::default(),
+            }],
+            locktime: 0,
+        };
+        let raw = transaction.encode().expect("transaction bytes");
+        let txid = TransactionHash::new(
+            transaction
+                .transaction_hash()
+                .expect("transaction hash")
+                .into_bytes(),
+        );
+        let stored = StoredWorkflow {
+            id: WorkflowId::new([41; 16]),
+            kind: WorkflowKind::HnsSend,
+            revision: 3,
+            state: HnsSendWorkflow {
+                plan: HnsSpendPlan {
+                    wallet_id: config.wallet_id,
+                    account_id: config.account_id,
+                    workflow_id: WorkflowId::new([41; 16]),
+                    request_nonce: 7,
+                    unsigned_transaction: raw.clone(),
+                    inputs: Vec::new(),
+                    amount: BaseUnits::new(90),
+                    fee: BaseUnits::new(10),
+                    maximum_fee: BaseUnits::new(10),
+                    destination: "rs1qexample".to_owned(),
+                    expires_at_unix: 2_000,
+                },
+                stage: HnsSendStage::Broadcast,
+                transaction: Some(txid),
+                signed_transaction: Some(raw.clone()),
+                fee_quote: None,
+            },
+            irreversible_broadcast_prepared: true,
+            updated_at_unix: 1_000,
+        };
+
+        let record = propagating_send_record(&stored).expect("broadcast activity");
+        assert_eq!(record.raw, raw);
+        assert_eq!(record.summary.txid, txid);
+        assert_eq!(record.summary.status, LocalTransactionStatus::Broadcast);
+        assert_eq!(record.summary.fee, Some(BaseUnits::new(10)));
+        assert_eq!(record.summary.first_seen_unix, Some(1_000));
+        assert!(record.summary.net_amount.negative);
+        assert_eq!(record.summary.net_amount.magnitude, BaseUnits::new(100));
+
+        let mut mismatched = stored;
+        mismatched.state.transaction = Some(TransactionHash::new([9; 32]));
+        assert!(matches!(
+            propagating_send_record(&mismatched),
+            Err(HnsWalletError::InvalidEvidence)
         ));
     }
 
