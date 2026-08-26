@@ -802,6 +802,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             change.account_save.expected_revision,
             committed_account_revision,
             change.account_save.value.clone(),
+            change.account_save.updated_at_unix,
         )
     }
 

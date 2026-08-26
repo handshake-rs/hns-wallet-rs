@@ -2807,10 +2807,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 &reservations,
                 &[],
             )?;
+            drop(store);
             self.install_committed_account(
                 account_revision,
                 next_account_revision,
                 account_save.value,
+                now_unix,
             )?;
         } else {
             store.save_workflow_with_entity_batch(

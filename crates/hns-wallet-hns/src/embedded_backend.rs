@@ -126,6 +126,20 @@ impl EmbeddedHnsBackend {
         Ok(changed)
     }
 
+    /// Append a locally allocated future change-gap script without rewinding
+    /// the verified block index. The light index independently validates the
+    /// exact persisted account transition and otherwise returns `false`.
+    pub fn extend_locally_allocated_change_watch_set(
+        &self,
+        account: &crate::HnsAccountRecord,
+        now_unix: u64,
+    ) -> Result<bool, HnsWalletError> {
+        self.lock()?
+            .index
+            .extend_locally_allocated_change_watch_set(account, now_unix)
+            .map_err(map_index_error)
+    }
+
     /// Current authenticated header-sync status owned by this wallet.
     pub fn header_sync_status(&self) -> Result<hns_light_sync::SyncStatus, HnsWalletError> {
         Ok(self.lock()?.authority.status())
@@ -669,6 +683,14 @@ impl HnsBackend for EmbeddedHnsBackend {
         let mut state = self.lock()?;
         admit_mempool(&mut state.mempool, txid, transaction, raw.to_vec(), now)?;
         Ok(TransactionHash::new(txid))
+    }
+
+    fn extend_locally_allocated_change_watch_set(
+        &self,
+        account: &crate::HnsAccountRecord,
+        now_unix: u64,
+    ) -> Result<bool, HnsWalletError> {
+        EmbeddedHnsBackend::extend_locally_allocated_change_watch_set(self, account, now_unix)
     }
 
     fn quote_transaction_fee(

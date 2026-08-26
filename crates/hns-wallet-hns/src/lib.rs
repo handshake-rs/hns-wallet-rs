@@ -627,6 +627,18 @@ pub trait HnsBackend {
         binding: SnapshotBinding,
     ) -> Result<OutpointSpendEvidence, HnsWalletError>;
     fn broadcast_transaction(&self, raw: &[u8]) -> Result<TransactionHash, HnsWalletError>;
+    /// Extend a direct wallet's public filter for a locally allocated future
+    /// change-gap script while retaining authenticated historical coverage.
+    /// Full-node backends need no such filter maintenance. Embedded backends
+    /// must return `false` unless the persisted account proves the exact safe
+    /// forward-only transition.
+    fn extend_locally_allocated_change_watch_set(
+        &self,
+        _account: &HnsAccountRecord,
+        _now_unix: u64,
+    ) -> Result<bool, HnsWalletError> {
+        Ok(false)
+    }
     /// Quotes one exact serialized transaction against the complete wallet
     /// reconciliation binding. The ordered coins are exact wallet evidence;
     /// the node resolves the same outpoints and returns policy/rate evidence
@@ -4131,10 +4143,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                             reservation_saves,
                             &[],
                         )?;
+                    drop(store);
                     self.install_committed_account(
                         account_save.expected_revision,
                         next_account_revision,
                         account_save.value.clone(),
+                        now_unix,
                     )?;
                 } else {
                     store.save_workflow_with_entity_batch(
@@ -4791,7 +4805,19 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         expected_revision: u64,
         next_revision: u64,
         next_account: HnsAccountRecord,
+        now_unix: u64,
     ) -> Result<(), HnsWalletError> {
+        {
+            let cache = self.cache_read()?;
+            if cache.account_revision != expected_revision {
+                if cache.account_revision == next_revision && cache.account == next_account {
+                    return Ok(());
+                }
+                return Err(HnsWalletError::StaleAddressReservation);
+            }
+        }
+        self.backend
+            .extend_locally_allocated_change_watch_set(&next_account, now_unix)?;
         let mut cache = self.cache_write()?;
         if cache.account_revision != expected_revision {
             if cache.account_revision == next_revision && cache.account == next_account {
@@ -8588,8 +8614,14 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
                 &[],
             )
             .map_err(map_chain_error)?;
-        self.install_committed_account(account_revision, next_account_revision, account_save.value)
-            .map_err(map_chain_error)?;
+        drop(store);
+        self.install_committed_account(
+            account_revision,
+            next_account_revision,
+            account_save.value,
+            now,
+        )
+        .map_err(map_chain_error)?;
         Ok(prepared)
     }
 

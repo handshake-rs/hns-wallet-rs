@@ -2203,6 +2203,29 @@ where
         now_unix,
     )
     .map_err(|error| HnsDirectPeerError::LightIndex(error.to_string()))?;
+    let current_account = store
+        .try_with_store(|wallet| {
+            wallet
+                .wallet_account::<crate::HnsAccountRecord>(&crate::account_entity_id(account))
+                .map_err(HnsWalletError::from)
+        })
+        .map_err(HnsDirectPeerError::Wallet)?
+        .ok_or(HnsDirectPeerError::Wallet(
+            HnsWalletError::AccountConfigurationMismatch,
+        ))?;
+    if current_account.value.config != *account {
+        return Err(HnsDirectPeerError::Wallet(
+            HnsWalletError::AccountConfigurationMismatch,
+        ));
+    }
+    // A process can stop after atomically persisting a local change-address
+    // allocation but before the adjacent embedded backend extends its Bloom
+    // watch set. Heal only that exact forward-only delta before the ordinary
+    // restore-set comparison; every historical/restoration delta still takes
+    // the rewind path below.
+    index
+        .extend_locally_allocated_change_watch_set(&current_account.value, now_unix)
+        .map_err(|error| HnsDirectPeerError::LightIndex(error.to_string()))?;
     let base_watch_set = store
         .try_with_store(|wallet| derive_hns_light_watch_set(wallet, account))
         .map_err(HnsDirectPeerError::Wallet)?;
@@ -3108,6 +3131,100 @@ mod tests {
         assert_eq!(scan.watched_scripts, 4);
         assert_eq!(scan.watched_names, 0);
         assert_eq!(scan.birthday_height, 0);
+    }
+
+    #[test]
+    fn locally_allocated_change_extends_direct_watch_set_without_restore_rewind() {
+        let config = direct_wallet_config();
+        let mut wallet =
+            WalletStore::create(":memory:", "direct wallet change passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[75; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let now = Network::Regtest.parameters().genesis_time.get() + 102;
+        let store = hns_wallet_store::SharedWalletStore::new(wallet);
+        let coordinator = open_wallet_direct_hns_peer_coordinator(
+            store.clone(),
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            coordinator
+                .backend()
+                .light_scan_status()
+                .unwrap()
+                .watched_scripts,
+            4
+        );
+
+        let mut stored = store
+            .try_with_store(|wallet| {
+                wallet
+                    .wallet_account::<crate::HnsAccountRecord>(&crate::account_entity_id(&config))
+                    .map_err(HnsWalletError::from)
+            })
+            .unwrap()
+            .unwrap();
+        stored.value.next_change_index = 1;
+        stored.value.internal_scan_end = 1;
+        store
+            .with_store_mut(|wallet| {
+                wallet.save_wallet_account(
+                    &crate::account_entity_id(&config),
+                    stored.revision,
+                    &stored.value,
+                    now + 1,
+                )
+            })
+            .unwrap();
+
+        assert!(
+            coordinator
+                .backend()
+                .extend_locally_allocated_change_watch_set(&stored.value, now + 1)
+                .unwrap()
+        );
+        assert_eq!(
+            coordinator
+                .backend()
+                .light_scan_status()
+                .unwrap()
+                .watched_scripts,
+            5
+        );
+        assert!(
+            !coordinator
+                .backend()
+                .extend_locally_allocated_change_watch_set(&stored.value, now + 2)
+                .unwrap()
+        );
+
+        let reopened = open_wallet_direct_hns_peer_coordinator(
+            store,
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now + 3,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .backend()
+                .light_scan_status()
+                .unwrap()
+                .watched_scripts,
+            5
+        );
     }
 
     #[test]

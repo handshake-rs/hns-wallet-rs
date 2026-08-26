@@ -13,12 +13,15 @@ use hns_urkel_proof::HsdUrkelProof;
 use hns_wallet_store::{
     EntityBatchDelete, EntityBatchSave, EntityKind, SharedWalletStore, StoreError, StoredEntity,
 };
-use hns_wallet_types::{AccountId, TransactionHash};
+use hns_wallet_types::{AccountId, KeyRole, TransactionHash};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{EncryptedHnsLightAuthority, HnsLightError, HnsNetwork, WalletAddressKey};
+use crate::{
+    EncryptedHnsLightAuthority, HnsAccountRecord, HnsLightError, HnsNetwork, WalletAddressKey,
+    derive_hns_light_watch_set, derive_restore_addresses,
+};
 
 /// Version of the encrypted filtered-block index envelope.
 pub const HNS_LIGHT_INDEX_FORMAT_VERSION: u16 = 1;
@@ -410,6 +413,151 @@ impl EncryptedHnsLightIndex {
             .ok_or(HnsLightIndexError::RevisionOverflow)?;
         self.scan = next_scan;
         self.scan_projection = HnsLightScanProjection::empty(&self.scan.watch_set);
+        Ok(true)
+    }
+
+    /// Append the one future internal-gap script created by a locally
+    /// committed change-address allocation without invalidating already
+    /// verified historical coverage.
+    ///
+    /// A normal restore frontier change must continue through
+    /// [`Self::install_watch_set`] and rewind to the birthday. This narrower
+    /// path succeeds only when the authenticated account is exactly one local
+    /// change allocation ahead of the installed watch set and that allocation
+    /// is ahead of its last chain-observed internal
+    /// derivation, the current base watch set differs by the final internal
+    /// trailing-gap script only, and no name or other derivation branch has
+    /// changed. Those conditions prove the appended script had not previously
+    /// been handed out by this persisted wallet and therefore has no missing
+    /// historical coverage.
+    pub(crate) fn extend_locally_allocated_change_watch_set(
+        &mut self,
+        account: &HnsAccountRecord,
+        now_unix: u64,
+    ) -> Result<bool, HnsLightIndexError> {
+        if account.config.account_id != self.account_id
+            || consensus_network(account.config.network) != self.network
+            || account.config.birthday_height != u64::from(self.scan.birthday_height)
+            || account.next_change_index == 0
+        {
+            return Ok(false);
+        }
+        let allocated_index = account.next_change_index - 1;
+        if account
+            .last_used_internal
+            .is_some_and(|last_used| allocated_index <= last_used)
+        {
+            return Ok(false);
+        }
+        let required_end = allocated_index
+            .checked_add(account.config.restore_lookahead)
+            .ok_or(HnsLightIndexError::InvalidWatchSet)?;
+        if account.internal_scan_end != required_end {
+            return Ok(false);
+        }
+
+        let derived = self
+            .store
+            .try_with_store(|wallet| {
+                let persisted = wallet
+                    .wallet_account::<HnsAccountRecord>(&crate::account_entity_id(&account.config))?
+                    .ok_or(crate::HnsWalletError::AccountConfigurationMismatch)?;
+                if persisted.value != *account {
+                    return Err(crate::HnsWalletError::AccountConfigurationMismatch);
+                }
+                let base = derive_hns_light_watch_set(wallet, &account.config)?;
+                let future = derive_restore_addresses(wallet, account, KeyRole::HnsCoin)?
+                    .into_iter()
+                    .find(|address| {
+                        address.derivation.change == 1
+                            && address.derivation.index == account.internal_scan_end
+                    })
+                    .ok_or(crate::HnsWalletError::InvalidEvidence)?;
+                Ok::<_, crate::HnsWalletError>((
+                    base,
+                    WalletAddressKey {
+                        version: 0,
+                        hash: future.program,
+                    },
+                ))
+            })
+            .map_err(|_| HnsLightIndexError::InvalidWatchSet)?;
+        let (base, expected_addition) = derived;
+        let installed_scripts = self.scan.watch_set.scripts.iter().collect::<BTreeSet<_>>();
+        let installed_names = self
+            .scan
+            .watch_set
+            .name_hashes
+            .iter()
+            .collect::<BTreeSet<_>>();
+        let missing_scripts = base
+            .scripts
+            .iter()
+            .filter(|script| !installed_scripts.contains(script))
+            .cloned()
+            .collect::<Vec<_>>();
+        let missing_names = base
+            .name_hashes
+            .iter()
+            .filter(|name| !installed_names.contains(name))
+            .count();
+        if missing_scripts.is_empty() && missing_names == 0 {
+            return Ok(false);
+        }
+        if missing_names != 0 || missing_scripts != [expected_addition.clone()] {
+            return Ok(false);
+        }
+
+        let mut scripts = self.scan.watch_set.scripts.clone();
+        scripts.push(expected_addition);
+        let extended = HnsLightWatchSet::new(scripts, self.scan.watch_set.name_hashes.clone())?;
+        self.extend_watch_set_without_rewind(extended, now_unix)
+    }
+
+    fn extend_watch_set_without_rewind(
+        &mut self,
+        watch_set: HnsLightWatchSet,
+        now_unix: u64,
+    ) -> Result<bool, HnsLightIndexError> {
+        watch_set.validate()?;
+        if watch_set == self.scan.watch_set {
+            return Ok(false);
+        }
+        if self
+            .scan
+            .watch_set
+            .scripts
+            .iter()
+            .any(|script| watch_set.scripts.binary_search(script).is_err())
+            || self
+                .scan
+                .watch_set
+                .name_hashes
+                .iter()
+                .any(|name| watch_set.name_hashes.binary_search(name).is_err())
+        {
+            return Err(HnsLightIndexError::InvalidWatchSet);
+        }
+        let observations = self.transactions()?;
+        let next_projection = HnsLightScanProjection::from_observations(&watch_set, &observations)?;
+        let mut next_scan = self.scan.clone();
+        next_scan.watch_digest = watch_set.digest(self.network, self.scan.birthday_height);
+        next_scan.watch_set = watch_set;
+        let saves = [EntityBatchSave {
+            id: scan_id(self.account_id),
+            expected_revision: self.scan_revision,
+            value: StoredHnsLightWalletRecord::Scan(next_scan.clone()),
+            updated_at_unix: now_unix,
+        }];
+        self.store.with_store_mut(|wallet| {
+            wallet.apply_entity_batch(EntityKind::HnsLightWallet, &saves, &[])
+        })?;
+        self.scan_revision = self
+            .scan_revision
+            .checked_add(1)
+            .ok_or(HnsLightIndexError::RevisionOverflow)?;
+        self.scan = next_scan;
+        self.scan_projection = next_projection;
         Ok(true)
     }
 
@@ -1373,6 +1521,72 @@ mod tests {
             .unwrap();
         assert_eq!(index.status().scanned_height, None);
         assert!(index.transactions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn forward_only_watch_extension_preserves_coverage_and_history() {
+        let store = store();
+        let account = AccountId::new([40; 16]);
+        let program = vec![41; 20];
+        let mut index = EncryptedHnsLightIndex::open_or_create(
+            store.clone(),
+            account,
+            HnsNetwork::Regtest,
+            1,
+            1,
+        )
+        .unwrap();
+        index
+            .install_watch_set(
+                HnsLightWatchSet::new(
+                    vec![WalletAddressKey {
+                        version: 0,
+                        hash: program.clone(),
+                    }],
+                    Vec::new(),
+                )
+                .unwrap(),
+                2,
+            )
+            .unwrap();
+        let (block, header) = verified_block(&program);
+        let authority = authority_for_header(store.clone(), account, header);
+        index.apply_verified_block(&authority, &block, 3).unwrap();
+        let prior_status = index.status();
+        let prior_transactions = index.transactions().unwrap();
+
+        assert!(
+            index
+                .extend_watch_set_without_rewind(
+                    HnsLightWatchSet::new(
+                        vec![
+                            WalletAddressKey {
+                                version: 0,
+                                hash: program,
+                            },
+                            WalletAddressKey {
+                                version: 0,
+                                hash: vec![42; 20],
+                            },
+                        ],
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    4,
+                )
+                .unwrap()
+        );
+        let next_status = index.status();
+        assert_eq!(next_status.scanned_height, prior_status.scanned_height);
+        assert_eq!(next_status.scanned_hash, prior_status.scanned_hash);
+        assert_eq!(next_status.watched_scripts, 2);
+        assert_eq!(index.transactions().unwrap(), prior_transactions);
+
+        let reopened =
+            EncryptedHnsLightIndex::open_or_create(store, account, HnsNetwork::Regtest, 1, 5)
+                .unwrap();
+        assert_eq!(reopened.status(), next_status);
+        assert_eq!(reopened.transactions().unwrap(), prior_transactions);
     }
 
     #[test]
