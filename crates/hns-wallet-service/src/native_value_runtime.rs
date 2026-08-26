@@ -2052,6 +2052,14 @@ fn chain_failure(error: ChainError) -> ServiceFailure {
             ServiceErrorCode::ApprovalStale,
             "HNS value approval is missing, stale, or mismatched",
         ),
+        ChainError::InvalidRequest("insufficient Handshake funds") => (
+            ServiceErrorCode::InvalidRequest,
+            "HNS wallet has insufficient confirmed spendable funds",
+        ),
+        ChainError::InvalidRequest("invalid Handshake wallet request") => (
+            ServiceErrorCode::InvalidRequest,
+            "HNS recipient address, network, or transaction request is invalid",
+        ),
         ChainError::InvalidRequest(_) => (
             ServiceErrorCode::InvalidRequest,
             "HNS value request is invalid",
@@ -2076,5 +2084,29 @@ fn chain_failure(error: ChainError) -> ServiceFailure {
         code,
         message: message.to_owned(),
         unsupported_capability: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_request_failures_preserve_safe_actionable_reasons() {
+        assert_eq!(
+            chain_failure(ChainError::InvalidRequest("insufficient Handshake funds")).message,
+            "HNS wallet has insufficient confirmed spendable funds",
+        );
+        assert_eq!(
+            chain_failure(ChainError::InvalidRequest(
+                "invalid Handshake wallet request"
+            ))
+            .message,
+            "HNS recipient address, network, or transaction request is invalid",
+        );
+        assert_eq!(
+            chain_failure(ChainError::InvalidRequest("unclassified request")).message,
+            "HNS value request is invalid",
+        );
     }
 }

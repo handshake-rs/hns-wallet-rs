@@ -2475,7 +2475,7 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
             scan.binding,
         )?;
         let balance = coins.iter().try_fold(BaseUnits::ZERO, |total, coin| {
-            if is_ordinary_hns_spend_candidate(coin) {
+            if is_confirmed_ordinary_hns_spend_candidate(coin) {
                 total
                     .checked_add(coin.coin.value)
                     .map_err(|_| HnsWalletError::Arithmetic)
@@ -4626,7 +4626,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             ),
         )?;
         let balance = coins.iter().try_fold(BaseUnits::ZERO, |total, coin| {
-            if is_ordinary_hns_spend_candidate(coin) {
+            if is_confirmed_ordinary_hns_spend_candidate(coin) {
                 total
                     .checked_add(coin.coin.value)
                     .map_err(|_| HnsWalletError::Arithmetic)
@@ -7992,6 +7992,10 @@ fn is_ordinary_hns_spend_candidate(coin: &TrackedHnsCoin) -> bool {
     is_ordinary_hns_derivation(coin.derivation) && !coin.coin.name_locked && !coin.coin.coinbase
 }
 
+fn is_confirmed_ordinary_hns_spend_candidate(coin: &TrackedHnsCoin) -> bool {
+    is_ordinary_hns_spend_candidate(coin) && coin.coin.confirmation_count > 0
+}
+
 fn decode_transaction_for_id(
     raw: &[u8],
     expected: TransactionHash,
@@ -8578,7 +8582,7 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
             .coins
             .iter()
             .try_fold(BaseUnits::ZERO, |total, coin| {
-                if !is_ordinary_hns_spend_candidate(coin) {
+                if !is_confirmed_ordinary_hns_spend_candidate(coin) {
                     Ok(total)
                 } else {
                     total
@@ -9005,7 +9009,7 @@ impl<B: HnsBackend, C: HnsClock> UtxoChainModule for HnsWalletRuntime<B, C> {
                     base_units: coin.coin.value,
                 },
                 confirmation_count: coin.coin.confirmation_count,
-                spendable: is_ordinary_hns_spend_candidate(coin),
+                spendable: is_confirmed_ordinary_hns_spend_candidate(coin),
             })
             .collect())
     }
@@ -9842,7 +9846,7 @@ fn build_unsigned_payment(
     if amount == 0 || fee_rate.is_zero() || maximum_fee.is_zero() {
         return Err(HnsWalletError::InvalidAmount);
     }
-    coins.retain(|coin| is_ordinary_hns_spend_candidate(coin) && coin.coin.confirmation_count > 0);
+    coins.retain(is_confirmed_ordinary_hns_spend_candidate);
     coins.sort_by(|left, right| {
         left.coin
             .value
@@ -12791,6 +12795,32 @@ mod tests {
             assert_eq!(tracked[0].derivation.role, role);
             assert!(!is_ordinary_hns_spend_candidate(&tracked[0]));
         }
+    }
+
+    #[test]
+    fn unconfirmed_ordinary_output_is_not_presented_as_spendable() {
+        let address = test_derived_address(KeyRole::HnsCoin, 33);
+        let mut coin = TrackedHnsCoin {
+            coin: WalletCoin {
+                outpoint: HnsOutpoint {
+                    transaction: TransactionHash::new([33; 32]),
+                    output_index: 0,
+                },
+                value: BaseUnits::new(1_000_000),
+                confirmation_count: 0,
+                confirmed_height: None,
+                coinbase: false,
+                covenant: Covenant::default().encode().expect("covenant"),
+                name_locked: false,
+            },
+            derivation: address.derivation,
+            address_program: address.program,
+        };
+        assert!(is_ordinary_hns_spend_candidate(&coin));
+        assert!(!is_confirmed_ordinary_hns_spend_candidate(&coin));
+        coin.coin.confirmation_count = 1;
+        coin.coin.confirmed_height = Some(500);
+        assert!(is_confirmed_ordinary_hns_spend_candidate(&coin));
     }
 
     #[test]
