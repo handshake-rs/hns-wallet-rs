@@ -40,7 +40,8 @@ const CURSOR_DOMAIN: &[u8] = b"hns-wallet-rs/embedded-backend-cursor/v1";
 ///
 /// Implementations succeed only after the bytes have been written to at least
 /// one ready Handshake peer. They do not decide validity or mutate wallet
-/// state; the backend decodes, hashes, and records the transaction locally.
+/// state. A successful write is submission, not peer mempool admission; only
+/// a later peer inventory/transaction response may enter the embedded mempool.
 pub trait HnsLightNetwork: Send + Sync {
     fn broadcast_transaction(&self, raw: &[u8]) -> Result<usize, HnsWalletError>;
 }
@@ -365,7 +366,7 @@ impl EmbeddedHnsBackend {
         Ok(admitted)
     }
 
-    /// Admit one bloom-matched or locally broadcast mempool transaction.
+    /// Admit one bloom-matched transaction returned by a connected peer.
     pub fn admit_mempool_transaction(
         &self,
         transaction: Transaction,
@@ -673,15 +674,9 @@ impl HnsBackend for EmbeddedHnsBackend {
         let written = self.network.broadcast_transaction(raw)?;
         if written == 0 {
             return Err(HnsWalletError::Backend(
-                "no ready Handshake peer accepted the transaction bytes".to_owned(),
+                "no ready Handshake peer received the transaction bytes".to_owned(),
             ));
         }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| HnsWalletError::Clock)?
-            .as_secs();
-        let mut state = self.lock()?;
-        admit_mempool(&mut state.mempool, txid, transaction, raw.to_vec(), now)?;
         Ok(TransactionHash::new(txid))
     }
 
@@ -2555,6 +2550,29 @@ mod tests {
         assert_eq!(
             network.broadcasts.lock().unwrap().as_slice(),
             std::slice::from_ref(&spend_raw)
+        );
+        let submitted = backend
+            .get_mempool_wallet_page(MempoolWalletPageRequest {
+                scripts: &scripts,
+                binding,
+                expected_mempool: None,
+                cursor: None,
+                limit: 1_024,
+            })
+            .unwrap();
+        assert!(submitted.history.is_empty());
+        assert_eq!(submitted.mempool, before_broadcast.mempool);
+        let submitted_evidence = backend
+            .get_transaction_evidence(spend_txid, binding, Some(submitted.mempool))
+            .unwrap();
+        assert!(!submitted_evidence.status.in_mempool);
+        assert!(submitted_evidence.raw.is_none());
+
+        assert_eq!(
+            backend
+                .admit_mempool_transaction(spend.clone(), now)
+                .unwrap(),
+            Some(spend_txid)
         );
         let mempool = backend
             .get_mempool_wallet_page(MempoolWalletPageRequest {

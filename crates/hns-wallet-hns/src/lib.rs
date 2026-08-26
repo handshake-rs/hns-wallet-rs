@@ -127,6 +127,10 @@ pub const MAX_HISTORY_RESULTS: usize = 10_000;
 pub const MAX_RECOVERY_CHECKPOINTS: usize = 288;
 pub const MAX_TRANSACTION_INPUTS: usize = 10_000;
 pub const PREPARED_ARTIFACT_LIFETIME_SECONDS: u64 = 300;
+/// Keep a newly submitted send in the durable broadcast state while connected
+/// peers have time to announce it back through their mempool inventory. A
+/// successful socket write is not itself remote mempool evidence.
+pub const SEND_PROPAGATION_GRACE_SECONDS: u64 = 120;
 pub const DEFAULT_DUST_THRESHOLD: u128 = 546;
 pub const HNS_LOCKTIME_THRESHOLD: u64 = 500_000_000;
 pub const MAX_SCAN_PAGE_RESULTS: usize = 256;
@@ -4420,13 +4424,14 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     .last_tip
                     .map(|old_tip| old_tip.height.min(tip.height));
         let coins = reconcile_coins(indexed_coins, &addresses, binding.tip.height)?;
-        let transactions = self.reconcile_transactions(
+        let mut transactions = self.reconcile_transactions(
             &history,
             &addresses,
             binding,
             mempool_binding,
             common_ancestor,
         )?;
+        self.retain_or_insert_propagating_sends(&store, &mut transactions, now)?;
         let revalidated_names = self.revalidate_names(&mut store, binding, now)?;
         persist_reconciled_entities(&mut store, &account.config, &coins, &transactions, now)?;
         let mut pending_user_actions =
@@ -5418,6 +5423,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 HnsSendStage::Confirmed
             } else if chain_status.in_mempool {
                 HnsSendStage::Mempool
+            } else if send_is_within_propagation_grace(
+                stored.state.stage,
+                stored.updated_at_unix,
+                now_unix,
+            ) {
+                HnsSendStage::Broadcast
             } else if matches!(
                 stored.state.stage,
                 HnsSendStage::Authorized
@@ -5455,6 +5466,87 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             }
         }
         Ok(pending)
+    }
+
+    fn retain_or_insert_propagating_sends(
+        &self,
+        store: &WalletStore,
+        transactions: &mut Vec<HnsTransactionRecord>,
+        now_unix: u64,
+    ) -> Result<(), HnsWalletError> {
+        let config = self.cache_read()?.account.config.clone();
+        let propagating = store
+            .list_workflows_complete::<HnsSendWorkflow>(WorkflowKind::HnsSend, MAX_HISTORY_RESULTS)?
+            .into_iter()
+            .filter(|stored| {
+                stored.state.plan.wallet_id == config.wallet_id
+                    && stored.state.plan.account_id == config.account_id
+                    && send_is_within_propagation_grace(
+                        stored.state.stage,
+                        stored.updated_at_unix,
+                        now_unix,
+                    )
+            })
+            .collect::<Vec<_>>();
+        for stored in propagating {
+            let txid = stored
+                .state
+                .transaction
+                .ok_or(HnsWalletError::InvalidWorkflow)?;
+            if let Some(transaction) = transactions
+                .iter_mut()
+                .find(|transaction| transaction.summary.txid == txid)
+            {
+                if transaction.summary.status == LocalTransactionStatus::Dropped {
+                    transaction.summary.status = LocalTransactionStatus::Broadcast;
+                }
+                continue;
+            }
+            let raw = stored
+                .state
+                .signed_transaction
+                .clone()
+                .ok_or(HnsWalletError::InvalidWorkflow)?;
+            decode_transaction_for_id(&raw, txid)?;
+            let magnitude = stored
+                .state
+                .plan
+                .amount
+                .get()
+                .checked_add(stored.state.plan.fee.get())
+                .ok_or(HnsWalletError::Arithmetic)?;
+            transactions.push(HnsTransactionRecord {
+                summary: TransactionSummary {
+                    module: ModuleId::Handshake,
+                    txid,
+                    status: LocalTransactionStatus::Broadcast,
+                    net_amount: SignedBaseUnits {
+                        negative: true,
+                        magnitude: BaseUnits::new(magnitude),
+                    },
+                    fee: Some(stored.state.plan.fee),
+                    block_height: None,
+                    first_seen_unix: Some(stored.updated_at_unix),
+                    confirmation_count: 0,
+                },
+                raw,
+                inclusion: None,
+            });
+        }
+        transactions.sort_by(|left, right| {
+            right
+                .summary
+                .block_height
+                .cmp(&left.summary.block_height)
+                .then_with(|| {
+                    right
+                        .summary
+                        .first_seen_unix
+                        .cmp(&left.summary.first_seen_unix)
+                })
+                .then_with(|| left.summary.txid.cmp(&right.summary.txid))
+        });
+        Ok(())
     }
 
     fn has_competing_spender(
@@ -6236,6 +6328,15 @@ fn hns_read_name_receive_target(
         .validate()
         .map_err(|_| HnsWalletError::InvalidEvidence)?;
     Ok(target)
+}
+
+fn send_is_within_propagation_grace(
+    stage: HnsSendStage,
+    updated_at_unix: u64,
+    now_unix: u64,
+) -> bool {
+    stage == HnsSendStage::Broadcast
+        && now_unix.saturating_sub(updated_at_unix) < SEND_PROPAGATION_GRACE_SECONDS
 }
 
 fn reconcile_hns_read_transactions<B: HnsBackend>(
@@ -10402,6 +10503,32 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn send_propagation_grace_applies_only_to_recent_broadcasts() {
+        assert!(send_is_within_propagation_grace(
+            HnsSendStage::Broadcast,
+            1_000,
+            1_000 + SEND_PROPAGATION_GRACE_SECONDS - 1,
+        ));
+        assert!(!send_is_within_propagation_grace(
+            HnsSendStage::Broadcast,
+            1_000,
+            1_000 + SEND_PROPAGATION_GRACE_SECONDS,
+        ));
+        assert!(!send_is_within_propagation_grace(
+            HnsSendStage::Mempool,
+            1_000,
+            1_001,
+        ));
+        // A persisted timestamp slightly ahead of a corrected wall clock is
+        // treated conservatively as recent instead of forcing a resubmission.
+        assert!(send_is_within_propagation_grace(
+            HnsSendStage::Broadcast,
+            1_001,
+            1_000,
+        ));
+    }
 
     fn test_runtime_config() -> HnsRuntimeConfig {
         HnsRuntimeConfig {
