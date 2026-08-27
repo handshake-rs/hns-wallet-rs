@@ -4662,7 +4662,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .iter()
             .map(|stored| stored.value.clone())
             .collect::<Vec<_>>();
-        let transactions = annotate_persisted_value_read_unavailable(
+        let mut transactions = annotate_persisted_value_read_unavailable(
             "reconciling the direct wallet history",
             reconcile_hns_read_transactions(
                 &self.backend,
@@ -4685,8 +4685,20 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 scan.binding,
             ),
         )?;
+        let reserved = self.store.try_with_store(|store| {
+            active_input_reservation_outpoints(store, &scan.account.config, now)
+        })?;
+        self.store.try_with_store(|store| {
+            retain_or_insert_pending_send_activity_for_config(
+                store,
+                &scan.account.config,
+                &mut transactions,
+            )
+        })?;
         let balance = coins.iter().try_fold(BaseUnits::ZERO, |total, coin| {
-            if is_confirmed_ordinary_hns_spend_candidate(coin) {
+            if is_confirmed_ordinary_hns_spend_candidate(coin)
+                && !reserved.contains(&coin.coin.outpoint)
+            {
                 total
                     .checked_add(coin.coin.value)
                     .map_err(|_| HnsWalletError::Arithmetic)
@@ -5546,63 +5558,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         transactions: &mut Vec<HnsTransactionRecord>,
     ) -> Result<(), HnsWalletError> {
         let config = self.cache_read()?.account.config.clone();
-        let pending = store
-            .list_workflows_complete::<HnsSendWorkflow>(WorkflowKind::HnsSend, MAX_HISTORY_RESULTS)?
-            .into_iter()
-            .filter(|stored| {
-                stored.state.plan.wallet_id == config.wallet_id
-                    && stored.state.plan.account_id == config.account_id
-                    && matches!(
-                        stored.state.stage,
-                        HnsSendStage::Authorized
-                            | HnsSendStage::Broadcast
-                            | HnsSendStage::Mempool
-                            | HnsSendStage::RequiresRebroadcast
-                            | HnsSendStage::Abandoned
-                    )
-            })
-            .collect::<Vec<_>>();
-        for stored in pending {
-            let txid = stored
-                .state
-                .transaction
-                .ok_or(HnsWalletError::InvalidWorkflow)?;
-            if let Some(transaction) = transactions
-                .iter_mut()
-                .find(|transaction| transaction.summary.txid == txid)
-            {
-                if transaction.summary.status == LocalTransactionStatus::Dropped
-                    && stored.state.stage == HnsSendStage::Broadcast
-                {
-                    transaction.summary.status = LocalTransactionStatus::Broadcast;
-                }
-                continue;
-            }
-            let status = match stored.state.stage {
-                HnsSendStage::Authorized => LocalTransactionStatus::Authorized,
-                HnsSendStage::Broadcast => LocalTransactionStatus::Broadcast,
-                HnsSendStage::Mempool => LocalTransactionStatus::Mempool,
-                HnsSendStage::RequiresRebroadcast | HnsSendStage::Abandoned => {
-                    LocalTransactionStatus::Dropped
-                }
-                _ => return Err(HnsWalletError::InvalidWorkflow),
-            };
-            transactions.push(pending_send_record(&stored, status)?);
-        }
-        transactions.sort_by(|left, right| {
-            right
-                .summary
-                .block_height
-                .cmp(&left.summary.block_height)
-                .then_with(|| {
-                    right
-                        .summary
-                        .first_seen_unix
-                        .cmp(&left.summary.first_seen_unix)
-                })
-                .then_with(|| left.summary.txid.cmp(&right.summary.txid))
-        });
-        Ok(())
+        retain_or_insert_pending_send_activity_for_config(store, &config, transactions)
     }
 
     fn has_competing_spender(
@@ -6393,6 +6349,77 @@ fn send_is_within_propagation_grace(
 ) -> bool {
     stage == HnsSendStage::Broadcast
         && now_unix.saturating_sub(updated_at_unix) < SEND_PROPAGATION_GRACE_SECONDS
+}
+
+fn retain_or_insert_pending_send_activity_for_config(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+    transactions: &mut Vec<HnsTransactionRecord>,
+) -> Result<(), HnsWalletError> {
+    let pending = store
+        .list_workflows_complete::<HnsSendWorkflow>(WorkflowKind::HnsSend, MAX_HISTORY_RESULTS)?
+        .into_iter()
+        .filter(|stored| {
+            stored.state.plan.wallet_id == config.wallet_id
+                && stored.state.plan.account_id == config.account_id
+                && matches!(
+                    stored.state.stage,
+                    HnsSendStage::Authorized
+                        | HnsSendStage::Broadcast
+                        | HnsSendStage::Mempool
+                        | HnsSendStage::RequiresRebroadcast
+                        | HnsSendStage::Abandoned
+                )
+        })
+        .collect::<Vec<_>>();
+    for stored in pending {
+        let txid = stored
+            .state
+            .transaction
+            .ok_or(HnsWalletError::InvalidWorkflow)?;
+        if let Some(transaction) = transactions
+            .iter_mut()
+            .find(|transaction| transaction.summary.txid == txid)
+        {
+            let status = match stored.state.stage {
+                HnsSendStage::Authorized => LocalTransactionStatus::Authorized,
+                HnsSendStage::Broadcast => LocalTransactionStatus::Broadcast,
+                HnsSendStage::Mempool => LocalTransactionStatus::Mempool,
+                HnsSendStage::RequiresRebroadcast | HnsSendStage::Abandoned => {
+                    LocalTransactionStatus::Dropped
+                }
+                _ => return Err(HnsWalletError::InvalidWorkflow),
+            };
+            if transaction.summary.status == LocalTransactionStatus::Dropped {
+                transaction.summary.status = status;
+            }
+            continue;
+        }
+        let status = match stored.state.stage {
+            HnsSendStage::Authorized => LocalTransactionStatus::Authorized,
+            HnsSendStage::Broadcast => LocalTransactionStatus::Broadcast,
+            HnsSendStage::Mempool => LocalTransactionStatus::Mempool,
+            HnsSendStage::RequiresRebroadcast | HnsSendStage::Abandoned => {
+                LocalTransactionStatus::Dropped
+            }
+            _ => return Err(HnsWalletError::InvalidWorkflow),
+        };
+        transactions.push(pending_send_record(&stored, status)?);
+    }
+    transactions.sort_by(|left, right| {
+        right
+            .summary
+            .block_height
+            .cmp(&left.summary.block_height)
+            .then_with(|| {
+                right
+                    .summary
+                    .first_seen_unix
+                    .cmp(&left.summary.first_seen_unix)
+            })
+            .then_with(|| left.summary.txid.cmp(&right.summary.txid))
+    });
+    Ok(())
 }
 
 fn pending_send_record(
@@ -8447,6 +8474,24 @@ fn account_input_reservations(
     Ok(reservations)
 }
 
+fn active_input_reservation_outpoints(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+    now_unix: u64,
+) -> Result<BTreeSet<HnsOutpoint>, HnsWalletError> {
+    Ok(account_input_reservations(store, config)?
+        .into_iter()
+        .filter(|stored| {
+            stored.value.kind.is_protected_shakedex()
+                || stored
+                    .value
+                    .expires_at_unix
+                    .is_none_or(|expiry| expiry > now_unix)
+        })
+        .map(|stored| stored.value.outpoint)
+        .collect())
+}
+
 fn available_unreserved_coins(
     store: &mut WalletStore,
     config: &HnsRuntimeConfig,
@@ -8788,20 +8833,26 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
     }
 
     fn balance(&self) -> Result<Amount, ChainError> {
-        let cache = self.cache_read().map_err(map_chain_error)?;
-        ensure_ready(&cache)?;
-        let total = cache
-            .coins
-            .iter()
-            .try_fold(BaseUnits::ZERO, |total, coin| {
-                if !is_confirmed_ordinary_hns_spend_candidate(coin) {
-                    Ok(total)
-                } else {
-                    total
-                        .checked_add(coin.coin.value)
-                        .map_err(|_| ChainError::Overflow)
-                }
-            })?;
+        let (config, coins) = {
+            let cache = self.cache_read().map_err(map_chain_error)?;
+            ensure_ready(&cache)?;
+            (cache.account.config.clone(), cache.coins.clone())
+        };
+        let now = self.clock.now_unix().map_err(map_chain_error)?;
+        let store = self.store_lock().map_err(map_chain_error)?;
+        let reserved =
+            active_input_reservation_outpoints(&store, &config, now).map_err(map_chain_error)?;
+        let total = coins.iter().try_fold(BaseUnits::ZERO, |total, coin| {
+            if !is_confirmed_ordinary_hns_spend_candidate(coin)
+                || reserved.contains(&coin.coin.outpoint)
+            {
+                Ok(total)
+            } else {
+                total
+                    .checked_add(coin.coin.value)
+                    .map_err(|_| ChainError::Overflow)
+            }
+        })?;
         Ok(Amount {
             asset: WalletAsset::Hns,
             base_units: total,
