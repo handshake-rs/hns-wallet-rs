@@ -852,7 +852,7 @@ fn name_reservation_saves(
     expires_at_unix: u64,
     now_unix: u64,
 ) -> Result<Vec<EntityBatchSave<HnsInputReservation>>, HnsWalletError> {
-    if source.derivation.role != KeyRole::HnsName
+    if !is_wallet_name_control_derivation(source.derivation)
         || funding_inputs.is_empty()
         || funding_inputs.len() >= MAX_TRANSACTION_INPUTS
         || funding_inputs
@@ -976,8 +976,7 @@ fn tracked_name_source(
     owner_inclusion: TransactionInclusion,
     derivation: DerivationReference,
 ) -> Result<TrackedHnsCoin, HnsWalletError> {
-    if derivation.role != KeyRole::HnsName
-        || derivation.change != 0
+    if !is_wallet_name_control_derivation(derivation)
         || owner_output.address.version != 0
         || owner_output.address.hash.len() != 20
         || owner_inclusion.height > binding.tip.height
@@ -2179,7 +2178,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             )?;
             let (unsigned, tracked, _) = validate_name_plan_transaction(&plan, None)?;
             let mut roles = Vec::with_capacity(tracked.len());
-            roles.push(KeyRole::HnsName);
+            roles.push(plan.source.owner_derivation.role);
             roles.resize(tracked.len(), KeyRole::HnsCoin);
             let signed = sign_ordered_p2pkh_inputs(&store, &account, unsigned, &tracked, &roles)?;
             let (signed_transaction, _, canonical) =
@@ -3105,8 +3104,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             _ => {}
         }
         let mut matches = wallet_name_addresses.iter().filter(|address| {
-            address.derivation.role == KeyRole::HnsName
-                && address.derivation.change == 0
+            is_wallet_name_control_derivation(address.derivation)
                 && address.program == owner_coin.address.hash
         });
         let owner_derivation = matches
@@ -3667,10 +3665,18 @@ mod tests {
         store: &WalletStore,
         account: &HnsAccountRecord,
     ) -> (TrackedHnsCoin, NameState, Transaction) {
+        owned_name_source_for_role(store, account, KeyRole::HnsName)
+    }
+
+    fn owned_name_source_for_role(
+        store: &WalletStore,
+        account: &HnsAccountRecord,
+        role: KeyRole,
+    ) -> (TrackedHnsCoin, NameState, Transaction) {
         let name = b"alpha".to_vec();
         let name_hash = hash_name(&name).expect("name hash");
         let derivation = DerivationReference {
-            role: KeyRole::HnsName,
+            role,
             account: account.config.account_derivation_index,
             change: 0,
             index: 0,
@@ -3732,6 +3738,64 @@ mod tests {
             address_program: program,
         };
         (source, state, transaction)
+    }
+
+    #[test]
+    fn name_owner_sent_to_payment_receive_is_fully_signable() {
+        let (store, account) = account_with_seed();
+        let (source, state, _) = owned_name_source_for_role(&store, &account, KeyRole::HnsCoin);
+        let funding = tracked_input(
+            &store,
+            &account,
+            KeyRole::HnsCoin,
+            1,
+            HnsOutpoint {
+                transaction: TransactionHash::new([97; 32]),
+                output_index: 1,
+            },
+            10_000,
+            395,
+            Covenant::default(),
+        );
+        let recipient = Address::new(0, vec![98; 20]).expect("recipient");
+        let change = Address::new(0, funding.address_program.clone()).expect("change");
+        let (unsigned, selected, _) = build_unsigned_name_operation(
+            HnsNameAction::Transfer,
+            &source,
+            &state,
+            &recipient,
+            None,
+            vec![funding],
+            &change,
+            1,
+            BaseUnits::new(1_000),
+            BaseUnits::new(10_000),
+            BaseUnits::new(DEFAULT_DUST_THRESHOLD),
+        )
+        .expect("payment-branch name transfer");
+        let mut inputs = vec![source];
+        inputs.extend(selected);
+        let signed = sign_ordered_p2pkh_inputs(
+            &store,
+            &account,
+            unsigned.clone(),
+            &inputs,
+            &[KeyRole::HnsCoin, KeyRole::HnsCoin],
+        )
+        .expect("payment-branch owner signatures");
+        let signed = validate_witness_only_change(&unsigned, &signed).expect("witness-only");
+        let canonical = canonical_input_coins(&inputs).expect("canonical inputs");
+        hns_transaction::verify_covenant_links(&signed, &canonical).expect("covenant linkage");
+        for (index, coin) in canonical.iter().enumerate() {
+            hns_script::verify_witness_program(
+                &signed,
+                index,
+                coin,
+                hns_script::ScriptFlags::STANDARD,
+                &hns_script::K256SignatureVerifier,
+            )
+            .expect("signature");
+        }
     }
 
     #[test]
