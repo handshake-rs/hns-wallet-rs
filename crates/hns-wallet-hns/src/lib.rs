@@ -3498,54 +3498,90 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     /// not survive controller replacement. A fresh persisted-value read can
     /// therefore classify a formerly broadcast transaction as dropped even
     /// though its encrypted send workflow still contains the exact signed
-    /// bytes the user approved. This bounded recovery path selects only those
-    /// dropped transactions, reuses [`Self::rebroadcast_pending_send`] for all
-    /// fee/transaction/workflow validation, and never prepares or signs a new
-    /// payment.
+    /// bytes the user approved. The native mobile value runtime deliberately
+    /// uses [`Self::synchronize_persisted_value_read`] instead of the legacy
+    /// workflow-mutating reconciliation path, so selection cannot depend on a
+    /// dropped record having first appeared in the projected activity cache.
+    /// This bounded recovery path verifies every active durable signed send
+    /// directly against the exact synchronized chain and mempool bindings,
+    /// reuses [`Self::rebroadcast_pending_send`] for all fee, transaction, and
+    /// workflow validation, and never prepares or signs a new payment.
     pub fn rebroadcast_dropped_pending_sends(
         &self,
     ) -> Result<Vec<BroadcastReceipt>, HnsWalletError> {
-        let (account, dropped) = {
+        let (account, binding, mempool_binding) = {
             let cache = self.cache_read()?;
             if cache.sync.phase != SyncPhase::Ready
                 || cache.sync.validated_height != cache.sync.scanned_height
             {
                 return Err(HnsWalletError::StaleNodeSnapshot);
             }
-            let dropped = cache
-                .transactions
-                .iter()
-                .filter(|record| record.summary.status == LocalTransactionStatus::Dropped)
-                .map(|record| record.summary.txid)
-                .collect::<BTreeSet<_>>();
-            (cache.account.config.clone(), dropped)
+            (
+                cache.account.config.clone(),
+                cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?,
+                cache
+                    .mempool_binding
+                    .ok_or(HnsWalletError::StaleNodeSnapshot)?,
+            )
         };
-        if dropped.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut candidates = self
+        let now = self.clock.now_unix()?;
+        let workflows = self
             .store_lock()?
-            .list_workflows_complete::<HnsSendWorkflow>(WorkflowKind::HnsSend, MAX_HISTORY_RESULTS)?
-            .into_iter()
-            .filter(|stored| {
-                stored.state.plan.wallet_id == account.wallet_id
-                    && stored.state.plan.account_id == account.account_id
-                    && matches!(
-                        stored.state.stage,
-                        HnsSendStage::Authorized
-                            | HnsSendStage::Broadcast
-                            | HnsSendStage::Mempool
-                            | HnsSendStage::RequiresRebroadcast
-                    )
-                    && stored
-                        .state
-                        .transaction
-                        .is_some_and(|txid| dropped.contains(&txid))
-                    && stored.state.signed_transaction.is_some()
-            })
-            .map(|stored| stored.id)
-            .collect::<Vec<_>>();
+            .list_workflows_complete::<HnsSendWorkflow>(
+                WorkflowKind::HnsSend,
+                MAX_HISTORY_RESULTS,
+            )?;
+        let mut dropped = BTreeSet::new();
+        let mut candidates = Vec::new();
+        for stored in workflows {
+            if stored.state.plan.wallet_id != account.wallet_id
+                || stored.state.plan.account_id != account.account_id
+            {
+                continue;
+            }
+            if stored.state.plan.workflow_id != stored.id {
+                return Err(HnsWalletError::InvalidWorkflow);
+            }
+            if !matches!(
+                stored.state.stage,
+                HnsSendStage::Authorized
+                    | HnsSendStage::Broadcast
+                    | HnsSendStage::Mempool
+                    | HnsSendStage::RequiresRebroadcast
+            ) || stored.state.signed_transaction.is_none()
+            {
+                continue;
+            }
+            let txid = stored
+                .state
+                .transaction
+                .ok_or(HnsWalletError::InvalidWorkflow)?;
+            let evidence =
+                self.backend
+                    .get_transaction_evidence(txid, binding, Some(mempool_binding))?;
+            if evidence.binding != binding || evidence.mempool != mempool_binding {
+                return Err(HnsWalletError::StaleNodeSnapshot);
+            }
+            let outpoints = stored
+                .state
+                .plan
+                .inputs
+                .iter()
+                .map(|input| input.coin.outpoint)
+                .collect::<Vec<_>>();
+            let competing_spender =
+                has_competing_spender_in_batches(&self.backend, &outpoints, binding, txid)?;
+            if evidence.status.conflicted
+                || evidence.status.confirmation_count > 0
+                || evidence.status.in_mempool
+                || competing_spender
+                || send_is_within_propagation_grace(stored.state.stage, stored.updated_at_unix, now)
+            {
+                continue;
+            }
+            dropped.insert(txid);
+            candidates.push(stored.id);
+        }
         candidates.sort();
 
         let mut receipts = Vec::with_capacity(candidates.len());
