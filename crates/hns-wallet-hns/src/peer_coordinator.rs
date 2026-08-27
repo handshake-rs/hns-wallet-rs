@@ -1213,10 +1213,10 @@ impl HnsDirectPeerCoordinator {
     /// frontier and atomically rewind the filtered-block index if it changed.
     ///
     /// This is valid only for coordinators opened through the wallet factory.
-    /// The caller invokes it after the native read path has refused to expose
-    /// a projection because a newly discovered trailing script was outside
-    /// the existing exact filter. The method does not accept scripts from the
-    /// host and does not publish any wallet data.
+    /// It is idempotent so products can install the complete bounded frontier
+    /// before their first activity scan instead of discovering an incomplete
+    /// filter only after finalization. The method does not accept scripts from
+    /// the host and does not publish any wallet data.
     pub fn extend_wallet_restore_watch_set(
         &self,
         now_unix: u64,
@@ -1253,9 +1253,7 @@ impl HnsDirectPeerCoordinator {
             HnsWalletError::ScanCapacityExhausted,
         ))?;
         if candidate == installed {
-            return Err(HnsDirectPeerError::Wallet(
-                HnsWalletError::ScanCapacityExhausted,
-            ));
+            return Ok(false);
         }
         self.backend
             .install_watch_set(candidate, now_unix)
@@ -3379,6 +3377,11 @@ mod tests {
         // eight bounded restoration gaps. This turns a boundary recovery into
         // one re-scan rather than one complete re-scan per gap.
         assert_eq!(expanded.scripts.len(), 36);
+        assert!(
+            !coordinator
+                .extend_wallet_restore_watch_set(now + 2)
+                .expect("bounded restoration pre-expansion is idempotent")
+        );
 
         let reopened = open_wallet_direct_hns_peer_coordinator(
             store,

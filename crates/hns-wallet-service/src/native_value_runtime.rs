@@ -1526,9 +1526,7 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         if self.runtime.exact_account()? != selected {
             return Err(hns_read_failure(HnsWalletError::StaleAccountRead));
         }
-        if snapshot.transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS
-            || snapshot.known_names.len() > MAX_PROVIDER_HNS_READ_ITEMS
-        {
+        if snapshot.transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS {
             return Err(hns_read_result_bound());
         }
         let known_names = snapshot
@@ -1651,19 +1649,36 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         &self,
         name: &str,
     ) -> Result<super::NativeHnsNameSummary, ServiceFailure> {
-        if name.is_empty()
-            || name.len() > MAX_HNS_NAME_BYTES
-            || !name.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+        self.import_trusted_native_hns_value_names_exact_text(&[name])?
+            .pop()
+            .ok_or_else(|| invalid_request("Handshake name text is invalid"))
+    }
+
+    /// Authenticate a bounded exact-name set against one reconciled value
+    /// snapshot and commit all known-name rows in one store transaction.
+    pub fn import_trusted_native_hns_value_names_exact_text(
+        &self,
+        names: &[&str],
+    ) -> Result<Vec<super::NativeHnsNameSummary>, ServiceFailure> {
+        if names.is_empty()
+            || names.len() > hns_wallet_hns::MAX_HISTORY_RESULTS
+            || names.iter().any(|name| {
+                name.is_empty()
+                    || name.len() > MAX_HNS_NAME_BYTES
+                    || !name.bytes().all(|byte| (0x20..=0x7e).contains(&byte))
+            })
         {
             return Err(invalid_request("Handshake name text is invalid"));
         }
         self.runtime.reconcile()?;
-        let imported = self
+        let name_bytes = names.iter().map(|name| name.as_bytes()).collect::<Vec<_>>();
+        self.runtime
             .runtime
-            .runtime
-            .import_name(name.as_bytes())
-            .map_err(hns_native_name_import_failure)?;
-        native_hns_name_summary(&imported)
+            .import_names(&name_bytes)
+            .map_err(hns_native_name_import_failure)?
+            .iter()
+            .map(native_hns_name_summary)
+            .collect()
     }
 
     /// Re-prepare, revalidate, sign, persist, and broadcast one exact approved

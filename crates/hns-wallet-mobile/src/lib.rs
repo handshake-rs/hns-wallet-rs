@@ -21,8 +21,9 @@ use hns_primitives::BlockHash as ProtocolBlockHash;
 use hns_swap::NetworkBinding;
 use hns_wallet_ffi::{
     AbiError, AccountSummary, ApprovalSummary, HnsNameDisclosure, HostFrame, HostPlatform,
-    SecretString, ServiceCapability, ServiceErrorCode, ServiceFailure, ServiceResponse,
-    WalletRequest, WalletResponse, WalletRuntimeStatus, decode_service_frame, encode_host_frame,
+    MAX_HNS_NAME_DISCLOSURES, SecretString, ServiceCapability, ServiceErrorCode, ServiceFailure,
+    ServiceResponse, WalletRequest, WalletResponse, WalletRuntimeStatus, decode_service_frame,
+    encode_host_frame,
 };
 /// Backend composition types exposed for downstream native shells. The RPC
 /// adapter remains available for explicitly configured local deployments; a
@@ -74,6 +75,7 @@ pub const MOBILE_DATABASE_KEY_BYTES: usize = 32;
 pub const MAX_MOBILE_RECOVERY_PHRASE_BYTES: usize = 256;
 pub const MAX_MOBILE_SHAKEDEX_POLICY_BYTES: usize = 16 * 1024;
 pub const MOBILE_ACCOUNT_LABEL: &str = "Handshake";
+pub const MAX_MOBILE_HNS_NAME_PAGE: usize = MAX_HNS_NAME_DISCLOSURES;
 const STORE_PASSPHRASE_DOMAIN: &str = "hns-wallet-mobile/store-passphrase/v1:";
 const RESTART_GENERATION: u64 = 1;
 const MAX_MOBILE_WALLET_ACCOUNTS: usize = 2;
@@ -208,8 +210,22 @@ pub struct MobileHnsReadSnapshot {
     pub receive_target: ReceiveTarget,
     pub name_receive_target: HnsNameReceiveTarget,
     pub transaction_history: Vec<TransactionSummary>,
+    /// First page only. Additional pages are obtained from the controller's
+    /// last authenticated synchronization without repeating reconciliation.
     pub known_names: Vec<MobileHnsNameSummary>,
+    pub known_name_count: u32,
+    pub known_names_complete: bool,
     pub module_status: SyncStatus,
+}
+
+/// One deterministic page from the last authenticated known-name projection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileHnsNamePage {
+    pub offset: u32,
+    pub total: u32,
+    pub names: Vec<MobileHnsNameSummary>,
+    pub has_more: bool,
 }
 
 /// Backend-injected native HNS read controller. It composes the exact same
@@ -222,6 +238,7 @@ pub struct MobileHnsReadSnapshot {
 pub struct MobileHnsReadController<B, C = HnsReadSystemClock> {
     session: MobileControllerSession<PersistentHnsReadRuntime<B, C>>,
     account_config: HnsRuntimeConfig,
+    known_names: Vec<MobileHnsNameSummary>,
 }
 
 /// Full same-store native HNS controller. It retains the signing runtime and
@@ -232,6 +249,7 @@ pub struct MobileHnsValueController<B: HnsBackend, C: HnsClock = HnsReadSystemCl
     session: MobileControllerSession<PersistentHnsValueRuntime<B, C>>,
     account_config: HnsRuntimeConfig,
     pending: Option<PendingMobileHnsValueAction>,
+    known_names: Vec<MobileHnsNameSummary>,
 }
 
 /// Full native HNS value controller composed with the wallet-owned direct
@@ -946,6 +964,7 @@ impl MobileWalletController {
             ),
             account_config,
             pending: None,
+            known_names: Vec::new(),
         };
         controller.session.negotiate_value(require_shakedex)?;
         Ok(controller)
@@ -1052,6 +1071,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
         let mut controller = Self {
             session: MobileControllerSession::new(store, host, service),
             account_config,
+            known_names: Vec::new(),
         };
         controller.session.negotiate_non_value()?;
         Ok(controller)
@@ -1082,6 +1102,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
     }
 
     pub fn lock(&mut self) -> Result<(), MobileWalletError> {
+        self.known_names.clear();
         match self.session.wallet_request(WalletRequest::Lock)? {
             WalletResponse::Locked => Ok(()),
             _ => Err(MobileWalletError::UnexpectedResponse),
@@ -1158,6 +1179,16 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
         Ok(self.synchronize()?.known_names)
     }
 
+    /// Return one page from the last successful authenticated synchronization
+    /// without performing another node reconciliation.
+    pub fn known_name_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MobileHnsNamePage, MobileWalletError> {
+        mobile_hns_name_page(&self.known_names, offset, limit)
+    }
+
     /// Import one exact canonical Handshake name through the trusted native
     /// service boundary. The text is passed through byte-for-byte: this method
     /// never trims, lowercases, applies IDNA, normalizes Unicode, or removes a
@@ -1175,6 +1206,27 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
             .import_trusted_native_hns_name_exact_text(name)
         {
             Ok(summary) => mobile_native_hns_name_summary(summary),
+            Err(failure) => {
+                if failure.code != ServiceErrorCode::InvalidRequest {
+                    self.session.lock_after_request_error();
+                }
+                Err(mobile_service_failure(failure))
+            }
+        }
+    }
+
+    /// Atomically import exact names and authenticate every proof before any
+    /// row is committed. Synchronization is intentionally caller-controlled.
+    pub fn import_names_exact_text(&mut self, names: &[&str]) -> Result<usize, MobileWalletError> {
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        match self
+            .session
+            .service
+            .import_trusted_native_hns_names_exact_text(names)
+        {
+            Ok(imported) => Ok(imported.len()),
             Err(failure) => {
                 if failure.code != ServiceErrorCode::InvalidRequest {
                     self.session.lock_after_request_error();
@@ -1229,6 +1281,11 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
                 .cmp(&right.name)
                 .then_with(|| left.name_hash.cmp(&right.name_hash))
         });
+        let known_name_count = u32::try_from(known_names.len())
+            .map_err(|_| MobileWalletError::Hns(HnsWalletError::HistoryLimit))?;
+        self.known_names.clone_from(&known_names);
+        known_names.truncate(MAX_MOBILE_HNS_NAME_PAGE);
+        let known_names_complete = known_names.len() == self.known_names.len();
         let height = snapshot.binding.chain.tip.height;
         Ok(MobileHnsReadSnapshot {
             balance: snapshot.balance,
@@ -1236,6 +1293,8 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
             name_receive_target: snapshot.name_receive_target,
             transaction_history: snapshot.transactions,
             known_names,
+            known_name_count,
+            known_names_complete,
             module_status: SyncStatus {
                 phase: SyncPhase::Ready,
                 validated_height: height,
@@ -1356,6 +1415,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
     }
 
     pub fn lock(&mut self) -> Result<(), MobileWalletError> {
+        self.known_names.clear();
         let discard = self.discard_pending_action();
         let lock = match self.session.wallet_request(WalletRequest::Lock) {
             Ok(WalletResponse::Locked) => Ok(()),
@@ -1429,7 +1489,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         result
     }
 
-    fn synchronize_inner(&self) -> Result<MobileHnsReadSnapshot, MobileWalletError> {
+    fn synchronize_inner(&mut self) -> Result<MobileHnsReadSnapshot, MobileWalletError> {
         if self.session.failed {
             return Err(MobileWalletError::ControllerFailed);
         }
@@ -1438,7 +1498,10 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .service
             .synchronize_trusted_native_hns_value()
             .map_err(mobile_service_failure)?;
-        mobile_hns_value_snapshot(self.account_config.account_id, snapshot)
+        let (snapshot, known_names) =
+            mobile_hns_value_snapshot(self.account_config.account_id, snapshot)?;
+        self.known_names = known_names;
+        Ok(snapshot)
     }
 
     /// Return the exact clock authority used by the native HNS runtime after
@@ -1585,6 +1648,40 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
                 Err(mobile_service_failure(failure))
             }
         }
+    }
+
+    /// Atomically import exact names after one reconciliation and defer the
+    /// caller's one desired post-import snapshot refresh.
+    pub fn import_names_exact_text(&mut self, names: &[&str]) -> Result<usize, MobileWalletError> {
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        if self.pending.is_some() {
+            return Err(MobileWalletError::ValueActionPending);
+        }
+        match self
+            .session
+            .service
+            .import_trusted_native_hns_value_names_exact_text(names)
+        {
+            Ok(imported) => Ok(imported.len()),
+            Err(failure) => {
+                if failure.code != ServiceErrorCode::InvalidRequest {
+                    self.session.lock_after_request_error();
+                }
+                Err(mobile_service_failure(failure))
+            }
+        }
+    }
+
+    /// Return one page from the last successful authenticated synchronization
+    /// without reconciling or loading the full name set into the host UI.
+    pub fn known_name_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<MobileHnsNamePage, MobileWalletError> {
+        mobile_hns_name_page(&self.known_names, offset, limit)
     }
 
     /// Prepare one exact value action and return the only summary the installed
@@ -1996,7 +2093,7 @@ impl MobileShakedexQuery {
 fn mobile_hns_value_snapshot(
     expected_account: AccountId,
     snapshot: NativeHnsValueSnapshot,
-) -> Result<MobileHnsReadSnapshot, MobileWalletError> {
+) -> Result<(MobileHnsReadSnapshot, Vec<MobileHnsNameSummary>), MobileWalletError> {
     if snapshot.account_id != expected_account
         || snapshot.balance.asset != WalletAsset::Hns
         || snapshot
@@ -2035,13 +2132,42 @@ fn mobile_hns_value_snapshot(
             .cmp(&right.name)
             .then_with(|| left.name_hash.cmp(&right.name_hash))
     });
-    Ok(MobileHnsReadSnapshot {
-        balance: snapshot.balance,
-        receive_target: snapshot.receive_target,
-        name_receive_target: snapshot.name_receive_target,
-        transaction_history: snapshot.transactions,
+    let known_name_count = u32::try_from(known_names.len())
+        .map_err(|_| MobileWalletError::Hns(HnsWalletError::HistoryLimit))?;
+    let mut first_page = known_names.clone();
+    first_page.truncate(MAX_MOBILE_HNS_NAME_PAGE);
+    let known_names_complete = first_page.len() == known_names.len();
+    Ok((
+        MobileHnsReadSnapshot {
+            balance: snapshot.balance,
+            receive_target: snapshot.receive_target,
+            name_receive_target: snapshot.name_receive_target,
+            transaction_history: snapshot.transactions,
+            known_names: first_page,
+            known_name_count,
+            known_names_complete,
+            module_status: snapshot.module_status,
+        },
         known_names,
-        module_status: snapshot.module_status,
+    ))
+}
+
+fn mobile_hns_name_page(
+    names: &[MobileHnsNameSummary],
+    offset: usize,
+    limit: usize,
+) -> Result<MobileHnsNamePage, MobileWalletError> {
+    if limit == 0 || limit > MAX_MOBILE_HNS_NAME_PAGE || offset > names.len() {
+        return Err(MobileWalletError::Hns(HnsWalletError::HistoryLimit));
+    }
+    let end = offset.saturating_add(limit).min(names.len());
+    Ok(MobileHnsNamePage {
+        offset: u32::try_from(offset)
+            .map_err(|_| MobileWalletError::Hns(HnsWalletError::HistoryLimit))?,
+        total: u32::try_from(names.len())
+            .map_err(|_| MobileWalletError::Hns(HnsWalletError::HistoryLimit))?,
+        names: names[offset..end].to_vec(),
+        has_more: end < names.len(),
     })
 }
 
@@ -3329,6 +3455,19 @@ mod tests {
         );
         assert!(snapshot.transaction_history.is_empty());
         assert!(snapshot.known_names.is_empty());
+        assert_eq!(snapshot.known_name_count, 0);
+        assert!(snapshot.known_names_complete);
+        assert_eq!(
+            reads
+                .known_name_page(0, MAX_MOBILE_HNS_NAME_PAGE)
+                .expect("empty authenticated name page"),
+            MobileHnsNamePage {
+                offset: 0,
+                total: 0,
+                names: Vec::new(),
+                has_more: false,
+            }
+        );
         assert_eq!(
             snapshot.module_status,
             SyncStatus {
@@ -3351,7 +3490,9 @@ mod tests {
             fields,
             BTreeSet::from([
                 "balance",
+                "knownNameCount",
                 "knownNames",
+                "knownNamesComplete",
                 "moduleStatus",
                 "nameReceiveTarget",
                 "receiveTarget",
@@ -3630,6 +3771,32 @@ mod tests {
         let mut oversized_height = known_name;
         oversized_height.proof_height = MAX_JAVASCRIPT_SAFE_INTEGER + 1;
         assert!(mobile_hns_name_summary(&oversized_height).is_err());
+    }
+
+    #[test]
+    fn known_name_pages_are_bounded_ordered_and_complete_without_resync() {
+        let names = (0..130)
+            .map(|index| MobileHnsNameSummary {
+                name: format!("name{index:04}"),
+                name_hash: format!("{index:064x}"),
+                proof_height: 500,
+                resource_status: MobileHnsNameResourceStatus::Empty,
+                ownership_status: MobileHnsNameOwnershipStatus::WalletOwned,
+                registered: Some(true),
+                expired: Some(false),
+            })
+            .collect::<Vec<_>>();
+        let first = mobile_hns_name_page(&names, 0, 64).expect("first page");
+        let second = mobile_hns_name_page(&names, 64, 64).expect("second page");
+        let final_page = mobile_hns_name_page(&names, 128, 64).expect("final page");
+        assert_eq!((first.offset, first.total, first.names.len()), (0, 130, 64));
+        assert!(first.has_more);
+        assert_eq!((second.offset, second.names.len()), (64, 64));
+        assert!(second.has_more);
+        assert_eq!((final_page.offset, final_page.names.len()), (128, 2));
+        assert!(!final_page.has_more);
+        assert!(mobile_hns_name_page(&names, 0, 65).is_err());
+        assert!(mobile_hns_name_page(&names, 131, 1).is_err());
     }
 
     #[test]

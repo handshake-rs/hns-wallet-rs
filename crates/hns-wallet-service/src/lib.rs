@@ -22,7 +22,7 @@ use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountReadSnapshot, HnsBackend, HnsClock,
     HnsExistingAccountSelector, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
     HnsPersistedRecoveryReadOnlyRuntime, HnsRuntimeConfig, HnsWalletError, KnownName,
-    NameOwnershipStatus, NameResourceStatus, SystemClock as HnsSystemClock,
+    MAX_HISTORY_RESULTS, NameOwnershipStatus, NameResourceStatus, SystemClock as HnsSystemClock,
 };
 use hns_wallet_provider::{
     ApprovedCall, HostAuthorityRegistration, Origin, PROVIDER_API_VERSION, PendingApproval,
@@ -590,9 +590,21 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsReadRuntime<B, C> {
     fn import_name_exact_text(&self, name: &str) -> Result<NativeHnsNameSummary, ServiceFailure> {
         let imported = self
             .runtime
-            .import_name_exact_text_bounded(name, MAX_HNS_NAME_DISCLOSURES)
+            .import_name_exact_text_bounded(name, MAX_HISTORY_RESULTS)
             .map_err(hns_native_name_import_failure)?;
         native_hns_name_summary(&imported)
+    }
+
+    fn import_names_exact_text(
+        &self,
+        names: &[&str],
+    ) -> Result<Vec<NativeHnsNameSummary>, ServiceFailure> {
+        self.runtime
+            .import_names_exact_text_bounded(names, MAX_HISTORY_RESULTS)
+            .map_err(hns_native_name_import_failure)?
+            .iter()
+            .map(native_hns_name_summary)
+            .collect()
     }
 
     fn unlock(&self, passphrase: &str) -> Result<(), ServiceFailure> {
@@ -2398,9 +2410,7 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsR
         &self,
     ) -> Result<HnsAccountReadSnapshot, ServiceFailure> {
         let snapshot = self.runtime.synchronize()?;
-        if snapshot.transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS
-            || snapshot.known_names.len() > MAX_HNS_NAME_DISCLOSURES
-        {
+        if snapshot.transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS {
             return Err(hns_read_result_bound());
         }
         Ok(snapshot)
@@ -2436,6 +2446,15 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsR
         name: &str,
     ) -> Result<NativeHnsNameSummary, ServiceFailure> {
         self.runtime.import_name_exact_text(name)
+    }
+
+    /// Atomically import a bounded exact-name set through the installed native
+    /// boundary. All proofs are authenticated before the first durable write.
+    pub fn import_trusted_native_hns_names_exact_text(
+        &self,
+        names: &[&str],
+    ) -> Result<Vec<NativeHnsNameSummary>, ServiceFailure> {
+        self.runtime.import_names_exact_text(names)
     }
 }
 

@@ -2311,6 +2311,74 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
         self.import_name_exact_text_bounded(name, MAX_HISTORY_RESULTS)
     }
 
+    /// Atomically import a bounded set of exact canonical Handshake names.
+    ///
+    /// Every name is validated and authenticated against one chain snapshot
+    /// before the account derivation high-water mark or any known-name row is
+    /// changed. The final account rotation and all name rows commit in one
+    /// encrypted store transaction, so a failed item can never leave a prefix
+    /// of a requested bulk import behind.
+    pub fn import_names_exact_text_bounded(
+        &self,
+        names: &[&str],
+        maximum_persisted_names: usize,
+    ) -> Result<Vec<KnownName>, HnsWalletError> {
+        if names.is_empty()
+            || names.len() > MAX_HISTORY_RESULTS
+            || maximum_persisted_names == 0
+            || maximum_persisted_names > MAX_HISTORY_RESULTS
+        {
+            return Err(HnsWalletError::HistoryLimit);
+        }
+        let mut requested = Vec::with_capacity(names.len());
+        let mut requested_hashes = BTreeSet::new();
+        for name in names {
+            let name_bytes = name.as_bytes();
+            if !validate_name(name_bytes) {
+                return Err(HnsWalletError::InvalidName);
+            }
+            let name_hash = hash_name(name_bytes)
+                .map_err(|_| HnsWalletError::InvalidName)?
+                .into_bytes();
+            if !requested_hashes.insert(name_hash) {
+                return Err(HnsWalletError::InvalidName);
+            }
+            requested.push((name_bytes.to_vec(), name_hash));
+        }
+
+        let _synchronization = self
+            .synchronization
+            .lock()
+            .map_err(|_| HnsWalletError::RuntimePoisoned)?;
+        let selected = self.selector.selected_account()?;
+        let preparation = self.store.try_with_store(|store| {
+            prepare_hns_name_bulk_import(store, &selected, &requested, maximum_persisted_names)
+        })?;
+        let binding = self.backend.get_chain_snapshot()?;
+        verify_hns_read_chain_identity(&self.backend, selected.config.network, binding)?;
+        let name_addresses = self
+            .store
+            .try_with_store(|store| derive_hns_name_bulk_import_addresses(store, &preparation))?;
+        let mut imported = Vec::with_capacity(requested.len());
+        for (name, _) in &requested {
+            imported.push(
+                validated_name_evidence(&self.backend, name, binding, Some(&name_addresses))?
+                    .known_name,
+            );
+        }
+        let now_unix = self.clock.now_unix()?;
+        if self.selector.selected_account()? != preparation.account.value {
+            return Err(HnsWalletError::StaleAccountRead);
+        }
+        if self.backend.get_chain_snapshot()? != binding {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        self.store.try_with_store_mut(|store| {
+            commit_hns_name_bulk_import(store, &preparation, &name_addresses, &imported, now_unix)
+        })?;
+        Ok(imported)
+    }
+
     /// Exact-text import with a caller-owned persisted-name result bound.
     /// Existing names remain re-importable at the bound; a new row is rejected
     /// before node I/O. Native service/mobile projections use this so a
@@ -2320,55 +2388,9 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
         name: &str,
         maximum_persisted_names: usize,
     ) -> Result<KnownName, HnsWalletError> {
-        let name_bytes = name.as_bytes();
-        if !validate_name(name_bytes) {
-            return Err(HnsWalletError::InvalidName);
-        }
-        let name_hash = hash_name(name_bytes)
-            .map_err(|_| HnsWalletError::InvalidName)?
-            .into_bytes();
-        if maximum_persisted_names == 0 || maximum_persisted_names > MAX_HISTORY_RESULTS {
-            return Err(HnsWalletError::HistoryLimit);
-        }
-
-        let _synchronization = self
-            .synchronization
-            .lock()
-            .map_err(|_| HnsWalletError::RuntimePoisoned)?;
-        let selected = self.selector.selected_account()?;
-        let preparation = self.store.try_with_store(|store| {
-            prepare_hns_name_import(store, &selected, name_hash, maximum_persisted_names)
-        })?;
-        if preparation
-            .existing_name
-            .as_ref()
-            .is_some_and(|stored| stored.value.name.as_slice() != name_bytes)
-        {
-            return Err(HnsWalletError::InvalidEvidence);
-        }
-
-        let binding = self.backend.get_chain_snapshot()?;
-        verify_hns_read_chain_identity(&self.backend, selected.config.network, binding)?;
-        // Preserve the script-free snapshot/genesis ordering: derive wallet
-        // identifiers only after network identity is authenticated, under a
-        // second exact account/name fence which returns before node evidence.
-        let name_addresses = self
-            .store
-            .try_with_store(|store| derive_hns_name_import_addresses(store, &preparation))?;
-        let imported =
-            validated_name_evidence(&self.backend, name_bytes, binding, Some(&name_addresses))?
-                .known_name;
-        let now_unix = self.clock.now_unix()?;
-        if self.selector.selected_account()? != preparation.account.value {
-            return Err(HnsWalletError::StaleAccountRead);
-        }
-        if self.backend.get_chain_snapshot()? != binding {
-            return Err(HnsWalletError::StaleNodeSnapshot);
-        }
-        self.store.try_with_store_mut(|store| {
-            commit_hns_name_import(store, &preparation, &name_addresses, &imported, now_unix)
-        })?;
-        Ok(imported)
+        self.import_names_exact_text_bounded(&[name], maximum_persisted_names)?
+            .pop()
+            .ok_or(HnsWalletError::InvalidEvidence)
     }
 
     /// Observe the exact selected account, its Shakedex network binding, and
@@ -2884,10 +2906,9 @@ struct HnsReadPreparation {
     names: Vec<StoredEntity<KnownName>>,
 }
 
-struct HnsNameImportPreparation {
+struct HnsNameBulkImportPreparation {
     account: StoredEntity<HnsAccountRecord>,
     names: Vec<StoredEntity<KnownName>>,
-    existing_name: Option<StoredEntity<KnownName>>,
 }
 
 struct HnsReadScan {
@@ -3632,6 +3653,29 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     }
 
     pub fn import_name(&self, name: &[u8]) -> Result<KnownName, HnsWalletError> {
+        self.import_names(&[name])?
+            .pop()
+            .ok_or(HnsWalletError::InvalidEvidence)
+    }
+
+    /// Authenticate a bounded name set against the current synchronized
+    /// binding and commit every resulting known-name row atomically.
+    pub fn import_names(&self, names: &[&[u8]]) -> Result<Vec<KnownName>, HnsWalletError> {
+        if names.is_empty() || names.len() > MAX_HISTORY_RESULTS {
+            return Err(HnsWalletError::HistoryLimit);
+        }
+        let mut requested_hashes = BTreeSet::new();
+        for name in names {
+            if !validate_name(name) {
+                return Err(HnsWalletError::InvalidName);
+            }
+            let name_hash = hash_name(name)
+                .map_err(|_| HnsWalletError::InvalidName)?
+                .into_bytes();
+            if !requested_hashes.insert(name_hash) {
+                return Err(HnsWalletError::InvalidName);
+            }
+        }
         let now = self.clock.now_unix()?;
         let cache = self.cache_read()?;
         let binding = cache.binding.ok_or(HnsWalletError::StaleNodeSnapshot)?;
@@ -3641,19 +3685,59 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let store = self.store_lock()?;
             persisted_name_addresses(&store, &config)?
         };
-        let current =
-            validated_name_evidence(&self.backend, name, binding, Some(&wallet_name_addresses))?
-                .known_name;
-        let id = namespaced_name_id(&config, current.name_hash);
+        let mut imported = Vec::with_capacity(names.len());
+        for name in names {
+            imported.push(
+                validated_name_evidence(
+                    &self.backend,
+                    name,
+                    binding,
+                    Some(&wallet_name_addresses),
+                )?
+                .known_name,
+            );
+        }
         let mut store = self.store_lock()?;
         if self.cache_read()?.binding != Some(binding) {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
-        let revision = store
-            .known_name::<KnownName>(&id)?
-            .map_or(0, |stored| stored.revision);
-        store.save_known_name(&id, revision, &current, now)?;
-        Ok(current)
+        let existing = store.list_entities_by_id_prefix::<KnownName>(
+            EntityKind::KnownName,
+            &account_entity_prefix(&config),
+            MAX_HISTORY_RESULTS,
+        )?;
+        let novel = imported
+            .iter()
+            .filter(|name| {
+                !existing
+                    .iter()
+                    .any(|stored| stored.value.name_hash == name.name_hash)
+            })
+            .count();
+        if existing
+            .len()
+            .checked_add(novel)
+            .is_none_or(|count| count > MAX_HISTORY_RESULTS)
+        {
+            return Err(HnsWalletError::HistoryLimit);
+        }
+        let saves = imported
+            .iter()
+            .map(|name| {
+                let id = namespaced_name_id(&config, name.name_hash);
+                EntityBatchSave {
+                    id: id.to_vec(),
+                    expected_revision: existing
+                        .iter()
+                        .find(|stored| stored.id.as_slice() == id.as_slice())
+                        .map_or(0, |stored| stored.revision),
+                    value: name.clone(),
+                    updated_at_unix: now,
+                }
+            })
+            .collect::<Vec<_>>();
+        store.apply_entity_batch(EntityKind::KnownName, &saves, &[])?;
+        Ok(imported)
     }
 
     /// Return the bounded, account-scoped canonical name cache. Every entry is
@@ -5857,12 +5941,12 @@ fn map_shared_store_error(error: StoreError) -> HnsWalletError {
     }
 }
 
-fn prepare_hns_name_import(
+fn prepare_hns_name_bulk_import(
     store: &WalletStore,
     selected: &HnsAccountRecord,
-    name_hash: [u8; 32],
+    requested: &[(Vec<u8>, [u8; 32])],
     maximum_persisted_names: usize,
-) -> Result<HnsNameImportPreparation, HnsWalletError> {
+) -> Result<HnsNameBulkImportPreparation, HnsWalletError> {
     if store.is_locked() {
         return Err(HnsWalletError::StoreLocked);
     }
@@ -5879,8 +5963,6 @@ fn prepare_hns_name_import(
         &account_entity_prefix(&selected.config),
         MAX_HISTORY_RESULTS,
     )?;
-    let mut existing_name = None;
-    let expected_name_id = namespaced_name_id(&selected.config, name_hash);
     let mut unique_hashes = BTreeSet::new();
     let mut unique_names = BTreeSet::new();
     for stored in &names {
@@ -5895,25 +5977,34 @@ fn prepare_hns_name_import(
         {
             return Err(HnsWalletError::InvalidEvidence);
         }
-        if stored.id.as_slice() == expected_name_id.as_slice() {
-            existing_name = Some(stored.clone());
+    }
+    let mut novel = 0_usize;
+    for (name, name_hash) in requested {
+        let expected_name_id = namespaced_name_id(&selected.config, *name_hash);
+        match names
+            .iter()
+            .find(|stored| stored.id.as_slice() == expected_name_id.as_slice())
+        {
+            Some(stored) if stored.value.name.as_slice() != name.as_slice() => {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            Some(_) => {}
+            None => novel = novel.checked_add(1).ok_or(HnsWalletError::HistoryLimit)?,
         }
     }
-    if names.len() > maximum_persisted_names
-        || (names.len() == maximum_persisted_names && existing_name.is_none())
+    if names
+        .len()
+        .checked_add(novel)
+        .is_none_or(|count| count > maximum_persisted_names)
     {
         return Err(HnsWalletError::HistoryLimit);
     }
-    Ok(HnsNameImportPreparation {
-        account,
-        names,
-        existing_name,
-    })
+    Ok(HnsNameBulkImportPreparation { account, names })
 }
 
-fn derive_hns_name_import_addresses(
+fn derive_hns_name_bulk_import_addresses(
     store: &WalletStore,
-    preparation: &HnsNameImportPreparation,
+    preparation: &HnsNameBulkImportPreparation,
 ) -> Result<Vec<DerivedHnsAddress>, HnsWalletError> {
     if store.is_locked() {
         return Err(HnsWalletError::StoreLocked);
@@ -6017,24 +6108,27 @@ fn rotate_imported_name_derivation(
     Ok(())
 }
 
-fn commit_hns_name_import(
+fn commit_hns_name_bulk_import(
     store: &mut WalletStore,
-    preparation: &HnsNameImportPreparation,
+    preparation: &HnsNameBulkImportPreparation,
     name_addresses: &[DerivedHnsAddress],
-    imported: &KnownName,
+    imported: &[KnownName],
     now_unix: u64,
 ) -> Result<(), HnsWalletError> {
     if store.is_locked() {
         return Err(HnsWalletError::StoreLocked);
     }
-    if !validate_name(&imported.name) {
-        return Err(HnsWalletError::InvalidEvidence);
-    }
-    let imported_hash = hash_name(&imported.name)
-        .map_err(|_| HnsWalletError::InvalidEvidence)?
-        .into_bytes();
-    if imported_hash != imported.name_hash {
-        return Err(HnsWalletError::InvalidEvidence);
+    let mut imported_hashes = BTreeSet::new();
+    for name in imported {
+        if !validate_name(&name.name) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let imported_hash = hash_name(&name.name)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?
+            .into_bytes();
+        if imported_hash != name.name_hash || !imported_hashes.insert(imported_hash) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
     }
     let account_id = account_entity_id(&preparation.account.value.config);
     let current_account = store
@@ -6049,33 +6143,31 @@ fn commit_hns_name_import(
         return Err(HnsWalletError::StaleAccountRead);
     }
 
-    let name_id = namespaced_name_id(&preparation.account.value.config, imported.name_hash);
-    if preparation
-        .existing_name
-        .as_ref()
-        .is_some_and(|stored| stored.id.as_slice() != name_id.as_slice())
-    {
-        return Err(HnsWalletError::InvalidEvidence);
-    }
     let mut account = preparation.account.value.clone();
-    rotate_imported_name_derivation(&mut account, name_addresses, &imported.ownership_status)?;
+    let mut name_saves = Vec::with_capacity(imported.len());
+    for name in imported {
+        rotate_imported_name_derivation(&mut account, name_addresses, &name.ownership_status)?;
+        let name_id = namespaced_name_id(&preparation.account.value.config, name.name_hash);
+        let expected_revision = preparation
+            .names
+            .iter()
+            .find(|stored| stored.id.as_slice() == name_id.as_slice())
+            .map_or(0, |stored| stored.revision);
+        name_saves.push(EntityBatchSave {
+            id: name_id.to_vec(),
+            expected_revision,
+            value: name.clone(),
+            updated_at_unix: now_unix,
+        });
+    }
     let account_save = EntityBatchSave {
         id: preparation.account.id.clone(),
         expected_revision: preparation.account.revision,
         value: account,
         updated_at_unix: now_unix,
     };
-    let name_save = EntityBatchSave {
-        id: name_id.to_vec(),
-        expected_revision: preparation
-            .existing_name
-            .as_ref()
-            .map_or(0, |stored| stored.revision),
-        value: imported.clone(),
-        updated_at_unix: now_unix,
-    };
     store
-        .apply_account_and_entity_batch(&account_save, EntityKind::KnownName, &[name_save], &[])
+        .apply_account_and_entity_batch(&account_save, EntityKind::KnownName, &name_saves, &[])
         .map(|_| ())
         .map_err(|error| match error {
             StoreError::Locked => HnsWalletError::StoreLocked,
@@ -11752,7 +11844,7 @@ mod tests {
         store: SharedWalletStore,
         account_id: [u8; 32],
         network: HnsNetwork,
-        evidence: NameEvidence,
+        evidence: Vec<NameEvidence>,
         mutate_account_on_evidence: AtomicBool,
         snapshot_calls: AtomicUsize,
         evidence_calls: AtomicUsize,
@@ -11768,7 +11860,7 @@ mod tests {
                 store,
                 account_id: account_entity_id(config),
                 network: config.network,
-                evidence,
+                evidence: vec![evidence],
                 mutate_account_on_evidence: AtomicBool::new(false),
                 snapshot_calls: AtomicUsize::new(0),
                 evidence_calls: AtomicUsize::new(0),
@@ -11778,6 +11870,11 @@ mod tests {
         fn with_stale_account_mutation(self) -> Self {
             self.mutate_account_on_evidence
                 .store(true, Ordering::SeqCst);
+            self
+        }
+
+        fn with_evidence(mut self, evidence: NameEvidence) -> Self {
+            self.evidence.push(evidence);
             self
         }
 
@@ -11899,7 +11996,12 @@ mod tests {
         ) -> Result<NameEvidence, HnsWalletError> {
             self.prove_store_mutex_is_released()?;
             self.evidence_calls.fetch_add(1, Ordering::SeqCst);
-            if name_hash != self.evidence.proof.name_hash || binding != Self::binding() {
+            let evidence = self
+                .evidence
+                .iter()
+                .find(|evidence| evidence.proof.name_hash == name_hash)
+                .ok_or(HnsWalletError::InvalidEvidence)?;
+            if binding != Self::binding() {
                 return Err(HnsWalletError::InvalidEvidence);
             }
             if self
@@ -11922,7 +12024,7 @@ mod tests {
                     })
                     .map_err(HnsWalletError::from)?;
             }
-            Ok(self.evidence.clone())
+            Ok(evidence.clone())
         }
 
         fn get_name_action_context(
@@ -12386,6 +12488,22 @@ mod tests {
             .expect("native import runtime")
     }
 
+    fn native_import_bulk_runtime(
+        store: SharedWalletStore,
+        config: HnsRuntimeConfig,
+        evidence: &[NameEvidence],
+    ) -> HnsAccountReadRuntime<NativeNameImportBackend, ProductionFollowupClock> {
+        let selector = HnsExistingAccountSelector::new(store.clone(), config.clone())
+            .expect("native bulk import selector");
+        let first = evidence.first().expect("nonempty bulk evidence").clone();
+        let backend = evidence.iter().skip(1).cloned().fold(
+            NativeNameImportBackend::new(store.clone(), &config, first),
+            NativeNameImportBackend::with_evidence,
+        );
+        HnsAccountReadRuntime::new(backend, ProductionFollowupClock, store, selector)
+            .expect("native bulk import runtime")
+    }
+
     fn validate_test_name_view(
         name: &[u8],
         state: &NameState,
@@ -12524,6 +12642,52 @@ mod tests {
         ));
         assert_eq!(runtime.backend.snapshot_calls.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.backend.evidence_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn native_bulk_name_import_authenticates_all_before_one_atomic_commit() {
+        let (store, config, _) = native_import_store();
+        let alpha = native_import_evidence(b"alpha", None);
+        let beta = native_import_evidence(b"beta", None);
+        let runtime =
+            native_import_bulk_runtime(store.clone(), config.clone(), std::slice::from_ref(&alpha));
+        assert!(matches!(
+            runtime.import_names_exact_text_bounded(&["alpha", "beta"], MAX_HISTORY_RESULTS),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
+        assert!(
+            store
+                .with_store(|wallet| wallet.list_entities_by_id_prefix::<KnownName>(
+                    EntityKind::KnownName,
+                    &account_entity_prefix(&config),
+                    MAX_HISTORY_RESULTS,
+                ))
+                .expect("failed bulk import leaves no prefix")
+                .is_empty()
+        );
+
+        let runtime = native_import_bulk_runtime(store.clone(), config.clone(), &[alpha, beta]);
+        let imported = runtime
+            .import_names_exact_text_bounded(&["alpha", "beta"], MAX_HISTORY_RESULTS)
+            .expect("authenticated bulk import");
+        assert_eq!(
+            imported
+                .iter()
+                .map(|name| name.name.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"alpha".as_slice(), b"beta".as_slice()]
+        );
+        assert_eq!(
+            store
+                .with_store(|wallet| wallet.list_entities_by_id_prefix::<KnownName>(
+                    EntityKind::KnownName,
+                    &account_entity_prefix(&config),
+                    MAX_HISTORY_RESULTS,
+                ))
+                .expect("atomic bulk rows")
+                .len(),
+            2
+        );
     }
 
     #[test]
