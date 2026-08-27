@@ -74,10 +74,11 @@ use hns_primitives::{
     BlockHash, Dollarydoos, Height, NameHash, TransactionHash as CanonicalTransactionHash, TreeRoot,
 };
 use hns_script::{
-    FeeRate, LOCKTIME_FLAG, LOCKTIME_MASK, LOCKTIME_MULTIPLIER, MAX_POLICY_TRANSACTION_SIGOPS,
-    MAX_POLICY_TRANSACTION_WEIGHT, OP_BLAKE160, OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_DROP,
-    OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUALVERIFY, OP_IF, OP_SHA256, SIGHASH_ALL, minimum_policy_fee,
-    signature_hash, transaction_policy_virtual_size, transaction_sigops,
+    FeeRate, K256SignatureVerifier, LOCKTIME_FLAG, LOCKTIME_MASK, LOCKTIME_MULTIPLIER,
+    MAX_POLICY_TRANSACTION_SIGOPS, MAX_POLICY_TRANSACTION_WEIGHT, OP_BLAKE160,
+    OP_CHECKLOCKTIMEVERIFY, OP_CHECKSIG, OP_DROP, OP_DUP, OP_ELSE, OP_ENDIF, OP_EQUALVERIFY, OP_IF,
+    OP_SHA256, SIGHASH_ALL, ScriptFlags, minimum_policy_fee, signature_hash,
+    transaction_policy_virtual_size, transaction_sigops, verify_witness_program,
 };
 use hns_swap::{HnsHtlc, HnsHtlcSpend, NetworkBinding, lock_script_hash};
 use hns_transaction::{Address, Coin, Input, Outpoint, Output, Transaction, Witness};
@@ -3424,6 +3425,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .as_ref()
             .ok_or(HnsWalletError::InvalidWorkflow)?;
         let input_coins = canonical_input_coins(&stored.state.plan.inputs)?;
+        let signed = validate_signed_payment_plan(&stored.state.plan, &raw)?;
+        validate_standard_input_authorizations(&signed, &input_coins)?;
         validate_final_fee_quote(
             &raw,
             &input_coins,
@@ -9073,6 +9076,9 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
             let signed = sign_payment_plan(&store, &account, &plan).map_err(map_chain_error)?;
             let transaction =
                 validate_signed_payment_plan(&plan, &signed).map_err(map_chain_error)?;
+            let input_coins = canonical_input_coins(&plan.inputs).map_err(map_chain_error)?;
+            validate_standard_input_authorizations(&transaction, &input_coins)
+                .map_err(map_chain_error)?;
             let txid = wallet_transaction_hash(&transaction).map_err(map_chain_error)?;
             (pending_approval, signed, txid)
         };
@@ -9169,6 +9175,10 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
                 .ok_or(ChainError::InvalidEvidence)?;
             let input_coins =
                 canonical_input_coins(&stored.state.plan.inputs).map_err(map_chain_error)?;
+            let signed =
+                validate_signed_payment_plan(&stored.state.plan, &raw).map_err(map_chain_error)?;
+            validate_standard_input_authorizations(&signed, &input_coins)
+                .map_err(map_chain_error)?;
             validate_final_fee_quote(
                 &raw,
                 &input_coins,
@@ -9528,8 +9538,10 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         )
         .map_err(map_chain_error)?;
         let signed = sign_payment_plan(&store, &account, &plan).map_err(map_chain_error)?;
-        validate_signed_payment_plan(&plan, &signed).map_err(map_chain_error)?;
         let input_coins = canonical_input_coins(&plan.inputs).map_err(map_chain_error)?;
+        let transaction = validate_signed_payment_plan(&plan, &signed).map_err(map_chain_error)?;
+        validate_standard_input_authorizations(&transaction, &input_coins)
+            .map_err(map_chain_error)?;
         drop(store);
         let quote = self
             .quote_final_transaction(&signed, &input_coins, fee, request.maximum_fee)
@@ -10084,6 +10096,31 @@ fn validate_signed_payment_plan(
     let unsigned = Transaction::decode(&plan.unsigned_transaction)
         .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
     validate_witness_only_change(&unsigned, signed_raw)
+}
+
+/// Execute every signed input under the same standard witness-program flags
+/// used by a Handshake relay node before any signed bytes are persisted or
+/// submitted. A successful socket write is not mempool admission, so this
+/// local check prevents an invalid authorization from being misreported as a
+/// peer-accepted transaction and makes durable rebroadcast fail closed.
+fn validate_standard_input_authorizations(
+    transaction: &Transaction,
+    input_coins: &[Coin],
+) -> Result<(), HnsWalletError> {
+    if transaction.inputs.is_empty() || transaction.inputs.len() != input_coins.len() {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    for (index, coin) in input_coins.iter().enumerate() {
+        verify_witness_program(
+            transaction,
+            index,
+            coin,
+            ScriptFlags::STANDARD,
+            &K256SignatureVerifier,
+        )
+        .map_err(|_| HnsWalletError::Signing)?;
+    }
+    Ok(())
 }
 
 fn decode_hns_address(network: HnsNetwork, value: &str) -> Result<Address, HnsWalletError> {
@@ -13590,6 +13627,15 @@ mod tests {
                 && input.witness.items[0].len() == 65
                 && input.witness.items[1].len() == 33
         }));
+        let input_coins = canonical_input_coins(&inputs).expect("canonical input coins");
+        validate_standard_input_authorizations(&signed, &input_coins)
+            .expect("standard input authorizations");
+        let mut corrupted = signed.clone();
+        corrupted.inputs[0].witness.items[0][0] ^= 1;
+        assert!(matches!(
+            validate_standard_input_authorizations(&corrupted, &input_coins),
+            Err(HnsWalletError::Signing)
+        ));
         assert!(matches!(
             sign_ordered_p2pkh_inputs(
                 &store,

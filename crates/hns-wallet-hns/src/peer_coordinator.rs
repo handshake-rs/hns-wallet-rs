@@ -1035,29 +1035,49 @@ impl NativeHnsPeerPool {
 impl HnsLightNetwork for NativeHnsPeerPool {
     fn broadcast_transaction(&self, raw: &[u8]) -> Result<usize, HnsWalletError> {
         let transaction = Transaction::decode(raw).map_err(|_| HnsWalletError::InvalidEvidence)?;
+        let transaction_hash = transaction
+            .transaction_hash()
+            .map_err(|_| HnsWalletError::InvalidEvidence)?
+            .into_bytes();
         let handles = self
             .ready_handles()
             .map_err(|error| HnsWalletError::Backend(error.to_string()))?;
-        let written = std::thread::scope(|scope| {
+        let results = std::thread::scope(|scope| {
             let tasks = handles
                 .into_iter()
                 .map(|(_, peer)| {
                     let transaction = transaction.clone();
+                    // Reuse the bounded connection deadline for the peer's
+                    // inventory round trip. The shorter event-poll interval
+                    // is intended for best-effort mempool draining and is too
+                    // aggressive for transaction delivery on mobile links.
+                    let timeout = self.config.connect_timeout;
                     scope.spawn(move || {
                         peer.lock()
                             .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
-                            .connection
-                            .send_wallet_packet(&Packet::Tx(transaction))?;
-                        Ok::<_, HnsDirectPeerError>(())
+                            .announce_transaction(transaction, transaction_hash, timeout)
                     })
                 })
                 .collect::<Vec<_>>();
             tasks
                 .into_iter()
-                .map(|task| usize::from(task.join().is_ok_and(|result| result.is_ok())))
-                .sum::<usize>()
+                .map(|task| {
+                    task.join()
+                        .map_err(|_| HnsDirectPeerError::WorkerPanicked)
+                        .and_then(|result| result)
+                })
+                .collect::<Vec<_>>()
         });
-        Ok(written)
+        let delivered = results
+            .iter()
+            .filter(|result| matches!(result, Ok(true)))
+            .count();
+        if delivered == 0 {
+            if let Some(error) = results.into_iter().find_map(Result::err) {
+                return Err(HnsWalletError::Backend(error.to_string()));
+            }
+        }
+        Ok(delivered)
     }
 }
 
@@ -2264,6 +2284,94 @@ fn reusable_wallet_watch_set(
 }
 
 impl NativePeer {
+    /// Relay a transaction using the standard Handshake inventory handshake.
+    /// A full transaction is sent only after this peer requests the exact
+    /// announced hash with `getdata`; HSD disconnects peers that send an
+    /// unsolicited `tx` packet.
+    fn announce_transaction(
+        &mut self,
+        transaction: Transaction,
+        transaction_hash: [u8; 32],
+        timeout: Duration,
+    ) -> Result<bool, HnsDirectPeerError> {
+        let original_timeout = self
+            .connection
+            .transport_mut()
+            .read_timeout()
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        let result = self.announce_transaction_inner(
+            transaction,
+            transaction_hash,
+            Instant::now() + timeout,
+        );
+        let restore = self
+            .connection
+            .transport_mut()
+            .set_read_timeout(original_timeout)
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()));
+        match (result, restore) {
+            (Ok(delivered), Ok(())) => Ok(delivered),
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+
+    fn announce_transaction_inner(
+        &mut self,
+        transaction: Transaction,
+        transaction_hash: [u8; 32],
+        deadline: Instant,
+    ) -> Result<bool, HnsDirectPeerError> {
+        let announced = Inventory {
+            kind: InventoryKind::Transaction,
+            hash: transaction_hash,
+        };
+        self.connection
+            .send_wallet_packet(&Packet::Inv(vec![announced.clone()]))?;
+        for _ in 0..MAX_RESPONSE_EVENTS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            self.connection
+                .transport_mut()
+                .set_read_timeout(Some(remaining))
+                .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+            match self.connection.receive_event(now_unix_or(0)) {
+                Ok(PeerEvent::Wallet(WalletPeerEvent::DataRequest(mut requested))) => {
+                    let exact_request = requested.iter().any(|item| item == &announced);
+                    requested.retain(|item| item != &announced);
+                    if !requested.is_empty() {
+                        self.defer_wallet(WalletPeerEvent::DataRequest(requested))?;
+                    }
+                    if exact_request {
+                        self.connection
+                            .send_wallet_packet(&Packet::Tx(transaction))?;
+                        return Ok(true);
+                    }
+                }
+                Ok(PeerEvent::Wallet(event)) => self.defer_wallet(event)?,
+                Ok(
+                    PeerEvent::Addresses(_)
+                    | PeerEvent::Ignored(_)
+                    | PeerEvent::Experimental { .. }
+                    | PeerEvent::Pong(_)
+                    | PeerEvent::Ready(_),
+                ) => {}
+                Ok(PeerEvent::Rejected(reject)) => {
+                    return Err(HnsDirectPeerError::PeerRejected(format!("{reject:?}")));
+                }
+                Ok(PeerEvent::Headers(_) | PeerEvent::Proof(_) | PeerEvent::Send(_)) => {
+                    return Err(HnsDirectPeerError::UnexpectedPeerEvent);
+                }
+                Err(PeerError::Io(
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut,
+                )) => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(HnsDirectPeerError::ResponseEventLimit)
+    }
+
     fn request_headers(
         &mut self,
         locator: Vec<BlockHash>,
@@ -3365,6 +3473,81 @@ mod tests {
         assert_eq!(client.negotiated_registry(), server.negotiated_registry());
         assert_eq!(client.address(), address);
         assert!(server.address().ip().is_loopback());
+    }
+
+    #[test]
+    fn transaction_relay_announces_inventory_before_serving_requested_bytes() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let now = 1_700_000_000;
+        let transaction = Transaction {
+            version: 0,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            locktime: 0,
+        };
+        let transaction_hash = transaction.transaction_hash().unwrap().into_bytes();
+        let server = thread::spawn({
+            let transaction = transaction.clone();
+            move || {
+                let (stream, remote) = listener.accept().unwrap();
+                let mut version = light_wallet_version(remote, [2; 8], 42, now);
+                version.services = SERVICE_NETWORK | SERVICE_BLOOM;
+                let mut connection = PeerConnection::accept(
+                    stream,
+                    PeerConfig::for_network(NetworkMagic::Regtest),
+                    &version,
+                    now,
+                )
+                .unwrap();
+                connection.complete_handshake(|| now).unwrap();
+                let announced = match connection.receive_event(now).unwrap() {
+                    PeerEvent::Wallet(WalletPeerEvent::Inventory(items)) => items,
+                    event => panic!("expected transaction inventory, received {event:?}"),
+                };
+                assert_eq!(
+                    announced,
+                    vec![Inventory {
+                        kind: InventoryKind::Transaction,
+                        hash: transaction_hash,
+                    }]
+                );
+                connection
+                    .send_wallet_packet(&Packet::GetData(announced))
+                    .unwrap();
+                match connection.receive_event(now).unwrap() {
+                    PeerEvent::Wallet(WalletPeerEvent::Transaction(received)) => {
+                        assert_eq!(received, transaction);
+                    }
+                    event => panic!("expected requested transaction, received {event:?}"),
+                }
+            }
+        });
+
+        let mut local_version = light_wallet_version(address, [1; 8], 42, now);
+        // The generic accepted-peer test adapter requires NETWORK and wallet
+        // packet emission requires negotiated BLOOM in both directions.
+        // Production wallet clients continue to advertise no service.
+        local_version.services = SERVICE_NETWORK | SERVICE_BLOOM;
+        let mut connection = PeerConnection::connect(
+            address,
+            PeerConfig::for_wallet_network(NetworkMagic::Regtest),
+            &local_version,
+            now,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        connection.complete_handshake(|| now).unwrap();
+        let mut peer = NativePeer {
+            address,
+            connection,
+            deferred_wallet: VecDeque::new(),
+        };
+        assert!(
+            peer.announce_transaction(transaction, transaction_hash, Duration::from_secs(1))
+                .unwrap()
+        );
+        server.join().unwrap();
     }
 
     #[test]
