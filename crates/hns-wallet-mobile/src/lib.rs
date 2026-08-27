@@ -10,7 +10,8 @@ use std::path::Path;
 
 pub use bitcoin::{
     MobileBitcoinBroadcastReceipt, MobileBitcoinDirectConfig, MobileBitcoinSendApproval,
-    MobileBitcoinSnapshot, MobileBitcoinValueController,
+    MobileBitcoinShutdownHandle, MobileBitcoinSnapshot, MobileBitcoinSyncProgress,
+    MobileBitcoinSyncProgressHandle, MobileBitcoinValueController,
 };
 pub use market::{
     MobileDenuoDirectAdmission, MobileDenuoDirectTransportReport, MobileDenuoSessionController,

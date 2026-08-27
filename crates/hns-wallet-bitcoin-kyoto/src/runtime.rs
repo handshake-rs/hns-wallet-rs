@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::{Arc, Mutex};
 
 use bdk_kyoto::bip157::chain::{BlockHeaderChanges, IndexedHeader};
 use bdk_kyoto::bip157::{self, ChainState, Client, Event, SyncUpdate};
 use bdk_kyoto::builder::Builder;
-use bdk_kyoto::{HashCheckpoint, LoggingSubscribers, Requester, ScanType};
+use bdk_kyoto::{HashCheckpoint, Info, LoggingSubscribers, Requester, ScanType};
 use bdk_wallet::bitcoin::consensus::{deserialize, serialize};
 use bdk_wallet::bitcoin::hashes::Hash;
 use bdk_wallet::bitcoin::{BlockHash, Network, ScriptBuf, Transaction};
@@ -953,6 +954,86 @@ pub struct KyotoSupervisor {
     store: SharedWalletStore,
 }
 
+/// A narrow, cloneable stop signal for a running Kyoto node.
+///
+/// Native shells keep this outside the wallet-controller mutex so lifecycle
+/// teardown can wake a synchronization that currently owns that mutex. The
+/// handle carries no wallet, descriptor, transaction, or store authority.
+#[derive(Clone, Debug)]
+pub struct KyotoShutdownHandle {
+    requester: Requester,
+}
+
+/// Public, bounded progress from Kyoto's own validated sync pipeline.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KyotoSyncProgress {
+    pub successful_handshakes: u8,
+    pub connections_met: bool,
+    pub chain_height: Option<u32>,
+    pub completion_basis_points: u16,
+}
+
+/// Read-only progress mailbox which contains no wallet or peer identity.
+#[derive(Clone, Debug)]
+pub struct KyotoSyncProgressHandle(Arc<Mutex<KyotoSyncProgress>>);
+
+impl KyotoSyncProgressHandle {
+    pub fn snapshot(&self) -> KyotoSyncProgress {
+        self.0.lock().map(|progress| *progress).unwrap_or_default()
+    }
+}
+
+/// Drain Kyoto's informational channel into a bounded public mailbox. Warning
+/// strings are deliberately discarded because peers must not control native
+/// UI text or diagnostic cardinality.
+pub fn monitor_kyoto_sync_progress(mut logging: LoggingSubscribers) -> KyotoSyncProgressHandle {
+    let progress = Arc::new(Mutex::new(KyotoSyncProgress::default()));
+    let worker_progress = Arc::clone(&progress);
+    std::mem::drop(tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                info = logging.info_subscriber.recv() => match info {
+                    Some(Info::SuccessfulHandshake) => {
+                        if let Ok(mut current) = worker_progress.lock() {
+                            current.successful_handshakes =
+                                current.successful_handshakes.saturating_add(1);
+                        }
+                    }
+                    Some(Info::ConnectionsMet) => {
+                        if let Ok(mut current) = worker_progress.lock() {
+                            current.connections_met = true;
+                        }
+                    }
+                    Some(Info::Progress(update)) => {
+                        if let Ok(mut current) = worker_progress.lock() {
+                            current.chain_height = Some(update.chain_height());
+                            current.completion_basis_points =
+                                (update.fraction_complete().clamp(0.0, 1.0) * 10_000.0)
+                                    .round() as u16;
+                        }
+                    }
+                    Some(Info::BlockReceived(_)) => {}
+                    None => break,
+                },
+                warning = logging.warning_subscriber.recv() => {
+                    if warning.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+    }));
+    KyotoSyncProgressHandle(progress)
+}
+
+impl KyotoShutdownHandle {
+    pub fn request_shutdown(&self) -> Result<(), BitcoinWalletError> {
+        self.requester
+            .shutdown()
+            .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))
+    }
+}
+
 impl KyotoSupervisor {
     pub fn start(
         wallet: &EncryptedPersistedBitcoinWallet,
@@ -1016,6 +1097,12 @@ impl KyotoSupervisor {
 
     pub fn state_revision(&self) -> u64 {
         self.durable.revision()
+    }
+
+    pub fn shutdown_handle(&self) -> KyotoShutdownHandle {
+        KyotoShutdownHandle {
+            requester: self.requester.clone(),
+        }
     }
 
     /// Drives one Kyoto update, durably records matched swap evidence before

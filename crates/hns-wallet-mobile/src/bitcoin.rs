@@ -15,10 +15,11 @@ use bdk_wallet::bitcoin::consensus::deserialize;
 use bdk_wallet::bitcoin::hashes::Hash;
 use hns_wallet_bitcoin_kyoto::{
     BIP39_SEED_BYTES, BitcoinBroadcastReceipt, BitcoinTransactionRecord, BitcoinWalletError,
-    EncryptedPersistedBitcoinWallet, KyotoRuntimeConfig, KyotoSupervisor, KyotoSyncReceipt,
-    KyotoWalletState, StoredKyotoWalletState, authorize_native_send, bitcoin_value_runtime_permit,
+    EncryptedPersistedBitcoinWallet, KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor,
+    KyotoSyncProgressHandle, KyotoSyncReceipt, KyotoWalletState, StoredKyotoWalletState,
+    authorize_native_send, bitcoin_value_runtime_permit,
     create_persisted_descriptor_wallet_from_seed, load_persisted_descriptor_wallet_from_seed,
-    persist_prepared_bitcoin_broadcast, prepare_native_send,
+    monitor_kyoto_sync_progress, persist_prepared_bitcoin_broadcast, prepare_native_send,
 };
 use hns_wallet_hns::{HnsNetwork, HnsRuntimeConfig};
 use hns_wallet_store::{SecretKind, SharedWalletStore};
@@ -157,8 +158,47 @@ pub struct MobileBitcoinValueController {
     runtime: Option<Runtime>,
     wallet: Option<EncryptedPersistedBitcoinWallet>,
     supervisor: Option<KyotoSupervisor>,
+    progress: Option<KyotoSyncProgressHandle>,
     receive_address: Option<String>,
     pending_send: Option<PendingMobileBitcoinSend>,
+}
+
+/// Lifecycle-only stop capability for the active direct Bitcoin node.
+///
+/// This can be retained outside a native controller lock so an app-background
+/// teardown does not wait for the full synchronization timeout.
+#[derive(Clone, Debug)]
+pub struct MobileBitcoinShutdownHandle(KyotoShutdownHandle);
+
+impl MobileBitcoinShutdownHandle {
+    pub fn request_shutdown(&self) -> Result<(), MobileWalletError> {
+        self.0.request_shutdown().map_err(MobileWalletError::from)
+    }
+}
+
+/// Bounded public progress suitable for native wallet UI presentation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileBitcoinSyncProgress {
+    pub successful_handshakes: u8,
+    pub connections_met: bool,
+    pub chain_height: Option<u32>,
+    pub completion_basis_points: u16,
+}
+
+#[derive(Clone, Debug)]
+pub struct MobileBitcoinSyncProgressHandle(KyotoSyncProgressHandle);
+
+impl MobileBitcoinSyncProgressHandle {
+    pub fn snapshot(&self) -> MobileBitcoinSyncProgress {
+        let progress = self.0.snapshot();
+        MobileBitcoinSyncProgress {
+            successful_handshakes: progress.successful_handshakes,
+            connections_met: progress.connections_met,
+            chain_height: progress.chain_height,
+            completion_basis_points: progress.completion_basis_points,
+        }
+    }
 }
 
 impl MobileBitcoinValueController {
@@ -175,6 +215,7 @@ impl MobileBitcoinValueController {
             runtime: None,
             wallet: None,
             supervisor: None,
+            progress: None,
             receive_address: None,
             pending_send: None,
         })
@@ -227,25 +268,34 @@ impl MobileBitcoinValueController {
             Err(error) => return Err(error.into()),
         };
         let runtime = Runtime::new().map_err(|_| MobileWalletError::BitcoinRuntimeUnavailable)?;
-        let supervisor = {
+        let (supervisor, progress) = {
             let _entered = runtime.enter();
-            KyotoSupervisor::start(&wallet, self.config.kyoto_config(), durable, now_unix).map(
-                |(supervisor, logging)| {
-                    // Native shells surface only bounded sync status, never
-                    // untrusted peer log strings.
-                    drop(logging);
-                    supervisor
-                },
-            )?
+            let (supervisor, logging) =
+                KyotoSupervisor::start(&wallet, self.config.kyoto_config(), durable, now_unix)?;
+            (supervisor, monitor_kyoto_sync_progress(logging))
         };
         self.runtime = Some(runtime);
         self.wallet = Some(wallet);
         self.supervisor = Some(supervisor);
+        self.progress = Some(progress);
         Ok(())
     }
 
     pub fn is_active(&self) -> bool {
         self.runtime.is_some() && self.wallet.is_some() && self.supervisor.is_some()
+    }
+
+    pub fn shutdown_handle(&self) -> Option<MobileBitcoinShutdownHandle> {
+        self.supervisor
+            .as_ref()
+            .map(|supervisor| MobileBitcoinShutdownHandle(supervisor.shutdown_handle()))
+    }
+
+    pub fn sync_progress_handle(&self) -> Option<MobileBitcoinSyncProgressHandle> {
+        self.progress
+            .as_ref()
+            .cloned()
+            .map(MobileBitcoinSyncProgressHandle)
     }
 
     /// Reveal and persist one deterministic Bitcoin receive address. This
@@ -462,6 +512,7 @@ impl MobileBitcoinValueController {
             .transpose();
         self.wallet.take();
         self.runtime.take();
+        self.progress.take();
         self.receive_address = None;
         self.pending_send = None;
         shutdown.map_err(MobileWalletError::from)?;
