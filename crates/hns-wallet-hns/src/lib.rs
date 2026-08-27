@@ -4458,9 +4458,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             mempool_binding,
             common_ancestor,
         )?;
-        self.retain_or_insert_propagating_sends(&store, &mut transactions, now)?;
         let revalidated_names = self.revalidate_names(&mut store, binding, now)?;
-        persist_reconciled_entities(&mut store, &account.config, &coins, &transactions, now)?;
         let mut pending_user_actions =
             self.reconcile_name_workflows(&mut store, binding, mempool_binding, now)?;
         pending_user_actions.extend(self.reconcile_send_workflows(
@@ -4469,6 +4467,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             mempool_binding,
             now,
         )?);
+        self.retain_or_insert_pending_send_activity(&store, &mut transactions)?;
+        persist_reconciled_entities(&mut store, &account.config, &coins, &transactions, now)?;
         pending_user_actions.extend(self.reconcile_settlement_workflows(
             &mut store,
             binding,
@@ -5495,27 +5495,29 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         Ok(pending)
     }
 
-    fn retain_or_insert_propagating_sends(
+    fn retain_or_insert_pending_send_activity(
         &self,
         store: &WalletStore,
         transactions: &mut Vec<HnsTransactionRecord>,
-        now_unix: u64,
     ) -> Result<(), HnsWalletError> {
         let config = self.cache_read()?.account.config.clone();
-        let propagating = store
+        let pending = store
             .list_workflows_complete::<HnsSendWorkflow>(WorkflowKind::HnsSend, MAX_HISTORY_RESULTS)?
             .into_iter()
             .filter(|stored| {
                 stored.state.plan.wallet_id == config.wallet_id
                     && stored.state.plan.account_id == config.account_id
-                    && send_is_within_propagation_grace(
+                    && matches!(
                         stored.state.stage,
-                        stored.updated_at_unix,
-                        now_unix,
+                        HnsSendStage::Authorized
+                            | HnsSendStage::Broadcast
+                            | HnsSendStage::Mempool
+                            | HnsSendStage::RequiresRebroadcast
+                            | HnsSendStage::Abandoned
                     )
             })
             .collect::<Vec<_>>();
-        for stored in propagating {
+        for stored in pending {
             let txid = stored
                 .state
                 .transaction
@@ -5524,12 +5526,23 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 .iter_mut()
                 .find(|transaction| transaction.summary.txid == txid)
             {
-                if transaction.summary.status == LocalTransactionStatus::Dropped {
+                if transaction.summary.status == LocalTransactionStatus::Dropped
+                    && stored.state.stage == HnsSendStage::Broadcast
+                {
                     transaction.summary.status = LocalTransactionStatus::Broadcast;
                 }
                 continue;
             }
-            transactions.push(propagating_send_record(&stored)?);
+            let status = match stored.state.stage {
+                HnsSendStage::Authorized => LocalTransactionStatus::Authorized,
+                HnsSendStage::Broadcast => LocalTransactionStatus::Broadcast,
+                HnsSendStage::Mempool => LocalTransactionStatus::Mempool,
+                HnsSendStage::RequiresRebroadcast | HnsSendStage::Abandoned => {
+                    LocalTransactionStatus::Dropped
+                }
+                _ => return Err(HnsWalletError::InvalidWorkflow),
+            };
+            transactions.push(pending_send_record(&stored, status)?);
         }
         transactions.sort_by(|left, right| {
             right
@@ -6337,9 +6350,19 @@ fn send_is_within_propagation_grace(
         && now_unix.saturating_sub(updated_at_unix) < SEND_PROPAGATION_GRACE_SECONDS
 }
 
-fn propagating_send_record(
+fn pending_send_record(
     stored: &StoredWorkflow<HnsSendWorkflow>,
+    status: LocalTransactionStatus,
 ) -> Result<HnsTransactionRecord, HnsWalletError> {
+    if !matches!(
+        status,
+        LocalTransactionStatus::Authorized
+            | LocalTransactionStatus::Broadcast
+            | LocalTransactionStatus::Mempool
+            | LocalTransactionStatus::Dropped
+    ) {
+        return Err(HnsWalletError::InvalidWorkflow);
+    }
     let txid = stored
         .state
         .transaction
@@ -6361,7 +6384,7 @@ fn propagating_send_record(
         summary: TransactionSummary {
             module: ModuleId::Handshake,
             txid,
-            status: LocalTransactionStatus::Broadcast,
+            status,
             net_amount: SignedBaseUnits {
                 negative: true,
                 magnitude: BaseUnits::new(magnitude),
@@ -10690,7 +10713,8 @@ mod tests {
             updated_at_unix: 1_000,
         };
 
-        let record = propagating_send_record(&stored).expect("broadcast activity");
+        let record = pending_send_record(&stored, LocalTransactionStatus::Broadcast)
+            .expect("broadcast activity");
         assert_eq!(record.raw, raw);
         assert_eq!(record.summary.txid, txid);
         assert_eq!(record.summary.status, LocalTransactionStatus::Broadcast);
@@ -10698,11 +10722,15 @@ mod tests {
         assert_eq!(record.summary.first_seen_unix, Some(1_000));
         assert!(record.summary.net_amount.negative);
         assert_eq!(record.summary.net_amount.magnitude, BaseUnits::new(100));
+        let dropped = pending_send_record(&stored, LocalTransactionStatus::Dropped)
+            .expect("durable dropped activity");
+        assert_eq!(dropped.summary.status, LocalTransactionStatus::Dropped);
+        assert_eq!(dropped.raw, raw);
 
         let mut mismatched = stored;
         mismatched.state.transaction = Some(TransactionHash::new([9; 32]));
         assert!(matches!(
-            propagating_send_record(&mismatched),
+            pending_send_record(&mismatched, LocalTransactionStatus::Broadcast),
             Err(HnsWalletError::InvalidEvidence)
         ));
     }
