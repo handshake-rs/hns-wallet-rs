@@ -2518,7 +2518,15 @@ impl NativePeer {
                     | PeerEvent::Pong(_)
                     | PeerEvent::Ready(_),
                 ) => {}
-                Ok(PeerEvent::Rejected(_)) => {}
+                // A reject received while draining the explicit mempool
+                // response may be the peer's policy/consensus response to the
+                // transaction written immediately before this refresh. Never
+                // discard it: socket completion is not admission, and losing
+                // the reject reason makes a permanently invalid signed send
+                // look like a propagation delay forever.
+                Ok(PeerEvent::Rejected(reject)) => {
+                    return Err(HnsDirectPeerError::PeerRejected(format!("{reject:?}")));
+                }
                 Ok(PeerEvent::Headers(_) | PeerEvent::Proof(_) | PeerEvent::Send(_)) => {
                     return Err(HnsDirectPeerError::UnexpectedPeerEvent);
                 }
