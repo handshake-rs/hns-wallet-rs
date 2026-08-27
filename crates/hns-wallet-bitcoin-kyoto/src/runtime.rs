@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use bdk_kyoto::bip157::chain::{BlockHeaderChanges, IndexedHeader};
 use bdk_kyoto::bip157::{self, ChainState, Client, Event, SyncUpdate};
 use bdk_kyoto::builder::Builder;
-use bdk_kyoto::{HashCheckpoint, Info, LoggingSubscribers, Requester, ScanType};
+use bdk_kyoto::{HashCheckpoint, Info, LoggingSubscribers, Requester, ScanType, Warning};
 use bdk_wallet::bitcoin::consensus::{deserialize, serialize};
 use bdk_wallet::bitcoin::hashes::Hash;
 use bdk_wallet::bitcoin::{BlockHash, Network, ScriptBuf, Transaction};
@@ -968,6 +968,9 @@ pub struct KyotoShutdownHandle {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KyotoSyncProgress {
     pub successful_handshakes: u8,
+    pub connection_failures: u16,
+    pub peer_timeouts: u16,
+    pub incompatible_peers: u16,
     pub connections_met: bool,
     pub chain_height: Option<u32>,
     pub completion_basis_points: u16,
@@ -1015,11 +1018,27 @@ pub fn monitor_kyoto_sync_progress(mut logging: LoggingSubscribers) -> KyotoSync
                     Some(Info::BlockReceived(_)) => {}
                     None => break,
                 },
-                warning = logging.warning_subscriber.recv() => {
-                    if warning.is_none() {
-                        break;
+                warning = logging.warning_subscriber.recv() => match warning {
+                    Some(Warning::CouldNotConnect) => {
+                        if let Ok(mut current) = worker_progress.lock() {
+                            current.connection_failures =
+                                current.connection_failures.saturating_add(1);
+                        }
                     }
-                }
+                    Some(Warning::PeerTimedOut) => {
+                        if let Ok(mut current) = worker_progress.lock() {
+                            current.peer_timeouts = current.peer_timeouts.saturating_add(1);
+                        }
+                    }
+                    Some(Warning::NoCompactFilters) => {
+                        if let Ok(mut current) = worker_progress.lock() {
+                            current.incompatible_peers =
+                                current.incompatible_peers.saturating_add(1);
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
             }
         }
     }));

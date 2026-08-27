@@ -158,7 +158,7 @@ pub struct MobileBitcoinValueController {
     runtime: Option<Runtime>,
     wallet: Option<EncryptedPersistedBitcoinWallet>,
     supervisor: Option<KyotoSupervisor>,
-    progress: Option<KyotoSyncProgressHandle>,
+    progress: Option<MobileBitcoinSyncProgressHandle>,
     receive_address: Option<String>,
     pending_send: Option<PendingMobileBitcoinSend>,
 }
@@ -181,19 +181,27 @@ impl MobileBitcoinShutdownHandle {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MobileBitcoinSyncProgress {
     pub successful_handshakes: u8,
+    pub required_peer_count: u8,
+    pub connection_failures: u16,
+    pub peer_timeouts: u16,
+    pub incompatible_peers: u16,
     pub connections_met: bool,
     pub chain_height: Option<u32>,
     pub completion_basis_points: u16,
 }
 
 #[derive(Clone, Debug)]
-pub struct MobileBitcoinSyncProgressHandle(KyotoSyncProgressHandle);
+pub struct MobileBitcoinSyncProgressHandle(KyotoSyncProgressHandle, u8);
 
 impl MobileBitcoinSyncProgressHandle {
     pub fn snapshot(&self) -> MobileBitcoinSyncProgress {
         let progress = self.0.snapshot();
         MobileBitcoinSyncProgress {
             successful_handshakes: progress.successful_handshakes,
+            required_peer_count: self.1,
+            connection_failures: progress.connection_failures,
+            peer_timeouts: progress.peer_timeouts,
+            incompatible_peers: progress.incompatible_peers,
             connections_met: progress.connections_met,
             chain_height: progress.chain_height,
             completion_basis_points: progress.completion_basis_points,
@@ -272,7 +280,13 @@ impl MobileBitcoinValueController {
             let _entered = runtime.enter();
             let (supervisor, logging) =
                 KyotoSupervisor::start(&wallet, self.config.kyoto_config(), durable, now_unix)?;
-            (supervisor, monitor_kyoto_sync_progress(logging))
+            (
+                supervisor,
+                MobileBitcoinSyncProgressHandle(
+                    monitor_kyoto_sync_progress(logging),
+                    self.config.required_peers,
+                ),
+            )
         };
         self.runtime = Some(runtime);
         self.wallet = Some(wallet);
@@ -292,10 +306,7 @@ impl MobileBitcoinValueController {
     }
 
     pub fn sync_progress_handle(&self) -> Option<MobileBitcoinSyncProgressHandle> {
-        self.progress
-            .as_ref()
-            .cloned()
-            .map(MobileBitcoinSyncProgressHandle)
+        self.progress.clone()
     }
 
     /// Reveal and persist one deterministic Bitcoin receive address. This
