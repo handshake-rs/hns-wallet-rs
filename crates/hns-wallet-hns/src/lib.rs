@@ -3571,12 +3571,21 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 .collect::<Vec<_>>();
             let competing_spender =
                 has_competing_spender_in_batches(&self.backend, &outpoints, binding, txid)?;
-            if evidence.status.conflicted
-                || evidence.status.confirmation_count > 0
-                || evidence.status.in_mempool
-                || competing_spender
-                || send_is_within_propagation_grace(stored.state.stage, stored.updated_at_unix, now)
-            {
+            let observed_stage = if evidence.status.conflicted || competing_spender {
+                Some(HnsSendStage::Conflicted)
+            } else if evidence.status.confirmation_count > 0 {
+                Some(HnsSendStage::Confirmed)
+            } else if evidence.status.in_mempool {
+                Some(HnsSendStage::Mempool)
+            } else {
+                None
+            };
+            if let Some(observed_stage) = observed_stage {
+                let mut store = self.store_lock()?;
+                persist_observed_send_stage(&mut store, &account, &stored, observed_stage, now)?;
+                continue;
+            }
+            if send_is_within_propagation_grace(stored.state.stage, stored.updated_at_unix, now) {
                 continue;
             }
             dropped.insert(txid);
@@ -8590,6 +8599,64 @@ fn reservation_deletes(
     Ok(deletes)
 }
 
+fn persist_observed_send_stage(
+    store: &mut WalletStore,
+    config: &HnsRuntimeConfig,
+    expected: &StoredWorkflow<HnsSendWorkflow>,
+    next_stage: HnsSendStage,
+    now_unix: u64,
+) -> Result<(), HnsWalletError> {
+    if !matches!(
+        next_stage,
+        HnsSendStage::Mempool | HnsSendStage::Confirmed | HnsSendStage::Conflicted
+    ) || expected.state.plan.wallet_id != config.wallet_id
+        || expected.state.plan.account_id != config.account_id
+        || expected.state.plan.workflow_id != expected.id
+        || !matches!(
+            expected.state.stage,
+            HnsSendStage::Authorized
+                | HnsSendStage::Broadcast
+                | HnsSendStage::Mempool
+                | HnsSendStage::RequiresRebroadcast
+        )
+        || expected.state.transaction.is_none()
+        || expected.state.signed_transaction.is_none()
+    {
+        return Err(HnsWalletError::InvalidWorkflow);
+    }
+    if expected.state.stage == next_stage {
+        return Ok(());
+    }
+    let current = store
+        .load_workflow::<HnsSendWorkflow>(expected.id)?
+        .ok_or(HnsWalletError::InvalidWorkflow)?;
+    if current.revision != expected.revision || current.state != expected.state {
+        return Err(HnsWalletError::InvalidWorkflow);
+    }
+    let mut state = current.state;
+    state.stage = next_stage;
+    let deletes = if matches!(
+        next_stage,
+        HnsSendStage::Confirmed | HnsSendStage::Conflicted
+    ) {
+        reservation_deletes(store, config, expected.id)?
+    } else {
+        Vec::new()
+    };
+    store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+        expected.id,
+        WorkflowKind::HnsSend,
+        current.revision,
+        &state,
+        true,
+        now_unix,
+        EntityKind::InputReservation,
+        &[],
+        &deletes,
+    )?;
+    Ok(())
+}
+
 fn abandon_obsolete_dropped_send(
     store: &mut WalletStore,
     config: &HnsRuntimeConfig,
@@ -10772,7 +10839,7 @@ mod tests {
     }
 
     #[test]
-    fn obsolete_dropped_send_atomically_releases_activated_reservation() {
+    fn terminal_dropped_sends_atomically_release_activated_reservations() {
         let mut store = WalletStore::create(":memory:", "passphrase").expect("store");
         let config = test_runtime_config();
         let workflow_id = WorkflowId::new([42; 16]);
@@ -10855,17 +10922,64 @@ mod tests {
             )
             .expect("activated reservation");
 
+        let observed = store
+            .load_workflow::<HnsSendWorkflow>(workflow_id)
+            .expect("load observed workflow")
+            .expect("observed workflow");
+        persist_observed_send_stage(
+            &mut store,
+            &config,
+            &observed,
+            HnsSendStage::Conflicted,
+            1_050,
+        )
+        .expect("persist conflict and release reservation");
+        let observed = store
+            .load_workflow::<HnsSendWorkflow>(workflow_id)
+            .expect("reload observed workflow")
+            .expect("observed workflow remains auditable");
+        assert_eq!(observed.state.stage, HnsSendStage::Conflicted);
+        assert!(
+            account_input_reservations(&store, &config)
+                .expect("conflict reservations")
+                .is_empty()
+        );
+
+        let obsolete_workflow_id = WorkflowId::new([48; 16]);
+        let mut obsolete_state = state;
+        obsolete_state.plan.workflow_id = obsolete_workflow_id;
+        let mut obsolete_reservation = reservation;
+        obsolete_reservation.workflow_id = obsolete_workflow_id;
+        store
+            .save_workflow(
+                obsolete_workflow_id,
+                WorkflowKind::HnsSend,
+                0,
+                &obsolete_state,
+                true,
+                1_075,
+            )
+            .expect("obsolete workflow");
+        store
+            .save_input_reservation(
+                &namespaced_outpoint_id(&config, outpoint),
+                0,
+                &obsolete_reservation,
+                1_075,
+            )
+            .expect("obsolete activated reservation");
+
         abandon_obsolete_dropped_send(
             &mut store,
             &config,
-            workflow_id,
+            obsolete_workflow_id,
             &BTreeSet::from([transaction_id]),
             1_100,
         )
         .expect("abandon obsolete send");
 
         let stored = store
-            .load_workflow::<HnsSendWorkflow>(workflow_id)
+            .load_workflow::<HnsSendWorkflow>(obsolete_workflow_id)
             .expect("load workflow")
             .expect("workflow remains auditable");
         assert_eq!(stored.state.stage, HnsSendStage::Abandoned);
