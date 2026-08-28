@@ -109,6 +109,10 @@ pub struct MobileBitcoinSnapshot {
     pub untrusted_pending_sats: u64,
     pub immature_sats: u64,
     pub total_sats: u64,
+    /// Zero means a full recovery scan. A nonzero value is the earliest
+    /// transaction block requested by the user; the durable recovery
+    /// checkpoint is its validated predecessor.
+    pub birthday_height: u32,
     pub synchronized_height: u32,
     pub connected_peer_count: u8,
     pub required_peer_count: u8,
@@ -343,6 +347,33 @@ impl MobileBitcoinValueController {
         Ok((receipt, snapshot))
     }
 
+    /// Explicitly replace an incomplete full-scan journal with a validated
+    /// Bitcoin birthday. The height names the earliest block that may contain
+    /// wallet activity, not the exclusive recovery checkpoint. Existing
+    /// scans at or beyond that height are never rewound or relabeled.
+    pub fn set_birthday_height(
+        &mut self,
+        earliest_transaction_height: u32,
+    ) -> Result<MobileBitcoinSnapshot, MobileWalletError> {
+        if self.pending_send.is_some() || earliest_transaction_height == 0 {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        let now_unix = now_unix()?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let supervisor = self
+            .supervisor
+            .as_mut()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        runtime
+            .block_on(supervisor.reset_birthday_height(earliest_transaction_height, now_unix))?;
+        self.deactivate()?;
+        self.activate()?;
+        self.snapshot()
+    }
+
     pub fn snapshot(&self) -> Result<MobileBitcoinSnapshot, MobileWalletError> {
         let wallet = self
             .wallet
@@ -354,6 +385,14 @@ impl MobileBitcoinValueController {
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
         let balance = wallet.balance();
         let state = supervisor.state();
+        let birthday_height = if matches!(
+            state.birthday.source,
+            hns_wallet_bitcoin_kyoto::BitcoinBirthdaySource::FullScan
+        ) {
+            0
+        } else {
+            state.birthday.checkpoint.height.saturating_add(1)
+        };
         Ok(MobileBitcoinSnapshot {
             network: bitcoin_network_name(self.config.network).to_owned(),
             receive_address: self.receive_address.clone().unwrap_or_else(|| {
@@ -367,6 +406,7 @@ impl MobileBitcoinValueController {
             untrusted_pending_sats: balance.untrusted_pending.to_sat(),
             immature_sats: balance.immature.to_sat(),
             total_sats: balance.total().to_sat(),
+            birthday_height,
             synchronized_height: state.scanned_checkpoint.height,
             connected_peer_count: state.connected_peer_count,
             required_peer_count: self.config.required_peers,

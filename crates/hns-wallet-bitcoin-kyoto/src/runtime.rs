@@ -732,6 +732,16 @@ impl StoredKyotoWalletState {
         })?;
         Ok(())
     }
+
+    fn replace(
+        &mut self,
+        state: KyotoWalletState,
+        now_unix: u64,
+    ) -> Result<(), BitcoinWalletError> {
+        state.validate()?;
+        self.state = state;
+        self.persist(now_unix)
+    }
 }
 
 fn wallet_scripts_for_scan(
@@ -1122,6 +1132,75 @@ impl KyotoSupervisor {
         KyotoShutdownHandle {
             requester: self.requester.clone(),
         }
+    }
+
+    /// Resolve a user-supplied earliest transaction height against Kyoto's
+    /// locally validated most-work header chain, then replace the recovery
+    /// journal with the preceding checkpoint. Starting one block earlier is
+    /// required because a recovery checkpoint is exclusive: the entered
+    /// earliest block itself must still be scanned.
+    ///
+    /// This is an explicit recovery reset, not a mutable sync preference. The
+    /// caller must own the controller exclusively and reconstruct the Kyoto
+    /// supervisor after success so its scan subscription starts from the new
+    /// durable checkpoint.
+    pub async fn reset_birthday_height(
+        &mut self,
+        earliest_transaction_height: u32,
+        now_unix: u64,
+    ) -> Result<BitcoinCheckpoint, BitcoinWalletError> {
+        if self.poisoned || earliest_transaction_height == 0 {
+            return Err(BitcoinWalletError::InvalidBirthday);
+        }
+        let current = self.durable.state.scanned_checkpoint.height;
+        if earliest_transaction_height <= current {
+            return Err(BitcoinWalletError::InvalidBirthday);
+        }
+        let checkpoint_height = earliest_transaction_height
+            .checked_sub(1)
+            .ok_or(BitcoinWalletError::InvalidBirthday)?;
+        let tip = tokio::time::timeout(self.request_timeout, self.requester.chain_tip())
+            .await
+            .map_err(|_| BitcoinWalletError::OperationTimedOut)?
+            .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
+        if earliest_transaction_height > tip.height {
+            return Err(BitcoinWalletError::InvalidBirthday);
+        }
+        let header = tokio::time::timeout(
+            self.request_timeout,
+            self.requester.get_header(checkpoint_height),
+        )
+        .await
+        .map_err(|_| BitcoinWalletError::OperationTimedOut)?
+        .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?
+        .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
+        if header.height != checkpoint_height {
+            return Err(BitcoinWalletError::InvalidCheckpoint);
+        }
+        let checkpoint = BitcoinCheckpoint {
+            height: checkpoint_height,
+            block_hash: header.header.block_hash().to_byte_array(),
+        };
+        checkpoint.validate(self.durable.state.network)?;
+        let canonical_height = tokio::time::timeout(
+            self.request_timeout,
+            self.requester
+                .height_of_hash(BlockHash::from_byte_array(checkpoint.block_hash)),
+        )
+        .await
+        .map_err(|_| BitcoinWalletError::OperationTimedOut)?
+        .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
+        if canonical_height != Some(checkpoint_height) {
+            return Err(BitcoinWalletError::InvalidCheckpoint);
+        }
+        let replacement = KyotoWalletState::restored_wallet(
+            self.durable.state.network,
+            Some(checkpoint),
+            self.durable.state.recovery_script_index,
+            now_unix,
+        )?;
+        self.durable.replace(replacement, now_unix)?;
+        Ok(checkpoint)
     }
 
     /// Drives one Kyoto update, durably records matched swap evidence before
