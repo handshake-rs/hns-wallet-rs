@@ -1239,6 +1239,10 @@ impl HnsDirectPeerCoordinator {
             .backend
             .light_watch_set()
             .map_err(HnsDirectPeerError::Wallet)?;
+        let base = source
+            .store
+            .try_with_store(|wallet| derive_hns_light_watch_set(wallet, &account))
+            .map_err(HnsDirectPeerError::Wallet)?;
         let mut largest_candidate = None;
         for extension in 1..=MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS {
             let candidate = source
@@ -1252,6 +1256,14 @@ impl HnsDirectPeerCoordinator {
         let candidate = largest_candidate.ok_or(HnsDirectPeerError::Wallet(
             HnsWalletError::ScanCapacityExhausted,
         ))?;
+        // A completed recovery can advance only one derivation branch by a
+        // non-window-aligned amount. The previously pre-expanded set remains
+        // complete in that case even though it is no longer exactly equal to
+        // `current base + N whole windows`. Keep that authenticated coverage
+        // until the required base actually reaches an unscanned script.
+        if installed != base && deterministic_watch_set_covers(&installed, &base, &candidate) {
+            return Ok(false);
+        }
         if candidate == installed {
             return Ok(false);
         }
@@ -2268,17 +2280,41 @@ fn reusable_wallet_watch_set(
     if installed == &base {
         return Ok(base);
     }
-    for extension in 1..=MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS {
-        let candidate = store
-            .try_with_store(|wallet| {
-                derive_hns_light_watch_set_with_restore_extension(wallet, account, extension)
-            })
-            .map_err(HnsDirectPeerError::Wallet)?;
-        if installed == &candidate {
-            return Ok(candidate);
-        }
+    let ceiling = store
+        .try_with_store(|wallet| {
+            derive_hns_light_watch_set_with_restore_extension(
+                wallet,
+                account,
+                MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS,
+            )
+        })
+        .map_err(HnsDirectPeerError::Wallet)?;
+    if deterministic_watch_set_covers(installed, &base, &ceiling) {
+        return Ok(installed.clone());
     }
     Ok(base)
+}
+
+/// Accept prior coverage only when it contains the complete current base and
+/// every retained script is still a wallet-derived member of the bounded
+/// restoration ceiling. Known-name membership remains exact: adding or
+/// removing an imported name changes compact-filter relevance and requires a
+/// deliberate rewind.
+fn deterministic_watch_set_covers(
+    installed: &crate::HnsLightWatchSet,
+    required: &crate::HnsLightWatchSet,
+    ceiling: &crate::HnsLightWatchSet,
+) -> bool {
+    installed.name_hashes == required.name_hashes
+        && ceiling.name_hashes == required.name_hashes
+        && required
+            .scripts
+            .iter()
+            .all(|script| installed.scripts.binary_search(script).is_ok())
+        && installed
+            .scripts
+            .iter()
+            .all(|script| ceiling.scripts.binary_search(script).is_ok())
 }
 
 impl NativePeer {
@@ -3399,6 +3435,80 @@ mod tests {
                 .watched_scripts,
             36
         );
+    }
+
+    #[test]
+    fn direct_wallet_shifted_branch_frontier_reuses_completed_expansion() {
+        let config = direct_wallet_config();
+        let mut wallet =
+            WalletStore::create(":memory:", "direct wallet shifted frontier passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[76; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let now = Network::Regtest.parameters().genesis_time.get() + 103;
+        let store = hns_wallet_store::SharedWalletStore::new(wallet);
+        let coordinator = open_wallet_direct_hns_peer_coordinator(
+            store.clone(),
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now,
+        )
+        .unwrap();
+        assert!(
+            coordinator
+                .extend_wallet_restore_watch_set(now + 1)
+                .expect("pre-expand direct wallet restoration watch set")
+        );
+        let expanded = coordinator.backend().light_watch_set().unwrap();
+
+        // Model a synchronized snapshot discovering activity on only one
+        // branch. The required base moves by one script, while the previous
+        // eight-window expansion still covers it in full.
+        let mut stored = store
+            .try_with_store(|wallet| {
+                wallet
+                    .wallet_account::<crate::HnsAccountRecord>(&crate::account_entity_id(&config))
+                    .map_err(HnsWalletError::from)
+            })
+            .unwrap()
+            .unwrap();
+        stored.value.last_used_external = Some(0);
+        stored.value.next_receive_index = 1;
+        stored.value.external_scan_end = 1;
+        store
+            .with_store_mut(|wallet| {
+                wallet.save_wallet_account(
+                    &crate::account_entity_id(&config),
+                    stored.revision,
+                    &stored.value,
+                    now + 2,
+                )
+            })
+            .unwrap();
+
+        let reopened = open_wallet_direct_hns_peer_coordinator(
+            store,
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now + 3,
+        )
+        .unwrap();
+        assert_eq!(reopened.backend().light_watch_set().unwrap(), expanded);
+        assert!(
+            !reopened
+                .extend_wallet_restore_watch_set(now + 4)
+                .expect("reuse prior complete restoration coverage")
+        );
+        assert_eq!(reopened.backend().light_watch_set().unwrap(), expanded);
     }
 
     #[test]
