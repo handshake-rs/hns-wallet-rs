@@ -369,7 +369,11 @@ impl MobileBitcoinValueController {
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
         runtime
             .block_on(supervisor.reset_birthday_height(earliest_transaction_height, now_unix))?;
-        self.deactivate()?;
+        // `deactivate` takes and drops the old supervisor/runtime before its
+        // shutdown result is returned. Always reconstruct after the durable
+        // birthday update, even when Kyoto reports that its already-retired
+        // requester could not accept another shutdown message.
+        let _ = self.deactivate();
         self.activate()?;
         self.snapshot()
     }

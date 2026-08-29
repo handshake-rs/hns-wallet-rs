@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bdk_kyoto::bip157::chain::{BlockHeaderChanges, IndexedHeader};
@@ -40,6 +41,11 @@ pub const MAX_RECONCILIATION_BATCH_SAVES: usize = 512;
 pub const MEDIAN_TIME_PAST_HEADERS: usize = 11;
 pub const MIN_DATE_BIRTHDAY_SAFETY_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const MAX_DATE_BIRTHDAY_SAFETY_SECONDS: u64 = 366 * 24 * 60 * 60;
+/// One deadline for the complete interactive birthday validation. The normal
+/// synchronization path can wait for peer/header convergence; a UI setter
+/// must instead fail quickly and leave the existing birthday untouched.
+pub const BITCOIN_BIRTHDAY_VALIDATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct BitcoinCheckpoint {
@@ -955,6 +961,7 @@ impl KyotoWalletSwapSubscriber {
 pub struct KyotoSupervisor {
     requester: Requester,
     updates: KyotoWalletSwapSubscriber,
+    cancellation: Arc<KyotoCancellation>,
     required_peers: u8,
     request_timeout: std::time::Duration,
     sync_timeout: std::time::Duration,
@@ -972,6 +979,34 @@ pub struct KyotoSupervisor {
 #[derive(Clone, Debug)]
 pub struct KyotoShutdownHandle {
     requester: Requester,
+    cancellation: Arc<KyotoCancellation>,
+}
+
+#[derive(Debug, Default)]
+struct KyotoCancellation {
+    requested: AtomicBool,
+    notification: tokio::sync::Notify,
+}
+
+impl KyotoCancellation {
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.notification.notify_waiters();
+    }
+
+    fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notification.notified();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Public, bounded progress from Kyoto's own validated sync pipeline.
@@ -1057,9 +1092,12 @@ pub fn monitor_kyoto_sync_progress(mut logging: LoggingSubscribers) -> KyotoSync
 
 impl KyotoShutdownHandle {
     pub fn request_shutdown(&self) -> Result<(), BitcoinWalletError> {
-        self.requester
-            .shutdown()
-            .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))
+        // Wake the controller-owned future first. Kyoto's shutdown request is
+        // still sent, but failure to enqueue it must not revoke local
+        // cancellation or strand the native caller inside `updates.update()`.
+        self.cancellation.request();
+        let _ = self.requester.shutdown();
+        Ok(())
     }
 }
 
@@ -1104,10 +1142,12 @@ impl KyotoSupervisor {
         })?;
         let (requester, logging, updates) =
             build_wallet_swap_client(wallet, config, scan_type, watched_scripts(&watches))?;
+        let cancellation = Arc::new(KyotoCancellation::default());
         Ok((
             Self {
                 requester,
                 updates,
+                cancellation,
                 required_peers,
                 request_timeout,
                 sync_timeout,
@@ -1131,6 +1171,7 @@ impl KyotoSupervisor {
     pub fn shutdown_handle(&self) -> KyotoShutdownHandle {
         KyotoShutdownHandle {
             requester: self.requester.clone(),
+            cancellation: Arc::clone(&self.cancellation),
         }
     }
 
@@ -1159,40 +1200,48 @@ impl KyotoSupervisor {
         let checkpoint_height = earliest_transaction_height
             .checked_sub(1)
             .ok_or(BitcoinWalletError::InvalidBirthday)?;
-        let tip = tokio::time::timeout(self.request_timeout, self.requester.chain_tip())
-            .await
-            .map_err(|_| BitcoinWalletError::OperationTimedOut)?
-            .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
-        if earliest_transaction_height > tip.height {
-            return Err(BitcoinWalletError::InvalidBirthday);
-        }
-        let header = tokio::time::timeout(
-            self.request_timeout,
-            self.requester.get_header(checkpoint_height),
-        )
-        .await
-        .map_err(|_| BitcoinWalletError::OperationTimedOut)?
-        .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?
-        .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
-        if header.height != checkpoint_height {
-            return Err(BitcoinWalletError::InvalidCheckpoint);
-        }
-        let checkpoint = BitcoinCheckpoint {
-            height: checkpoint_height,
-            block_hash: header.header.block_hash().to_byte_array(),
+        let validation = async {
+            let tip = self
+                .requester
+                .chain_tip()
+                .await
+                .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
+            if earliest_transaction_height > tip.height {
+                return Err(BitcoinWalletError::InvalidBirthday);
+            }
+            let header = self
+                .requester
+                .get_header(checkpoint_height)
+                .await
+                .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?
+                .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
+            if header.height != checkpoint_height {
+                return Err(BitcoinWalletError::InvalidCheckpoint);
+            }
+            let checkpoint = BitcoinCheckpoint {
+                height: checkpoint_height,
+                block_hash: header.header.block_hash().to_byte_array(),
+            };
+            checkpoint.validate(self.durable.state.network)?;
+            let canonical_height = self
+                .requester
+                .height_of_hash(BlockHash::from_byte_array(checkpoint.block_hash))
+                .await
+                .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
+            if canonical_height != Some(checkpoint_height) {
+                return Err(BitcoinWalletError::InvalidCheckpoint);
+            }
+            Ok(checkpoint)
         };
-        checkpoint.validate(self.durable.state.network)?;
-        let canonical_height = tokio::time::timeout(
-            self.request_timeout,
-            self.requester
-                .height_of_hash(BlockHash::from_byte_array(checkpoint.block_hash)),
-        )
-        .await
-        .map_err(|_| BitcoinWalletError::OperationTimedOut)?
-        .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
-        if canonical_height != Some(checkpoint_height) {
-            return Err(BitcoinWalletError::InvalidCheckpoint);
-        }
+        let checkpoint = tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => {
+                return Err(BitcoinWalletError::KyotoNodeStopped);
+            }
+            result = tokio::time::timeout(BITCOIN_BIRTHDAY_VALIDATION_TIMEOUT, validation) => {
+                result.map_err(|_| BitcoinWalletError::OperationTimedOut)??
+            }
+        };
         let replacement = KyotoWalletState::restored_wallet(
             self.durable.state.network,
             Some(checkpoint),
@@ -1206,8 +1255,10 @@ impl KyotoSupervisor {
     /// Drives one Kyoto update, durably records matched swap evidence before
     /// advancing the BDK checkpoint, reconciles bounded encrypted
     /// transaction/output mirrors, and only then commits a ready scan
-    /// checkpoint. A configured timeout poisons this supervisor and requires
-    /// reconstruction because Kyoto's update future is not cancel safe.
+    /// checkpoint. A timeout or explicit cancellation poisons this supervisor
+    /// and requires reconstruction because Kyoto's update future is not
+    /// cancel safe. Native callers retire the complete supervisor immediately;
+    /// a cancelled update future is never polled or reused.
     pub async fn synchronize_once(
         &mut self,
         wallet: &mut EncryptedPersistedBitcoinWallet,
@@ -1258,7 +1309,24 @@ impl KyotoSupervisor {
         };
         self.durable.persist(now_unix)?;
 
-        let update = match tokio::time::timeout(self.sync_timeout, self.updates.update()).await {
+        let update_result = tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => {
+                self.poisoned = true;
+                let _ = self.requester.shutdown();
+                self.durable.state.phase = KyotoSyncPhase::RecoveryRequired {
+                    reason: if self.durable.state.completed_syncs == 0 {
+                        KyotoRecoveryReason::InterruptedInitialScan
+                    } else {
+                        KyotoRecoveryReason::InterruptedSynchronization
+                    },
+                };
+                self.durable.persist(now_unix)?;
+                return Err(BitcoinWalletError::KyotoNodeStopped);
+            }
+            result = tokio::time::timeout(self.sync_timeout, self.updates.update()) => result,
+        };
+        let update = match update_result {
             Ok(Ok(update)) => update,
             Ok(Err(_)) => {
                 self.poisoned = true;
@@ -1559,6 +1627,7 @@ impl KyotoSupervisor {
     }
 
     pub fn shutdown(&self) -> Result<(), BitcoinWalletError> {
+        self.cancellation.request();
         self.requester
             .shutdown()
             .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))
@@ -2657,5 +2726,32 @@ mod restart_tests {
             median_time_past([]),
             Err(BitcoinWalletError::InvalidChainLockContext)
         ));
+    }
+
+    #[test]
+    fn shutdown_cancellation_is_sticky_and_wakes_an_existing_waiter() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let cancellation = Arc::new(KyotoCancellation::default());
+            let waiter_cancellation = Arc::clone(&cancellation);
+            let waiter = tokio::spawn(async move {
+                waiter_cancellation.cancelled().await;
+            });
+            tokio::task::yield_now().await;
+            cancellation.request();
+            tokio::time::timeout(std::time::Duration::from_millis(50), waiter)
+                .await
+                .expect("an active sync waiter wakes immediately")
+                .expect("waiter completes");
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                cancellation.cancelled(),
+            )
+            .await
+            .expect("a shutdown request remains visible to late waiters");
+        });
     }
 }
