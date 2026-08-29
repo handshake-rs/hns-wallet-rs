@@ -490,6 +490,7 @@ pub struct KyotoTipDiscovery {
     request_timeout: std::time::Duration,
     sync_timeout: std::time::Duration,
     validated_tip: Option<BitcoinCheckpoint>,
+    cancellation: Arc<KyotoCancellation>,
     poisoned: bool,
 }
 
@@ -529,6 +530,7 @@ impl KyotoTipDiscovery {
         std::mem::drop(runtime.spawn(async move {
             let _ = node.run().await;
         }));
+        let cancellation = Arc::new(KyotoCancellation::default());
         Ok((
             Self {
                 network,
@@ -538,6 +540,7 @@ impl KyotoTipDiscovery {
                 request_timeout: supervisor_request_timeout,
                 sync_timeout: supervisor_sync_timeout,
                 validated_tip: None,
+                cancellation,
                 poisoned: false,
             },
             LoggingSubscribers {
@@ -554,7 +557,17 @@ impl KyotoTipDiscovery {
             return Err(BitcoinWalletError::SupervisorPoisoned);
         }
         let sync_timeout = self.sync_timeout;
-        match tokio::time::timeout(sync_timeout, self.wait_for_validated_tip_inner()).await {
+        let cancellation = Arc::clone(&self.cancellation);
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                self.poisoned = true;
+                let _ = self.requester.shutdown();
+                return Err(BitcoinWalletError::KyotoNodeStopped);
+            }
+            result = tokio::time::timeout(sync_timeout, self.wait_for_validated_tip_inner()) => result,
+        };
+        match result {
             Ok(result) => result,
             Err(_) => {
                 self.poisoned = true;
@@ -609,12 +622,69 @@ impl KyotoTipDiscovery {
                 return Ok(DiscoveredKyotoTip {
                     network: self.network,
                     checkpoint,
-                    recovery_anchor: self.anchor,
+                    recovery_anchor: checkpoint,
                     recent_checkpoints: recent,
                 });
             }
         }
         Err(BitcoinWalletError::KyotoNodeStopped)
+    }
+
+    /// Resolve an imported wallet's earliest possible transaction height
+    /// against the chain established by this discovery operation. The
+    /// predecessor is returned so the requested block remains in the scan.
+    pub async fn validate_recovery_height(
+        &self,
+        earliest_transaction_height: u32,
+    ) -> Result<BitcoinCheckpoint, BitcoinWalletError> {
+        let tip = self
+            .validated_tip
+            .ok_or(BitcoinWalletError::RuntimeNotReady)?;
+        if earliest_transaction_height == 0 || earliest_transaction_height > tip.height {
+            return Err(BitcoinWalletError::InvalidBirthday);
+        }
+        let checkpoint_height = earliest_transaction_height
+            .checked_sub(1)
+            .ok_or(BitcoinWalletError::InvalidBirthday)?;
+        let validation = async {
+            let header = self
+                .requester
+                .get_header(checkpoint_height)
+                .await
+                .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?
+                .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
+            if header.height != checkpoint_height {
+                return Err(BitcoinWalletError::InvalidCheckpoint);
+            }
+            let checkpoint = BitcoinCheckpoint {
+                height: checkpoint_height,
+                block_hash: header.header.block_hash().to_byte_array(),
+            };
+            checkpoint.validate(self.network)?;
+            let canonical_height = self
+                .requester
+                .height_of_hash(BlockHash::from_byte_array(checkpoint.block_hash))
+                .await
+                .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
+            if canonical_height != Some(checkpoint_height) {
+                return Err(BitcoinWalletError::InvalidCheckpoint);
+            }
+            Ok(checkpoint)
+        };
+        tokio::select! {
+            biased;
+            _ = self.cancellation.cancelled() => Err(BitcoinWalletError::KyotoNodeStopped),
+            result = tokio::time::timeout(self.request_timeout, validation) => {
+                result.map_err(|_| BitcoinWalletError::OperationTimedOut)?
+            }
+        }
+    }
+
+    pub fn shutdown_handle(&self) -> KyotoShutdownHandle {
+        KyotoShutdownHandle {
+            requester: self.requester.clone(),
+            cancellation: Arc::clone(&self.cancellation),
+        }
     }
 
     /// Verifies that a caller-selected birthday checkpoint is in the synced
@@ -674,6 +744,7 @@ impl KyotoTipDiscovery {
     }
 
     pub fn shutdown(&self) -> Result<(), BitcoinWalletError> {
+        self.cancellation.request();
         self.requester
             .shutdown()
             .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))
@@ -739,7 +810,7 @@ impl StoredKyotoWalletState {
         Ok(())
     }
 
-    fn replace(
+    pub fn replace(
         &mut self,
         state: KyotoWalletState,
         now_unix: u64,
@@ -2345,6 +2416,106 @@ fn tip_mismatch_requires_recovery(
     // restarting from that journal requires a recovery scan rather than
     // silently treating the old checkpoint as current.
     wallet_tip != last_consistent_checkpoint
+}
+
+/// Advance a pristine generated descriptor wallet to its independently
+/// validated creation-tip checkpoint without scanning pre-creation history.
+/// This is idempotent across a crash between the scan-journal and BDK writes.
+pub fn initialize_pristine_wallet_at_creation_tip(
+    wallet: &mut EncryptedPersistedBitcoinWallet,
+    state: &KyotoWalletState,
+    now_unix: u64,
+) -> Result<(), BitcoinWalletError> {
+    if !matches!(
+        state.birthday.source,
+        BitcoinBirthdaySource::NewWalletValidatedTip
+    ) || state.completed_syncs != 0
+        || wallet.transactions().next().is_some()
+    {
+        return Err(BitcoinWalletError::InvalidBirthday);
+    }
+    let wallet_tip = BitcoinCheckpoint::from_wallet(wallet);
+    if wallet_tip == state.birthday.checkpoint {
+        return Ok(());
+    }
+    if wallet_tip.height != 0 {
+        return Err(BitcoinWalletError::CheckpointMismatch);
+    }
+    let genesis = HashCheckpoint::from_genesis(state.network);
+    if wallet_tip.block_hash != genesis.hash.to_byte_array() {
+        return Err(BitcoinWalletError::NetworkMismatch);
+    }
+    let mut chain = CheckPoint::new(BlockId {
+        height: 0,
+        hash: genesis.hash,
+    });
+    for checkpoint in &state.recent_checkpoints {
+        if checkpoint.height == 0 {
+            continue;
+        }
+        chain = chain.insert(BlockId {
+            height: checkpoint.height,
+            hash: BlockHash::from_byte_array(checkpoint.block_hash),
+        });
+    }
+    if chain.height() != state.birthday.checkpoint.height
+        || chain.hash().to_byte_array() != state.birthday.checkpoint.block_hash
+    {
+        return Err(BitcoinWalletError::InvalidCheckpoint);
+    }
+    wallet
+        .apply_update(Update {
+            chain: Some(chain),
+            ..Update::default()
+        })
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
+    wallet.persist(now_unix)?;
+    Ok(())
+}
+
+/// Install the authenticated exclusive recovery checkpoint for an imported
+/// wallet before its first bounded scan. No transaction graph is discarded;
+/// only a pristine descriptor wallet may take this shortcut.
+pub fn initialize_pristine_wallet_at_recovery_checkpoint(
+    wallet: &mut EncryptedPersistedBitcoinWallet,
+    state: &KyotoWalletState,
+    now_unix: u64,
+) -> Result<(), BitcoinWalletError> {
+    if !matches!(
+        state.birthday.source,
+        BitcoinBirthdaySource::KnownCheckpoint
+    ) || state.completed_syncs != 0
+        || wallet.transactions().next().is_some()
+    {
+        return Err(BitcoinWalletError::InvalidBirthday);
+    }
+    let target = state.recovery_checkpoint;
+    let wallet_tip = BitcoinCheckpoint::from_wallet(wallet);
+    if wallet_tip == target {
+        return Ok(());
+    }
+    if wallet_tip.height > target.height {
+        return Err(BitcoinWalletError::CheckpointMismatch);
+    }
+    let genesis = HashCheckpoint::from_genesis(state.network);
+    let mut chain = CheckPoint::new(BlockId {
+        height: 0,
+        hash: genesis.hash,
+    });
+    if target.height != 0 {
+        chain = chain.insert(BlockId {
+            height: target.height,
+            hash: BlockHash::from_byte_array(target.block_hash),
+        });
+    }
+    wallet
+        .apply_update(Update {
+            chain: Some(chain),
+            ..Update::default()
+        })
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
+    wallet.persist(now_unix)?;
+    Ok(())
 }
 
 fn wallet_recent_checkpoints(

@@ -569,6 +569,12 @@ impl MobileWalletController {
             passphrase.as_str(),
             move |mut store| -> Result<MobileWalletCreation, MobileWalletError> {
                 bootstrap.persist(&mut store, now_unix)?;
+                bitcoin::persist_mobile_bitcoin_wallet_origin(
+                    &mut store,
+                    account_config.account_id.as_bytes(),
+                    bitcoin::MobileBitcoinWalletOrigin::Generated,
+                    now_unix,
+                )?;
                 let controller = Self::from_unlocked_store(store, account_config, platform, host)?;
                 Ok(MobileWalletCreation {
                     controller,
@@ -598,6 +604,12 @@ impl MobileWalletController {
             passphrase.as_str(),
             move |mut store| -> Result<Self, MobileWalletError> {
                 bootstrap.persist(&mut store, now_unix)?;
+                bitcoin::persist_mobile_bitcoin_wallet_origin(
+                    &mut store,
+                    account_config.account_id.as_bytes(),
+                    bitcoin::MobileBitcoinWalletOrigin::Restored,
+                    now_unix,
+                )?;
                 Self::from_unlocked_store(store, account_config, platform, host)
             },
         )

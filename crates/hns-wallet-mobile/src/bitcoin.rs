@@ -5,6 +5,7 @@
 //! filters, headers, descriptor state, and the restart journal remain local.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bdk_wallet::KeychainKind;
@@ -14,15 +15,17 @@ use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
 use bdk_wallet::bitcoin::consensus::deserialize;
 use bdk_wallet::bitcoin::hashes::Hash;
 use hns_wallet_bitcoin_kyoto::{
-    BIP39_SEED_BYTES, BitcoinBroadcastReceipt, BitcoinTransactionRecord, BitcoinWalletError,
-    EncryptedPersistedBitcoinWallet, KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor,
-    KyotoSyncProgressHandle, KyotoSyncReceipt, KyotoWalletState, StoredKyotoWalletState,
+    BIP39_SEED_BYTES, BitcoinBirthdaySource, BitcoinBroadcastReceipt, BitcoinCheckpoint,
+    BitcoinTransactionRecord, BitcoinWalletError, EncryptedPersistedBitcoinWallet,
+    KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor, KyotoSyncProgressHandle,
+    KyotoSyncReceipt, KyotoTipDiscovery, KyotoWalletState, StoredKyotoWalletState,
     authorize_native_send, bitcoin_value_runtime_permit,
-    create_persisted_descriptor_wallet_from_seed, load_persisted_descriptor_wallet_from_seed,
+    create_persisted_descriptor_wallet_from_seed, initialize_pristine_wallet_at_creation_tip,
+    initialize_pristine_wallet_at_recovery_checkpoint, load_persisted_descriptor_wallet_from_seed,
     monitor_kyoto_sync_progress, persist_prepared_bitcoin_broadcast, prepare_native_send,
 };
 use hns_wallet_hns::{HnsNetwork, HnsRuntimeConfig};
-use hns_wallet_store::{SecretKind, SharedWalletStore};
+use hns_wallet_store::{SecretKind, SharedWalletStore, WalletStore};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use zeroize::Zeroizing;
@@ -32,6 +35,79 @@ use crate::MobileWalletError;
 const BITCOIN_RECOVERY_SCRIPT_INDEX: u32 = 1;
 const BITCOIN_SEND_APPROVAL_LIFETIME_SECONDS: u64 = 300;
 const MOBILE_ACTION_TOKEN_BYTES: usize = 32;
+const BITCOIN_INITIALIZATION_VERSION: u8 = 1;
+const BITCOIN_INITIALIZATION_ID_DOMAIN: &[u8] = b"hns-mobile-bitcoin-initialization/v1/";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MobileBitcoinWalletOrigin {
+    Generated,
+    Restored,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MobileBitcoinInitialization {
+    origin: MobileBitcoinWalletOrigin,
+    requested_recovery_height: Option<u32>,
+}
+
+impl MobileBitcoinInitialization {
+    fn encode(self) -> [u8; 6] {
+        let mut encoded = [0_u8; 6];
+        encoded[0] = BITCOIN_INITIALIZATION_VERSION;
+        encoded[1] = match self.origin {
+            MobileBitcoinWalletOrigin::Generated => 1,
+            MobileBitcoinWalletOrigin::Restored => 2,
+        };
+        encoded[2..].copy_from_slice(&self.requested_recovery_height.unwrap_or(0).to_be_bytes());
+        encoded
+    }
+
+    fn decode(encoded: &[u8]) -> Result<Self, MobileWalletError> {
+        if encoded.len() != 6 || encoded[0] != BITCOIN_INITIALIZATION_VERSION {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        let origin = match encoded[1] {
+            1 => MobileBitcoinWalletOrigin::Generated,
+            2 => MobileBitcoinWalletOrigin::Restored,
+            _ => return Err(MobileWalletError::InvalidBitcoinAction),
+        };
+        let height = u32::from_be_bytes(
+            encoded[2..]
+                .try_into()
+                .map_err(|_| MobileWalletError::InvalidBitcoinAction)?,
+        );
+        Ok(Self {
+            origin,
+            requested_recovery_height: (height != 0).then_some(height),
+        })
+    }
+}
+
+fn bitcoin_initialization_id(account_id: &[u8]) -> Vec<u8> {
+    let mut id = Vec::with_capacity(BITCOIN_INITIALIZATION_ID_DOMAIN.len() + account_id.len());
+    id.extend_from_slice(BITCOIN_INITIALIZATION_ID_DOMAIN);
+    id.extend_from_slice(account_id);
+    id
+}
+
+pub(crate) fn persist_mobile_bitcoin_wallet_origin(
+    store: &mut WalletStore,
+    account_id: &[u8],
+    origin: MobileBitcoinWalletOrigin,
+    now_unix: u64,
+) -> Result<(), MobileWalletError> {
+    let record = MobileBitcoinInitialization {
+        origin,
+        requested_recovery_height: None,
+    };
+    store.put_secret(
+        &bitcoin_initialization_id(account_id),
+        SecretKind::MetadataKey,
+        &record.encode(),
+        now_unix,
+    )?;
+    Ok(())
+}
 
 /// Configuration for one wallet-owned Kyoto client. `data_dir` is an app
 /// private directory, never a server endpoint or a hosted index state.
@@ -113,9 +189,19 @@ pub struct MobileBitcoinSnapshot {
     /// transaction block requested by the user; the durable recovery
     /// checkpoint is its validated predecessor.
     pub birthday_height: u32,
+    pub birthday_state: MobileBitcoinBirthdayState,
     pub synchronized_height: u32,
     pub connected_peer_count: u8,
     pub required_peer_count: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MobileBitcoinBirthdayState {
+    AwaitingCreationTip,
+    RecoveryUnknown,
+    RecoveryPendingValidation,
+    Validated,
 }
 
 /// The only information an installed UI receives before it explicitly
@@ -162,6 +248,9 @@ pub struct MobileBitcoinValueController {
     runtime: Option<Runtime>,
     wallet: Option<EncryptedPersistedBitcoinWallet>,
     supervisor: Option<KyotoSupervisor>,
+    tip_discovery: Option<KyotoTipDiscovery>,
+    initialization: MobileBitcoinInitialization,
+    shutdown: Option<MobileBitcoinShutdownHandle>,
     progress: Option<MobileBitcoinSyncProgressHandle>,
     receive_address: Option<String>,
     pending_send: Option<PendingMobileBitcoinSend>,
@@ -172,11 +261,24 @@ pub struct MobileBitcoinValueController {
 /// This can be retained outside a native controller lock so an app-background
 /// teardown does not wait for the full synchronization timeout.
 #[derive(Clone, Debug)]
-pub struct MobileBitcoinShutdownHandle(KyotoShutdownHandle);
+pub struct MobileBitcoinShutdownHandle(Arc<Mutex<KyotoShutdownHandle>>);
 
 impl MobileBitcoinShutdownHandle {
     pub fn request_shutdown(&self) -> Result<(), MobileWalletError> {
-        self.0.request_shutdown().map_err(MobileWalletError::from)
+        let handle = self
+            .0
+            .lock()
+            .map_err(|_| MobileWalletError::BitcoinRuntimeInactive)?
+            .clone();
+        handle.request_shutdown().map_err(MobileWalletError::from)
+    }
+
+    fn replace(&self, handle: KyotoShutdownHandle) -> Result<(), MobileWalletError> {
+        *self
+            .0
+            .lock()
+            .map_err(|_| MobileWalletError::BitcoinRuntimeInactive)? = handle;
+        Ok(())
     }
 }
 
@@ -195,14 +297,17 @@ pub struct MobileBitcoinSyncProgress {
 }
 
 #[derive(Clone, Debug)]
-pub struct MobileBitcoinSyncProgressHandle(KyotoSyncProgressHandle, u8);
+pub struct MobileBitcoinSyncProgressHandle(Arc<Mutex<(KyotoSyncProgressHandle, u8)>>);
 
 impl MobileBitcoinSyncProgressHandle {
     pub fn snapshot(&self) -> MobileBitcoinSyncProgress {
-        let progress = self.0.snapshot();
+        let Ok(target) = self.0.lock() else {
+            return MobileBitcoinSyncProgress::default();
+        };
+        let progress = target.0.snapshot();
         MobileBitcoinSyncProgress {
             successful_handshakes: progress.successful_handshakes,
-            required_peer_count: self.1,
+            required_peer_count: target.1,
             connection_failures: progress.connection_failures,
             peer_timeouts: progress.peer_timeouts,
             incompatible_peers: progress.incompatible_peers,
@@ -210,6 +315,22 @@ impl MobileBitcoinSyncProgressHandle {
             chain_height: progress.chain_height,
             completion_basis_points: progress.completion_basis_points,
         }
+    }
+
+    fn new(progress: KyotoSyncProgressHandle, required_peers: u8) -> Self {
+        Self(Arc::new(Mutex::new((progress, required_peers))))
+    }
+
+    fn replace(
+        &self,
+        progress: KyotoSyncProgressHandle,
+        required_peers: u8,
+    ) -> Result<(), MobileWalletError> {
+        *self
+            .0
+            .lock()
+            .map_err(|_| MobileWalletError::BitcoinRuntimeInactive)? = (progress, required_peers);
+        Ok(())
     }
 }
 
@@ -227,6 +348,12 @@ impl MobileBitcoinValueController {
             runtime: None,
             wallet: None,
             supervisor: None,
+            tip_discovery: None,
+            initialization: MobileBitcoinInitialization {
+                origin: MobileBitcoinWalletOrigin::Restored,
+                requested_recovery_height: None,
+            },
+            shutdown: None,
             progress: None,
             receive_address: None,
             pending_send: None,
@@ -244,7 +371,7 @@ impl MobileBitcoinValueController {
         let now_unix = now_unix()?;
         let seed = self.recovery_seed()?;
         let account_id = self.hns_account.account_id.as_bytes();
-        let wallet = match load_persisted_descriptor_wallet_from_seed(
+        let mut wallet = match load_persisted_descriptor_wallet_from_seed(
             seed.as_slice(),
             self.config.network,
             self.store.clone(),
@@ -264,9 +391,39 @@ impl MobileBitcoinValueController {
             Err(error) => return Err(error.into()),
         };
         drop(seed);
+        let initialization = self.load_initialization()?;
         let durable = match StoredKyotoWalletState::load(&self.store, account_id) {
-            Ok(state) => state,
-            Err(BitcoinWalletError::BitcoinStateNotFound) => StoredKyotoWalletState::create(
+            Ok(state) => Some(state),
+            Err(BitcoinWalletError::BitcoinStateNotFound) => None,
+            Err(error) => return Err(error.into()),
+        };
+        let runtime = Runtime::new().map_err(|_| MobileWalletError::BitcoinRuntimeUnavailable)?;
+        let requires_tip_discovery = initialization.requested_recovery_height.is_some()
+            || (durable.is_none() && initialization.origin == MobileBitcoinWalletOrigin::Generated);
+        if requires_tip_discovery {
+            let _entered = runtime.enter();
+            let genesis = genesis_block(self.config.network)
+                .block_hash()
+                .to_byte_array();
+            let (tip_discovery, logging) = KyotoTipDiscovery::start(
+                self.config.kyoto_config(),
+                BitcoinCheckpoint {
+                    height: 0,
+                    block_hash: genesis,
+                },
+            )?;
+            let shutdown = tip_discovery.shutdown_handle();
+            let progress = monitor_kyoto_sync_progress(logging);
+            self.runtime = Some(runtime);
+            self.wallet = Some(wallet);
+            self.tip_discovery = Some(tip_discovery);
+            self.initialization = initialization;
+            self.install_runtime_handles(shutdown, progress)?;
+            return Ok(());
+        }
+        let durable = match durable {
+            Some(state) => state,
+            None => StoredKyotoWalletState::create(
                 &self.store,
                 account_id,
                 KyotoWalletState::restored_wallet(
@@ -277,36 +434,46 @@ impl MobileBitcoinValueController {
                 )?,
                 now_unix,
             )?,
-            Err(error) => return Err(error.into()),
         };
-        let runtime = Runtime::new().map_err(|_| MobileWalletError::BitcoinRuntimeUnavailable)?;
-        let (supervisor, progress) = {
+        if matches!(
+            durable.state().birthday.source,
+            BitcoinBirthdaySource::NewWalletValidatedTip
+        ) && durable.state().completed_syncs == 0
+        {
+            initialize_pristine_wallet_at_creation_tip(&mut wallet, durable.state(), now_unix)?;
+        } else if matches!(
+            durable.state().birthday.source,
+            BitcoinBirthdaySource::KnownCheckpoint
+        ) && durable.state().completed_syncs == 0
+        {
+            initialize_pristine_wallet_at_recovery_checkpoint(
+                &mut wallet,
+                durable.state(),
+                now_unix,
+            )?;
+        }
+        let (supervisor, logging) = {
             let _entered = runtime.enter();
-            let (supervisor, logging) =
-                KyotoSupervisor::start(&wallet, self.config.kyoto_config(), durable, now_unix)?;
-            (
-                supervisor,
-                MobileBitcoinSyncProgressHandle(
-                    monitor_kyoto_sync_progress(logging),
-                    self.config.required_peers,
-                ),
-            )
+            KyotoSupervisor::start(&wallet, self.config.kyoto_config(), durable, now_unix)?
         };
+        let shutdown = supervisor.shutdown_handle();
+        let progress = monitor_kyoto_sync_progress(logging);
         self.runtime = Some(runtime);
         self.wallet = Some(wallet);
         self.supervisor = Some(supervisor);
-        self.progress = Some(progress);
+        self.initialization = initialization;
+        self.install_runtime_handles(shutdown, progress)?;
         Ok(())
     }
 
     pub fn is_active(&self) -> bool {
-        self.runtime.is_some() && self.wallet.is_some() && self.supervisor.is_some()
+        self.runtime.is_some()
+            && self.wallet.is_some()
+            && (self.supervisor.is_some() || self.tip_discovery.is_some())
     }
 
     pub fn shutdown_handle(&self) -> Option<MobileBitcoinShutdownHandle> {
-        self.supervisor
-            .as_ref()
-            .map(|supervisor| MobileBitcoinShutdownHandle(supervisor.shutdown_handle()))
+        self.shutdown.clone()
     }
 
     pub fn sync_progress_handle(&self) -> Option<MobileBitcoinSyncProgressHandle> {
@@ -334,6 +501,9 @@ impl MobileBitcoinValueController {
         &mut self,
     ) -> Result<(KyotoSyncReceipt, MobileBitcoinSnapshot), MobileWalletError> {
         let now_unix = now_unix()?;
+        if self.tip_discovery.is_some() {
+            self.complete_pending_initialization(now_unix)?;
+        }
         let runtime = self
             .runtime
             .as_ref()
@@ -359,20 +529,22 @@ impl MobileBitcoinValueController {
             return Err(MobileWalletError::InvalidBitcoinAction);
         }
         let now_unix = now_unix()?;
-        let runtime = self
-            .runtime
-            .as_ref()
-            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
-        let supervisor = self
-            .supervisor
-            .as_mut()
-            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
-        runtime
-            .block_on(supervisor.reset_birthday_height(earliest_transaction_height, now_unix))?;
-        // `deactivate` takes and drops the old supervisor/runtime before its
-        // shutdown result is returned. Always reconstruct after the durable
-        // birthday update, even when Kyoto reports that its already-retired
-        // requester could not accept another shutdown message.
+        if self.initialization.origin == MobileBitcoinWalletOrigin::Generated {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        if let Some(supervisor) = self.supervisor.as_ref() {
+            let state = supervisor.state();
+            if !matches!(state.birthday.source, BitcoinBirthdaySource::FullScan)
+                || earliest_transaction_height <= state.scanned_checkpoint.height
+            {
+                return Err(MobileWalletError::InvalidBitcoinAction);
+            }
+        }
+        self.initialization.requested_recovery_height = Some(earliest_transaction_height);
+        self.persist_initialization(now_unix)?;
+        // Retire any genesis recovery scan and reopen as a header-only tip
+        // discovery. The requested height is authenticated later by the first
+        // synchronization; this setter itself performs no networking.
         let _ = self.deactivate();
         self.activate()?;
         self.snapshot()
@@ -383,20 +555,46 @@ impl MobileBitcoinValueController {
             .wallet
             .as_ref()
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
-        let supervisor = self
-            .supervisor
-            .as_ref()
-            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
         let balance = wallet.balance();
-        let state = supervisor.state();
-        let birthday_height = if matches!(
-            state.birthday.source,
-            hns_wallet_bitcoin_kyoto::BitcoinBirthdaySource::FullScan
-        ) {
-            0
-        } else {
-            state.birthday.checkpoint.height.saturating_add(1)
-        };
+        let (birthday_height, birthday_state, synchronized_height, connected_peer_count) =
+            if let Some(supervisor) = self.supervisor.as_ref() {
+                let state = supervisor.state();
+                if matches!(state.birthday.source, BitcoinBirthdaySource::FullScan) {
+                    (
+                        0,
+                        MobileBitcoinBirthdayState::RecoveryUnknown,
+                        state.scanned_checkpoint.height,
+                        state.connected_peer_count,
+                    )
+                } else {
+                    (
+                        state.birthday.checkpoint.height.saturating_add(1),
+                        MobileBitcoinBirthdayState::Validated,
+                        state.scanned_checkpoint.height,
+                        state.connected_peer_count,
+                    )
+                }
+            } else if self.tip_discovery.is_some() {
+                match (
+                    self.initialization.origin,
+                    self.initialization.requested_recovery_height,
+                ) {
+                    (MobileBitcoinWalletOrigin::Generated, _) => {
+                        (0, MobileBitcoinBirthdayState::AwaitingCreationTip, 0, 0)
+                    }
+                    (MobileBitcoinWalletOrigin::Restored, Some(height)) => (
+                        height,
+                        MobileBitcoinBirthdayState::RecoveryPendingValidation,
+                        0,
+                        0,
+                    ),
+                    (MobileBitcoinWalletOrigin::Restored, None) => {
+                        (0, MobileBitcoinBirthdayState::RecoveryUnknown, 0, 0)
+                    }
+                }
+            } else {
+                return Err(MobileWalletError::BitcoinRuntimeInactive);
+            };
         Ok(MobileBitcoinSnapshot {
             network: bitcoin_network_name(self.config.network).to_owned(),
             receive_address: self.receive_address.clone().unwrap_or_else(|| {
@@ -411,8 +609,9 @@ impl MobileBitcoinValueController {
             immature_sats: balance.immature.to_sat(),
             total_sats: balance.total().to_sat(),
             birthday_height,
-            synchronized_height: state.scanned_checkpoint.height,
-            connected_peer_count: state.connected_peer_count,
+            birthday_state,
+            synchronized_height,
+            connected_peer_count,
             required_peer_count: self.config.required_peers,
         })
     }
@@ -560,17 +759,135 @@ impl MobileBitcoinValueController {
     /// recovery journal remains in the encrypted store and is reconstructed on
     /// the next unlock.
     pub fn deactivate(&mut self) -> Result<(), MobileWalletError> {
-        let shutdown = self
+        let supervisor_shutdown = self
             .supervisor
             .take()
             .map(|supervisor| supervisor.shutdown())
             .transpose();
+        let discovery_shutdown = self
+            .tip_discovery
+            .take()
+            .map(|discovery| discovery.shutdown())
+            .transpose();
         self.wallet.take();
         self.runtime.take();
+        self.shutdown.take();
         self.progress.take();
         self.receive_address = None;
         self.pending_send = None;
-        shutdown.map_err(MobileWalletError::from)?;
+        supervisor_shutdown.map_err(MobileWalletError::from)?;
+        discovery_shutdown.map_err(MobileWalletError::from)?;
+        Ok(())
+    }
+
+    fn load_initialization(&self) -> Result<MobileBitcoinInitialization, MobileWalletError> {
+        let id = bitcoin_initialization_id(self.hns_account.account_id.as_bytes());
+        Ok(self.store.try_with_store(|store| {
+            let encoded = store.get_secret(&id, SecretKind::MetadataKey)?;
+            match encoded {
+                Some(encoded) => MobileBitcoinInitialization::decode(&encoded),
+                // Legacy wallets did not persist origin. Treating them as
+                // restored is the only safe migration because an empty
+                // balance cannot prove that their addresses are new.
+                None => Ok(MobileBitcoinInitialization {
+                    origin: MobileBitcoinWalletOrigin::Restored,
+                    requested_recovery_height: None,
+                }),
+            }
+        })?)
+    }
+
+    fn persist_initialization(&self, now_unix: u64) -> Result<(), MobileWalletError> {
+        let id = bitcoin_initialization_id(self.hns_account.account_id.as_bytes());
+        let encoded = self.initialization.encode();
+        self.store.try_with_store_mut(|store| {
+            store.put_secret(&id, SecretKind::MetadataKey, &encoded, now_unix)
+        })?;
+        Ok(())
+    }
+
+    fn install_runtime_handles(
+        &mut self,
+        shutdown: KyotoShutdownHandle,
+        progress: KyotoSyncProgressHandle,
+    ) -> Result<(), MobileWalletError> {
+        if let Some(handle) = self.shutdown.as_ref() {
+            handle.replace(shutdown)?;
+        } else {
+            self.shutdown = Some(MobileBitcoinShutdownHandle(Arc::new(Mutex::new(shutdown))));
+        }
+        if let Some(handle) = self.progress.as_ref() {
+            handle.replace(progress, self.config.required_peers)?;
+        } else {
+            self.progress = Some(MobileBitcoinSyncProgressHandle::new(
+                progress,
+                self.config.required_peers,
+            ));
+        }
+        Ok(())
+    }
+
+    fn complete_pending_initialization(&mut self, now_unix: u64) -> Result<(), MobileWalletError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let discovery = self
+            .tip_discovery
+            .as_mut()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let discovered = runtime.block_on(discovery.wait_for_validated_tip())?;
+        let state = match self.initialization.origin {
+            MobileBitcoinWalletOrigin::Generated => {
+                KyotoWalletState::new_wallet(discovered, now_unix)?
+            }
+            MobileBitcoinWalletOrigin::Restored => {
+                let requested = self
+                    .initialization
+                    .requested_recovery_height
+                    .ok_or(MobileWalletError::InvalidBitcoinAction)?;
+                let checkpoint = runtime.block_on(discovery.validate_recovery_height(requested))?;
+                KyotoWalletState::restored_wallet(
+                    self.config.network,
+                    Some(checkpoint),
+                    BITCOIN_RECOVERY_SCRIPT_INDEX,
+                    now_unix,
+                )?
+            }
+        };
+        let account_id = self.hns_account.account_id.as_bytes();
+        let durable = match StoredKyotoWalletState::load(&self.store, account_id) {
+            Ok(mut durable) => {
+                durable.replace(state, now_unix)?;
+                durable
+            }
+            Err(BitcoinWalletError::BitcoinStateNotFound) => {
+                StoredKyotoWalletState::create(&self.store, account_id, state, now_unix)?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        self.initialization.requested_recovery_height = None;
+        self.persist_initialization(now_unix)?;
+        if let Some(discovery) = self.tip_discovery.take() {
+            let _ = discovery.shutdown();
+        }
+        let wallet = self
+            .wallet
+            .as_mut()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        if self.initialization.origin == MobileBitcoinWalletOrigin::Generated {
+            initialize_pristine_wallet_at_creation_tip(wallet, durable.state(), now_unix)?;
+        } else {
+            initialize_pristine_wallet_at_recovery_checkpoint(wallet, durable.state(), now_unix)?;
+        }
+        let (supervisor, logging) = {
+            let _entered = runtime.enter();
+            KyotoSupervisor::start(wallet, self.config.kyoto_config(), durable, now_unix)?
+        };
+        let shutdown = supervisor.shutdown_handle();
+        let progress = monitor_kyoto_sync_progress(logging);
+        self.supervisor = Some(supervisor);
+        self.install_runtime_handles(shutdown, progress)?;
         Ok(())
     }
 
@@ -685,6 +1002,28 @@ const fn bitcoin_network_name(network: BitcoinNetwork) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_and_restored_initialization_records_roundtrip_exactly() {
+        for initialization in [
+            MobileBitcoinInitialization {
+                origin: MobileBitcoinWalletOrigin::Generated,
+                requested_recovery_height: None,
+            },
+            MobileBitcoinInitialization {
+                origin: MobileBitcoinWalletOrigin::Restored,
+                requested_recovery_height: Some(964_458),
+            },
+        ] {
+            assert_eq!(
+                MobileBitcoinInitialization::decode(&initialization.encode())
+                    .expect("initialization record"),
+                initialization,
+            );
+        }
+        assert!(MobileBitcoinInitialization::decode(&[1, 3, 0, 0, 0, 0]).is_err());
+        assert!(MobileBitcoinInitialization::decode(&[2, 1, 0, 0, 0, 0]).is_err());
+    }
 
     #[test]
     fn hns_networks_map_to_the_matching_direct_bitcoin_network() {
