@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod direct_board;
+mod direct_maker;
 mod session_board;
 mod settlement_key;
 
@@ -26,6 +27,10 @@ pub use direct_board::{
     MAX_DENUO_DIRECT_OFFERS, admit_denuo_direct_offer, admit_denuo_direct_offer_cancellation,
     denuo_direct_offer_inventory, live_denuo_direct_offer_levels, load_denuo_direct_offer,
     load_denuo_direct_offers,
+};
+pub use direct_maker::{
+    DenuoBtcForHnsOfferRequest, DenuoLocalDirectOffer, create_denuo_btc_for_hns_offer,
+    list_local_denuo_direct_offers,
 };
 pub use session_board::{
     DenuoDirectSwapAdmission, DenuoDirectSwapPeerStatus, DenuoDirectSwapPolicy,

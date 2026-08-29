@@ -14,7 +14,8 @@ pub use bitcoin::{
     MobileBitcoinSyncProgressHandle, MobileBitcoinValueController,
 };
 pub use market::{
-    MobileDenuoDirectAdmission, MobileDenuoDirectTransportReport, MobileDenuoSessionController,
+    MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDenuoDirectAdmission,
+    MobileDenuoDirectTransportReport, MobileDenuoSessionController,
 };
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
@@ -1403,6 +1404,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         Ok(MobileDenuoSessionController::new(
             self.session.store.clone(),
             swap_policy,
+            self.account_config.wallet_id,
         ))
     }
 
@@ -2505,6 +2507,18 @@ pub enum MobileWalletError {
     InvalidBitcoinAction,
     #[error("the direct Denuo HNS/Bitcoin session message is invalid")]
     InvalidDenuoSessionMessage,
+    #[error("a direct BTC-for-HNS offer approval is already pending")]
+    DirectOfferActionPending,
+    #[error("there is no pending direct BTC-for-HNS offer approval")]
+    NoPendingDirectOfferAction,
+    #[error("the direct BTC-for-HNS offer approval token is invalid")]
+    InvalidDirectOfferActionToken,
+    #[error("the direct BTC-for-HNS offer approval has expired")]
+    DirectOfferActionExpired,
+    #[error("the direct BTC-for-HNS offer request is invalid")]
+    InvalidDirectOfferAction,
+    #[error("confirmed Bitcoin does not cover active offers, this offer, and its fee reserve")]
+    InsufficientBitcoinForDirectOffer,
     #[error("private wallet host/service response was unexpected")]
     UnexpectedResponse,
     #[error("private mobile wallet controller failed closed and must be reopened")]
