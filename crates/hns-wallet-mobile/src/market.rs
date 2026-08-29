@@ -7,8 +7,9 @@ use hns_wallet_market::{
     DenuoDirectSwapAdmission, DenuoDirectSwapPolicy, DenuoLocalDirectOffer,
     admit_denuo_direct_offer, admit_denuo_direct_offer_cancellation, admit_denuo_direct_offer_take,
     admit_denuo_direct_swap_hello, admit_denuo_direct_swap_proposal,
-    create_denuo_btc_for_hns_offer, denuo_direct_offer_inventory, list_local_denuo_direct_offers,
-    load_denuo_direct_offer, validate_denuo_direct_swap_peer_status,
+    cancel_denuo_local_direct_offer, create_denuo_btc_for_hns_offer, denuo_direct_offer_inventory,
+    list_local_denuo_direct_offers, load_denuo_direct_offer,
+    validate_denuo_direct_swap_peer_status,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::WalletId;
@@ -250,6 +251,44 @@ impl MobileDenuoSessionController {
             .collect()
     }
 
+    pub fn cancel_local_btc_for_hns_offer(
+        &mut self,
+        offer_id: &str,
+        now_unix: u64,
+    ) -> Result<(), MobileWalletError> {
+        let offer_id = decode_offer_id(offer_id)?;
+        self.store
+            .try_with_store_mut(|store| {
+                cancel_denuo_local_direct_offer(
+                    store,
+                    &self.policy.board_policy(),
+                    self.wallet_id,
+                    offer_id,
+                    now_unix,
+                )
+            })
+            .map_err(MobileWalletError::from)?;
+        Ok(())
+    }
+
+    pub fn announce_direct_offer_cancellation(
+        &self,
+        peer: &mut HnsDirectDenuoPeer,
+        offer_id: &str,
+    ) -> Result<(), MobileWalletError> {
+        let offer_id = decode_offer_id(offer_id)?;
+        let cancellation = self
+            .store
+            .try_with_store(|store| {
+                load_denuo_direct_offer(store, &self.policy.board_policy(), offer_id)
+            })
+            .map_err(MobileWalletError::from)?
+            .and_then(|record| record.cancellation)
+            .ok_or(MobileWalletError::InvalidDirectOfferAction)?;
+        peer.send_cross_chain_message(&CrossChainMessage::CancelDirectOffer(cancellation))?;
+        Ok(())
+    }
+
     /// Admit exactly one canonical direct-peer fixed-offer or session message.
     /// Inventory/get exchange remains transport-level discovery; only signed
     /// offers, cancellations, takes, proposals, accepted terms, and statuses
@@ -408,4 +447,27 @@ fn summary(offer: DenuoLocalDirectOffer) -> Result<MobileBtcForHnsOfferSummary, 
         created_at_unix: offer.offer.created_at_unix,
         expires_at_unix: offer.offer.expires_at_unix,
     })
+}
+
+fn decode_offer_id(encoded: &str) -> Result<[u8; 32], MobileWalletError> {
+    if encoded.len() != 64
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(MobileWalletError::InvalidDirectOfferAction);
+    }
+    let mut offer_id = [0_u8; 32];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |byte| match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => 0,
+        };
+        offer_id[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    if offer_id.iter().all(|byte| *byte == 0) {
+        return Err(MobileWalletError::InvalidDirectOfferAction);
+    }
+    Ok(offer_id)
 }

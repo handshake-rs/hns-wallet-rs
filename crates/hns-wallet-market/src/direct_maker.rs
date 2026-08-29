@@ -7,8 +7,8 @@
 
 use hkdf::Hkdf;
 use hns_marketplace_protocol::{
-    AssetAmount, AssetId, CrossChainMessage, DirectOffer, MARKETPLACE_PROTOCOL_VERSION, MarketPair,
-    SignedObjectHeader,
+    AssetAmount, AssetId, CrossChainMessage, DirectOffer, DirectOfferCancellation,
+    MARKETPLACE_PROTOCOL_VERSION, MarketPair, SignedObjectHeader,
 };
 use hns_wallet_store::{EntityKind, RECOVERY_SEED_BYTES, SecretKind, WalletStore};
 use hns_wallet_types::{ObjectHash, SessionId, WalletId};
@@ -19,7 +19,8 @@ use zeroize::Zeroizing;
 
 use crate::{
     CrossChainSwapKeyRequest, DenuoDirectOfferBoardPolicy, DenuoDirectOfferSnapshot, MarketError,
-    SwapParticipant, admit_denuo_direct_offer, allocate_cross_chain_swap_key,
+    SwapParticipant, admit_denuo_direct_offer, admit_denuo_direct_offer_cancellation,
+    allocate_cross_chain_swap_key,
 };
 
 const STORAGE_VERSION: u16 = 1;
@@ -98,7 +99,7 @@ pub fn create_denuo_btc_for_hns_offer(
     let identity = derive_board_identity(store, request.wallet_id, policy)?;
     let mut sequence_bytes = [0_u8; 8];
     sequence_bytes.copy_from_slice(&request.nonce[..8]);
-    let sequence = u64::from_be_bytes(sequence_bytes).max(1);
+    let sequence = (u64::from_be_bytes(sequence_bytes) & i64::MAX as u64).max(1);
     let mut offer = DirectOffer {
         header: SignedObjectHeader {
             version: MARKETPLACE_PROTOCOL_VERSION,
@@ -146,6 +147,63 @@ pub fn create_denuo_btc_for_hns_offer(
         session_id,
         bitcoin_fee_reserve_sats: request.bitcoin_fee_reserve_sats,
     })
+}
+
+pub fn cancel_denuo_local_direct_offer(
+    store: &mut WalletStore,
+    policy: &DenuoDirectOfferBoardPolicy,
+    wallet_id: WalletId,
+    offer_id: [u8; 32],
+    now_unix: u64,
+) -> Result<DenuoDirectOfferSnapshot, MarketError> {
+    if now_unix == 0 || offer_id.iter().all(|byte| *byte == 0) {
+        return Err(MarketError::InvalidDenuoDirectOffer);
+    }
+    let local = store
+        .load_entity::<PersistedLocalDirectOffer>(
+            EntityKind::DenuoBoardObject,
+            &local_record_id(wallet_id, offer_id),
+        )?
+        .ok_or(MarketError::UnknownDenuoDirectOffer)?;
+    if local.revision != 1
+        || local.value.storage_version != STORAGE_VERSION
+        || local.value.wallet_id != wallet_id
+        || local.value.offer_id.into_bytes() != offer_id
+    {
+        return Err(MarketError::CorruptDenuoDirectOfferBoard);
+    }
+    let offer = crate::load_denuo_direct_offer(store, policy, offer_id)?
+        .ok_or(MarketError::UnknownDenuoDirectOffer)?;
+    if !offer.is_active_at(now_unix) {
+        return Err(MarketError::InvalidDenuoDirectOffer);
+    }
+    let identity = derive_board_identity(store, wallet_id, policy)?;
+    let mut cancellation = DirectOfferCancellation {
+        header: SignedObjectHeader {
+            version: MARKETPLACE_PROTOCOL_VERSION,
+            network: policy.network(),
+            pair: MarketPair::HNS_BTC,
+            signer_public_key: [0; 33],
+            sequence: offer
+                .offer
+                .header
+                .sequence
+                .checked_add(1)
+                .ok_or(MarketError::InvalidDenuoDirectOffer)?,
+            created_at: now_unix,
+            expires_at: offer.offer.header.expires_at,
+        },
+        offer_id,
+        offer_sequence: offer.offer.header.sequence,
+        signature: [0; 64],
+    };
+    cancellation
+        .sign(&identity)
+        .map_err(|_| MarketError::InvalidDenuoDirectOffer)?;
+    let envelope = CrossChainMessage::CancelDirectOffer(cancellation)
+        .encode_envelope(1)
+        .map_err(|_| MarketError::InvalidDenuoDirectOffer)?;
+    Ok(admit_denuo_direct_offer_cancellation(store, policy, &envelope, now_unix)?.snapshot())
 }
 
 pub fn list_local_denuo_direct_offers(
@@ -348,5 +406,39 @@ mod tests {
             },
         );
         assert_eq!(result, Err(MarketError::InvalidDenuoDirectOffer));
+    }
+
+    #[test]
+    fn local_maker_can_cancel_its_retained_live_offer() {
+        let wallet_id = WalletId::new([7; 16]);
+        let mut store = seeded_store(wallet_id);
+        let created = create_denuo_btc_for_hns_offer(
+            &mut store,
+            &policy(),
+            DenuoBtcForHnsOfferRequest {
+                wallet_id,
+                btc_amount_sats: 8_500,
+                hns_amount_dollarydoos: 2_000_000,
+                bitcoin_fee_reserve_sats: 1_500,
+                created_at_unix: 100,
+                expires_at_unix: 1_000,
+                nonce: [0xff; 32],
+            },
+        )
+        .expect("created");
+        let cancelled = cancel_denuo_local_direct_offer(
+            &mut store,
+            &policy(),
+            wallet_id,
+            created.offer.offer_id.into_bytes(),
+            200,
+        )
+        .expect("cancelled");
+        assert_eq!(cancelled.cancelled_at_unix, Some(200));
+        assert!(
+            list_local_denuo_direct_offers(&store, &policy(), wallet_id, 201)
+                .expect("live offers")
+                .is_empty()
+        );
     }
 }
