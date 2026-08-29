@@ -413,7 +413,7 @@ impl MobileBitcoinValueController {
                 },
             )?;
             let shutdown = tip_discovery.shutdown_handle();
-            let progress = monitor_kyoto_sync_progress(logging);
+            let progress = monitor_kyoto_sync_progress(runtime.handle(), logging);
             self.runtime = Some(runtime);
             self.wallet = Some(wallet);
             self.tip_discovery = Some(tip_discovery);
@@ -457,7 +457,7 @@ impl MobileBitcoinValueController {
             KyotoSupervisor::start(&wallet, self.config.kyoto_config(), durable, now_unix)?
         };
         let shutdown = supervisor.shutdown_handle();
-        let progress = monitor_kyoto_sync_progress(logging);
+        let progress = monitor_kyoto_sync_progress(runtime.handle(), logging);
         self.runtime = Some(runtime);
         self.wallet = Some(wallet);
         self.supervisor = Some(supervisor);
@@ -885,7 +885,7 @@ impl MobileBitcoinValueController {
             KyotoSupervisor::start(wallet, self.config.kyoto_config(), durable, now_unix)?
         };
         let shutdown = supervisor.shutdown_handle();
-        let progress = monitor_kyoto_sync_progress(logging);
+        let progress = monitor_kyoto_sync_progress(runtime.handle(), logging);
         self.supervisor = Some(supervisor);
         self.install_runtime_handles(shutdown, progress)?;
         Ok(())

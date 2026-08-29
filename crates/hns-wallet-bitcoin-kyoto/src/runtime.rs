@@ -1105,10 +1105,17 @@ impl KyotoSyncProgressHandle {
 /// Drain Kyoto's informational channel into a bounded public mailbox. Warning
 /// strings are deliberately discarded because peers must not control native
 /// UI text or diagnostic cardinality.
-pub fn monitor_kyoto_sync_progress(mut logging: LoggingSubscribers) -> KyotoSyncProgressHandle {
+pub fn monitor_kyoto_sync_progress(
+    runtime: &tokio::runtime::Handle,
+    mut logging: LoggingSubscribers,
+) -> KyotoSyncProgressHandle {
     let progress = Arc::new(Mutex::new(KyotoSyncProgress::default()));
     let worker_progress = Arc::clone(&progress);
-    std::mem::drop(tokio::spawn(async move {
+    // Mobile controller methods are invoked from ordinary JNI/Swift worker
+    // threads. Never depend on an ambient Tokio context here: the Kyoto
+    // supervisor owns an explicit runtime and its handle is the authority for
+    // this monitor task.
+    std::mem::drop(runtime.spawn(async move {
         loop {
             tokio::select! {
                 info = logging.info_subscriber.recv() => match info {
