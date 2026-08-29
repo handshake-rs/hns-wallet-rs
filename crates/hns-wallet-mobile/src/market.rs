@@ -128,25 +128,7 @@ impl MobileDenuoSessionController {
         let requested = btc_amount_sats
             .checked_add(bitcoin_fee_reserve_sats)
             .ok_or(MobileWalletError::InvalidDirectOfferAction)?;
-        let already_reserved = self
-            .store
-            .try_with_store(|store| {
-                list_local_denuo_direct_offers(
-                    store,
-                    &self.policy.board_policy(),
-                    self.wallet_id,
-                    now_unix,
-                )
-            })
-            .map_err(MobileWalletError::from)?
-            .into_iter()
-            .try_fold(0_u64, |sum, offer| {
-                let offered = u64::try_from(offer.offer.offered_amount)
-                    .map_err(|_| MobileWalletError::InvalidDirectOfferAction)?;
-                sum.checked_add(offered)
-                    .and_then(|sum| sum.checked_add(offer.bitcoin_fee_reserve_sats))
-                    .ok_or(MobileWalletError::InvalidDirectOfferAction)
-            })?;
+        let already_reserved = self.reserved_bitcoin_sats(now_unix)?;
         if already_reserved
             .checked_add(requested)
             .is_none_or(|total| total > confirmed_sats)
@@ -249,6 +231,27 @@ impl MobileDenuoSessionController {
             .into_iter()
             .map(summary)
             .collect()
+    }
+
+    pub fn reserved_bitcoin_sats(&self, now_unix: u64) -> Result<u64, MobileWalletError> {
+        self.store
+            .try_with_store(|store| {
+                list_local_denuo_direct_offers(
+                    store,
+                    &self.policy.board_policy(),
+                    self.wallet_id,
+                    now_unix,
+                )
+            })
+            .map_err(MobileWalletError::from)?
+            .into_iter()
+            .try_fold(0_u64, |sum, offer| {
+                let offered = u64::try_from(offer.offer.offered_amount)
+                    .map_err(|_| MobileWalletError::InvalidDirectOfferAction)?;
+                sum.checked_add(offered)
+                    .and_then(|sum| sum.checked_add(offer.bitcoin_fee_reserve_sats))
+                    .ok_or(MobileWalletError::InvalidDirectOfferAction)
+            })
     }
 
     pub fn cancel_local_btc_for_hns_offer(
