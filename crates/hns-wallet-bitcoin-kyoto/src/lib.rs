@@ -476,6 +476,24 @@ pub fn prepare_native_send(
     fee_rate_sat_vb: u64,
     maximum_fee_sats: u64,
 ) -> Result<PreparedBitcoinSend, BitcoinWalletError> {
+    prepare_native_send_excluding(
+        wallet,
+        destination,
+        amount_sats,
+        fee_rate_sat_vb,
+        maximum_fee_sats,
+        &[],
+    )
+}
+
+pub fn prepare_native_send_excluding(
+    wallet: &mut Wallet,
+    destination: &str,
+    amount_sats: u64,
+    fee_rate_sat_vb: u64,
+    maximum_fee_sats: u64,
+    unspendable: &[OutPoint],
+) -> Result<PreparedBitcoinSend, BitcoinWalletError> {
     if amount_sats == 0 || fee_rate_sat_vb == 0 {
         return Err(BitcoinWalletError::InvalidAmount);
     }
@@ -493,6 +511,9 @@ pub fn prepare_native_send(
             BitcoinAmount::from_sat(amount_sats),
         )
         .fee_rate(fee_rate);
+    for outpoint in unspendable {
+        builder.add_unspendable(*outpoint);
+    }
     let psbt = builder
         .finish()
         .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
@@ -606,6 +627,26 @@ pub fn prepare_bitcoin_htlc_funding(
     fee_rate_sat_vb: u64,
     maximum_fee_sats: u64,
 ) -> Result<PreparedBitcoinHtlcFunding, BitcoinWalletError> {
+    prepare_bitcoin_htlc_funding_excluding(
+        wallet,
+        _permit,
+        htlc,
+        value_sats,
+        fee_rate_sat_vb,
+        maximum_fee_sats,
+        &[],
+    )
+}
+
+pub fn prepare_bitcoin_htlc_funding_excluding(
+    wallet: &mut Wallet,
+    _permit: &BitcoinValueRuntimePermit,
+    htlc: &BitcoinHtlc,
+    value_sats: u64,
+    fee_rate_sat_vb: u64,
+    maximum_fee_sats: u64,
+    unspendable: &[OutPoint],
+) -> Result<PreparedBitcoinHtlcFunding, BitcoinWalletError> {
     htlc.validate()?;
     if value_sats < MIN_HTLC_DUST_SATS || fee_rate_sat_vb == 0 || maximum_fee_sats == 0 {
         return Err(BitcoinWalletError::InvalidAmount);
@@ -616,6 +657,9 @@ pub fn prepare_bitcoin_htlc_funding(
     builder
         .add_recipient(htlc.script_pubkey(), BitcoinAmount::from_sat(value_sats))
         .fee_rate(fee_rate);
+    for outpoint in unspendable {
+        builder.add_unspendable(*outpoint);
+    }
     let mut psbt = builder
         .finish()
         .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
@@ -1921,6 +1965,99 @@ mod tests {
                 .iter()
                 .all(|input| !input.witness.is_empty())
         );
+    }
+
+    #[test]
+    fn approved_unobserved_broadcast_inputs_cannot_be_selected_or_committed_twice() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = parse_recovery_phrase(phrase).expect("mnemonic");
+        let mut wallet = create_descriptor_wallet(&mnemonic, Network::Regtest).expect("wallet");
+        let receive = wallet.reveal_next_address(KeychainKind::External).address;
+        let funding_transaction = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bdk_wallet::bitcoin::Txid::from_byte_array([43; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: BitcoinAmount::from_sat(100_000),
+                script_pubkey: receive.script_pubkey(),
+            }],
+        };
+        wallet.apply_unconfirmed_txs([(funding_transaction, 1)]);
+        let permit = BitcoinValueRuntimePermit(());
+        let first = prepare_bitcoin_htlc_funding(&mut wallet, &permit, &htlc(), 50_000, 2, 5_000)
+            .expect("first signed funding");
+        let conflicting =
+            prepare_bitcoin_htlc_funding(&mut wallet, &permit, &htlc(), 40_000, 2, 5_000)
+                .expect("BDK has not observed the first spend yet");
+        let mut store = hns_wallet_store::WalletStore::create(":memory:", "broadcast-test")
+            .expect("wallet store");
+        let now_unix = 1_000;
+        let expires_at_unix = 1_100;
+        let first_approval = derive_bitcoin_broadcast_approval(
+            &wallet,
+            first.raw_transaction(),
+            5_000,
+            expires_at_unix,
+        )
+        .expect("first approval");
+        persist_prepared_bitcoin_broadcast(
+            &wallet,
+            &mut store,
+            first.raw_transaction(),
+            first_approval.commitment,
+            5_000,
+            0,
+            now_unix,
+            expires_at_unix,
+        )
+        .expect("durable first approval");
+
+        let committed = unobserved_approved_broadcast_inputs(&store, Network::Regtest)
+            .expect("committed inputs");
+        let first_transaction: Transaction =
+            deserialize(first.raw_transaction()).expect("first transaction");
+        assert_eq!(committed, vec![first_transaction.input[0].previous_output]);
+        assert!(
+            prepare_bitcoin_htlc_funding_excluding(
+                &mut wallet,
+                &permit,
+                &htlc(),
+                40_000,
+                2,
+                5_000,
+                &committed,
+            )
+            .is_err()
+        );
+
+        let conflicting_approval = derive_bitcoin_broadcast_approval(
+            &wallet,
+            conflicting.raw_transaction(),
+            5_000,
+            expires_at_unix,
+        )
+        .expect("conflicting approval shape");
+        assert!(matches!(
+            persist_prepared_bitcoin_broadcast(
+                &wallet,
+                &mut store,
+                conflicting.raw_transaction(),
+                conflicting_approval.commitment,
+                5_000,
+                0,
+                now_unix,
+                expires_at_unix,
+            ),
+            Err(BitcoinWalletError::BroadcastConflict)
+        ));
     }
 
     #[test]

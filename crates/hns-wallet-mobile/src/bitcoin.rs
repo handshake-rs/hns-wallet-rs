@@ -25,9 +25,9 @@ use hns_wallet_bitcoin_kyoto::{
     initialize_pristine_wallet_at_recovery_checkpoint, load_bitcoin_htlc_watch,
     load_persisted_descriptor_wallet_from_seed, monitor_kyoto_sync_progress,
     persist_prepared_bitcoin_broadcast, persist_prepared_bitcoin_htlc_spend_broadcast,
-    prepare_bitcoin_htlc_funding, prepare_native_send,
-    sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer, verify_htlc_funding,
-    verify_signed_bitcoin_htlc_spend,
+    prepare_bitcoin_htlc_funding_excluding, prepare_native_send_excluding,
+    sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
+    unobserved_approved_broadcast_inputs, verify_htlc_funding, verify_signed_bitcoin_htlc_spend,
 };
 use hns_wallet_hns::{HnsNetwork, HnsRuntimeConfig};
 use hns_wallet_store::{SecretKind, SharedWalletStore, WalletStore};
@@ -730,12 +730,14 @@ impl MobileBitcoinValueController {
             .as_ref()
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
         let fee_rate_sat_vb = runtime.block_on(supervisor.minimum_broadcast_fee_rate_sat_vb())?;
-        let prepared = prepare_native_send(
+        let committed_inputs = self.unobserved_approved_inputs()?;
+        let prepared = prepare_native_send_excluding(
             self.wallet_mut()?,
             destination,
             amount_sats,
             fee_rate_sat_vb,
             maximum_fee_sats,
+            &committed_inputs,
         )?;
         let action_token = random_nonzero_bytes()?;
         let approval = MobileBitcoinSendApproval {
@@ -885,13 +887,15 @@ impl MobileBitcoinValueController {
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
         let fee_rate_sat_vb = runtime.block_on(supervisor.minimum_broadcast_fee_rate_sat_vb())?;
         let value_sats = binding.value_sats;
-        let prepared = prepare_bitcoin_htlc_funding(
+        let committed_inputs = self.unobserved_approved_inputs()?;
+        let prepared = prepare_bitcoin_htlc_funding_excluding(
             self.wallet_mut()?,
             &bitcoin_value_runtime_permit()?,
             &binding.htlc,
             value_sats,
             fee_rate_sat_vb,
             maximum_fee_sats,
+            &committed_inputs,
         )?;
         match (&mut self.supervisor, &self.wallet) {
             (Some(supervisor), Some(wallet)) => {
@@ -1468,6 +1472,19 @@ impl MobileBitcoinValueController {
         self.wallet
             .as_mut()
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)
+    }
+
+    fn unobserved_approved_inputs(
+        &self,
+    ) -> Result<Vec<bdk_wallet::bitcoin::OutPoint>, MobileWalletError> {
+        let network = self
+            .wallet
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?
+            .network();
+        self.store
+            .try_with_store(|store| unobserved_approved_broadcast_inputs(store, network))
+            .map_err(Into::into)
     }
 
     fn require_pending_send_token(&self, action_token: &str) -> Result<(), MobileWalletError> {

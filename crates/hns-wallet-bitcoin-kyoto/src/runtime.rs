@@ -8,7 +8,7 @@ use bdk_kyoto::builder::Builder;
 use bdk_kyoto::{HashCheckpoint, Info, LoggingSubscribers, Requester, ScanType, Warning};
 use bdk_wallet::bitcoin::consensus::{deserialize, serialize};
 use bdk_wallet::bitcoin::hashes::Hash;
-use bdk_wallet::bitcoin::{BlockHash, Network, ScriptBuf, Transaction};
+use bdk_wallet::bitcoin::{BlockHash, Network, OutPoint, ScriptBuf, Transaction};
 use bdk_wallet::chain::keychain_txout::KeychainTxOutIndex;
 use bdk_wallet::chain::{
     BlockId, ChainPosition, CheckPoint, ConfirmationBlockTime, IndexedTxGraph, TxUpdate,
@@ -2086,6 +2086,50 @@ impl BitcoinTransactionRecord {
     }
 }
 
+/// Return every descriptor-wallet input already committed to an approved
+/// transaction that the canonical wallet view has not observed yet. New
+/// wallet-funded transactions must exclude these exact outpoints so an
+/// interrupted broadcast cannot be replaced by a conflicting spend.
+pub fn unobserved_approved_broadcast_inputs(
+    store: &WalletStore,
+    network: Network,
+) -> Result<Vec<OutPoint>, BitcoinWalletError> {
+    let records = store
+        .bitcoin_transactions::<BitcoinTransactionRecord>(MAX_TRACKED_BITCOIN_TRANSACTIONS + 1)?;
+    if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
+        return Err(BitcoinWalletError::BitcoinTransactionCapacity);
+    }
+    let mut outpoints = BTreeSet::new();
+    for stored in records {
+        let record = stored.value;
+        record.validate()?;
+        let Some(intent) = record.broadcast.as_ref() else {
+            continue;
+        };
+        if intent.network != network {
+            return Err(BitcoinWalletError::NetworkMismatch);
+        }
+        if !matches!(
+            record.observation,
+            BitcoinChainObservation::AbsentFromCanonicalWalletView
+        ) {
+            continue;
+        }
+        let raw = record
+            .raw_transaction
+            .as_ref()
+            .ok_or(BitcoinWalletError::CorruptRuntimeState)?;
+        let transaction: Transaction =
+            deserialize(raw).map_err(|_| BitcoinWalletError::CorruptRuntimeState)?;
+        for input in transaction.input {
+            if !outpoints.insert(input.previous_output) {
+                return Err(BitcoinWalletError::BroadcastConflict);
+            }
+        }
+    }
+    Ok(outpoints.into_iter().collect())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BitcoinUtxoRecord {
     pub schema_version: u16,
@@ -2370,6 +2414,17 @@ fn persist_approved_bitcoin_broadcast(
         }
         for stored in records {
             stored.value.validate()?;
+        }
+        let committed_inputs: BTreeSet<_> =
+            unobserved_approved_broadcast_inputs(store, approval.network)?
+                .into_iter()
+                .collect();
+        if transaction
+            .input
+            .iter()
+            .any(|input| committed_inputs.contains(&input.previous_output))
+        {
+            return Err(BitcoinWalletError::BroadcastConflict);
         }
     }
     let mut record = existing.map_or_else(
