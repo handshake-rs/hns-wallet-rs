@@ -535,7 +535,7 @@ fn maker_preimage_record_id(session_id: SessionId) -> Vec<u8> {
     id
 }
 
-fn derive_board_identity(
+pub(crate) fn derive_board_identity(
     store: &WalletStore,
     wallet_id: WalletId,
     policy: &DenuoDirectOfferBoardPolicy,

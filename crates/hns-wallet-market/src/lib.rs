@@ -3,6 +3,7 @@
 
 mod direct_board;
 mod direct_maker;
+mod direct_taker;
 mod session_board;
 mod settlement_key;
 
@@ -33,6 +34,11 @@ pub use direct_maker::{
     DenuoLocalDirectOffer, cancel_denuo_local_direct_offer,
     create_denuo_btc_for_hns_maker_proposal, create_denuo_btc_for_hns_offer,
     list_local_denuo_direct_offers, load_denuo_btc_for_hns_maker_preimage,
+};
+pub use direct_taker::{
+    DenuoHnsForBtcTakeRequest, DenuoLocalDirectTake, DenuoTakerAcceptedSession,
+    accept_denuo_hns_for_btc_maker_proposal, create_denuo_hns_for_btc_take,
+    list_local_denuo_direct_takes,
 };
 pub use session_board::{
     DenuoDirectSwapAdmission, DenuoDirectSwapPeerStatus, DenuoDirectSwapPolicy,
