@@ -45,7 +45,8 @@ pub use session_board::{
     DenuoDirectSwapAdmission, DenuoDirectSwapPeerStatus, DenuoDirectSwapPolicy,
     DenuoDirectSwapRecord, DenuoDirectSwapSnapshot, DenuoDirectSwapStage, MAX_DENUO_DIRECT_SWAPS,
     admit_denuo_direct_offer_take, admit_denuo_direct_swap_hello, admit_denuo_direct_swap_proposal,
-    load_denuo_direct_swap, load_denuo_direct_swaps, validate_denuo_direct_swap_peer_status,
+    admit_denuo_direct_swap_watch_ready, load_denuo_direct_swap, load_denuo_direct_swaps,
+    validate_denuo_direct_swap_peer_status,
 };
 pub use settlement_key::{
     CrossChainSwapKey, CrossChainSwapKeyAllocation, CrossChainSwapKeyError,

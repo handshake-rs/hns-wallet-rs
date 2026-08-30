@@ -886,7 +886,7 @@ impl MobileBitcoinValueController {
     /// the counterparty broadcasts Bitcoin. This signs and spends nothing.
     pub fn register_counterparty_denuo_htlc_watch(
         &mut self,
-        permit: MobileDenuoBitcoinWatchPermit,
+        permit: &MobileDenuoBitcoinWatchPermit,
     ) -> Result<(), MobileWalletError> {
         let now_unix = now_unix()?;
         let hello = permit.hello();

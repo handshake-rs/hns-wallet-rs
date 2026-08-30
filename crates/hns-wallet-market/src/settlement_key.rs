@@ -10,7 +10,7 @@ use core::fmt;
 use hkdf::Hkdf;
 use hns_marketplace_protocol::{
     ChainId, MarketPair, MarketplaceError, NetworkBinding, SwapFundingStatus, SwapRedeemStatus,
-    SwapRefundStatus, SwapSessionHello, SwapSessionProposal,
+    SwapRefundStatus, SwapSessionHello, SwapSessionProposal, SwapWatchReady,
 };
 use hns_wallet_chain_api::{SettlementSigner, SettlementSigningError};
 use hns_wallet_store::{EntityKind, RECOVERY_SEED_BYTES, SecretKind, StoreError, WalletStore};
@@ -318,6 +318,23 @@ impl CrossChainSwapKey {
         }
         status.sign(&self.secret)?;
         status.verify_for_session(hello, self.request.network, now_unix)?;
+        Ok(())
+    }
+
+    /// Sign the local receiver's exact-chain durable watch acknowledgement.
+    /// This coordination message cannot stand in for chain evidence.
+    pub fn sign_watch_ready(
+        &self,
+        ready: &mut SwapWatchReady,
+        hello: &SwapSessionHello,
+        now_unix: u64,
+    ) -> Result<(), CrossChainSwapKeyError> {
+        self.validate_accepted_hello(hello)?;
+        if ready.chain != self.request.participant.redeem_chain(hello) {
+            return Err(CrossChainSwapKeyError::WrongParticipant);
+        }
+        ready.sign(&self.secret)?;
+        ready.verify_for_session(hello, self.request.network, now_unix)?;
         Ok(())
     }
 

@@ -3,6 +3,7 @@
 use hns_marketplace_protocol::{
     AssetId, CrossChainMessage, DirectOffer, DirectOfferTake, MarketPair, NetworkBinding,
     SwapFundingStatus, SwapRedeemStatus, SwapRefundStatus, SwapSessionHello, SwapSessionProposal,
+    SwapWatchReady,
 };
 use hns_wallet_store::{EntityKind, StoredEntity, WalletStore};
 use hns_wallet_types::{ObjectHash, SessionId};
@@ -72,6 +73,8 @@ pub struct DenuoDirectSwapRecord {
     pub take: DirectOfferTake,
     pub proposal: Option<SwapSessionProposal>,
     pub hello: Option<SwapSessionHello>,
+    pub watch_ready_accepted_at_unix: Option<u64>,
+    pub first_chain_watch_ready: Option<SwapWatchReady>,
 }
 
 impl DenuoDirectSwapRecord {
@@ -105,7 +108,8 @@ impl DenuoDirectSwapRecord {
             offered_refund_at_unix: terms.map(|terms| terms.offered_refund_deadline.value),
             received_refund_at_unix: terms.map(|terms| terms.received_refund_deadline.value),
             last_accepted_at_unix: self
-                .hello_accepted_at_unix
+                .watch_ready_accepted_at_unix
+                .or(self.hello_accepted_at_unix)
                 .or(self.proposal_accepted_at_unix)
                 .unwrap_or(self.take_accepted_at_unix),
         }
@@ -154,6 +158,7 @@ pub enum DenuoDirectSwapPeerStatus {
     Funding(SwapFundingStatus),
     Redeem(SwapRedeemStatus),
     Refund(SwapRefundStatus),
+    WatchReady(SwapWatchReady),
 }
 
 impl DenuoDirectSwapPeerStatus {
@@ -162,6 +167,7 @@ impl DenuoDirectSwapPeerStatus {
             Self::Funding(status) => SessionId::new(status.swap_session_id),
             Self::Redeem(status) => SessionId::new(status.swap_session_id),
             Self::Refund(status) => SessionId::new(status.swap_session_id),
+            Self::WatchReady(status) => SessionId::new(status.swap_session_id),
         }
     }
 }
@@ -181,6 +187,10 @@ struct PersistedDenuoDirectSwap {
     take_hex: String,
     proposal_hex: Option<String>,
     hello_hex: Option<String>,
+    #[serde(default)]
+    watch_ready_accepted_at_unix: Option<u64>,
+    #[serde(default)]
+    first_chain_watch_ready_hex: Option<String>,
 }
 
 pub fn load_denuo_direct_swap(
@@ -261,6 +271,8 @@ pub fn admit_denuo_direct_offer_take(
         take_hex: encode_hex(&take)?,
         proposal_hex: None,
         hello_hex: None,
+        watch_ready_accepted_at_unix: None,
+        first_chain_watch_ready_hex: None,
     };
     let revision = store.save_entity(
         EntityKind::SwapSession,
@@ -280,6 +292,8 @@ pub fn admit_denuo_direct_offer_take(
         take,
         proposal: None,
         hello: None,
+        watch_ready_accepted_at_unix: None,
+        first_chain_watch_ready: None,
     };
     Ok(DenuoDirectSwapAdmission::Created(record.snapshot()))
 }
@@ -384,6 +398,54 @@ pub fn admit_denuo_direct_swap_hello(
     Ok(DenuoDirectSwapAdmission::Advanced(record.snapshot()))
 }
 
+/// Authenticate and durably retain the receiver's acknowledgement that the
+/// exact first-chain HTLC watch is installed. Replays of the identical
+/// canonical message are idempotent; conflicting acknowledgements fail.
+pub fn admit_denuo_direct_swap_watch_ready(
+    store: &mut WalletStore,
+    policy: &DenuoDirectSwapPolicy,
+    envelope_bytes: &[u8],
+    accepted_at_unix: u64,
+) -> Result<DenuoDirectSwapAdmission, MarketError> {
+    let (_, message) = decode_canonical_envelope(envelope_bytes)?;
+    let CrossChainMessage::SwapWatchReady(ready) = message else {
+        return Err(MarketError::InvalidDenuoPeerMessage);
+    };
+    let session_id = SessionId::new(ready.swap_session_id);
+    let mut record = load_denuo_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+    let hello = record
+        .hello
+        .as_ref()
+        .ok_or(MarketError::InvalidDenuoDirectSwap)?;
+    if ready.chain != hello.first_funding_chain {
+        return Err(MarketError::InvalidDenuoPeerMessage);
+    }
+    ready
+        .verify_for_session(hello, policy.network(), accepted_at_unix)
+        .map_err(|_| MarketError::InvalidDenuoPeerMessage)?;
+    if let Some(existing) = &record.first_chain_watch_ready {
+        if existing == &ready {
+            return Ok(DenuoDirectSwapAdmission::Existing(record.snapshot()));
+        }
+        return Err(MarketError::DenuoDirectSwapConflict);
+    }
+    let mut persisted = encode_persisted(policy, &record)?;
+    persisted.watch_ready_accepted_at_unix = Some(accepted_at_unix);
+    persisted.first_chain_watch_ready_hex = Some(encode_hex(&ready)?);
+    let next_revision = store.save_entity(
+        EntityKind::SwapSession,
+        &record_id(policy, session_id),
+        record.store_revision,
+        &persisted,
+        accepted_at_unix,
+    )?;
+    record.store_revision = next_revision;
+    record.watch_ready_accepted_at_unix = Some(accepted_at_unix);
+    record.first_chain_watch_ready = Some(ready);
+    Ok(DenuoDirectSwapAdmission::Advanced(record.snapshot()))
+}
+
 pub fn validate_denuo_direct_swap_peer_status(
     store: &WalletStore,
     policy: &DenuoDirectSwapPolicy,
@@ -395,6 +457,7 @@ pub fn validate_denuo_direct_swap_peer_status(
         CrossChainMessage::SwapFundingStatus(status) => DenuoDirectSwapPeerStatus::Funding(status),
         CrossChainMessage::SwapRedeemStatus(status) => DenuoDirectSwapPeerStatus::Redeem(status),
         CrossChainMessage::SwapRefundStatus(status) => DenuoDirectSwapPeerStatus::Refund(status),
+        CrossChainMessage::SwapWatchReady(status) => DenuoDirectSwapPeerStatus::WatchReady(status),
         _ => return Err(MarketError::InvalidDenuoPeerMessage),
     };
     let record = load_denuo_direct_swap(store, policy, status.session_id())?
@@ -411,6 +474,9 @@ pub fn validate_denuo_direct_swap_peer_status(
             status.verify_for_session(hello, policy.network(), now_unix)
         }
         DenuoDirectSwapPeerStatus::Refund(status) => {
+            status.verify_for_session(hello, policy.network(), now_unix)
+        }
+        DenuoDirectSwapPeerStatus::WatchReady(status) => {
             status.verify_for_session(hello, policy.network(), now_unix)
         }
     }
@@ -432,6 +498,9 @@ fn decode_stored_swap(
         || value.proposal_request_id.is_some() != value.proposal_hex.is_some()
         || value.hello_accepted_at_unix.is_some() != value.hello_hex.is_some()
         || value.hello_hex.is_some() && value.proposal_hex.is_none()
+        || value.watch_ready_accepted_at_unix.is_some()
+            != value.first_chain_watch_ready_hex.is_some()
+        || value.first_chain_watch_ready_hex.is_some() && value.hello_hex.is_none()
     {
         return Err(MarketError::CorruptDenuoDirectSwap);
     }
@@ -446,6 +515,11 @@ fn decode_stored_swap(
     }
     let proposal = value.proposal_hex.as_deref().map(decode_hex).transpose()?;
     let hello = value.hello_hex.as_deref().map(decode_hex).transpose()?;
+    let first_chain_watch_ready = value
+        .first_chain_watch_ready_hex
+        .as_deref()
+        .map(decode_hex)
+        .transpose()?;
     let record = DenuoDirectSwapRecord {
         store_revision: stored.revision,
         take_request_id: value.take_request_id,
@@ -457,6 +531,8 @@ fn decode_stored_swap(
         take,
         proposal,
         hello,
+        watch_ready_accepted_at_unix: value.watch_ready_accepted_at_unix,
+        first_chain_watch_ready,
     };
     if let (Some(proposal), Some(at)) = (&record.proposal, record.proposal_accepted_at_unix) {
         proposal
@@ -474,6 +550,19 @@ fn decode_stored_swap(
         let mut maker_terms = hello.clone();
         maker_terms.taker_signature = [0; 64];
         if proposal.terms() != &maker_terms {
+            return Err(MarketError::CorruptDenuoDirectSwap);
+        }
+    }
+    if let (Some(ready), Some(at), Some(hello)) = (
+        &record.first_chain_watch_ready,
+        record.watch_ready_accepted_at_unix,
+        &record.hello,
+    ) {
+        if ready.chain != hello.first_funding_chain
+            || ready
+                .verify_for_session(hello, policy.network(), at)
+                .is_err()
+        {
             return Err(MarketError::CorruptDenuoDirectSwap);
         }
     }
@@ -502,6 +591,12 @@ fn encode_persisted(
         take_hex: encode_hex(&record.take)?,
         proposal_hex: record.proposal.as_ref().map(encode_hex).transpose()?,
         hello_hex: record.hello.as_ref().map(encode_hex).transpose()?,
+        watch_ready_accepted_at_unix: record.watch_ready_accepted_at_unix,
+        first_chain_watch_ready_hex: record
+            .first_chain_watch_ready
+            .as_ref()
+            .map(encode_hex)
+            .transpose()?,
     })
 }
 
@@ -510,6 +605,7 @@ fn timestamps_monotonic(record: &DenuoDirectSwapRecord) -> bool {
         Some(record.take_accepted_at_unix),
         record.proposal_accepted_at_unix,
         record.hello_accepted_at_unix,
+        record.watch_ready_accepted_at_unix,
     ]
     .into_iter()
     .flatten()
@@ -544,6 +640,7 @@ canonical_direct_object!(
     DirectOfferTake,
     SwapSessionProposal,
     SwapSessionHello,
+    SwapWatchReady,
 );
 
 fn encode_hex<T: CanonicalDirectObject>(value: &T) -> Result<String, MarketError> {

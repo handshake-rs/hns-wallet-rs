@@ -704,9 +704,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a423d169b430185d42ec32ece6a9f06a2ce5ae68d7656266d30a21e0dd45a8a"
 dependencies = [
  "blake2",
- "hns-encoding",
- "hns-primitives",
+ "hns-encoding 0.3.1",
+ "hns-primitives 0.3.1",
  "sha3",
+ "thiserror",
+]
+
+[[package]]
+name = "hns-encoding"
+version = "0.3.0"
+dependencies = [
  "thiserror",
 ]
 
@@ -726,8 +733,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "73641b99a32955205be2cfaacc7f2160b09e41543e8c8b7f4475103b5a2642ff"
 dependencies = [
  "blake2",
- "hns-encoding",
- "hns-primitives",
+ "hns-encoding 0.3.1",
+ "hns-primitives 0.3.1",
  "sha3",
  "thiserror",
 ]
@@ -740,9 +747,9 @@ checksum = "8dbbca83648e2f60d7dd6dd146c9692d8888006f99647595db947daa6992f3ee"
 dependencies = [
  "blake2",
  "hns-covenants",
- "hns-encoding",
+ "hns-encoding 0.3.1",
  "hns-header-consensus",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "hns-urkel-proof",
  "thiserror",
 ]
@@ -755,7 +762,7 @@ checksum = "dda76cca1ca788d63d9a8f1be2bc3a2576398b05fed378392328d7d4dd5f2622"
 dependencies = [
  "hns-header-consensus",
  "hns-p2p-wire",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "hns-transaction",
  "thiserror",
 ]
@@ -769,7 +776,7 @@ dependencies = [
  "hns-header-consensus",
  "hns-light-chain",
  "hns-p2p-wire",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "thiserror",
 ]
 
@@ -780,11 +787,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "527027d1ae468a71cd8d4a10fbb285191226f807d976531d252e0ec320e0c2c4"
 dependencies = [
  "blake2",
- "hns-encoding",
+ "hns-encoding 0.3.1",
  "hns-header-consensus",
  "hns-light-chain",
  "hns-p2p-wire",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "hns-transaction",
  "thiserror",
 ]
@@ -794,9 +801,9 @@ name = "hns-marketplace-protocol"
 version = "0.4.0"
 dependencies = [
  "blake2",
- "hns-encoding",
- "hns-p2p-experimental",
- "hns-primitives",
+ "hns-encoding 0.3.1",
+ "hns-p2p-experimental 0.3.0",
+ "hns-primitives 0.3.1",
  "hns-swap",
  "k256",
  "sha2",
@@ -812,11 +819,24 @@ checksum = "0d7d8902df977b7b0c885e78bc510fe4603104389a40f384bda2babf92990e2f"
 dependencies = [
  "blake2",
  "hns-covenants",
- "hns-encoding",
+ "hns-encoding 0.3.1",
  "hns-header-consensus",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "hns-transaction",
  "thiserror",
+]
+
+[[package]]
+name = "hns-p2p-experimental"
+version = "0.3.0"
+dependencies = [
+ "hex",
+ "hns-encoding 0.3.0",
+ "hns-primitives 0.3.0",
+ "serde",
+ "sha2",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -826,8 +846,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "18e41ae74ab0179b1840ef35f7184db2695ae95e21ae5756f4203917eab0191e"
 dependencies = [
  "hex",
- "hns-encoding",
- "hns-primitives",
+ "hns-encoding 0.3.1",
+ "hns-primitives 0.3.1",
  "serde",
  "sha2",
  "thiserror",
@@ -841,12 +861,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0084790190701ba2385ec2073437b45b63f78ab28f3af909ab5d21844d48404c"
 dependencies = [
  "blake2",
- "hns-encoding",
+ "hns-encoding 0.3.1",
  "hns-header-consensus",
  "hns-mining",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "hns-transaction",
  "hns-urkel-proof",
+ "thiserror",
+]
+
+[[package]]
+name = "hns-primitives"
+version = "0.3.0"
+dependencies = [
+ "hex",
  "thiserror",
 ]
 
@@ -867,8 +895,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b4d09362215c66509f36cfb5fd54797092f2cb939e43fb0040660d544900836"
 dependencies = [
  "blake2",
- "hns-encoding",
- "hns-primitives",
+ "hns-encoding 0.3.1",
+ "hns-primitives 0.3.1",
  "hns-transaction",
  "k256",
  "ripemd",
@@ -886,8 +914,8 @@ checksum = "44c030325fc0154fe4ee7696af0334fdae4bdba982f019deef5e8cab0fece6c3"
 dependencies = [
  "blake2",
  "hns-covenants",
- "hns-encoding",
- "hns-primitives",
+ "hns-encoding 0.3.1",
+ "hns-primitives 0.3.1",
  "hns-script",
  "hns-transaction",
  "k256",
@@ -904,8 +932,8 @@ checksum = "adc5fd7e6f7cbcf782f7566411db78b5db2fb2af4840234df8c675dc434098b4"
 dependencies = [
  "blake2",
  "hns-covenants",
- "hns-encoding",
- "hns-primitives",
+ "hns-encoding 0.3.1",
+ "hns-primitives 0.3.1",
  "thiserror",
 ]
 
@@ -916,7 +944,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e240b52c4f22775a3a00812ed96fe063766b40e09e49a1d48ca69da44737c944"
 dependencies = [
  "blake2",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "thiserror",
 ]
 
@@ -931,7 +959,7 @@ dependencies = [
  "bitcoin",
  "hkdf",
  "hns-marketplace-protocol",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "hns-wallet-chain-api",
  "hns-wallet-store",
  "hns-wallet-types",
@@ -999,9 +1027,9 @@ dependencies = [
  "hns-light-sync",
  "hns-light-wallet",
  "hns-marketplace-protocol",
- "hns-p2p-experimental",
+ "hns-p2p-experimental 0.3.1",
  "hns-p2p-wire",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "hns-script",
  "hns-swap",
  "hns-transaction",
@@ -1036,7 +1064,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hns-marketplace-protocol",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "hns-swap",
  "hns-wallet-bitcoin-kyoto",
  "hns-wallet-chain-api",
@@ -1058,7 +1086,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hns-header-consensus",
  "hns-marketplace-protocol",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "hns-swap",
  "hns-transaction",
  "hns-wallet-bitcoin-kyoto",
@@ -1123,7 +1151,7 @@ dependencies = [
  "hex",
  "hns-covenants",
  "hns-marketplace-protocol",
- "hns-primitives",
+ "hns-primitives 0.3.1",
  "hns-script",
  "hns-swap",
  "hns-transaction",
