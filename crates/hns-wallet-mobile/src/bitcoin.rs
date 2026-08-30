@@ -15,12 +15,13 @@ use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
 use bdk_wallet::bitcoin::consensus::deserialize;
 use bdk_wallet::bitcoin::hashes::Hash;
 use hns_wallet_bitcoin_kyoto::{
-    BIP39_SEED_BYTES, BitcoinBirthdaySource, BitcoinBroadcastReceipt, BitcoinCheckpoint,
-    BitcoinHtlcWatchRequest, BitcoinTransactionRecord, BitcoinWalletError,
-    EncryptedPersistedBitcoinWallet, HtlcSpendBranch, KyotoRuntimeConfig, KyotoShutdownHandle,
-    KyotoSupervisor, KyotoSyncProgressHandle, KyotoSyncReceipt, KyotoTipDiscovery,
-    KyotoWalletState, PreparedBitcoinHtlcFunding, StoredKyotoWalletState, VerifiedBitcoinLock,
-    authorize_native_send, bitcoin_value_runtime_permit, build_denuo_bitcoin_htlc,
+    BIP39_SEED_BYTES, BitcoinBirthdaySource, BitcoinBroadcastReceipt,
+    BitcoinBroadcastRecoverySummary, BitcoinCheckpoint, BitcoinHtlcWatchRequest,
+    BitcoinTransactionRecord, BitcoinWalletError, EncryptedPersistedBitcoinWallet, HtlcSpendBranch,
+    KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor, KyotoSyncProgressHandle,
+    KyotoSyncReceipt, KyotoTipDiscovery, KyotoWalletState, PreparedBitcoinHtlcFunding,
+    StoredKyotoWalletState, VerifiedBitcoinLock, authorize_native_send,
+    bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit, build_denuo_bitcoin_htlc,
     create_persisted_descriptor_wallet_from_seed, initialize_pristine_wallet_at_creation_tip,
     initialize_pristine_wallet_at_recovery_checkpoint, load_bitcoin_htlc_watch,
     load_persisted_descriptor_wallet_from_seed, monitor_kyoto_sync_progress,
@@ -1265,6 +1266,21 @@ impl MobileBitcoinValueController {
             )
             .map(|receipts| receipts.len())
             .map_err(MobileWalletError::from)
+    }
+
+    /// Return only non-sensitive durable broadcast recovery metadata for
+    /// platform status presentation.
+    pub fn approved_broadcast_recovery(
+        &self,
+    ) -> Result<BitcoinBroadcastRecoverySummary, MobileWalletError> {
+        let network = self
+            .wallet
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?
+            .network();
+        self.store
+            .try_with_store(|store| bitcoin_broadcast_recovery_summary(store, network))
+            .map_err(Into::into)
     }
 
     /// Return funding evidence only when the durable HTLC watch is reconciled

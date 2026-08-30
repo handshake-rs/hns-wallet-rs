@@ -15,7 +15,9 @@ pub use bitcoin::{
     MobileBitcoinSnapshot, MobileBitcoinSyncProgress, MobileBitcoinSyncProgressHandle,
     MobileBitcoinValueController,
 };
-pub use hns_wallet_bitcoin_kyoto::{VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock};
+pub use hns_wallet_bitcoin_kyoto::{
+    BitcoinBroadcastRecoverySummary, VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock,
+};
 pub use market::{
     MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDenuoBitcoinFundingPermit,
     MobileDenuoBitcoinSettlementPermit, MobileDenuoBitcoinWatchPermit, MobileDenuoDirectAdmission,

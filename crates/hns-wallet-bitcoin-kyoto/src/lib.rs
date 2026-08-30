@@ -2031,6 +2031,15 @@ mod tests {
 
         let committed = unobserved_approved_broadcast_inputs(&store, Network::Regtest)
             .expect("committed inputs");
+        let recovery = bitcoin_broadcast_recovery_summary(&store, Network::Regtest)
+            .expect("non-sensitive recovery summary");
+        assert_eq!(recovery.total_approved, 1);
+        assert_eq!(recovery.unobserved_prepared, 1);
+        assert_eq!(recovery.unobserved_submission_started, 0);
+        assert_eq!(recovery.unobserved_submitted, 0);
+        assert_eq!(recovery.observed, 0);
+        assert_eq!(recovery.highest_attempt_count, 0);
+        assert_eq!(recovery.last_changed_at_unix, Some(now_unix));
         let first_transaction: Transaction =
             deserialize(first.raw_transaction()).expect("first transaction");
         assert_eq!(committed, vec![first_transaction.input[0].previous_output]);
@@ -2067,6 +2076,75 @@ mod tests {
             ),
             Err(BitcoinWalletError::BroadcastConflict)
         ));
+
+        let mut stored = store
+            .bitcoin_transaction::<BitcoinTransactionRecord>(&first_approval.txid)
+            .expect("stored first broadcast")
+            .expect("first broadcast exists");
+        let intent = stored.value.broadcast.as_mut().expect("approved intent");
+        intent.phase = BitcoinBroadcastPhase::SubmissionStarted;
+        intent.attempt_count = 1;
+        intent.last_submission_started_at_unix = Some(now_unix + 1);
+        stored.value.last_changed_at_unix = now_unix + 1;
+        let revision = store
+            .save_bitcoin_transaction(
+                &first_approval.txid,
+                stored.revision,
+                &stored.value,
+                now_unix + 1,
+            )
+            .expect("submission-started transition");
+        let recovery = bitcoin_broadcast_recovery_summary(&store, Network::Regtest)
+            .expect("submission-started summary");
+        assert_eq!(recovery.unobserved_prepared, 0);
+        assert_eq!(recovery.unobserved_submission_started, 1);
+        assert_eq!(recovery.highest_attempt_count, 1);
+
+        let mut stored = store
+            .bitcoin_transaction::<BitcoinTransactionRecord>(&first_approval.txid)
+            .expect("stored submitted broadcast")
+            .expect("submitted broadcast exists");
+        assert_eq!(stored.revision, revision);
+        let intent = stored.value.broadcast.as_mut().expect("approved intent");
+        intent.phase = BitcoinBroadcastPhase::Submitted;
+        intent.last_submitted_at_unix = Some(now_unix + 1);
+        stored.value.last_changed_at_unix = now_unix + 2;
+        let revision = store
+            .save_bitcoin_transaction(
+                &first_approval.txid,
+                stored.revision,
+                &stored.value,
+                now_unix + 2,
+            )
+            .expect("submitted transition");
+        let recovery = bitcoin_broadcast_recovery_summary(&store, Network::Regtest)
+            .expect("submitted summary");
+        assert_eq!(recovery.unobserved_submission_started, 0);
+        assert_eq!(recovery.unobserved_submitted, 1);
+
+        let mut stored = store
+            .bitcoin_transaction::<BitcoinTransactionRecord>(&first_approval.txid)
+            .expect("stored observed broadcast")
+            .expect("observed broadcast exists");
+        assert_eq!(stored.revision, revision);
+        stored.value.observation = BitcoinChainObservation::Unconfirmed {
+            first_seen_at_unix: Some(now_unix + 3),
+            last_seen_at_unix: Some(now_unix + 3),
+        };
+        stored.value.last_changed_at_unix = now_unix + 3;
+        store
+            .save_bitcoin_transaction(
+                &first_approval.txid,
+                stored.revision,
+                &stored.value,
+                now_unix + 3,
+            )
+            .expect("observed transition");
+        let recovery =
+            bitcoin_broadcast_recovery_summary(&store, Network::Regtest).expect("observed summary");
+        assert_eq!(recovery.unobserved_submitted, 0);
+        assert_eq!(recovery.observed, 1);
+        assert_eq!(recovery.last_changed_at_unix, Some(now_unix + 3));
     }
 
     #[test]

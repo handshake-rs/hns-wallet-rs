@@ -2086,6 +2086,78 @@ impl BitcoinTransactionRecord {
     }
 }
 
+/// Bounded, non-sensitive state for approved Bitcoin transaction recovery.
+/// It deliberately omits transaction bytes, input outpoints, commitments,
+/// values, addresses, and peer information.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BitcoinBroadcastRecoverySummary {
+    pub total_approved: u32,
+    pub unobserved_prepared: u32,
+    pub unobserved_submission_started: u32,
+    pub unobserved_submitted: u32,
+    pub observed: u32,
+    pub highest_attempt_count: u16,
+    pub last_changed_at_unix: Option<u64>,
+}
+
+/// Authenticate and summarize all approved broadcasts for the selected
+/// network without exposing their signed bytes or wallet inputs.
+pub fn bitcoin_broadcast_recovery_summary(
+    store: &WalletStore,
+    network: Network,
+) -> Result<BitcoinBroadcastRecoverySummary, BitcoinWalletError> {
+    let records = store
+        .bitcoin_transactions::<BitcoinTransactionRecord>(MAX_TRACKED_BITCOIN_TRANSACTIONS + 1)?;
+    if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
+        return Err(BitcoinWalletError::BitcoinTransactionCapacity);
+    }
+    let mut summary = BitcoinBroadcastRecoverySummary::default();
+    for stored in records {
+        let record = stored.value;
+        record.validate()?;
+        let Some(intent) = record.broadcast else {
+            continue;
+        };
+        if intent.network != network {
+            return Err(BitcoinWalletError::NetworkMismatch);
+        }
+        summary.total_approved = summary
+            .total_approved
+            .checked_add(1)
+            .ok_or(BitcoinWalletError::BitcoinTransactionCapacity)?;
+        summary.highest_attempt_count = summary.highest_attempt_count.max(intent.attempt_count);
+        summary.last_changed_at_unix = Some(
+            summary
+                .last_changed_at_unix
+                .map_or(record.last_changed_at_unix, |prior| {
+                    prior.max(record.last_changed_at_unix)
+                }),
+        );
+        if matches!(
+            record.observation,
+            BitcoinChainObservation::AbsentFromCanonicalWalletView
+        ) {
+            let count = match intent.phase {
+                BitcoinBroadcastPhase::Prepared => &mut summary.unobserved_prepared,
+                BitcoinBroadcastPhase::SubmissionStarted => {
+                    &mut summary.unobserved_submission_started
+                }
+                BitcoinBroadcastPhase::Submitted => &mut summary.unobserved_submitted,
+            };
+            *count = count
+                .checked_add(1)
+                .ok_or(BitcoinWalletError::BitcoinTransactionCapacity)?;
+        } else {
+            summary.observed = summary
+                .observed
+                .checked_add(1)
+                .ok_or(BitcoinWalletError::BitcoinTransactionCapacity)?;
+        }
+    }
+    Ok(summary)
+}
+
 /// Return every descriptor-wallet input already committed to an approved
 /// transaction that the canonical wallet view has not observed yet. New
 /// wallet-funded transactions must exclude these exact outpoints so an
