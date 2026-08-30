@@ -1344,7 +1344,7 @@ impl MobileBitcoinValueController {
 
     fn load_initialization(&self) -> Result<MobileBitcoinInitialization, MobileWalletError> {
         let id = bitcoin_initialization_id(self.hns_account.account_id.as_bytes());
-        Ok(self.store.try_with_store(|store| {
+        self.store.try_with_store(|store| {
             let encoded = store.get_secret(&id, SecretKind::MetadataKey)?;
             match encoded {
                 Some(encoded) => MobileBitcoinInitialization::decode(&encoded),
@@ -1356,7 +1356,7 @@ impl MobileBitcoinValueController {
                     requested_recovery_height: None,
                 }),
             }
-        })?)
+        })
     }
 
     fn persist_initialization(&self, now_unix: u64) -> Result<(), MobileWalletError> {

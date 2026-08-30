@@ -63,7 +63,7 @@ recorded only after its own locked CI, CodeQL, and normalized preflight pass.
 | Provider core | exact `2229be8` CI passed, including account binding, scoped reads, exact Names consent, and unavailable-method ordering | grants persist; pending approval/UI authority remains process-local | no installed-browser wallet consent or backend E2E | browser and value exposure unavailable |
 | Fixed-price Shakedex | exact `2229be8` CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Denuo, provider, trusted UI, or product coin selection | Shakedex and dependent HNS value source gates enabled; live product integration pending |
 | Market sessions | exact `2229be8` workspace CI passed | CAS journal source; recovery evidence incomplete | no pair E2E, rendezvous, or relay transport | unavailable |
-| Bitcoin Kyoto | exact `2229be8` CI passed, including encrypted BDK persistence, allocation regressions, and the ahead-tip crash edge | exact source restart resume; no multi-process rollback run | no regtest/P2P/broadcast run | send and settlement hard-disabled; normalized or chunked backend pending |
+| Bitcoin Kyoto | historical `2229be8` CI plus current candidate coverage for encrypted BDK persistence, allocation, bilateral HTLC funding/settlement, restart resumption, and conflicting-input exclusion | exact source restart resume and reorg tests; no installed multi-process rollback run | Android/iOS product wiring present; installed live P2P swap not recorded here | send and atomic settlement enabled through the private trusted-mobile permit; normalized or chunked backend remains future capacity work |
 | Ethereum | exact `2229be8` CI and deterministic contract check passed | offline derivation and dormant primitives only | no embedded Helios/local-chain run; no contract audit | synchronization, history, send, signing, settlement, and mainnet unavailable |
 | ABI, service, and host | exact `2229be8` CI passed, including canonical framed projections, approval-v3, session handling, and host retention | private process session/authority state; no installed restart E2E | downstream browser/future-mobile-provider adoption and rendering pending; trusted-native reads are a separate non-provider surface | private control only; browser/value unavailable |
 | Mobile controller | exact historical `bc5901f` CI passed the lifecycle, synchronized-read, same-authority, fresh-read, script-free snapshot, zero-script-query wrong-network, trusted import, and failure-lock/retry regressions | atomic seed/account bootstrap and source reopen coverage; installed platform restart remains downstream | downstream Android/iOS 0.5.9 candidate source still requires exact import-binding/UI adoption; no archive-capable production device wallet-index backend, installed-device synchronization, resource benchmark, or production network qualification; the loopback adapter is not device transport | `bc5901f` supplies the library projection, including native direct-value composition; no device import UI is qualified, provider/market integration remains unimplemented, and installed-product qualification is pending |
@@ -237,10 +237,12 @@ publication credentials, and cannot execute an upload.
 
 ## Fixed release gates
 
-The following compile-time release gates remain `false`:
-
-- `BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED`;
-- every Ethereum synchronization, value, settlement, and mainnet gate.
+Every Ethereum synchronization, value, settlement, and mainnet gate remains
+`false`. The Bitcoin value-runtime gate is enabled in the current candidate
+after connecting the durable product coordinator, bilateral funding watches,
+redeem/refund recovery, exact approved-broadcast resumption, and committed-input
+exclusion. Publication and installed-product qualification remain separate
+release evidence; enabling this source gate does not claim either one occurred.
 
 The HNS value, HNS fee-quote, HNS Shakedex-funding, and three Shakedex source
 gates are enabled. Their live operation remains conditional on the applicable

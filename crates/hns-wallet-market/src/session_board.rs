@@ -557,14 +557,12 @@ fn decode_stored_swap(
         &record.first_chain_watch_ready,
         record.watch_ready_accepted_at_unix,
         &record.hello,
-    ) {
-        if ready.chain != hello.first_funding_chain
-            || ready
-                .verify_for_session(hello, policy.network(), at)
-                .is_err()
-        {
-            return Err(MarketError::CorruptDenuoDirectSwap);
-        }
+    ) && (ready.chain != hello.first_funding_chain
+        || ready
+            .verify_for_session(hello, policy.network(), at)
+            .is_err())
+    {
+        return Err(MarketError::CorruptDenuoDirectSwap);
     }
     if stored.updated_at_unix != record.snapshot().last_accepted_at_unix
         || !timestamps_monotonic(&record)

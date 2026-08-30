@@ -77,9 +77,9 @@ This first backend stores one aggregate changeset and therefore inherits the
 encrypted entity cleartext limit of 1 MiB. BDK's persistent script cache is
 disabled to avoid needless growth, but transaction and derivation history can
 still reach the limit. Capacity exhaustion fails closed. A normalized or
-authenticated chunked BDK backend is required before the documented 4,096-row
-mirror ceilings can be treated as production-scale capacity; this is an
-independent reason the Bitcoin value gate remains false.
+authenticated chunked BDK backend would raise the current capacity ceiling.
+Until then, exhaustion rejects the operation rather than authorizing a partial
+wallet view.
 
 The former standalone BDK SQLite backend is not imported, opened, truncated,
 or deleted. There is no migration tool in this revision. An upgraded product
@@ -118,10 +118,11 @@ latest-attempt timestamp. This prevents a backward wall-clock jump from
 silently extending approval or retry windows, but a qualified product still
 needs a reviewed trusted-time/monotonic-clock policy.
 
-`BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED` remains `false`. No
-`BitcoinValueRuntimePermit` can be obtained, capability discovery does not
-advertise send or atomic settlement, and both native-send signing and broadcast
-require that unavailable permit in this source revision.
+`BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED` is enabled for the connected mobile
+path. Capability discovery advertises send and atomic settlement, but signing
+and broadcast still require the private permit obtained by that trusted Rust
+controller. Platform callers receive only bounded approval projections and
+process-local action tokens.
 
 ## Atomic-swap key derivation
 
@@ -212,11 +213,10 @@ single or batch deletion. These controls detect isolated mutation, not a whole
 database snapshot rollback. Session IDs must never be recycled, and recovering
 an already active allocation requires its current encrypted database records.
 
-This source addition does not expose a signing or value permit and does not
-advertise atomic settlement. The allocator, exact signed-spend verifier,
-durable broadcast journal, and canonical compact-filter HTLC watcher are not
-yet wired together by the cross-chain product coordinator. Complete product
-restart, multi-connection, snapshot-rollback, and network qualification remain.
+The allocator, exact signed-spend verifier, durable broadcast journal, and
+canonical compact-filter HTLC watcher are wired together by the mobile
+cross-chain coordinator. The signing/value permit remains private to Rust;
+neither peer messages nor platform input can construct it.
 
 ## HTLC profile
 
@@ -240,8 +240,9 @@ bound to its HTLC script position and signs an exact spend template; the
 chain-neutral session signer can be used by both native adapters without
 exporting a private scalar. The combined Kyoto subscriber watches the script
 itself, so neither a Denuo peer nor the counterparty supplies chain authority
-or block locations. The cross-chain settlement coordinator remains to be
-connected.
+or block locations. The mobile cross-chain coordinator binds these primitives
+to the signed bilateral session, ordered funding, explicit approvals, durable
+state, and independently verified spend observations.
 
 ## Qualification and benchmarks
 
@@ -252,7 +253,8 @@ passed, 0 failed, and 8 filtered out. No standalone build/check, full workspace
 gate, optimized RocksDB compilation, network test, or benchmark was run in that
 historical event. The allocation, encrypted BDK persistence, and ahead-tip
 crash regressions are now also covered by exact `2229be8` complete workspace CI.
-Neither source result qualifies the Bitcoin value runtime.
+Those historical results predate the connected value-runtime candidate and do
+not qualify the current source revision.
 
 | Scenario | Disk | Bandwidth | Usable balance | Full scan | Peak mobile memory |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -262,8 +264,8 @@ Neither source result qualifies the Bitcoin value runtime.
 | Five-year restore | not measured | not measured | not measured | not measured | not measured |
 | Genesis restore | not measured | not measured | not measured | not measured | not measured |
 
-Bitcoin send and settlement remain unavailable until the complete cross-chain
-coordinator and installed product flow are connected and the final direct-peer
-restart/reorg/broadcast/HTLC qualification is recorded. Full header/filter
-database persistence is an optimization, not a requirement for wallet-owned
-light-client authority.
+Bitcoin send and settlement are available through the connected trusted mobile
+controller. Full header/filter database persistence remains an optimization,
+not a requirement for wallet-owned light-client authority. Installed-product,
+resource, and live-network results must still be recorded separately from
+source-level qualification.

@@ -19,8 +19,10 @@ swap-session exchange; Kyoto independently verifies and settles the Bitcoin
 side. A reorganization can roll back funding or spend confirmations, but it
 cannot erase a preimage that has already become public.
 
-The public Bitcoin value permit remains unavailable until these primitives are
-connected to the durable product-level swap coordinator and qualified as one
-complete flow. See the
+The public Bitcoin value permit is issued only through the connected durable
+product-level swap coordinator. Value actions require an exact process-local
+approval, persist signed bytes and their fee cap before submission, recover
+approved broadcasts after interruption, and exclude their committed inputs
+until the canonical wallet view observes the transaction. See the
 [workspace repository](https://github.com/handshake-rs/hns-wallet-rs) for the
 backend policy and release gates.

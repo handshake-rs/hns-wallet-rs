@@ -2662,7 +2662,7 @@ impl TrackedHnsCoin {
             return Err(HnsWalletError::InvalidEvidence);
         }
         let covenant = decode_canonical_covenant(&self.coin.covenant)?;
-        if self.coin.name_locked != !matches!(covenant.kind, CovenantKind::None) {
+        if self.coin.name_locked == matches!(covenant.kind, CovenantKind::None) {
             return Err(HnsWalletError::InvalidEvidence);
         }
         if self.coin.value.is_zero()

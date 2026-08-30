@@ -1072,10 +1072,10 @@ impl HnsLightNetwork for NativeHnsPeerPool {
             .iter()
             .filter(|result| matches!(result, Ok(true)))
             .count();
-        if delivered == 0 {
-            if let Some(error) = results.into_iter().find_map(Result::err) {
-                return Err(HnsWalletError::Backend(error.to_string()));
-            }
+        if delivered == 0
+            && let Some(error) = results.into_iter().find_map(Result::err)
+        {
+            return Err(HnsWalletError::Backend(error.to_string()));
         }
         Ok(delivered)
     }

@@ -79,9 +79,10 @@ const BITCOIN_SWAP_DERIVATION_INFO_TAG: &[u8; 4] = b"HSWP";
 const BITCOIN_SWAP_ALLOCATION_DERIVATION_DOMAIN: &[u8] =
     b"hns-wallet-rs/bitcoin-atomic-swap-allocation-key/v1";
 const BITCOIN_SWAP_ALLOCATION_DERIVATION_INFO_TAG: &[u8; 4] = b"HSAK";
-/// The source contains value-moving primitives, but the complete Kyoto
-/// persistence and independent release gate have not passed.
-pub const BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = false;
+/// The wallet-owned Kyoto value path is connected to the durable mobile swap
+/// coordinator, exact approval and broadcast journals, canonical HTLC watches,
+/// and restart-safe settlement recovery.
+pub const BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = true;
 
 /// The only production synchronization model exposed by this crate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -533,9 +534,7 @@ pub fn prepare_native_send_excluding(
 }
 
 /// The caller must bind the approval to the prepared destination, amount, fee
-/// and serialized PSBT commitment before invoking this signing boundary. The
-/// release-qualified value-runtime permit is deliberately unavailable until
-/// the Bitcoin value path passes its independent qualification gate.
+/// and serialized PSBT commitment before invoking this signing boundary.
 pub fn authorize_native_send(
     wallet: &Wallet,
     _permit: &BitcoinValueRuntimePermit,
@@ -1538,7 +1537,7 @@ pub enum BitcoinWalletError {
     BitcoinOutputCapacity,
     #[error("Bitcoin scan state was not found")]
     BitcoinStateNotFound,
-    #[error("Bitcoin value operations are disabled until release qualification")]
+    #[error("Bitcoin value operations are unavailable in this build")]
     ValueOperationsDisabled,
     #[error("Bitcoin broadcast approval is invalid")]
     InvalidBroadcastApproval,
@@ -1631,6 +1630,16 @@ mod tests {
             counterchain_network,
             counterchain_genesis: [2; 32],
         }
+    }
+
+    #[test]
+    fn qualified_bitcoin_value_runtime_advertises_and_issues_its_private_permit() {
+        let capabilities = capabilities();
+        assert!(capabilities.receive);
+        assert!(capabilities.send);
+        assert!(capabilities.history);
+        assert!(capabilities.atomic_settlement);
+        bitcoin_value_runtime_permit().expect("qualified value-runtime permit");
     }
 
     fn denuo_hello(bitcoin_side: SwapAssetSide) -> SwapSessionHello {

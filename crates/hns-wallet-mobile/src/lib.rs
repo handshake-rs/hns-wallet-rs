@@ -2005,7 +2005,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .service
             .verify_trusted_native_persisted_hns_htlc_lock(
                 session_id,
-                binding.descriptor.clone(),
+                binding.descriptor,
                 hello.received_minimum_confirmations,
             )
             .map_err(mobile_service_failure)?

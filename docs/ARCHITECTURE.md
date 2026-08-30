@@ -390,10 +390,12 @@ that record.
 The BDK entity and encrypted scan journal share one store/key authority but are
 independent commits, so ready-last sequencing supplies logical recovery rather
 than pretending they are one SQLite transaction. The aggregate BDK entity is
-bounded to 1 MiB and requires a normalized or authenticated chunked successor
-before production scale. Pinned Kyoto does not durably expose headers, filter
-headers/filters, or its address book; those missing objects prevent production
-qualification. `BITCOIN_VALUE_RUNTIME_RELEASE_QUALIFIED` remains false.
+bounded to 1 MiB. Pinned Kyoto does not durably expose headers, filter
+headers/filters, or its address book, so those public chain objects are
+re-fetched and revalidated after restart while the encrypted BDK checkpoint
+remains the durable wallet anchor. The connected mobile value path persists
+exact approved broadcasts, resumes their bytes, and excludes committed inputs
+until canonical wallet observation. Its Bitcoin value-runtime gate is enabled.
 
 ## Ethereum containment boundary
 
