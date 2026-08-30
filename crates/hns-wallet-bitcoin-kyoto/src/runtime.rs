@@ -1779,6 +1779,52 @@ impl KyotoSupervisor {
             submitted_at_unix,
         })
     }
+
+    /// Resume exact signed transactions whose explicit approvals were
+    /// durably committed before submission was interrupted. Retry cooldowns
+    /// remain enforced and already-observed transactions are idempotent.
+    pub async fn resume_approved_broadcasts(
+        &self,
+        permit: &BitcoinValueRuntimePermit,
+        now_unix: u64,
+    ) -> Result<Vec<BitcoinBroadcastReceipt>, BitcoinWalletError> {
+        let txids = self.store.try_with_store(|store| {
+            let records = store.bitcoin_transactions::<BitcoinTransactionRecord>(
+                MAX_TRACKED_BITCOIN_TRANSACTIONS + 1,
+            )?;
+            if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
+                return Err(BitcoinWalletError::BitcoinTransactionCapacity);
+            }
+            records
+                .into_iter()
+                .filter_map(|stored| {
+                    let record = stored.value;
+                    if let Err(error) = record.validate() {
+                        return Some(Err(error));
+                    }
+                    (record.broadcast.is_some()
+                        && record.raw_transaction.is_some()
+                        && matches!(
+                            record.observation,
+                            BitcoinChainObservation::AbsentFromCanonicalWalletView
+                        ))
+                    .then_some(Ok(record.txid))
+                })
+                .collect::<Result<Vec<_>, BitcoinWalletError>>()
+        })?;
+        let mut receipts = Vec::with_capacity(txids.len());
+        for txid in txids {
+            match self
+                .broadcast_prepared_transaction(permit, txid, now_unix)
+                .await
+            {
+                Ok(receipt) => receipts.push(receipt),
+                Err(BitcoinWalletError::BroadcastRetryNotReady) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(receipts)
+    }
 }
 
 fn median_time_past(
@@ -1833,9 +1879,9 @@ fn begin_broadcast_submission(
     if now_unix < intent.prepared_at_unix {
         return Err(BitcoinWalletError::ClockRollbackDetected);
     }
-    if now_unix >= intent.expires_at_unix {
-        return Err(BitcoinWalletError::BroadcastApprovalExpired);
-    }
+    // Expiry bounds review and initial persistence. Once committed, the
+    // irreversible approval remains durable so an interrupted submission can
+    // resume without constructing a conflicting replacement transaction.
     if matches!(
         &record.observation,
         BitcoinChainObservation::Confirmed { .. } | BitcoinChainObservation::Unconfirmed { .. }
@@ -2009,9 +2055,7 @@ impl BitcoinTransactionRecord {
                 .last_submission_started_at_unix
                 .into_iter()
                 .chain(intent.last_submitted_at_unix)
-                .all(|timestamp| {
-                    timestamp >= intent.prepared_at_unix && timestamp < intent.expires_at_unix
-                });
+                .all(|timestamp| timestamp >= intent.prepared_at_unix);
             if intent.approval_commitment == [0; 32]
                 || intent.fee_sats == 0
                 || intent.fee_sats > intent.maximum_fee_sats

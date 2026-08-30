@@ -1242,6 +1242,27 @@ impl MobileBitcoinValueController {
         Ok(())
     }
 
+    /// Re-submit only exact transactions whose signed bytes and user approval
+    /// are already durable. This creates no new transaction and consumes no
+    /// new signing authority.
+    pub fn resume_approved_broadcasts(&self) -> Result<usize, MobileWalletError> {
+        let now_unix = now_unix()?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        runtime
+            .block_on(
+                supervisor.resume_approved_broadcasts(&bitcoin_value_runtime_permit()?, now_unix),
+            )
+            .map(|receipts| receipts.len())
+            .map_err(MobileWalletError::from)
+    }
+
     /// Return funding evidence only when the durable HTLC watch is reconciled
     /// to this controller's exact current Kyoto checkpoint and has reached the
     /// confirmation threshold signed into the swap session.

@@ -2120,6 +2120,13 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .map_err(mobile_service_failure)
     }
 
+    pub fn resume_approved_denuo_hns_settlements(&self) -> Result<usize, MobileWalletError> {
+        self.session
+            .service
+            .rebroadcast_trusted_native_hns_settlements()
+            .map_err(mobile_service_failure)
+    }
+
     pub fn verified_denuo_hns_funding(
         &self,
         permit: MobileDenuoHnsVerificationPermit,

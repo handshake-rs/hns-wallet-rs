@@ -1507,6 +1507,14 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             .map_err(hns_runtime_failure)
     }
 
+    pub fn rebroadcast_trusted_native_hns_settlements(&self) -> Result<usize, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .rebroadcast_pending_settlements()
+            .map_err(hns_runtime_failure)
+    }
+
     pub fn trusted_native_hns_settlement_transaction_id(
         &self,
         artifact: &PreparedArtifact,

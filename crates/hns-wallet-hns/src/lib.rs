@@ -4264,6 +4264,51 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         })
     }
 
+    /// Resume exact HNS settlements that reached the durable submission
+    /// checkpoint but were not observed in the mempool or chain. The original
+    /// signed bytes, fee cap, and still-live policy quote are reused.
+    pub fn rebroadcast_pending_settlements(&self) -> Result<usize, HnsWalletError> {
+        let now = self.clock.now_unix()?;
+        let config = self.cache_read()?.account.config.clone();
+        let candidates = {
+            let store = self.store_lock()?;
+            let mut candidates = Vec::new();
+            for kind in [WorkflowKind::AtomicSwap, WorkflowKind::Refund] {
+                for stored in store
+                    .list_workflows_complete::<HnsPreparedSettlement>(kind, MAX_HISTORY_RESULTS)?
+                {
+                    if stored.state.wallet_id == config.wallet_id
+                        && stored.state.account_id == config.account_id
+                        && stored.state.stage == HnsSettlementStage::RequiresRebroadcast
+                        && stored.state.expires_at_unix > now
+                        && now.saturating_sub(stored.updated_at_unix)
+                            >= SEND_PROPAGATION_GRACE_SECONDS
+                    {
+                        candidates.push(stored.state);
+                    }
+                }
+            }
+            candidates
+        };
+        let mut submitted = 0_usize;
+        for mut prepared in candidates {
+            prepared.stage = HnsSettlementStage::Prepared;
+            let artifact = PreparedArtifact::new(
+                ModuleId::Handshake,
+                prepared.session_id,
+                prepared.fee,
+                prepared.expires_at_unix,
+                serde_json::to_vec(&prepared)?,
+            )
+            .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+            self.broadcast_prepared_settlement(&artifact)?;
+            submitted = submitted
+                .checked_add(1)
+                .ok_or(HnsWalletError::HistoryLimit)?;
+        }
+        Ok(submitted)
+    }
+
     // These values comprise the complete atomic settlement snapshot and stay
     // explicit to keep the persistence boundary straightforward to audit.
     #[allow(clippy::too_many_arguments)]
