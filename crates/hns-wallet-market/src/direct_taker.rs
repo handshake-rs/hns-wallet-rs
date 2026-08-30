@@ -227,6 +227,43 @@ pub fn list_local_denuo_direct_takes(
         .collect()
 }
 
+#[doc(hidden)]
+pub fn derive_local_hns_for_btc_taker_key(
+    store: &WalletStore,
+    policy: &DenuoDirectSwapPolicy,
+    wallet_id: WalletId,
+    session_id: SessionId,
+) -> Result<(crate::CrossChainSwapKey, u64), MarketError> {
+    let local = load_local_take(store, wallet_id, session_id)?
+        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+    let record = load_denuo_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+    if record.offer.offer_id != local.offer_id.into_bytes()
+        || record.hello.as_ref().is_none_or(|hello| {
+            hello.swap_session_id != session_id.into_bytes()
+                || hello.offered_asset != hns_marketplace_protocol::AssetId::BTC
+                || hello.received_asset != hns_marketplace_protocol::AssetId::HNS
+        })
+    {
+        return Err(MarketError::DenuoDirectSwapConflict);
+    }
+    let key = derive_cross_chain_swap_key_from_store(
+        store,
+        CrossChainSwapKeyRequest {
+            wallet_id,
+            session_id,
+            participant: SwapParticipant::Taker,
+            network: policy.network(),
+            intent_id: local.offer_id,
+        },
+    )
+    .map_err(|_| MarketError::Persistence)?;
+    if key.public_key() != record.take.taker_settlement_public_key {
+        return Err(MarketError::DenuoDirectSwapConflict);
+    }
+    Ok((key, local.hns_fee_reserve_dollarydoos))
+}
+
 fn validate_request(request: DenuoHnsForBtcTakeRequest) -> Result<(), MarketError> {
     if request.wallet_id.as_bytes().iter().all(|byte| *byte == 0)
         || request.offer_id.as_bytes().iter().all(|byte| *byte == 0)

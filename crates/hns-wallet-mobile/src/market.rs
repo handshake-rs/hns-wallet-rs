@@ -10,8 +10,9 @@ use hns_wallet_market::{
     admit_denuo_direct_offer_cancellation, admit_denuo_direct_offer_take,
     admit_denuo_direct_swap_hello, admit_denuo_direct_swap_proposal,
     cancel_denuo_local_direct_offer, create_denuo_btc_for_hns_offer, denuo_direct_offer_inventory,
-    denuo_execution_workflow_id, list_local_denuo_direct_offers, load_denuo_direct_offer,
-    load_denuo_direct_swap, open_denuo_execution, validate_denuo_direct_swap_peer_status,
+    denuo_execution_workflow_id, list_denuo_executions, list_local_denuo_direct_offers,
+    load_denuo_direct_offer, load_denuo_direct_swap, open_denuo_execution,
+    validate_denuo_direct_swap_peer_status,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::WalletId;
@@ -36,6 +37,50 @@ pub struct MobileDenuoSessionController {
 pub struct MobileDenuoBitcoinFundingPermit {
     hello: SwapSessionHello,
     bitcoin_fee_reserve_sats: u64,
+}
+
+pub struct MobileDenuoHnsFundingPermit {
+    hello: SwapSessionHello,
+    settlement_key: hns_wallet_market::CrossChainSwapKey,
+    hns_fee_reserve_dollarydoos: u64,
+}
+
+pub struct MobileDenuoBitcoinWatchPermit {
+    hello: SwapSessionHello,
+}
+
+pub struct MobileDenuoHnsVerificationPermit {
+    hello: SwapSessionHello,
+}
+
+impl MobileDenuoHnsVerificationPermit {
+    pub(crate) const fn hello(&self) -> &SwapSessionHello {
+        &self.hello
+    }
+
+    pub const fn session_id(&self) -> hns_wallet_types::SessionId {
+        hns_wallet_types::SessionId::new(self.hello.swap_session_id)
+    }
+}
+
+impl MobileDenuoBitcoinWatchPermit {
+    pub(crate) const fn hello(&self) -> &SwapSessionHello {
+        &self.hello
+    }
+}
+
+impl MobileDenuoHnsFundingPermit {
+    pub(crate) const fn hello(&self) -> &SwapSessionHello {
+        &self.hello
+    }
+
+    pub(crate) const fn settlement_key(&self) -> &hns_wallet_market::CrossChainSwapKey {
+        &self.settlement_key
+    }
+
+    pub(crate) const fn hns_fee_reserve_dollarydoos(&self) -> u64 {
+        self.hns_fee_reserve_dollarydoos
+    }
 }
 
 impl MobileDenuoBitcoinFundingPermit {
@@ -86,6 +131,32 @@ pub struct MobileBtcForHnsOfferSummary {
     pub bitcoin_fee_reserve_sats: u64,
     pub created_at_unix: u64,
     pub expires_at_unix: u64,
+}
+
+/// Non-sensitive durable execution projection for native recovery UI. It
+/// contains no transaction bytes, preimage, derivation path, peer endpoint, or
+/// private key material; chain actions remain behind explicit approvals.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileDenuoExecutionSummary {
+    pub session_id: String,
+    pub revision: u64,
+    pub state: SwapState,
+    pub first_chain: String,
+    pub second_chain: String,
+    pub offered_asset: String,
+    pub offered_amount: u128,
+    pub received_asset: String,
+    pub received_amount: u128,
+    pub first_refund_at_unix: u64,
+    pub second_refund_at_unix: u64,
+    pub first_funding_confirmed: bool,
+    pub second_funding_confirmed: bool,
+    pub first_redemption_confirmed: bool,
+    pub second_redemption_confirmed: bool,
+    pub refund_confirmed: bool,
+    pub last_verified_at_unix: u64,
+    pub failure_reason: Option<String>,
 }
 
 /// One locally admitted direct-board or direct-session event. The native
@@ -266,6 +337,62 @@ impl MobileDenuoSessionController {
             .map_err(MobileWalletError::from)
     }
 
+    pub fn durable_executions(
+        &self,
+    ) -> Result<Vec<MobileDenuoExecutionSummary>, MobileWalletError> {
+        self.store
+            .try_with_store(|store| list_denuo_executions(store, &self.policy))
+            .map_err(MobileWalletError::from)?
+            .into_iter()
+            .map(execution_summary)
+            .collect()
+    }
+
+    /// Identify exact sessions whose first-chain Bitcoin lock still needs
+    /// locally verified confirmation. The platform may use this closed set to
+    /// query Kyoto after a sync, then feed only checkpoint-bound locks through
+    /// `apply_local_verified_bitcoin_funding`.
+    pub fn pending_first_bitcoin_funding_sessions(
+        &self,
+    ) -> Result<Vec<hns_wallet_types::SessionId>, MobileWalletError> {
+        self.store
+            .try_with_store(|store| list_denuo_executions(store, &self.policy))
+            .map_err(MobileWalletError::from)
+            .map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| {
+                        session.state == SwapState::FirstFundingPending
+                            && session.first_module == hns_wallet_types::ModuleId::Bitcoin
+                    })
+                    .map(|session| session.id)
+                    .collect()
+            })
+    }
+
+    pub fn pending_second_hns_funding_verifications(
+        &self,
+    ) -> Result<Vec<MobileDenuoHnsVerificationPermit>, MobileWalletError> {
+        let policy = self.policy;
+        self.store
+            .try_with_store(|store| {
+                list_denuo_executions(store, &policy)?
+                    .into_iter()
+                    .filter(|session| {
+                        session.state == SwapState::SecondFundingPending
+                            && session.second_module == hns_wallet_types::ModuleId::Handshake
+                    })
+                    .map(|session| {
+                        load_denuo_direct_swap(store, &policy, session.id)?
+                            .and_then(|record| record.hello)
+                            .map(|hello| MobileDenuoHnsVerificationPermit { hello })
+                            .ok_or(hns_wallet_market::MarketError::CorruptDenuoDirectSwap)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(MobileWalletError::from)
+    }
+
     pub fn cancel_local_btc_for_hns_offer(
         &mut self,
         offer_id: &str,
@@ -367,6 +494,78 @@ impl MobileDenuoSessionController {
             .map_err(MobileWalletError::from)
     }
 
+    /// Prepare the HNS-offering taker's independent Bitcoin watch before the
+    /// maker may safely broadcast. This validates the taker's own HNS refund
+    /// branch and advances the same durable pre-funding gates without granting
+    /// any authority to spend the maker's Bitcoin.
+    pub fn authorize_counterparty_bitcoin_watch(
+        &mut self,
+        session_id: hns_wallet_types::SessionId,
+        now_unix: u64,
+    ) -> Result<MobileDenuoBitcoinWatchPermit, MobileWalletError> {
+        let policy = self.policy;
+        let wallet_id = self.wallet_id;
+        self.store
+            .try_with_store_mut(|store| {
+                let record = load_denuo_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                hello
+                    .verify_new_funding_at(policy.network(), now_unix)
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                if hello.offered_asset != hns_marketplace_protocol::AssetId::BTC
+                    || hello.received_asset != hns_marketplace_protocol::AssetId::HNS
+                    || hello.first_funding_chain != hns_marketplace_protocol::ChainId::BITCOIN
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                }
+                let (taker_key, _) = hns_wallet_market::derive_local_hns_for_btc_taker_key(
+                    store, &policy, wallet_id, session_id,
+                )?;
+                let bitcoin = build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered)
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                if bitcoin.commitment.into_bytes() != hello.offered_lock_commitment {
+                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                }
+                let hns = hello
+                    .build_hns_htlc(
+                        SwapAssetSide::Received,
+                        hello.maker_settlement_public_key,
+                        hello.taker_settlement_public_key,
+                    )
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                if hns.descriptor_hash != hello.received_lock_commitment
+                    || hns.descriptor.refund_public_key != taker_key.public_key()
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                }
+                let mut execution = open_denuo_execution(store, &policy, session_id, now_unix)?;
+                if execution.state == SwapState::TermsFrozen {
+                    let mut journal = WalletStoreJournal {
+                        store,
+                        workflow_id: denuo_execution_workflow_id(session_id),
+                        updated_at_unix: now_unix,
+                    };
+                    execution.apply(VerifiedEvidence::RefundsValidated, now_unix, &mut journal)?;
+                }
+                if execution.state == SwapState::RefundsPrepared {
+                    let mut journal = WalletStoreJournal {
+                        store,
+                        workflow_id: denuo_execution_workflow_id(session_id),
+                        updated_at_unix: now_unix,
+                    };
+                    execution.apply(VerifiedEvidence::FundingReady, now_unix, &mut journal)?;
+                }
+                if execution.state != SwapState::FirstFundingPending {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
+                Ok(MobileDenuoBitcoinWatchPermit { hello })
+            })
+            .map_err(MobileWalletError::from)
+    }
+
     /// Advance the atomic-swap journal only from the checkpoint-bound result
     /// returned by the local Kyoto watch. A broadcast receipt or peer status
     /// cannot satisfy this boundary.
@@ -387,6 +586,88 @@ impl MobileDenuoSessionController {
                     now_unix,
                 )
                 .map(|session| session.state)
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    pub fn apply_local_verified_hns_funding(
+        &mut self,
+        session_id: hns_wallet_types::SessionId,
+        lock: hns_wallet_chain_api::VerifiedLock,
+        now_unix: u64,
+    ) -> Result<SwapState, MobileWalletError> {
+        let policy = self.policy;
+        self.store
+            .try_with_store_mut(|store| {
+                hns_wallet_market::apply_locally_verified_denuo_funding(
+                    store,
+                    &policy,
+                    session_id,
+                    hns_wallet_market::LocallyVerifiedSwapFunding::Hns(lock),
+                    now_unix,
+                )
+                .map(|session| session.state)
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    /// Authorize the taker's second-chain HNS lock only after the maker's
+    /// Bitcoin lock has been independently confirmed and durably journaled.
+    pub fn authorize_local_hns_second_funding(
+        &mut self,
+        session_id: hns_wallet_types::SessionId,
+        now_unix: u64,
+    ) -> Result<MobileDenuoHnsFundingPermit, MobileWalletError> {
+        let policy = self.policy;
+        let wallet_id = self.wallet_id;
+        self.store
+            .try_with_store_mut(|store| {
+                let execution =
+                    hns_wallet_market::load_denuo_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                if execution.state != SwapState::FirstFunded
+                    || execution.first_module != hns_wallet_types::ModuleId::Bitcoin
+                    || execution.second_module != hns_wallet_types::ModuleId::Handshake
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
+                let record = load_denuo_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                hello
+                    .verify_agreement(policy.network())
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                let (settlement_key, hns_fee_reserve_dollarydoos) =
+                    hns_wallet_market::derive_local_hns_for_btc_taker_key(
+                        store, &policy, wallet_id, session_id,
+                    )?;
+                let hns = hello
+                    .build_hns_htlc(
+                        SwapAssetSide::Received,
+                        hello.maker_settlement_public_key,
+                        hello.taker_settlement_public_key,
+                    )
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                if hns.descriptor_hash != hello.received_lock_commitment
+                    || hns.descriptor.refund_public_key != settlement_key.public_key()
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                }
+                let workflow_id = denuo_execution_workflow_id(session_id);
+                let mut execution = execution;
+                let mut journal = WalletStoreJournal {
+                    store,
+                    workflow_id,
+                    updated_at_unix: now_unix,
+                };
+                execution.apply(VerifiedEvidence::SecondFundingReady, now_unix, &mut journal)?;
+                Ok(MobileDenuoHnsFundingPermit {
+                    hello,
+                    settlement_key,
+                    hns_fee_reserve_dollarydoos,
+                })
             })
             .map_err(MobileWalletError::from)
     }
@@ -569,6 +850,49 @@ fn summary(offer: DenuoLocalDirectOffer) -> Result<MobileBtcForHnsOfferSummary, 
     })
 }
 
+fn execution_summary(
+    session: hns_wallet_market::SwapSession,
+) -> Result<MobileDenuoExecutionSummary, MobileWalletError> {
+    let chain = |module| -> Result<String, MobileWalletError> {
+        match module {
+            hns_wallet_types::ModuleId::Bitcoin => Ok("bitcoin".to_owned()),
+            hns_wallet_types::ModuleId::Handshake => Ok("handshake".to_owned()),
+            hns_wallet_types::ModuleId::Ethereum => {
+                Err(MobileWalletError::InvalidDenuoSessionMessage)
+            }
+        }
+    };
+    let asset = |asset| -> Result<String, MobileWalletError> {
+        match asset {
+            hns_wallet_types::WalletAsset::Btc => Ok("btc".to_owned()),
+            hns_wallet_types::WalletAsset::Hns => Ok("hns".to_owned()),
+            hns_wallet_types::WalletAsset::Eth => {
+                Err(MobileWalletError::InvalidDenuoSessionMessage)
+            }
+        }
+    };
+    Ok(MobileDenuoExecutionSummary {
+        session_id: super::lowercase_hex(session.id.as_bytes()),
+        revision: session.revision,
+        state: session.state,
+        first_chain: chain(session.first_module)?,
+        second_chain: chain(session.second_module)?,
+        offered_asset: asset(session.offered.asset)?,
+        offered_amount: session.offered.base_units.get(),
+        received_asset: asset(session.received.asset)?,
+        received_amount: session.received.base_units.get(),
+        first_refund_at_unix: session.timeouts.first_chain_refund_at,
+        second_refund_at_unix: session.timeouts.second_chain_refund_at,
+        first_funding_confirmed: session.first_funding.is_some(),
+        second_funding_confirmed: session.second_funding.is_some(),
+        first_redemption_confirmed: session.first_redemption.is_some(),
+        second_redemption_confirmed: session.second_redemption.is_some(),
+        refund_confirmed: matches!(session.state, SwapState::Refunded),
+        last_verified_at_unix: session.last_verified_at_unix,
+        failure_reason: session.failure_reason,
+    })
+}
+
 fn decode_offer_id(encoded: &str) -> Result<[u8; 32], MobileWalletError> {
     if encoded.len() != 64
         || !encoded
@@ -716,6 +1040,17 @@ mod tests {
         admit_denuo_direct_swap_hello(&mut maker, &policy, &accepted.envelope, START + 30)
             .expect("maker admits hello");
 
+        let taker_shared = SharedWalletStore::new(taker);
+        let mut taker_controller =
+            MobileDenuoSessionController::new(taker_shared.clone(), policy, taker_id);
+        let watch_permit = taker_controller
+            .authorize_counterparty_bitcoin_watch(offer.offer.session_id, START + 34)
+            .expect("taker watch permit");
+        assert_eq!(
+            watch_permit.hello().swap_session_id,
+            offer.offer.session_id.into_bytes()
+        );
+
         // Simulate termination after only the first durable funding gate.
         let mut interrupted =
             open_denuo_execution(&mut maker, &policy, offer.offer.session_id, START + 35)
@@ -732,6 +1067,15 @@ mod tests {
 
         let shared = SharedWalletStore::new(maker);
         let mut controller = MobileDenuoSessionController::new(shared.clone(), policy, maker_id);
+        let resumed = controller.durable_executions().expect("durable executions");
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].state, SwapState::RefundsPrepared);
+        assert_eq!(
+            resumed[0].session_id,
+            crate::lowercase_hex(offer.offer.session_id.as_bytes())
+        );
+        assert_eq!(resumed[0].first_chain, "bitcoin");
+        assert!(!resumed[0].first_funding_confirmed);
         let permit = controller
             .authorize_local_btc_first_funding(offer.offer.session_id, START + 40)
             .expect("funding permit");
@@ -775,13 +1119,47 @@ mod tests {
                         output_index: 0,
                         value_sats: binding.value_sats,
                         confirmation_count: 1,
-                        htlc: binding.htlc,
+                        htlc: binding.htlc.clone(),
                     },
                     START + 50,
                 )
                 .expect("verified funding"),
             SwapState::FirstFunded
         );
+        assert_eq!(
+            taker_controller
+                .apply_local_verified_bitcoin_funding(
+                    offer.offer.session_id,
+                    hns_wallet_bitcoin_kyoto::VerifiedBitcoinLock {
+                        funding_txid: hns_wallet_types::TransactionHash::new([9; 32]),
+                        output_index: 0,
+                        value_sats: binding.value_sats,
+                        confirmation_count: 1,
+                        htlc: binding.htlc.clone(),
+                    },
+                    START + 50,
+                )
+                .expect("taker independently verifies funding"),
+            SwapState::FirstFunded
+        );
+        let hns_permit = taker_controller
+            .authorize_local_hns_second_funding(offer.offer.session_id, START + 51)
+            .expect("ordered HNS funding permit");
+        assert_eq!(
+            hns_permit.hello().swap_session_id,
+            offer.offer.session_id.into_bytes()
+        );
+        assert_eq!(hns_permit.hns_fee_reserve_dollarydoos(), 10_000);
+        assert_eq!(
+            taker_controller
+                .durable_executions()
+                .expect("taker execution")[0]
+                .state,
+            SwapState::SecondFundingPending
+        );
+        let funded = controller.durable_executions().expect("funded execution");
+        assert_eq!(funded[0].state, SwapState::FirstFunded);
+        assert!(funded[0].first_funding_confirmed);
         assert_eq!(
             controller
                 .reserved_bitcoin_sats(START + 50)

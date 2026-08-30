@@ -18,6 +18,7 @@ hns-wallet-chain-api.workspace = true
 hns-wallet-ffi.workspace = true
 hns-wallet-hns.workspace = true
 hns-marketplace-protocol.workspace = true
+hns-swap.workspace = true
 hns-wallet-provider.workspace = true
 hns-wallet-shakedex.workspace = true
 hns-wallet-store.workspace = true

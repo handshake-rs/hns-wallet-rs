@@ -4064,6 +4064,27 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         Ok(())
     }
 
+    /// Return only the exact transaction identifier committed by a prepared
+    /// settlement artifact, after re-authenticating its closed persisted
+    /// payload. This supports native review without exposing transaction bytes.
+    pub fn prepared_settlement_transaction_id(
+        &self,
+        artifact: &PreparedArtifact,
+    ) -> Result<TransactionHash, HnsWalletError> {
+        if artifact.module != ModuleId::Handshake {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let prepared: HnsPreparedSettlement = serde_json::from_slice(artifact.commitment_bytes())?;
+        if prepared.stage != HnsSettlementStage::Prepared
+            || prepared.session_id != artifact.session_id
+            || prepared.fee != artifact.fee
+            || prepared.expires_at_unix != artifact.expires_at_unix
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        Ok(prepared.transaction)
+    }
+
     pub fn settlement_key_target(
         &self,
         session_id: SessionId,
@@ -5272,6 +5293,109 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             absolute_timelock: u64::from(descriptor.refund_locktime),
             maximum_fee,
         })
+    }
+
+    /// Independently retrieve and verify the exact native-HNS lock committed
+    /// by a bilateral session. Confirmation status comes from the runtime's
+    /// authenticated backend binding; callers provide neither raw bytes nor a
+    /// claimed confirmation count.
+    pub fn verify_native_htlc_lock(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        funding_transaction: TransactionHash,
+        minimum_confirmations: u32,
+    ) -> Result<Option<VerifiedLock>, ChainError> {
+        self.verify_native_htlc_network(&descriptor)?;
+        if minimum_confirmations == 0 {
+            return Err(ChainError::InvalidRequest(
+                "invalid HNS confirmation minimum",
+            ));
+        }
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_settlement_ready(&cache)?;
+        let binding = cache.binding.ok_or(ChainError::NotSynchronized)?;
+        let mempool = cache.mempool_binding.ok_or(ChainError::NotSynchronized)?;
+        drop(cache);
+        let evidence = self
+            .backend
+            .get_transaction_evidence(funding_transaction, binding, Some(mempool))
+            .map_err(map_chain_error)?;
+        if evidence.binding != binding || evidence.mempool != mempool || evidence.status.conflicted
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        if evidence.status.confirmation_count < minimum_confirmations {
+            return Ok(None);
+        }
+        let raw = evidence.raw.ok_or(ChainError::InvalidEvidence)?;
+        let verified = <Self as AtomicSettlement>::verify_lock(
+            self,
+            VerifySettlementLockRequest {
+                expected: SettlementLockExpectation {
+                    session_id,
+                    module: ModuleId::Handshake,
+                    amount: Amount::new(WalletAsset::Hns, u128::from(descriptor.value.get())),
+                    hashlock: ObjectHash::new(descriptor.hashlock),
+                    receiver: hex::encode(descriptor.receiver_public_key),
+                    refund_target: hex::encode(descriptor.refund_public_key),
+                    absolute_timelock: u64::from(descriptor.refund_locktime),
+                    minimum_confirmations,
+                },
+                transaction_or_receipt: raw,
+                confirmation_count: evidence.status.confirmation_count,
+            },
+        )?;
+        Ok(Some(verified.0))
+    }
+
+    /// Resume verification of this wallet's persisted native lock after
+    /// restart without requiring the platform to retain transaction bytes or
+    /// a broadcast receipt.
+    pub fn verify_persisted_native_htlc_lock(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        minimum_confirmations: u32,
+    ) -> Result<Option<VerifiedLock>, ChainError> {
+        self.verify_native_htlc_network(&descriptor)?;
+        let config = self
+            .cache_read()
+            .map_err(map_chain_error)?
+            .account
+            .config
+            .clone();
+        let workflow_id = settlement_workflow_id(&config, session_id, HnsSettlementAction::Lock);
+        let stored = self
+            .store_lock()
+            .map_err(map_chain_error)?
+            .load_workflow::<HnsPreparedSettlement>(workflow_id)
+            .map_err(map_chain_error)?
+            .ok_or(ChainError::InvalidEvidence)?;
+        let HnsSettlementTerms::Lock { request } = &stored.state.terms else {
+            return Err(ChainError::InvalidEvidence);
+        };
+        if stored.kind != settlement_workflow_kind(HnsSettlementAction::Lock)
+            || stored.state.session_id != session_id
+            || stored.state.action != HnsSettlementAction::Lock
+            || !matches!(
+                stored.state.stage,
+                HnsSettlementStage::Broadcast
+                    | HnsSettlementStage::Mempool
+                    | HnsSettlementStage::Confirmed
+                    | HnsSettlementStage::RequiresRebroadcast
+            )
+            || request.amount != Amount::new(WalletAsset::Hns, u128::from(descriptor.value.get()))
+            || request.hashlock != ObjectHash::new(descriptor.hashlock)
+            || request.receiver != hex::encode(descriptor.receiver_public_key)
+            || request.refund_target != hex::encode(descriptor.refund_public_key)
+            || request.absolute_timelock != u64::from(descriptor.refund_locktime)
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let transaction = stored.state.transaction;
+        drop(stored);
+        self.verify_native_htlc_lock(session_id, descriptor, transaction, minimum_confirmations)
     }
 
     /// Prepare a refund from the exact descriptor committed by a bilateral

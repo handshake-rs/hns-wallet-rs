@@ -9,8 +9,10 @@
 use std::collections::BTreeSet;
 
 use hns_marketplace_protocol::NameMarketMessage;
+use hns_swap::HnsHtlc;
 use hns_wallet_chain_api::{
-    AuthorizeSend, BroadcastReceipt, BroadcastSend, ChainError, ChainModule, SendRequest,
+    AuthorizeSend, BroadcastReceipt, BroadcastSend, ChainError, ChainModule, PreparedArtifact,
+    PreparedSettlementLock, SendRequest,
 };
 use hns_wallet_ffi::{
     AccountSummary, ApprovalSummary, ApprovalWarning, NameMarketApprovalAction, ServiceCapability,
@@ -37,7 +39,8 @@ use hns_wallet_shakedex::{
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::{
     AccountId, Amount, ApprovalId, ApprovalKind, BaseUnits, FinalityModel, HnsNameReceiveTarget,
-    ModuleId, ObjectHash, ReceiveTarget, SyncStatus, TransactionSummary, WalletAsset, WorkflowId,
+    ModuleId, ObjectHash, ReceiveTarget, SessionId, SyncStatus, TransactionSummary, WalletAsset,
+    WorkflowId,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -1425,6 +1428,63 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
 }
 
 impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsValueRuntime<B, C>> {
+    pub fn prepare_trusted_native_hns_htlc_lock(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        maximum_fee: BaseUnits,
+    ) -> Result<PreparedSettlementLock, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .prepare_native_htlc_lock(session_id, descriptor, maximum_fee)
+            .map_err(chain_failure)
+    }
+
+    pub fn broadcast_trusted_native_hns_settlement(
+        &self,
+        artifact: &PreparedArtifact,
+    ) -> Result<BroadcastReceipt, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .broadcast_prepared_settlement(artifact)
+            .map_err(hns_runtime_failure)
+    }
+
+    pub fn cancel_trusted_native_hns_settlement(
+        &self,
+        artifact: &PreparedArtifact,
+    ) -> Result<(), ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .cancel_prepared_settlement(artifact)
+            .map_err(hns_runtime_failure)
+    }
+
+    pub fn trusted_native_hns_settlement_transaction_id(
+        &self,
+        artifact: &PreparedArtifact,
+    ) -> Result<hns_wallet_types::TransactionHash, ServiceFailure> {
+        self.runtime
+            .runtime
+            .prepared_settlement_transaction_id(artifact)
+            .map_err(hns_runtime_failure)
+    }
+
+    pub fn verify_trusted_native_persisted_hns_htlc_lock(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        minimum_confirmations: u32,
+    ) -> Result<Option<hns_wallet_chain_api::VerifiedLock>, ServiceFailure> {
+        self.runtime
+            .runtime
+            .verify_persisted_native_htlc_lock(session_id, descriptor, minimum_confirmations)
+            .map_err(chain_failure)
+    }
+
     /// Re-submit exact signed sends that a fresh authenticated wallet snapshot
     /// classifies as dropped. No caller-provided workflow, transaction bytes,
     /// destination, amount, fee, or signing authority crosses this boundary.

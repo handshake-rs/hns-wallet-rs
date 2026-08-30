@@ -14,7 +14,7 @@ use hns_wallet_bitcoin_kyoto::{
 };
 use hns_wallet_chain_api::{Preimage, VerifiedLock};
 use hns_wallet_hns::VerifiedNativeHtlcSpend;
-use hns_wallet_store::{SecretKind, StoreError, WalletStore};
+use hns_wallet_store::{SecretKind, StoreError, StoredWorkflow, WalletStore};
 use hns_wallet_types::{
     Amount, ModuleId, ObjectHash, SessionId, WalletAsset, WorkflowId, WorkflowKind,
 };
@@ -39,7 +39,7 @@ pub use direct_maker::{
 pub use direct_taker::{
     DenuoHnsForBtcTakeRequest, DenuoLocalDirectTake, DenuoTakerAcceptedSession,
     accept_denuo_hns_for_btc_maker_proposal, create_denuo_hns_for_btc_take,
-    list_local_denuo_direct_takes,
+    derive_local_hns_for_btc_taker_key, list_local_denuo_direct_takes,
 };
 pub use session_board::{
     DenuoDirectSwapAdmission, DenuoDirectSwapPeerStatus, DenuoDirectSwapPolicy,
@@ -379,6 +379,44 @@ pub fn open_denuo_execution(
     Ok(expected)
 }
 
+/// Load one durable accepted Denuo execution without consulting the peer or
+/// reopening its funding window. Every persisted identity, revision, workflow
+/// identifier, and countersigned term is re-authenticated before projection.
+pub fn load_denuo_execution(
+    store: &WalletStore,
+    policy: &DenuoDirectSwapPolicy,
+    session_id: SessionId,
+) -> Result<Option<SwapSession>, MarketError> {
+    let workflow_id = denuo_execution_workflow_id(session_id);
+    store
+        .load_workflow::<SwapSession>(workflow_id)?
+        .map(|stored| validate_denuo_execution(policy, session_id, workflow_id, stored))
+        .transpose()
+}
+
+/// Return every durable Denuo execution within the protocol capacity. This is
+/// the recovery/UI source of truth: active board listings may expire or be
+/// cancelled after bilateral terms are frozen, but their execution journals
+/// remain independently discoverable and resumable.
+pub fn list_denuo_executions(
+    store: &WalletStore,
+    policy: &DenuoDirectSwapPolicy,
+) -> Result<Vec<SwapSession>, MarketError> {
+    store
+        .list_workflows_complete::<SwapSession>(WorkflowKind::AtomicSwap, MAX_DENUO_DIRECT_SWAPS)?
+        .into_iter()
+        .map(|stored| {
+            let session_id = stored.state.id;
+            validate_denuo_execution(
+                policy,
+                session_id,
+                denuo_execution_workflow_id(session_id),
+                stored,
+            )
+        })
+        .collect()
+}
+
 /// A funding lock independently verified by one wallet's chain authority.
 /// Constructing this value is not verification: callers must obtain the HNS
 /// variant from the HNS wallet's proof-bound settlement verifier or the
@@ -696,7 +734,32 @@ fn load_denuo_execution_for_local_evidence(
     let stored = store
         .load_workflow::<SwapSession>(workflow_id)?
         .ok_or(MarketError::UnknownDenuoDirectSwap)?;
-    if stored.kind != WorkflowKind::AtomicSwap || stored.state.id != session_id {
+    validate_denuo_execution_record(policy, session_id, workflow_id, &stored)?;
+    Ok(stored)
+}
+
+fn validate_denuo_execution(
+    policy: &DenuoDirectSwapPolicy,
+    session_id: SessionId,
+    workflow_id: WorkflowId,
+    stored: StoredWorkflow<SwapSession>,
+) -> Result<SwapSession, MarketError> {
+    validate_denuo_execution_record(policy, session_id, workflow_id, &stored)?;
+    Ok(stored.state)
+}
+
+fn validate_denuo_execution_record(
+    policy: &DenuoDirectSwapPolicy,
+    session_id: SessionId,
+    workflow_id: WorkflowId,
+    stored: &StoredWorkflow<SwapSession>,
+) -> Result<(), MarketError> {
+    if stored.kind != WorkflowKind::AtomicSwap
+        || stored.id != workflow_id
+        || stored.state.id != session_id
+        || stored.revision != stored.state.revision
+        || stored.updated_at_unix != stored.state.last_verified_at_unix
+    {
         return Err(MarketError::DenuoDirectSwapConflict);
     }
     let terms = stored
@@ -711,7 +774,7 @@ fn load_denuo_execution_for_local_evidence(
     {
         return Err(MarketError::CorruptDenuoDirectSwap);
     }
-    Ok(stored)
+    Ok(())
 }
 
 fn denuo_observed_preimage_id(session_id: SessionId) -> Vec<u8> {

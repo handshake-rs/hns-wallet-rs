@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use zeroize::Zeroizing;
 
-use crate::{MobileDenuoBitcoinFundingPermit, MobileWalletError};
+use crate::{MobileDenuoBitcoinFundingPermit, MobileDenuoBitcoinWatchPermit, MobileWalletError};
 
 const BITCOIN_RECOVERY_SCRIPT_INDEX: u32 = 1;
 const BITCOIN_SEND_APPROVAL_LIFETIME_SECONDS: u64 = 300;
@@ -880,6 +880,37 @@ impl MobileBitcoinValueController {
             expires_at_unix,
         });
         Ok(approval)
+    }
+
+    /// Register the HNS-offering taker's durable compact-filter watch before
+    /// the counterparty broadcasts Bitcoin. This signs and spends nothing.
+    pub fn register_counterparty_denuo_htlc_watch(
+        &mut self,
+        permit: MobileDenuoBitcoinWatchPermit,
+    ) -> Result<(), MobileWalletError> {
+        let now_unix = now_unix()?;
+        let hello = permit.hello();
+        let binding =
+            build_denuo_bitcoin_htlc(hello, hns_marketplace_protocol::SwapAssetSide::Offered)?;
+        if binding.commitment.into_bytes() != hello.offered_lock_commitment {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        match (&mut self.supervisor, &self.wallet) {
+            (Some(supervisor), Some(wallet)) => {
+                supervisor.register_htlc_watch(
+                    wallet,
+                    BitcoinHtlcWatchRequest {
+                        session_id: SessionId::new(hello.swap_session_id),
+                        htlc: binding.htlc,
+                        expected_value_sats: binding.value_sats,
+                        minimum_confirmations: hello.offered_minimum_confirmations,
+                    },
+                    now_unix,
+                )?;
+                Ok(())
+            }
+            _ => Err(MobileWalletError::BitcoinRuntimeInactive),
+        }
     }
 
     /// Persist the exact signed HTLC funding bytes before handing their txid
