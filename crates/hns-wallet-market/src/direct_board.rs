@@ -9,7 +9,7 @@ use hns_marketplace_protocol::{
     AssetId, CrossChainMessage, DirectOffer, DirectOfferCancellation, MarketPair, NetworkBinding,
 };
 use hns_wallet_store::{EntityKind, StoredEntity, WalletStore};
-use hns_wallet_types::ObjectHash;
+use hns_wallet_types::{ObjectHash, SessionId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -90,6 +90,7 @@ impl DenuoDirectOfferRecord {
         DenuoDirectOfferSnapshot {
             store_revision: self.store_revision,
             offer_id: ObjectHash::new(self.offer.offer_id),
+            session_id: SessionId::new(self.offer.swap_session_id),
             signer_public_key: self.offer.header.signer_public_key,
             maker_settlement_public_key: self.offer.maker_settlement_public_key,
             offered_asset: self.offer.offered_asset,
@@ -114,6 +115,7 @@ impl DenuoDirectOfferRecord {
 pub struct DenuoDirectOfferSnapshot {
     pub store_revision: u64,
     pub offer_id: ObjectHash,
+    pub session_id: SessionId,
     pub signer_public_key: [u8; 33],
     pub maker_settlement_public_key: [u8; 33],
     pub offered_asset: AssetId,
@@ -561,6 +563,7 @@ mod tests {
         let mut offer = DirectOffer {
             header: header(1),
             offer_id: [0; 32],
+            swap_session_id: [3; 32],
             maker_settlement_public_key: key(9),
             offered_asset: AssetId::HNS,
             offered_amount: AssetAmount::new(10_000_000),

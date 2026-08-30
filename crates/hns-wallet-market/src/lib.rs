@@ -29,8 +29,10 @@ pub use direct_board::{
     load_denuo_direct_offers,
 };
 pub use direct_maker::{
-    DenuoBtcForHnsOfferRequest, DenuoLocalDirectOffer, cancel_denuo_local_direct_offer,
-    create_denuo_btc_for_hns_offer, list_local_denuo_direct_offers,
+    DenuoBtcForHnsMakerProposal, DenuoBtcForHnsMakerProposalRequest, DenuoBtcForHnsOfferRequest,
+    DenuoLocalDirectOffer, cancel_denuo_local_direct_offer,
+    create_denuo_btc_for_hns_maker_proposal, create_denuo_btc_for_hns_offer,
+    list_local_denuo_direct_offers, load_denuo_btc_for_hns_maker_preimage,
 };
 pub use session_board::{
     DenuoDirectSwapAdmission, DenuoDirectSwapPeerStatus, DenuoDirectSwapPolicy,

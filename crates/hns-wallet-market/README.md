@@ -14,6 +14,14 @@ The board can group currently live offers by their exact reduced BTC-per-HNS
 ratio for a user interface. That grouping is display-only: selection, take,
 proposal, hello, and HTLC funding each bind the original offer ID and both
 native amounts. A level total can never authorize a different exchange rate.
+The signed offer also fixes the swap session identifier used by its delegated
+maker settlement key; a taker cannot substitute an unrelated session.
+
+For locally created BTC-for-HNS offers, an admitted take can be promoted to a
+maker-signed proposal with canonical Bitcoin and Handshake HTLC commitments.
+The maker preimage is recovery-seed-derived and stored encrypted before the
+proposal is admitted. Bitcoin funds first, the HNS refund deadline is earlier,
+and the Bitcoin refund deadline includes an explicit bounded safety margin.
 
 A signed take binds a locally retained active offer to a unique session and a
 taker settlement key. The corresponding maker proposal and accepted session

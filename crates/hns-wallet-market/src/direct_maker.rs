@@ -7,9 +7,12 @@
 
 use hkdf::Hkdf;
 use hns_marketplace_protocol::{
-    AssetAmount, AssetId, CrossChainMessage, DirectOffer, DirectOfferCancellation,
-    MARKETPLACE_PROTOCOL_VERSION, MarketPair, SignedObjectHeader,
+    AssetAmount, AssetId, ChainId, CrossChainMessage, DeadlineKind, DirectOffer,
+    DirectOfferCancellation, MARKETPLACE_PROTOCOL_VERSION, MarketPair, SettlementDeadline,
+    SignedObjectHeader, SwapAssetSide, SwapSessionHello, SwapSessionProposal,
 };
+use hns_wallet_bitcoin_kyoto::build_denuo_bitcoin_htlc;
+use hns_wallet_chain_api::Preimage;
 use hns_wallet_store::{EntityKind, RECOVERY_SEED_BYTES, SecretKind, WalletStore};
 use hns_wallet_types::{ObjectHash, SessionId, WalletId};
 use k256::ecdsa::SigningKey;
@@ -20,16 +23,24 @@ use zeroize::Zeroizing;
 use crate::{
     CrossChainSwapKeyRequest, DenuoDirectOfferBoardPolicy, DenuoDirectOfferSnapshot, MarketError,
     SwapParticipant, admit_denuo_direct_offer, admit_denuo_direct_offer_cancellation,
-    allocate_cross_chain_swap_key,
+    admit_denuo_direct_swap_proposal, allocate_cross_chain_swap_key,
+    derive_cross_chain_swap_key_from_store, load_denuo_direct_swap,
 };
 
-const STORAGE_VERSION: u16 = 1;
+const STORAGE_VERSION: u16 = 2;
 const RECORD_PREFIX: &[u8] = b"local-direct-offer/v1/";
 const INTENT_DOMAIN: &[u8] = b"hns-wallet/direct-offer-intent/v1\0";
 const SESSION_DOMAIN: &[u8] = b"hns-wallet/direct-offer-session/v1\0";
 const IDENTITY_SALT: &[u8] = b"hns-wallet/direct-board-identity/hkdf-sha256/v1\0";
 const IDENTITY_INFO: &[u8] = b"hns-wallet/direct-board-identity/scalar/v1\0";
+const MAKER_PREIMAGE_SALT: &[u8] = b"hns-wallet/direct-maker-preimage/hkdf-sha256/v1\0";
+const MAKER_PREIMAGE_INFO: &[u8] = b"hns-wallet/direct-maker-preimage/value/v1\0";
+const MAKER_PREIMAGE_RECORD_DOMAIN: &[u8] = b"hns-wallet/direct-maker-preimage/record/v1\0";
 const MAX_DERIVATION_ATTEMPTS: u32 = 256;
+const MIN_FUNDING_WINDOW_SECONDS: u64 = 10 * 60;
+const MIN_SECOND_REFUND_AFTER_SECONDS: u64 = 60 * 60;
+const MIN_REFUND_SAFETY_MARGIN_SECONDS: u64 = 60 * 60;
+const MAX_SETTLEMENT_HORIZON_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DenuoBtcForHnsOfferRequest {
@@ -65,8 +76,27 @@ struct PersistedLocalDirectOffer {
     wallet_id: WalletId,
     offer_id: ObjectHash,
     session_id: SessionId,
+    intent_id: ObjectHash,
     bitcoin_fee_reserve_sats: u64,
     created_at_unix: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DenuoBtcForHnsMakerProposalRequest {
+    pub wallet_id: WalletId,
+    pub session_id: SessionId,
+    pub now_unix: u64,
+    pub funding_window_seconds: u64,
+    pub second_refund_after_seconds: u64,
+    pub refund_safety_margin_seconds: u64,
+    pub bitcoin_minimum_confirmations: u32,
+    pub hns_minimum_confirmations: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DenuoBtcForHnsMakerProposal {
+    pub proposal: SwapSessionProposal,
+    pub envelope: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +141,7 @@ pub fn create_denuo_btc_for_hns_offer(
             expires_at: request.expires_at_unix,
         },
         offer_id: [0; 32],
+        swap_session_id: session_id.into_bytes(),
         maker_settlement_public_key: settlement.compressed_public_key(),
         offered_asset: AssetId::BTC,
         offered_amount: AssetAmount::new(u128::from(request.btc_amount_sats)),
@@ -132,6 +163,7 @@ pub fn create_denuo_btc_for_hns_offer(
         wallet_id: request.wallet_id,
         offer_id,
         session_id,
+        intent_id: intent,
         bitcoin_fee_reserve_sats: request.bitcoin_fee_reserve_sats,
         created_at_unix: request.created_at_unix,
     };
@@ -147,6 +179,161 @@ pub fn create_denuo_btc_for_hns_offer(
         session_id,
         bitcoin_fee_reserve_sats: request.bitcoin_fee_reserve_sats,
     })
+}
+
+/// Turn one already admitted exact take of a local BTC-for-HNS offer into the
+/// maker-signed canonical HTLC proposal. The maker's preimage is derived from
+/// the encrypted recovery seed and persisted before the proposal is admitted,
+/// making restart recovery independent of process memory.
+pub fn create_denuo_btc_for_hns_maker_proposal(
+    store: &mut WalletStore,
+    policy: &crate::DenuoDirectSwapPolicy,
+    request: DenuoBtcForHnsMakerProposalRequest,
+) -> Result<DenuoBtcForHnsMakerProposal, MarketError> {
+    validate_maker_proposal_request(request)?;
+    let record = load_denuo_direct_swap(store, policy, request.session_id)?
+        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+    if record.offer.swap_session_id != request.session_id.into_bytes()
+        || record.take.swap_session_id != request.session_id.into_bytes()
+        || record.offer.offered_asset != AssetId::BTC
+        || record.offer.received_asset != AssetId::HNS
+    {
+        return Err(MarketError::DenuoDirectSwapConflict);
+    }
+    let local = load_local_offer(store, request.wallet_id, record.offer.offer_id)?;
+    if local.session_id != request.session_id
+        || local.offer_id != ObjectHash::new(record.offer.offer_id)
+    {
+        return Err(MarketError::DenuoDirectSwapConflict);
+    }
+    if let Some(proposal) = record.proposal {
+        let envelope = CrossChainMessage::SwapSessionProposal(proposal.clone())
+            .encode_envelope(record.take_request_id)
+            .map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
+        return Ok(DenuoBtcForHnsMakerProposal { proposal, envelope });
+    }
+    let funding_expires_at = request
+        .now_unix
+        .checked_add(request.funding_window_seconds)
+        .ok_or(MarketError::UnsafeTimeouts)?;
+    let received_refund_at = request
+        .now_unix
+        .checked_add(request.second_refund_after_seconds)
+        .ok_or(MarketError::UnsafeTimeouts)?;
+    let offered_refund_at = received_refund_at
+        .checked_add(request.refund_safety_margin_seconds)
+        .ok_or(MarketError::UnsafeTimeouts)?;
+    if funding_expires_at > record.take.header.expires_at
+        || funding_expires_at > received_refund_at
+        || u32::try_from(offered_refund_at).is_err()
+    {
+        return Err(MarketError::UnsafeTimeouts);
+    }
+
+    let preimage = derive_maker_preimage(
+        store,
+        request.wallet_id,
+        request.session_id,
+        local.intent_id,
+        record.offer.offer_id,
+    )?;
+    store.put_secret(
+        &maker_preimage_record_id(request.session_id),
+        SecretKind::HtlcPreimage,
+        preimage.expose_for_settlement(),
+        request.now_unix,
+    )?;
+    let hashlock = Sha256::digest(preimage.expose_for_settlement()).into();
+    let settlement = derive_cross_chain_swap_key_from_store(
+        store,
+        CrossChainSwapKeyRequest {
+            wallet_id: request.wallet_id,
+            session_id: request.session_id,
+            participant: SwapParticipant::Maker,
+            network: policy.network(),
+            intent_id: local.intent_id,
+        },
+    )
+    .map_err(|_| MarketError::Persistence)?;
+    if settlement.public_key() != record.offer.maker_settlement_public_key {
+        return Err(MarketError::DenuoDirectSwapConflict);
+    }
+    let mut hello = SwapSessionHello {
+        header: SignedObjectHeader {
+            version: MARKETPLACE_PROTOCOL_VERSION,
+            network: policy.network(),
+            pair: MarketPair::HNS_BTC,
+            signer_public_key: record.offer.header.signer_public_key,
+            sequence: record
+                .offer
+                .header
+                .sequence
+                .checked_add(1)
+                .ok_or(MarketError::InvalidDenuoDirectSwap)?,
+            created_at: request.now_unix,
+            expires_at: funding_expires_at,
+        },
+        direct_offer_id: record.offer.offer_id,
+        swap_session_id: request.session_id.into_bytes(),
+        maker_settlement_public_key: settlement.public_key(),
+        taker_settlement_public_key: record.take.taker_settlement_public_key,
+        offered_asset: record.offer.offered_asset,
+        offered_amount: record.offer.offered_amount,
+        received_asset: record.offer.received_asset,
+        received_amount: record.offer.received_amount,
+        hashlock,
+        first_funding_chain: ChainId::BITCOIN,
+        offered_lock_commitment: [1; 32],
+        offered_refund_deadline: SettlementDeadline {
+            kind: DeadlineKind::UnixTime,
+            value: offered_refund_at,
+        },
+        offered_minimum_confirmations: request.bitcoin_minimum_confirmations,
+        received_lock_commitment: [1; 32],
+        received_refund_deadline: SettlementDeadline {
+            kind: DeadlineKind::UnixTime,
+            value: received_refund_at,
+        },
+        received_minimum_confirmations: request.hns_minimum_confirmations,
+        maker_signature: [0; 64],
+        taker_signature: [0; 64],
+    };
+    hello
+        .build_and_bind_hns_htlc(
+            SwapAssetSide::Received,
+            hello.maker_settlement_public_key,
+            hello.taker_settlement_public_key,
+        )
+        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+    hello.offered_lock_commitment = build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered)
+        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?
+        .commitment
+        .into_bytes();
+    let proposal = settlement
+        .into_maker_proposal(hello)
+        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+    let envelope = CrossChainMessage::SwapSessionProposal(proposal.clone())
+        .encode_envelope(record.take_request_id)
+        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+    admit_denuo_direct_swap_proposal(store, policy, &envelope, request.now_unix)?;
+    Ok(DenuoBtcForHnsMakerProposal { proposal, envelope })
+}
+
+pub fn load_denuo_btc_for_hns_maker_preimage(
+    store: &WalletStore,
+    session_id: SessionId,
+) -> Result<Option<Preimage>, MarketError> {
+    store
+        .get_secret(
+            &maker_preimage_record_id(session_id),
+            SecretKind::HtlcPreimage,
+        )?
+        .map(|stored| {
+            let bytes = <[u8; Preimage::LENGTH]>::try_from(stored.as_slice())
+                .map_err(|_| MarketError::InvalidEvidence)?;
+            Ok(Preimage::new(bytes))
+        })
+        .transpose()
 }
 
 pub fn cancel_denuo_local_direct_offer(
@@ -169,6 +356,18 @@ pub fn cancel_denuo_local_direct_offer(
         || local.value.storage_version != STORAGE_VERSION
         || local.value.wallet_id != wallet_id
         || local.value.offer_id.into_bytes() != offer_id
+        || local
+            .value
+            .session_id
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        || local
+            .value
+            .intent_id
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
     {
         return Err(MarketError::CorruptDenuoDirectOfferBoard);
     }
@@ -176,6 +375,9 @@ pub fn cancel_denuo_local_direct_offer(
         .ok_or(MarketError::UnknownDenuoDirectOffer)?;
     if !offer.is_active_at(now_unix) {
         return Err(MarketError::InvalidDenuoDirectOffer);
+    }
+    if offer.offer.swap_session_id != local.value.session_id.into_bytes() {
+        return Err(MarketError::CorruptDenuoDirectOfferBoard);
     }
     let identity = derive_board_identity(store, wallet_id, policy)?;
     let mut cancellation = DirectOfferCancellation {
@@ -224,6 +426,7 @@ pub fn list_local_denuo_direct_offers(
         if stored.revision != 1
             || record.storage_version != STORAGE_VERSION
             || record.wallet_id != wallet_id
+            || record.intent_id.as_bytes().iter().all(|byte| *byte == 0)
             || record.created_at_unix != stored.updated_at_unix
         {
             return Err(MarketError::CorruptDenuoDirectOfferBoard);
@@ -233,6 +436,9 @@ pub fn list_local_denuo_direct_offers(
         else {
             return Err(MarketError::CorruptDenuoDirectOfferBoard);
         };
+        if offer.offer.swap_session_id != record.session_id.into_bytes() {
+            return Err(MarketError::CorruptDenuoDirectOfferBoard);
+        }
         if offer.is_active_at(now_unix) {
             offers.push(DenuoLocalDirectOffer {
                 offer: offer.snapshot(),
@@ -242,6 +448,91 @@ pub fn list_local_denuo_direct_offers(
         }
     }
     Ok(offers)
+}
+
+fn validate_maker_proposal_request(
+    request: DenuoBtcForHnsMakerProposalRequest,
+) -> Result<(), MarketError> {
+    if request.wallet_id.as_bytes().iter().all(|byte| *byte == 0)
+        || request.session_id.as_bytes().iter().all(|byte| *byte == 0)
+        || request.now_unix == 0
+        || !(MIN_FUNDING_WINDOW_SECONDS..=MAX_SETTLEMENT_HORIZON_SECONDS)
+            .contains(&request.funding_window_seconds)
+        || !(MIN_SECOND_REFUND_AFTER_SECONDS..=MAX_SETTLEMENT_HORIZON_SECONDS)
+            .contains(&request.second_refund_after_seconds)
+        || !(MIN_REFUND_SAFETY_MARGIN_SECONDS..=MAX_SETTLEMENT_HORIZON_SECONDS)
+            .contains(&request.refund_safety_margin_seconds)
+        || request.funding_window_seconds >= request.second_refund_after_seconds
+        || request
+            .second_refund_after_seconds
+            .checked_add(request.refund_safety_margin_seconds)
+            .is_none_or(|horizon| horizon > MAX_SETTLEMENT_HORIZON_SECONDS)
+        || request.bitcoin_minimum_confirmations == 0
+        || request.hns_minimum_confirmations == 0
+    {
+        return Err(MarketError::UnsafeTimeouts);
+    }
+    Ok(())
+}
+
+fn load_local_offer(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    offer_id: [u8; 32],
+) -> Result<PersistedLocalDirectOffer, MarketError> {
+    let stored = store
+        .load_entity::<PersistedLocalDirectOffer>(
+            EntityKind::DenuoBoardObject,
+            &local_record_id(wallet_id, offer_id),
+        )?
+        .ok_or(MarketError::UnknownDenuoDirectOffer)?;
+    let record = stored.value;
+    if stored.revision != 1
+        || record.storage_version != STORAGE_VERSION
+        || record.wallet_id != wallet_id
+        || record.offer_id != ObjectHash::new(offer_id)
+        || record.session_id.as_bytes().iter().all(|byte| *byte == 0)
+        || record.intent_id.as_bytes().iter().all(|byte| *byte == 0)
+        || record.created_at_unix != stored.updated_at_unix
+    {
+        return Err(MarketError::CorruptDenuoDirectOfferBoard);
+    }
+    Ok(record)
+}
+
+fn derive_maker_preimage(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    session_id: SessionId,
+    intent_id: ObjectHash,
+    offer_id: [u8; 32],
+) -> Result<Preimage, MarketError> {
+    let seed = store
+        .get_secret(wallet_id.as_bytes(), SecretKind::RecoverySeed)?
+        .ok_or(MarketError::Invariant)?;
+    if seed.len() != RECOVERY_SEED_BYTES {
+        return Err(MarketError::Invariant);
+    }
+    let hkdf = Hkdf::<Sha256>::new(Some(MAKER_PREIMAGE_SALT), &seed);
+    let mut info = Vec::with_capacity(MAKER_PREIMAGE_INFO.len() + 32 + 32 + 32);
+    info.extend_from_slice(MAKER_PREIMAGE_INFO);
+    info.extend_from_slice(session_id.as_bytes());
+    info.extend_from_slice(intent_id.as_bytes());
+    info.extend_from_slice(&offer_id);
+    let mut preimage = Zeroizing::new([0_u8; Preimage::LENGTH]);
+    hkdf.expand(&info, &mut *preimage)
+        .map_err(|_| MarketError::Invariant)?;
+    if preimage.iter().all(|byte| *byte == 0) {
+        return Err(MarketError::Invariant);
+    }
+    Ok(Preimage::new(*preimage))
+}
+
+fn maker_preimage_record_id(session_id: SessionId) -> Vec<u8> {
+    let mut id = Vec::with_capacity(MAKER_PREIMAGE_RECORD_DOMAIN.len() + 32);
+    id.extend_from_slice(MAKER_PREIMAGE_RECORD_DOMAIN);
+    id.extend_from_slice(session_id.as_bytes());
+    id
 }
 
 fn derive_board_identity(
@@ -323,7 +614,9 @@ fn local_record_id(wallet_id: WalletId, offer_id: [u8; 32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use hns_marketplace_protocol::{ChainId, NetworkBinding};
+    use hns_marketplace_protocol::{
+        ChainId, DirectOfferTake, NetworkBinding, SignedObjectHeader, SwapAssetSide,
+    };
     use hns_primitives::BlockHash;
     use hns_wallet_store::WalletStore;
 
@@ -353,6 +646,16 @@ mod tests {
             )
             .expect("seed");
         store
+    }
+
+    fn public_key(secret: [u8; 32]) -> [u8; 33] {
+        SigningKey::from_bytes((&secret).into())
+            .expect("signing key")
+            .verifying_key()
+            .to_encoded_point(true)
+            .as_bytes()
+            .try_into()
+            .expect("compressed key")
     }
 
     #[test]
@@ -440,5 +743,118 @@ mod tests {
                 .expect("live offers")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn admitted_take_creates_one_recoverable_canonical_btc_first_proposal() {
+        const START: u64 = 1_700_000_000;
+        let wallet_id = WalletId::new([6; 16]);
+        let mut store = seeded_store(wallet_id);
+        let board_policy = policy();
+        let swap_policy = crate::DenuoDirectSwapPolicy::new(board_policy).expect("swap policy");
+        let created = create_denuo_btc_for_hns_offer(
+            &mut store,
+            &board_policy,
+            DenuoBtcForHnsOfferRequest {
+                wallet_id,
+                btc_amount_sats: 9_000,
+                hns_amount_dollarydoos: 2_000_000,
+                bitcoin_fee_reserve_sats: 1_000,
+                created_at_unix: START,
+                expires_at_unix: START + 10_000,
+                nonce: [5; 32],
+            },
+        )
+        .expect("offer");
+        let mut take = DirectOfferTake {
+            header: SignedObjectHeader {
+                version: MARKETPLACE_PROTOCOL_VERSION,
+                network: board_policy.network(),
+                pair: MarketPair::HNS_BTC,
+                signer_public_key: [0; 33],
+                sequence: 2,
+                created_at: START + 10,
+                expires_at: START + 10_000,
+            },
+            offer_id: created.offer.offer_id.into_bytes(),
+            swap_session_id: created.offer.session_id.into_bytes(),
+            taker_settlement_public_key: public_key([11; 32]),
+            signature: [0; 64],
+        };
+        take.sign(&[10; 32]).expect("take signature");
+        let take_envelope = CrossChainMessage::TakeDirectOffer(take.clone())
+            .encode_envelope(77)
+            .expect("take envelope");
+        crate::admit_denuo_direct_offer_take(&mut store, &swap_policy, &take_envelope, START + 10)
+            .expect("admit take");
+
+        let made = create_denuo_btc_for_hns_maker_proposal(
+            &mut store,
+            &swap_policy,
+            DenuoBtcForHnsMakerProposalRequest {
+                wallet_id,
+                session_id: created.offer.session_id,
+                now_unix: START + 20,
+                funding_window_seconds: 600,
+                second_refund_after_seconds: 3_600,
+                refund_safety_margin_seconds: 3_600,
+                bitcoin_minimum_confirmations: 1,
+                hns_minimum_confirmations: 1,
+            },
+        )
+        .expect("maker proposal");
+        made.proposal
+            .verify_for_direct_offer(
+                &crate::load_denuo_direct_offer(
+                    &store,
+                    &board_policy,
+                    created.offer.offer_id.into_bytes(),
+                )
+                .expect("load offer")
+                .expect("offer exists")
+                .offer,
+                &take,
+                board_policy.network(),
+                START + 20,
+            )
+            .expect("proposal verifies");
+        let terms = made.proposal.terms();
+        assert_eq!(terms.first_funding_chain, ChainId::BITCOIN);
+        assert_eq!(terms.offered_refund_deadline.value, START + 7_220);
+        assert_eq!(terms.received_refund_deadline.value, START + 3_620);
+        assert_eq!(
+            build_denuo_bitcoin_htlc(terms, SwapAssetSide::Offered)
+                .expect("bitcoin descriptor")
+                .commitment
+                .into_bytes(),
+            terms.offered_lock_commitment
+        );
+        let preimage = load_denuo_btc_for_hns_maker_preimage(&store, created.offer.session_id)
+            .expect("load preimage")
+            .expect("preimage retained");
+        assert_eq!(
+            Sha256::digest(preimage.expose_for_settlement()).as_slice(),
+            terms.hashlock
+        );
+        let (request_id, wire) =
+            CrossChainMessage::decode_envelope(&made.envelope).expect("decode proposal envelope");
+        assert_eq!(request_id, 77);
+        assert_eq!(wire, CrossChainMessage::SwapSessionProposal(made.proposal));
+        let retried = create_denuo_btc_for_hns_maker_proposal(
+            &mut store,
+            &swap_policy,
+            DenuoBtcForHnsMakerProposalRequest {
+                wallet_id,
+                session_id: created.offer.session_id,
+                now_unix: START + 21,
+                funding_window_seconds: 600,
+                second_refund_after_seconds: 3_600,
+                refund_safety_margin_seconds: 3_600,
+                bitcoin_minimum_confirmations: 1,
+                hns_minimum_confirmations: 1,
+            },
+        )
+        .expect("idempotent retry");
+        assert_eq!(retried.envelope, made.envelope);
     }
 }

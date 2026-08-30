@@ -441,7 +441,7 @@ impl MobileDenuoSessionController {
 fn summary(offer: DenuoLocalDirectOffer) -> Result<MobileBtcForHnsOfferSummary, MobileWalletError> {
     Ok(MobileBtcForHnsOfferSummary {
         offer_id: super::lowercase_hex(offer.offer.offer_id.as_bytes()),
-        session_id: super::lowercase_hex(offer.session_id.as_bytes()),
+        session_id: super::lowercase_hex(offer.offer.session_id.as_bytes()),
         btc_amount_sats: u64::try_from(offer.offer.offered_amount)
             .map_err(|_| MobileWalletError::InvalidDirectOfferAction)?,
         hns_amount_dollarydoos: u64::try_from(offer.offer.received_amount)
