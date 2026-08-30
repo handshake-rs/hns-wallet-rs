@@ -531,14 +531,26 @@ pub fn apply_locally_verified_denuo_funding(
     verify_local_funding_against_denuo_terms(&hello, &funding)?;
     let evidence = match stored.state.state {
         SwapState::FirstFundingPending if funding.module() == stored.state.first_module => {
-            VerifiedEvidence::FirstFundingConfirmed {
+            vec![VerifiedEvidence::FirstFundingConfirmed {
                 evidence: funding_evidence_id(&funding),
-            }
+            }]
         }
         SwapState::SecondFundingPending if funding.module() == stored.state.second_module => {
-            VerifiedEvidence::SecondFundingConfirmed {
+            vec![VerifiedEvidence::SecondFundingConfirmed {
                 evidence: funding_evidence_id(&funding),
-            }
+            }]
+        }
+        // The party that does not construct the second lock has no local
+        // preparation call to cross this checkpoint. Its independently
+        // verified counterparty lock is both readiness evidence and funding
+        // evidence, persisted as two restart-safe journal revisions.
+        SwapState::FirstFunded if funding.module() == stored.state.second_module => {
+            vec![
+                VerifiedEvidence::SecondFundingReady,
+                VerifiedEvidence::SecondFundingConfirmed {
+                    evidence: funding_evidence_id(&funding),
+                },
+            ]
         }
         _ => return Err(MarketError::InvalidTransition),
     };
@@ -548,7 +560,9 @@ pub fn apply_locally_verified_denuo_funding(
         workflow_id,
         updated_at_unix: now_unix,
     };
-    session.apply(evidence, now_unix, &mut journal)?;
+    for evidence in evidence {
+        session.apply(evidence, now_unix, &mut journal)?;
+    }
     Ok(session)
 }
 

@@ -1040,12 +1040,7 @@ impl MobileDenuoSessionController {
                         .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
                 if execution.second_funding.is_none()
                     || execution.second_module != hns_wallet_types::ModuleId::Handshake
-                    || !matches!(
-                        execution.state,
-                        SwapState::BothFunded
-                            | SwapState::FirstRedeemed
-                            | SwapState::SecretObserved
-                    )
+                    || execution.state != SwapState::BothFunded
                 {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
@@ -1680,6 +1675,184 @@ mod tests {
         assert!(
             controller
                 .authorize_local_btc_first_funding(offer.offer.session_id, START + 621)
+                .is_err()
+        );
+
+        let hns_binding = hns_permit
+            .hello()
+            .build_hns_htlc(
+                hns_marketplace_protocol::SwapAssetSide::Received,
+                hns_permit.hello().maker_settlement_public_key,
+                hns_permit.hello().taker_settlement_public_key,
+            )
+            .expect("HNS binding");
+        let hns_lock = hns_wallet_chain_api::VerifiedLock {
+            module: hns_wallet_types::ModuleId::Handshake,
+            session_id: offer.offer.session_id,
+            funding_id: hns_wallet_types::TransactionHash::new([0x71; 32]),
+            amount: hns_wallet_types::Amount::new(
+                hns_wallet_types::WalletAsset::Hns,
+                u128::from(hns_binding.descriptor.value.get()),
+            ),
+            hashlock: hns_wallet_types::ObjectHash::new(hns_binding.descriptor.hashlock),
+            absolute_timelock: u64::from(hns_binding.descriptor.refund_locktime),
+            confirmation_count: 1,
+            evidence_hash: hns_wallet_types::ObjectHash::new([0x72; 32]),
+        };
+        assert_eq!(
+            controller
+                .apply_local_verified_hns_funding(
+                    offer.offer.session_id,
+                    hns_lock.clone(),
+                    START + 60,
+                )
+                .expect("maker verifies HNS funding"),
+            SwapState::BothFunded
+        );
+        assert_eq!(
+            taker_controller
+                .apply_local_verified_hns_funding(offer.offer.session_id, hns_lock, START + 60,)
+                .expect("taker verifies HNS funding"),
+            SwapState::BothFunded
+        );
+
+        let maker_hns_redeem = controller
+            .authorize_local_hns_redeem(offer.offer.session_id)
+            .expect("maker HNS redeem permit");
+        assert_eq!(
+            maker_hns_redeem.action(),
+            MobileDenuoSettlementAction::Redeem
+        );
+        assert!(maker_hns_redeem.preimage.is_some());
+        let known_preimage = *maker_hns_redeem
+            .preimage
+            .as_ref()
+            .expect("maker preimage")
+            .expose_for_settlement();
+        assert!(
+            taker_controller
+                .authorize_local_hns_redeem(offer.offer.session_id)
+                .is_err()
+        );
+        let taker_hns_refund = taker_controller
+            .authorize_local_hns_refund(offer.offer.session_id)
+            .expect("taker HNS refund permit");
+        assert_eq!(taker_hns_refund.fee_reserve(), 10_000);
+        assert!(
+            controller
+                .authorize_local_hns_refund(offer.offer.session_id)
+                .is_err()
+        );
+        let maker_bitcoin_refund = controller
+            .authorize_local_bitcoin_refund(offer.offer.session_id)
+            .expect("maker Bitcoin refund permit");
+        assert_eq!(maker_bitcoin_refund.fee_reserve(), 1_000);
+        assert!(
+            taker_controller
+                .authorize_local_bitcoin_refund(offer.offer.session_id)
+                .is_err()
+        );
+        assert!(
+            controller
+                .authorize_local_bitcoin_redeem(offer.offer.session_id)
+                .is_err()
+        );
+        assert!(
+            taker_controller
+                .authorize_local_bitcoin_redeem(offer.offer.session_id)
+                .is_err()
+        );
+
+        assert!(
+            controller
+                .apply_local_verified_hns_spend(
+                    offer.offer.session_id,
+                    hns_wallet_hns::VerifiedNativeHtlcSpend::Redeem {
+                        transaction: hns_wallet_types::TransactionHash::new([0x81; 32]),
+                        confirmation_count: 1,
+                        preimage: hns_wallet_chain_api::Preimage::new([0xaa; 32]),
+                    },
+                    START + 70,
+                )
+                .is_err()
+        );
+        let hns_redeem = || hns_wallet_hns::VerifiedNativeHtlcSpend::Redeem {
+            transaction: hns_wallet_types::TransactionHash::new([0x82; 32]),
+            confirmation_count: 1,
+            preimage: hns_wallet_chain_api::Preimage::new(known_preimage),
+        };
+        assert_eq!(
+            controller
+                .apply_local_verified_hns_spend(offer.offer.session_id, hns_redeem(), START + 71,)
+                .expect("maker verifies HNS redeem"),
+            SwapState::SecretObserved
+        );
+        assert_eq!(
+            taker_controller
+                .apply_local_verified_hns_spend(offer.offer.session_id, hns_redeem(), START + 71,)
+                .expect("taker verifies HNS redeem"),
+            SwapState::SecretObserved
+        );
+        assert!(
+            taker_controller
+                .authorize_local_hns_refund(offer.offer.session_id)
+                .is_err()
+        );
+        let taker_bitcoin_redeem = taker_controller
+            .authorize_local_bitcoin_redeem(offer.offer.session_id)
+            .expect("taker Bitcoin redeem permit after secret observation");
+        assert_eq!(
+            *taker_bitcoin_redeem
+                .preimage
+                .as_ref()
+                .expect("observed preimage")
+                .expose_for_settlement(),
+            known_preimage
+        );
+        assert!(
+            controller
+                .authorize_local_bitcoin_redeem(offer.offer.session_id)
+                .is_err()
+        );
+
+        let bitcoin_redeem = hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcSpendObservation {
+            spend: hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcSpend {
+                txid: hns_wallet_types::TransactionHash::new([0x91; 32]),
+                wtxid: [0x92; 32],
+                fee_sats: 400,
+                branch: hns_wallet_bitcoin_kyoto::HtlcSpendBranch::Redeem,
+                revealed_preimage: Some(known_preimage),
+            },
+            confirmation_count: 1,
+        };
+        assert_eq!(
+            controller
+                .apply_local_verified_bitcoin_spend(
+                    offer.offer.session_id,
+                    bitcoin_redeem,
+                    START + 80,
+                )
+                .expect("maker verifies Bitcoin redeem"),
+            SwapState::Completed
+        );
+        assert_eq!(
+            taker_controller
+                .apply_local_verified_bitcoin_spend(
+                    offer.offer.session_id,
+                    bitcoin_redeem,
+                    START + 80,
+                )
+                .expect("taker verifies Bitcoin redeem"),
+            SwapState::Completed
+        );
+        assert!(
+            taker_controller
+                .authorize_local_bitcoin_redeem(offer.offer.session_id)
+                .is_err()
+        );
+        assert!(
+            controller
+                .authorize_local_bitcoin_refund(offer.offer.session_id)
                 .is_err()
         );
     }
