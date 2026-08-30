@@ -14,7 +14,7 @@ pub use bitcoin::{
     MobileBitcoinSnapshot, MobileBitcoinSyncProgress, MobileBitcoinSyncProgressHandle,
     MobileBitcoinValueController,
 };
-pub use hns_wallet_bitcoin_kyoto::VerifiedBitcoinLock;
+pub use hns_wallet_bitcoin_kyoto::{VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock};
 pub use market::{
     MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDenuoBitcoinFundingPermit,
     MobileDenuoBitcoinWatchPermit, MobileDenuoDirectAdmission, MobileDenuoDirectTransportReport,
@@ -1947,6 +1947,40 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
                 binding.descriptor,
                 hello.received_minimum_confirmations,
             )
+            .map_err(mobile_service_failure)
+    }
+
+    pub fn verified_denuo_hns_spend(
+        &self,
+        permit: MobileDenuoHnsVerificationPermit,
+    ) -> Result<Option<hns_wallet_hns::VerifiedNativeHtlcSpend>, MobileWalletError> {
+        let hello = permit.hello();
+        let binding = hello
+            .build_hns_htlc(
+                hns_marketplace_protocol::SwapAssetSide::Received,
+                hello.maker_settlement_public_key,
+                hello.taker_settlement_public_key,
+            )
+            .map_err(|_| MobileWalletError::InvalidValueAction)?;
+        if binding.descriptor_hash != hello.received_lock_commitment {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
+        let session_id = hns_wallet_types::SessionId::new(hello.swap_session_id);
+        let Some(lock) = self
+            .session
+            .service
+            .verify_trusted_native_persisted_hns_htlc_lock(
+                session_id,
+                binding.descriptor,
+                hello.received_minimum_confirmations,
+            )
+            .map_err(mobile_service_failure)?
+        else {
+            return Ok(None);
+        };
+        self.session
+            .service
+            .verify_trusted_native_hns_htlc_spend(session_id, binding.descriptor, lock)
             .map_err(mobile_service_failure)
     }
 

@@ -1029,6 +1029,30 @@ impl MobileBitcoinValueController {
             .map_err(MobileWalletError::from)
     }
 
+    pub fn verified_denuo_htlc_spend(
+        &self,
+        session_id: SessionId,
+    ) -> Result<
+        Option<hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcSpendObservation>,
+        MobileWalletError,
+    > {
+        let wallet = self
+            .wallet
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let checkpoint = supervisor.state().scanned_checkpoint;
+        self.store
+            .try_with_store(|store| {
+                load_bitcoin_htlc_watch(store, wallet.network(), wallet.account_id(), session_id)
+                    .map(|watch| watch.and_then(|watch| watch.verified_spend_at(checkpoint)))
+            })
+            .map_err(MobileWalletError::from)
+    }
+
     /// Stop the direct node before the shared store is relocked. A durable
     /// recovery journal remains in the encrypted store and is reconstructed on
     /// the next unlock.

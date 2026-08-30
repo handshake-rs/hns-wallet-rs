@@ -5547,6 +5547,50 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         }
     }
 
+    /// Discover and verify the confirmed transaction spending an exact native
+    /// HNS HTLC funding outpoint. The backend supplies only the candidate
+    /// transaction identifier; `verify_native_htlc_spend` still fetches the
+    /// raw bytes and executes the committed witness script locally.
+    pub fn verify_observed_native_htlc_spend(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: VerifiedLock,
+    ) -> Result<Option<VerifiedNativeHtlcSpend>, ChainError> {
+        self.verify_native_htlc_network(&descriptor)?;
+        validate_native_htlc_lock(&descriptor, session_id, &lock)?;
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        ensure_settlement_ready(&cache)?;
+        let binding = cache.binding.ok_or(ChainError::NotSynchronized)?;
+        let config = cache.account.config.clone();
+        drop(cache);
+        let record = self
+            .store_lock()
+            .map_err(map_chain_error)?
+            .hns_verified_settlement::<HnsVerifiedSettlementRecord>(&settlement_entity_id(
+                &config, session_id,
+            ))
+            .map_err(map_chain_error)?
+            .ok_or(ChainError::InvalidEvidence)?
+            .value;
+        if record.verified != lock {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let outpoint = HnsOutpoint {
+            transaction: lock.funding_id,
+            output_index: record.output_index,
+        };
+        let evidence = self
+            .backend
+            .get_outpoint_spend_evidence(&[outpoint], binding)
+            .map_err(map_chain_error)?;
+        validate_spend_evidence(&evidence, binding, &[outpoint]).map_err(map_chain_error)?;
+        let Some(spending) = evidence.entries[0].spending else {
+            return Ok(None);
+        };
+        self.verify_native_htlc_spend(session_id, descriptor, lock, spending.transaction)
+    }
+
     fn verify_native_htlc_network(&self, descriptor: &HnsHtlc) -> Result<(), ChainError> {
         let cache = self.cache_read().map_err(map_chain_error)?;
         let network =

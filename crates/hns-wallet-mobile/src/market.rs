@@ -435,6 +435,59 @@ impl MobileDenuoSessionController {
             .map_err(MobileWalletError::from)
     }
 
+    pub fn pending_hns_spend_verifications(
+        &self,
+    ) -> Result<Vec<MobileDenuoHnsVerificationPermit>, MobileWalletError> {
+        let policy = self.policy;
+        self.store
+            .try_with_store(|store| {
+                list_denuo_executions(store, &policy)?
+                    .into_iter()
+                    .filter(|session| {
+                        session.second_module == hns_wallet_types::ModuleId::Handshake
+                            && matches!(
+                                session.state,
+                                SwapState::BothFunded
+                                    | SwapState::FirstRedeemed
+                                    | SwapState::SecretObserved
+                                    | SwapState::RefundEligible
+                                    | SwapState::RefundBroadcast
+                            )
+                    })
+                    .map(|session| {
+                        load_denuo_direct_swap(store, &policy, session.id)?
+                            .and_then(|record| record.hello)
+                            .map(|hello| MobileDenuoHnsVerificationPermit { hello })
+                            .ok_or(hns_wallet_market::MarketError::CorruptDenuoDirectSwap)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    pub fn pending_bitcoin_spend_sessions(
+        &self,
+    ) -> Result<Vec<hns_wallet_types::SessionId>, MobileWalletError> {
+        self.store
+            .try_with_store(|store| list_denuo_executions(store, &self.policy))
+            .map_err(MobileWalletError::from)
+            .map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| {
+                        session.first_module == hns_wallet_types::ModuleId::Bitcoin
+                            && matches!(
+                                session.state,
+                                SwapState::SecretObserved
+                                    | SwapState::RefundEligible
+                                    | SwapState::RefundBroadcast
+                            )
+                    })
+                    .map(|session| session.id)
+                    .collect()
+            })
+    }
+
     pub fn cancel_local_btc_for_hns_offer(
         &mut self,
         offer_id: &str,
@@ -730,6 +783,74 @@ impl MobileDenuoSessionController {
                     hns_wallet_market::LocallyVerifiedSwapFunding::Hns(lock),
                     now_unix,
                 )
+                .map(|session| session.state)
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    pub fn apply_local_verified_hns_spend(
+        &mut self,
+        session_id: hns_wallet_types::SessionId,
+        spend: hns_wallet_hns::VerifiedNativeHtlcSpend,
+        now_unix: u64,
+    ) -> Result<SwapState, MobileWalletError> {
+        let policy = self.policy;
+        self.store
+            .try_with_store_mut(|store| {
+                let refund = matches!(
+                    spend,
+                    hns_wallet_hns::VerifiedNativeHtlcSpend::Refund { .. }
+                );
+                if refund {
+                    hns_wallet_market::apply_locally_verified_denuo_refund(
+                        store,
+                        &policy,
+                        session_id,
+                        hns_wallet_market::LocallyVerifiedSwapSpend::Hns(spend),
+                        now_unix,
+                    )
+                } else {
+                    hns_wallet_market::apply_locally_verified_denuo_first_redemption(
+                        store,
+                        &policy,
+                        session_id,
+                        hns_wallet_market::LocallyVerifiedSwapSpend::Hns(spend),
+                        now_unix,
+                    )
+                }
+                .map(|session| session.state)
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    pub fn apply_local_verified_bitcoin_spend(
+        &mut self,
+        session_id: hns_wallet_types::SessionId,
+        spend: hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcSpendObservation,
+        now_unix: u64,
+    ) -> Result<SwapState, MobileWalletError> {
+        let policy = self.policy;
+        self.store
+            .try_with_store_mut(|store| {
+                let refund =
+                    spend.spend.branch == hns_wallet_bitcoin_kyoto::HtlcSpendBranch::Refund;
+                if refund {
+                    hns_wallet_market::apply_locally_verified_denuo_refund(
+                        store,
+                        &policy,
+                        session_id,
+                        hns_wallet_market::LocallyVerifiedSwapSpend::Bitcoin(spend),
+                        now_unix,
+                    )
+                } else {
+                    hns_wallet_market::apply_locally_verified_denuo_second_redemption(
+                        store,
+                        &policy,
+                        session_id,
+                        hns_wallet_market::LocallyVerifiedSwapSpend::Bitcoin(spend),
+                        now_unix,
+                    )
+                }
                 .map(|session| session.state)
             })
             .map_err(MobileWalletError::from)

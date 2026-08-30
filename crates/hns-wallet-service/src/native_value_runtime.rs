@@ -1485,6 +1485,18 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             .map_err(chain_failure)
     }
 
+    pub fn verify_trusted_native_hns_htlc_spend(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: hns_wallet_chain_api::VerifiedLock,
+    ) -> Result<Option<hns_wallet_hns::VerifiedNativeHtlcSpend>, ServiceFailure> {
+        self.runtime
+            .runtime
+            .verify_observed_native_htlc_spend(session_id, descriptor, lock)
+            .map_err(chain_failure)
+    }
+
     /// Re-submit exact signed sends that a fresh authenticated wallet snapshot
     /// classifies as dropped. No caller-provided workflow, transaction bytes,
     /// destination, amount, fee, or signing authority crosses this boundary.
