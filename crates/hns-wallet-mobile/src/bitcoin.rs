@@ -17,15 +17,17 @@ use bdk_wallet::bitcoin::hashes::Hash;
 use hns_wallet_bitcoin_kyoto::{
     BIP39_SEED_BYTES, BitcoinBirthdaySource, BitcoinBroadcastReceipt, BitcoinCheckpoint,
     BitcoinHtlcWatchRequest, BitcoinTransactionRecord, BitcoinWalletError,
-    EncryptedPersistedBitcoinWallet, KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor,
-    KyotoSyncProgressHandle, KyotoSyncReceipt, KyotoTipDiscovery, KyotoWalletState,
-    PreparedBitcoinHtlcFunding, StoredKyotoWalletState, VerifiedBitcoinLock, authorize_native_send,
-    bitcoin_value_runtime_permit, build_denuo_bitcoin_htlc,
+    EncryptedPersistedBitcoinWallet, HtlcSpendBranch, KyotoRuntimeConfig, KyotoShutdownHandle,
+    KyotoSupervisor, KyotoSyncProgressHandle, KyotoSyncReceipt, KyotoTipDiscovery,
+    KyotoWalletState, PreparedBitcoinHtlcFunding, StoredKyotoWalletState, VerifiedBitcoinLock,
+    authorize_native_send, bitcoin_value_runtime_permit, build_denuo_bitcoin_htlc,
     create_persisted_descriptor_wallet_from_seed, initialize_pristine_wallet_at_creation_tip,
     initialize_pristine_wallet_at_recovery_checkpoint, load_bitcoin_htlc_watch,
     load_persisted_descriptor_wallet_from_seed, monitor_kyoto_sync_progress,
-    persist_prepared_bitcoin_broadcast, prepare_bitcoin_htlc_funding, prepare_native_send,
-    verify_htlc_funding,
+    persist_prepared_bitcoin_broadcast, persist_prepared_bitcoin_htlc_spend_broadcast,
+    prepare_bitcoin_htlc_funding, prepare_native_send,
+    sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer, verify_htlc_funding,
+    verify_signed_bitcoin_htlc_spend,
 };
 use hns_wallet_hns::{HnsNetwork, HnsRuntimeConfig};
 use hns_wallet_store::{SecretKind, SharedWalletStore, WalletStore};
@@ -34,7 +36,10 @@ use serde::{Deserialize, Serialize};
 use tokio::runtime::Runtime;
 use zeroize::Zeroizing;
 
-use crate::{MobileDenuoBitcoinFundingPermit, MobileDenuoBitcoinWatchPermit, MobileWalletError};
+use crate::{
+    MobileDenuoBitcoinFundingPermit, MobileDenuoBitcoinSettlementPermit,
+    MobileDenuoBitcoinWatchPermit, MobileDenuoSettlementAction, MobileWalletError,
+};
 
 const BITCOIN_RECOVERY_SCRIPT_INDEX: u32 = 1;
 const BITCOIN_SEND_APPROVAL_LIFETIME_SECONDS: u64 = 300;
@@ -251,6 +256,17 @@ struct PendingMobileBitcoinHtlcFunding {
     expires_at_unix: u64,
 }
 
+struct PendingMobileBitcoinHtlcSettlement {
+    action_token: [u8; MOBILE_ACTION_TOKEN_BYTES],
+    session_id: SessionId,
+    action: MobileDenuoSettlementAction,
+    branch: HtlcSpendBranch,
+    raw_transaction: Vec<u8>,
+    lock: VerifiedBitcoinLock,
+    maximum_fee_sats: u64,
+    expires_at_unix: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MobileBitcoinHtlcFundingApproval {
@@ -273,6 +289,30 @@ pub struct MobileBitcoinHtlcFundingReceipt {
     pub submitted_at_unix: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileBitcoinHtlcSettlementApproval {
+    pub action_token: String,
+    pub session_id: String,
+    pub action: MobileDenuoSettlementAction,
+    pub txid: String,
+    pub input_amount_sats: u64,
+    pub output_amount_sats: u64,
+    pub fee_sats: u64,
+    pub maximum_fee_sats: u64,
+    pub expires_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileBitcoinHtlcSettlementReceipt {
+    pub session_id: String,
+    pub action: MobileDenuoSettlementAction,
+    pub txid: String,
+    pub attempt_count: u16,
+    pub submitted_at_unix: Option<u64>,
+}
+
 /// Wallet-owned Kyoto state for the installed HNS/Bitcoin product. It opens
 /// only while the shared encrypted store is unlocked and tears down its direct
 /// peer node before that store is relocked.
@@ -290,6 +330,7 @@ pub struct MobileBitcoinValueController {
     receive_address: Option<String>,
     pending_send: Option<PendingMobileBitcoinSend>,
     pending_htlc_funding: Option<PendingMobileBitcoinHtlcFunding>,
+    pending_htlc_settlement: Option<PendingMobileBitcoinHtlcSettlement>,
 }
 
 /// Lifecycle-only stop capability for the active direct Bitcoin node.
@@ -394,6 +435,7 @@ impl MobileBitcoinValueController {
             receive_address: None,
             pending_send: None,
             pending_htlc_funding: None,
+            pending_htlc_settlement: None,
         })
     }
 
@@ -564,6 +606,7 @@ impl MobileBitcoinValueController {
     ) -> Result<MobileBitcoinSnapshot, MobileWalletError> {
         if self.pending_send.is_some()
             || self.pending_htlc_funding.is_some()
+            || self.pending_htlc_settlement.is_some()
             || earliest_transaction_height == 0
         {
             return Err(MobileWalletError::InvalidBitcoinAction);
@@ -665,7 +708,10 @@ impl MobileBitcoinValueController {
         amount_sats: u64,
         maximum_fee_sats: u64,
     ) -> Result<MobileBitcoinSendApproval, MobileWalletError> {
-        if self.pending_send.is_some() || self.pending_htlc_funding.is_some() {
+        if self.pending_send.is_some()
+            || self.pending_htlc_funding.is_some()
+            || self.pending_htlc_settlement.is_some()
+        {
             return Err(MobileWalletError::BitcoinActionPending);
         }
         if maximum_fee_sats == 0 {
@@ -803,7 +849,10 @@ impl MobileBitcoinValueController {
         permit: MobileDenuoBitcoinFundingPermit,
         maximum_fee_sats: u64,
     ) -> Result<MobileBitcoinHtlcFundingApproval, MobileWalletError> {
-        if self.pending_send.is_some() || self.pending_htlc_funding.is_some() {
+        if self.pending_send.is_some()
+            || self.pending_htlc_funding.is_some()
+            || self.pending_htlc_settlement.is_some()
+        {
             return Err(MobileWalletError::BitcoinActionPending);
         }
         if maximum_fee_sats == 0 || maximum_fee_sats > permit.bitcoin_fee_reserve_sats() {
@@ -1005,6 +1054,194 @@ impl MobileBitcoinValueController {
         Ok(())
     }
 
+    /// Prepare one receiver or timeout spend of the exact verified Bitcoin
+    /// HTLC. The destination is a newly persisted internal wallet address;
+    /// only a non-sensitive summary and a process-local token leave Rust.
+    pub fn prepare_denuo_htlc_settlement(
+        &mut self,
+        mut permit: MobileDenuoBitcoinSettlementPermit,
+        maximum_fee_sats: u64,
+    ) -> Result<MobileBitcoinHtlcSettlementApproval, MobileWalletError> {
+        if self.pending_send.is_some()
+            || self.pending_htlc_funding.is_some()
+            || self.pending_htlc_settlement.is_some()
+        {
+            return Err(MobileWalletError::BitcoinActionPending);
+        }
+        if maximum_fee_sats == 0 || maximum_fee_sats > permit.fee_reserve() {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        let now_unix = now_unix()?;
+        let expires_at_unix = now_unix
+            .checked_add(BITCOIN_SEND_APPROVAL_LIFETIME_SECONDS)
+            .ok_or(MobileWalletError::InvalidBitcoinAction)?;
+        let hello = permit.hello().clone();
+        let binding =
+            build_denuo_bitcoin_htlc(&hello, hns_marketplace_protocol::SwapAssetSide::Offered)?;
+        if binding.commitment.into_bytes() != hello.offered_lock_commitment {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        let branch = match permit.action() {
+            MobileDenuoSettlementAction::Redeem => HtlcSpendBranch::Redeem,
+            MobileDenuoSettlementAction::Refund => HtlcSpendBranch::Refund,
+        };
+        let expected_key = match branch {
+            HtlcSpendBranch::Redeem => &binding.htlc.receiver_public_key,
+            HtlcSpendBranch::Refund => &binding.htlc.refund_public_key,
+        };
+        if expected_key.as_slice() != permit.settlement_key().public_key() {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        let session_id = SessionId::new(hello.swap_session_id);
+        let lock = self
+            .verified_denuo_htlc_funding(session_id)?
+            .ok_or(MobileWalletError::InvalidBitcoinAction)?;
+        if lock.htlc != binding.htlc || lock.value_sats != binding.value_sats {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let fee_rate_sat_vb = runtime.block_on(supervisor.minimum_broadcast_fee_rate_sat_vb())?;
+        let chain_context = runtime.block_on(supervisor.validated_chain_lock_context())?;
+        let destination = {
+            let wallet = self.wallet_mut()?;
+            let destination = wallet
+                .reveal_next_address(KeychainKind::Internal)
+                .address
+                .script_pubkey();
+            wallet.persist(now_unix)?;
+            destination
+        };
+        let preimage = permit
+            .take_preimage()
+            .map(|preimage| *preimage.expose_for_settlement());
+        let raw_transaction = sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer(
+            &lock,
+            &bitcoin_value_runtime_permit()?,
+            destination,
+            branch,
+            preimage,
+            chain_context,
+            fee_rate_sat_vb,
+            maximum_fee_sats,
+            permit.settlement_key(),
+        )?;
+        let verified = verify_signed_bitcoin_htlc_spend(&raw_transaction, &lock, branch)?;
+        let output_amount_sats = lock
+            .value_sats
+            .checked_sub(verified.fee_sats)
+            .ok_or(MobileWalletError::InvalidBitcoinAction)?;
+        let action_token = random_nonzero_bytes()?;
+        let approval = MobileBitcoinHtlcSettlementApproval {
+            action_token: lowercase_hex(&action_token),
+            session_id: lowercase_hex(session_id.as_bytes()),
+            action: permit.action(),
+            txid: lowercase_hex(verified.txid.as_bytes()),
+            input_amount_sats: lock.value_sats,
+            output_amount_sats,
+            fee_sats: verified.fee_sats,
+            maximum_fee_sats,
+            expires_at_unix,
+        };
+        self.pending_htlc_settlement = Some(PendingMobileBitcoinHtlcSettlement {
+            action_token,
+            session_id,
+            action: permit.action(),
+            branch,
+            raw_transaction,
+            lock,
+            maximum_fee_sats,
+            expires_at_unix,
+        });
+        Ok(approval)
+    }
+
+    pub fn approve_denuo_htlc_settlement(
+        &mut self,
+        action_token: &str,
+    ) -> Result<MobileBitcoinHtlcSettlementReceipt, MobileWalletError> {
+        self.require_pending_htlc_settlement_token(action_token)?;
+        let now_unix = now_unix()?;
+        if self
+            .pending_htlc_settlement
+            .as_ref()
+            .is_none_or(|pending| now_unix >= pending.expires_at_unix)
+        {
+            self.pending_htlc_settlement = None;
+            return Err(MobileWalletError::BitcoinActionExpired);
+        }
+        let pending = self
+            .pending_htlc_settlement
+            .take()
+            .ok_or(MobileWalletError::NoPendingBitcoinAction)?;
+        let wallet = self
+            .wallet
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let approval = hns_wallet_bitcoin_kyoto::derive_bitcoin_htlc_spend_broadcast_approval(
+            wallet,
+            &pending.raw_transaction,
+            &pending.lock,
+            pending.branch,
+            pending.maximum_fee_sats,
+            pending.expires_at_unix,
+        )?;
+        let expected_revision = self.store.try_with_store(|store| {
+            store
+                .bitcoin_transaction::<BitcoinTransactionRecord>(&approval.txid)
+                .map(|record| record.map_or(0, |stored| stored.revision))
+        })?;
+        let prepared = self.store.try_with_store_mut(|store| {
+            persist_prepared_bitcoin_htlc_spend_broadcast(
+                wallet,
+                store,
+                &pending.raw_transaction,
+                &pending.lock,
+                pending.branch,
+                approval.commitment,
+                pending.maximum_fee_sats,
+                expected_revision,
+                now_unix,
+                pending.expires_at_unix,
+            )
+        })?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let receipt = runtime.block_on(supervisor.broadcast_prepared_transaction(
+            &bitcoin_value_runtime_permit()?,
+            prepared.txid,
+            now_unix,
+        ))?;
+        Ok(MobileBitcoinHtlcSettlementReceipt {
+            session_id: lowercase_hex(pending.session_id.as_bytes()),
+            action: pending.action,
+            txid: lowercase_hex(&receipt.txid),
+            attempt_count: receipt.attempt_count,
+            submitted_at_unix: receipt.submitted_at_unix,
+        })
+    }
+
+    pub fn reject_denuo_htlc_settlement(
+        &mut self,
+        action_token: &str,
+    ) -> Result<(), MobileWalletError> {
+        self.require_pending_htlc_settlement_token(action_token)?;
+        self.pending_htlc_settlement = None;
+        Ok(())
+    }
+
     /// Return funding evidence only when the durable HTLC watch is reconciled
     /// to this controller's exact current Kyoto checkpoint and has reached the
     /// confirmation threshold signed into the swap session.
@@ -1074,6 +1311,7 @@ impl MobileBitcoinValueController {
         self.receive_address = None;
         self.pending_send = None;
         self.pending_htlc_funding = None;
+        self.pending_htlc_settlement = None;
         supervisor_shutdown.map_err(MobileWalletError::from)?;
         discovery_shutdown.map_err(MobileWalletError::from)?;
         Ok(())
@@ -1228,6 +1466,20 @@ impl MobileBitcoinValueController {
     ) -> Result<(), MobileWalletError> {
         let pending = self
             .pending_htlc_funding
+            .as_ref()
+            .ok_or(MobileWalletError::NoPendingBitcoinAction)?;
+        if !action_token_matches(&pending.action_token, action_token) {
+            return Err(MobileWalletError::InvalidBitcoinActionToken);
+        }
+        Ok(())
+    }
+
+    fn require_pending_htlc_settlement_token(
+        &self,
+        action_token: &str,
+    ) -> Result<(), MobileWalletError> {
+        let pending = self
+            .pending_htlc_settlement
             .as_ref()
             .ok_or(MobileWalletError::NoPendingBitcoinAction)?;
         if !action_token_matches(&pending.action_token, action_token) {

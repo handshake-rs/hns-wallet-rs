@@ -1441,6 +1441,50 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             .map_err(chain_failure)
     }
 
+    pub fn prepare_trusted_native_hns_htlc_redeem(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: hns_wallet_chain_api::VerifiedLock,
+        preimage: hns_wallet_chain_api::Preimage,
+        maximum_fee: BaseUnits,
+        signer: &dyn hns_wallet_chain_api::SettlementSigner,
+    ) -> Result<hns_wallet_chain_api::PreparedSettlementRedeem, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .prepare_native_htlc_redeem_with_settlement_signer(
+                session_id,
+                descriptor,
+                lock,
+                preimage,
+                maximum_fee,
+                signer,
+            )
+            .map_err(chain_failure)
+    }
+
+    pub fn prepare_trusted_native_hns_htlc_refund(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: hns_wallet_chain_api::VerifiedLock,
+        maximum_fee: BaseUnits,
+        signer: &dyn hns_wallet_chain_api::SettlementSigner,
+    ) -> Result<hns_wallet_chain_api::PreparedSettlementRefund, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .prepare_native_htlc_refund_with_settlement_signer(
+                session_id,
+                descriptor,
+                lock,
+                maximum_fee,
+                signer,
+            )
+            .map_err(chain_failure)
+    }
+
     pub fn broadcast_trusted_native_hns_settlement(
         &self,
         artifact: &PreparedArtifact,

@@ -10,21 +10,23 @@ use std::path::Path;
 
 pub use bitcoin::{
     MobileBitcoinBroadcastReceipt, MobileBitcoinDirectConfig, MobileBitcoinHtlcFundingApproval,
-    MobileBitcoinHtlcFundingReceipt, MobileBitcoinSendApproval, MobileBitcoinShutdownHandle,
+    MobileBitcoinHtlcFundingReceipt, MobileBitcoinHtlcSettlementApproval,
+    MobileBitcoinHtlcSettlementReceipt, MobileBitcoinSendApproval, MobileBitcoinShutdownHandle,
     MobileBitcoinSnapshot, MobileBitcoinSyncProgress, MobileBitcoinSyncProgressHandle,
     MobileBitcoinValueController,
 };
 pub use hns_wallet_bitcoin_kyoto::{VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock};
 pub use market::{
     MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDenuoBitcoinFundingPermit,
-    MobileDenuoBitcoinWatchPermit, MobileDenuoDirectAdmission, MobileDenuoDirectTransportReport,
-    MobileDenuoExecutionSummary, MobileDenuoHnsFundingPermit, MobileDenuoHnsVerificationPermit,
-    MobileDenuoSessionController,
+    MobileDenuoBitcoinSettlementPermit, MobileDenuoBitcoinWatchPermit, MobileDenuoDirectAdmission,
+    MobileDenuoDirectTransportReport, MobileDenuoExecutionSummary, MobileDenuoHnsFundingPermit,
+    MobileDenuoHnsSettlementPermit, MobileDenuoHnsVerificationPermit, MobileDenuoSessionController,
+    MobileDenuoSettlementAction,
 };
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
 use hns_swap::NetworkBinding;
-use hns_wallet_chain_api::PreparedSettlementLock;
+use hns_wallet_chain_api::{PreparedArtifact, PreparedSettlementLock};
 use hns_wallet_ffi::{
     AbiError, AccountSummary, ApprovalSummary, HnsNameDisclosure, HostFrame, HostPlatform,
     MAX_HNS_NAME_DISCLOSURES, SecretString, ServiceCapability, ServiceErrorCode, ServiceFailure,
@@ -256,6 +258,7 @@ pub struct MobileHnsValueController<B: HnsBackend, C: HnsClock = HnsReadSystemCl
     account_config: HnsRuntimeConfig,
     pending: Option<PendingMobileHnsValueAction>,
     pending_denuo_hns_funding: Option<PendingMobileDenuoHnsFunding>,
+    pending_denuo_hns_settlement: Option<PendingMobileDenuoHnsSettlement>,
     known_names: Vec<MobileHnsNameSummary>,
 }
 
@@ -380,6 +383,14 @@ struct PendingMobileDenuoHnsFunding {
     maximum_fee: BaseUnits,
 }
 
+struct PendingMobileDenuoHnsSettlement {
+    action_token: [u8; 32],
+    session_id: hns_wallet_types::SessionId,
+    action: MobileDenuoSettlementAction,
+    prepared: PreparedArtifact,
+    maximum_fee: BaseUnits,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MobileDenuoHnsFundingApproval {
@@ -397,6 +408,29 @@ pub struct MobileDenuoHnsFundingApproval {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MobileDenuoHnsFundingReceipt {
     pub session_id: String,
+    pub transaction_id: String,
+    pub accepted_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileDenuoHnsSettlementApproval {
+    pub action_token: String,
+    pub session_id: String,
+    pub action: MobileDenuoSettlementAction,
+    pub transaction_id: String,
+    pub input_amount_dollarydoos: u64,
+    pub output_amount_dollarydoos: u64,
+    pub fee_dollarydoos: u64,
+    pub maximum_fee_dollarydoos: u64,
+    pub expires_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileDenuoHnsSettlementReceipt {
+    pub session_id: String,
+    pub action: MobileDenuoSettlementAction,
     pub transaction_id: String,
     pub accepted_at_unix: u64,
 }
@@ -1012,6 +1046,7 @@ impl MobileWalletController {
             account_config,
             pending: None,
             pending_denuo_hns_funding: None,
+            pending_denuo_hns_settlement: None,
             known_names: Vec::new(),
         };
         controller.session.negotiate_value(require_shakedex)?;
@@ -1467,6 +1502,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         self.known_names.clear();
         let discard = self.discard_pending_action();
         let discard_denuo = self.discard_pending_denuo_hns_funding();
+        let discard_settlement = self.discard_pending_denuo_hns_settlement();
         let lock = match self.session.wallet_request(WalletRequest::Lock) {
             Ok(WalletResponse::Locked) => Ok(()),
             Ok(_) => Err(MobileWalletError::UnexpectedResponse),
@@ -1474,6 +1510,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         };
         discard?;
         discard_denuo?;
+        discard_settlement?;
         lock
     }
 
@@ -1825,7 +1862,10 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         permit: MobileDenuoHnsFundingPermit,
         maximum_fee_dollarydoos: u64,
     ) -> Result<MobileDenuoHnsFundingApproval, MobileWalletError> {
-        if self.pending.is_some() || self.pending_denuo_hns_funding.is_some() {
+        if self.pending.is_some()
+            || self.pending_denuo_hns_funding.is_some()
+            || self.pending_denuo_hns_settlement.is_some()
+        {
             return Err(MobileWalletError::ValueActionPending);
         }
         if maximum_fee_dollarydoos == 0
@@ -1891,6 +1931,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .take()
             .ok_or(MobileWalletError::NoPendingValueAction)?;
         if !mobile_action_token_matches(&pending.action_token, action_token) {
+            self.pending_denuo_hns_funding = Some(pending);
             return Err(MobileWalletError::InvalidActionToken);
         }
         if pending.prepared.0.fee > pending.maximum_fee {
@@ -1917,11 +1958,165 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .take()
             .ok_or(MobileWalletError::NoPendingValueAction)?;
         if !mobile_action_token_matches(&pending.action_token, action_token) {
+            self.pending_denuo_hns_funding = Some(pending);
             return Err(MobileWalletError::InvalidActionToken);
         }
         self.session
             .service
             .cancel_trusted_native_hns_settlement(&pending.prepared.0)
+            .map_err(mobile_service_failure)
+    }
+
+    pub fn prepare_denuo_hns_settlement(
+        &mut self,
+        mut permit: MobileDenuoHnsSettlementPermit,
+        maximum_fee_dollarydoos: u64,
+    ) -> Result<MobileDenuoHnsSettlementApproval, MobileWalletError> {
+        if self.pending.is_some()
+            || self.pending_denuo_hns_funding.is_some()
+            || self.pending_denuo_hns_settlement.is_some()
+        {
+            return Err(MobileWalletError::ValueActionPending);
+        }
+        if maximum_fee_dollarydoos == 0 || maximum_fee_dollarydoos > permit.fee_reserve() {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
+        let hello = permit.hello().clone();
+        let binding = hello
+            .build_hns_htlc(
+                hns_marketplace_protocol::SwapAssetSide::Received,
+                hello.maker_settlement_public_key,
+                hello.taker_settlement_public_key,
+            )
+            .map_err(|_| MobileWalletError::InvalidValueAction)?;
+        if binding.descriptor_hash != hello.received_lock_commitment {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
+        let expected_key = match permit.action() {
+            MobileDenuoSettlementAction::Redeem => binding.descriptor.receiver_public_key,
+            MobileDenuoSettlementAction::Refund => binding.descriptor.refund_public_key,
+        };
+        if expected_key != permit.settlement_key().public_key() {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
+        let session_id = hns_wallet_types::SessionId::new(hello.swap_session_id);
+        let lock = self
+            .session
+            .service
+            .verify_trusted_native_persisted_hns_htlc_lock(
+                session_id,
+                binding.descriptor.clone(),
+                hello.received_minimum_confirmations,
+            )
+            .map_err(mobile_service_failure)?
+            .ok_or(MobileWalletError::InvalidValueAction)?;
+        let maximum_fee = BaseUnits::new(u128::from(maximum_fee_dollarydoos));
+        let action = permit.action();
+        let prepared = match action {
+            MobileDenuoSettlementAction::Redeem => self
+                .session
+                .service
+                .prepare_trusted_native_hns_htlc_redeem(
+                    session_id,
+                    binding.descriptor,
+                    lock,
+                    permit
+                        .take_preimage()
+                        .ok_or(MobileWalletError::InvalidValueAction)?,
+                    maximum_fee,
+                    permit.settlement_key(),
+                )
+                .map(|prepared| prepared.0),
+            MobileDenuoSettlementAction::Refund => self
+                .session
+                .service
+                .prepare_trusted_native_hns_htlc_refund(
+                    session_id,
+                    binding.descriptor,
+                    lock,
+                    maximum_fee,
+                    permit.settlement_key(),
+                )
+                .map(|prepared| prepared.0),
+        }
+        .map_err(mobile_service_failure)?;
+        let transaction_id = self
+            .session
+            .service
+            .trusted_native_hns_settlement_transaction_id(&prepared)
+            .map_err(mobile_service_failure)?;
+        let input_amount_dollarydoos = u64::try_from(hello.received_amount.get())
+            .map_err(|_| MobileWalletError::InvalidValueAction)?;
+        let fee_dollarydoos =
+            u64::try_from(prepared.fee.get()).map_err(|_| MobileWalletError::InvalidValueAction)?;
+        let output_amount_dollarydoos = input_amount_dollarydoos
+            .checked_sub(fee_dollarydoos)
+            .ok_or(MobileWalletError::InvalidValueAction)?;
+        let action_token = random_nonzero_bytes()?;
+        let approval = MobileDenuoHnsSettlementApproval {
+            action_token: lowercase_hex(&action_token),
+            session_id: lowercase_hex(session_id.as_bytes()),
+            action,
+            transaction_id: lowercase_hex(transaction_id.as_bytes()),
+            input_amount_dollarydoos,
+            output_amount_dollarydoos,
+            fee_dollarydoos,
+            maximum_fee_dollarydoos,
+            expires_at_unix: prepared.expires_at_unix,
+        };
+        self.pending_denuo_hns_settlement = Some(PendingMobileDenuoHnsSettlement {
+            action_token,
+            session_id,
+            action,
+            prepared,
+            maximum_fee,
+        });
+        Ok(approval)
+    }
+
+    pub fn approve_denuo_hns_settlement(
+        &mut self,
+        action_token: &str,
+    ) -> Result<MobileDenuoHnsSettlementReceipt, MobileWalletError> {
+        let pending = self
+            .pending_denuo_hns_settlement
+            .take()
+            .ok_or(MobileWalletError::NoPendingValueAction)?;
+        if !mobile_action_token_matches(&pending.action_token, action_token) {
+            self.pending_denuo_hns_settlement = Some(pending);
+            return Err(MobileWalletError::InvalidActionToken);
+        }
+        if pending.prepared.fee > pending.maximum_fee {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
+        let receipt = self
+            .session
+            .service
+            .broadcast_trusted_native_hns_settlement(&pending.prepared)
+            .map_err(mobile_service_failure)?;
+        Ok(MobileDenuoHnsSettlementReceipt {
+            session_id: lowercase_hex(pending.session_id.as_bytes()),
+            action: pending.action,
+            transaction_id: lowercase_hex(receipt.txid.as_bytes()),
+            accepted_at_unix: receipt.accepted_at_unix,
+        })
+    }
+
+    pub fn reject_denuo_hns_settlement(
+        &mut self,
+        action_token: &str,
+    ) -> Result<(), MobileWalletError> {
+        let pending = self
+            .pending_denuo_hns_settlement
+            .take()
+            .ok_or(MobileWalletError::NoPendingValueAction)?;
+        if !mobile_action_token_matches(&pending.action_token, action_token) {
+            self.pending_denuo_hns_settlement = Some(pending);
+            return Err(MobileWalletError::InvalidActionToken);
+        }
+        self.session
+            .service
+            .cancel_trusted_native_hns_settlement(&pending.prepared)
             .map_err(mobile_service_failure)
     }
 
@@ -2012,6 +2207,16 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         self.session
             .service
             .cancel_trusted_native_hns_settlement(&pending.prepared.0)
+            .map_err(mobile_service_failure)
+    }
+
+    fn discard_pending_denuo_hns_settlement(&mut self) -> Result<(), MobileWalletError> {
+        let Some(pending) = self.pending_denuo_hns_settlement.take() else {
+            return Ok(());
+        };
+        self.session
+            .service
+            .cancel_trusted_native_hns_settlement(&pending.prepared)
             .map_err(mobile_service_failure)
     }
 }

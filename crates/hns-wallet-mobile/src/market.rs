@@ -55,6 +55,65 @@ pub struct MobileDenuoHnsVerificationPermit {
     hello: SwapSessionHello,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MobileDenuoSettlementAction {
+    Redeem,
+    Refund,
+}
+
+pub struct MobileDenuoHnsSettlementPermit {
+    hello: SwapSessionHello,
+    settlement_key: hns_wallet_market::CrossChainSwapKey,
+    preimage: Option<hns_wallet_chain_api::Preimage>,
+    action: MobileDenuoSettlementAction,
+    fee_reserve: u64,
+}
+
+pub struct MobileDenuoBitcoinSettlementPermit {
+    hello: SwapSessionHello,
+    settlement_key: hns_wallet_market::CrossChainSwapKey,
+    preimage: Option<hns_wallet_chain_api::Preimage>,
+    action: MobileDenuoSettlementAction,
+    fee_reserve: u64,
+}
+
+impl MobileDenuoHnsSettlementPermit {
+    pub(crate) const fn hello(&self) -> &SwapSessionHello {
+        &self.hello
+    }
+    pub(crate) const fn settlement_key(&self) -> &hns_wallet_market::CrossChainSwapKey {
+        &self.settlement_key
+    }
+    pub(crate) fn take_preimage(&mut self) -> Option<hns_wallet_chain_api::Preimage> {
+        self.preimage.take()
+    }
+    pub(crate) const fn action(&self) -> MobileDenuoSettlementAction {
+        self.action
+    }
+    pub(crate) const fn fee_reserve(&self) -> u64 {
+        self.fee_reserve
+    }
+}
+
+impl MobileDenuoBitcoinSettlementPermit {
+    pub(crate) const fn hello(&self) -> &SwapSessionHello {
+        &self.hello
+    }
+    pub(crate) const fn settlement_key(&self) -> &hns_wallet_market::CrossChainSwapKey {
+        &self.settlement_key
+    }
+    pub(crate) fn take_preimage(&mut self) -> Option<hns_wallet_chain_api::Preimage> {
+        self.preimage.take()
+    }
+    pub(crate) const fn action(&self) -> MobileDenuoSettlementAction {
+        self.action
+    }
+    pub(crate) const fn fee_reserve(&self) -> u64 {
+        self.fee_reserve
+    }
+}
+
 impl MobileDenuoHnsVerificationPermit {
     pub(crate) const fn hello(&self) -> &SwapSessionHello {
         &self.hello
@@ -912,6 +971,202 @@ impl MobileDenuoSessionController {
                     hello,
                     settlement_key,
                     hns_fee_reserve_dollarydoos,
+                })
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    pub fn authorize_local_hns_redeem(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+    ) -> Result<MobileDenuoHnsSettlementPermit, MobileWalletError> {
+        let policy = self.policy;
+        let wallet_id = self.wallet_id;
+        self.store
+            .try_with_store(|store| {
+                let execution =
+                    hns_wallet_market::load_denuo_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                if execution.state != SwapState::BothFunded
+                    || execution.second_module != hns_wallet_types::ModuleId::Handshake
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
+                let record = load_denuo_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                let (key, _) = hns_wallet_market::derive_local_btc_for_hns_maker_key(
+                    store, &policy, wallet_id, session_id,
+                )?;
+                let preimage =
+                    hns_wallet_market::load_denuo_btc_for_hns_maker_preimage(store, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::InvalidEvidence)?;
+                let hns = hello
+                    .build_hns_htlc(
+                        SwapAssetSide::Received,
+                        hello.maker_settlement_public_key,
+                        hello.taker_settlement_public_key,
+                    )
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                if hns.descriptor.receiver_public_key != key.public_key()
+                    || hns.descriptor.hashlock
+                        != hns_swap::HnsHtlc::hash_preimage(preimage.expose_for_settlement())
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                }
+                Ok(MobileDenuoHnsSettlementPermit {
+                    hello,
+                    settlement_key: key,
+                    preimage: Some(preimage),
+                    action: MobileDenuoSettlementAction::Redeem,
+                    fee_reserve: u64::MAX,
+                })
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    pub fn authorize_local_hns_refund(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+    ) -> Result<MobileDenuoHnsSettlementPermit, MobileWalletError> {
+        let policy = self.policy;
+        let wallet_id = self.wallet_id;
+        self.store
+            .try_with_store(|store| {
+                let execution =
+                    hns_wallet_market::load_denuo_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                if execution.second_funding.is_none()
+                    || execution.second_module != hns_wallet_types::ModuleId::Handshake
+                    || !matches!(
+                        execution.state,
+                        SwapState::BothFunded
+                            | SwapState::FirstRedeemed
+                            | SwapState::SecretObserved
+                    )
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
+                let record = load_denuo_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                let (key, fee_reserve) = hns_wallet_market::derive_local_hns_for_btc_taker_key(
+                    store, &policy, wallet_id, session_id,
+                )?;
+                let hns = hello
+                    .build_hns_htlc(
+                        SwapAssetSide::Received,
+                        hello.maker_settlement_public_key,
+                        hello.taker_settlement_public_key,
+                    )
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                if hns.descriptor.refund_public_key != key.public_key() {
+                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                }
+                Ok(MobileDenuoHnsSettlementPermit {
+                    hello,
+                    settlement_key: key,
+                    preimage: None,
+                    action: MobileDenuoSettlementAction::Refund,
+                    fee_reserve,
+                })
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    pub fn authorize_local_bitcoin_redeem(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+    ) -> Result<MobileDenuoBitcoinSettlementPermit, MobileWalletError> {
+        let policy = self.policy;
+        let wallet_id = self.wallet_id;
+        self.store
+            .try_with_store(|store| {
+                let execution =
+                    hns_wallet_market::load_denuo_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                if execution.state != SwapState::SecretObserved
+                    || execution.first_module != hns_wallet_types::ModuleId::Bitcoin
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
+                let record = load_denuo_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                let (key, _) = hns_wallet_market::derive_local_hns_for_btc_taker_key(
+                    store, &policy, wallet_id, session_id,
+                )?;
+                let preimage =
+                    hns_wallet_market::load_locally_verified_denuo_preimage(store, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::InvalidEvidence)?;
+                let bitcoin = build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered)
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                if bitcoin.htlc.receiver_public_key != key.public_key()
+                    || bitcoin.htlc.hashlock
+                        != hns_swap::HnsHtlc::hash_preimage(preimage.expose_for_settlement())
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                }
+                Ok(MobileDenuoBitcoinSettlementPermit {
+                    hello,
+                    settlement_key: key,
+                    preimage: Some(preimage),
+                    action: MobileDenuoSettlementAction::Redeem,
+                    fee_reserve: u64::MAX,
+                })
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    pub fn authorize_local_bitcoin_refund(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+    ) -> Result<MobileDenuoBitcoinSettlementPermit, MobileWalletError> {
+        let policy = self.policy;
+        let wallet_id = self.wallet_id;
+        self.store
+            .try_with_store(|store| {
+                let execution =
+                    hns_wallet_market::load_denuo_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                if execution.first_funding.is_none()
+                    || execution.first_module != hns_wallet_types::ModuleId::Bitcoin
+                    || !matches!(
+                        execution.state,
+                        SwapState::FirstFunded
+                            | SwapState::SecondFundingPending
+                            | SwapState::BothFunded
+                            | SwapState::FirstRedeemed
+                            | SwapState::SecretObserved
+                    )
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
+                let record = load_denuo_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                let (key, fee_reserve) = hns_wallet_market::derive_local_btc_for_hns_maker_key(
+                    store, &policy, wallet_id, session_id,
+                )?;
+                let bitcoin = build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered)
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                if bitcoin.htlc.refund_public_key != key.public_key() {
+                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                }
+                Ok(MobileDenuoBitcoinSettlementPermit {
+                    hello,
+                    settlement_key: key,
+                    preimage: None,
+                    action: MobileDenuoSettlementAction::Refund,
+                    fee_reserve,
                 })
             })
             .map_err(MobileWalletError::from)

@@ -1074,6 +1074,60 @@ pub fn sign_bitcoin_htlc_spend_with_settlement_signer(
     finalize_signed_htlc_spend(transaction, request.branch, sighash, signature, &public_key)
 }
 
+/// Sign an HTLC spend at the wallet's validated minimum relay fee while
+/// enforcing the user's absolute fee ceiling. The exact DER signature can
+/// change transaction virtual size by a byte, so the quote is refined from
+/// the complete signed transaction until its paid fee covers that size.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the swap settlement boundary keeps the verified lock, destination, branch, secret, chain context, fee rate, user cap, and signer explicit"
+)]
+pub fn sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer(
+    lock: &VerifiedBitcoinLock,
+    permit: &BitcoinValueRuntimePermit,
+    destination: ScriptBuf,
+    branch: HtlcSpendBranch,
+    preimage: Option<[u8; 32]>,
+    chain_context: BitcoinChainLockContext,
+    fee_rate_sat_vb: u64,
+    maximum_fee_sats: u64,
+    signer: &dyn SettlementSigner,
+) -> Result<Vec<u8>, BitcoinWalletError> {
+    if fee_rate_sat_vb == 0 || maximum_fee_sats == 0 {
+        return Err(BitcoinWalletError::InvalidFee);
+    }
+    let mut fee_sats = 1_u64;
+    for _ in 0..8 {
+        let raw = sign_bitcoin_htlc_spend_with_settlement_signer(
+            lock,
+            permit,
+            BitcoinHtlcSpendRequest {
+                destination: destination.clone(),
+                fee_sats,
+                branch,
+                preimage,
+                chain_context,
+            },
+            signer,
+        )?;
+        let transaction: Transaction =
+            deserialize(&raw).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+        let virtual_bytes =
+            u64::try_from(transaction.vsize()).map_err(|_| BitcoinWalletError::InvalidFee)?;
+        let required_fee = fee_rate_sat_vb
+            .checked_mul(virtual_bytes)
+            .ok_or(BitcoinWalletError::InvalidFee)?;
+        if required_fee > maximum_fee_sats {
+            return Err(BitcoinWalletError::FeeLimit);
+        }
+        if fee_sats >= required_fee {
+            return Ok(raw);
+        }
+        fee_sats = required_fee;
+    }
+    Err(BitcoinWalletError::InvalidFee)
+}
+
 fn finalize_signed_htlc_spend(
     mut transaction: Transaction,
     branch: HtlcSpendBranch,
@@ -2136,6 +2190,39 @@ mod tests {
         )
         .expect("shared settlement signer spend");
         assert!(verify_signed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Redeem).is_ok());
+
+        let fee_rate_raw = sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer(
+            &lock,
+            &BitcoinValueRuntimePermit(()),
+            ScriptBuf::new_p2wpkh(&key(8).wpubkey_hash().expect("compressed destination")),
+            HtlcSpendBranch::Redeem,
+            Some(preimage),
+            chain_context(501),
+            2,
+            1_000,
+            &signer,
+        )
+        .expect("fee-rate settlement spend");
+        let transaction: Transaction = deserialize(&fee_rate_raw).expect("signed transaction");
+        let verified =
+            verify_signed_bitcoin_htlc_spend(&fee_rate_raw, &lock, HtlcSpendBranch::Redeem)
+                .expect("verified fee-rate settlement spend");
+        assert!(verified.fee_sats >= u64::try_from(transaction.vsize()).unwrap() * 2);
+        assert!(verified.fee_sats <= 1_000);
+        assert!(matches!(
+            sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer(
+                &lock,
+                &BitcoinValueRuntimePermit(()),
+                ScriptBuf::new_p2wpkh(&key(8).wpubkey_hash().expect("compressed destination")),
+                HtlcSpendBranch::Redeem,
+                Some(preimage),
+                chain_context(501),
+                10,
+                100,
+                &signer,
+            ),
+            Err(BitcoinWalletError::FeeLimit)
+        ));
     }
 
     #[test]
