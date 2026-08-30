@@ -23,6 +23,16 @@ The maker preimage is recovery-seed-derived and stored encrypted before the
 proposal is admitted. Bitcoin funds first, the HNS refund deadline is earlier,
 and the Bitcoin refund deadline includes an explicit bounded safety margin.
 
+Before that maker may prepare first-chain funding, the mobile boundary
+reconstructs both signed HTLC descriptors, proves that the advertised Bitcoin
+refund key belongs to the wallet, and durably advances through refund-validated
+and funding-ready checkpoints. An interrupted transition resumes from its last
+checkpoint. The Bitcoin controller registers the exact compact-filter watch
+before constructing funding, requires a separate approval of the actual txid
+and fee, persists the signed transaction before submission, and accepts only
+checkpoint-bound watch evidence—not a broadcast receipt or peer claim—as
+confirmed funding.
+
 A signed take binds a locally retained active offer to a unique session and a
 taker settlement key. The corresponding maker proposal and accepted session
 hello are stored separately. Funding, redeem, and refund status is peer

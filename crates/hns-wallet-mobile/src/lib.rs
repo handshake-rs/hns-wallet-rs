@@ -9,13 +9,14 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 pub use bitcoin::{
-    MobileBitcoinBroadcastReceipt, MobileBitcoinDirectConfig, MobileBitcoinSendApproval,
-    MobileBitcoinShutdownHandle, MobileBitcoinSnapshot, MobileBitcoinSyncProgress,
-    MobileBitcoinSyncProgressHandle, MobileBitcoinValueController,
+    MobileBitcoinBroadcastReceipt, MobileBitcoinDirectConfig, MobileBitcoinHtlcFundingApproval,
+    MobileBitcoinHtlcFundingReceipt, MobileBitcoinSendApproval, MobileBitcoinShutdownHandle,
+    MobileBitcoinSnapshot, MobileBitcoinSyncProgress, MobileBitcoinSyncProgressHandle,
+    MobileBitcoinValueController,
 };
 pub use market::{
-    MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDenuoDirectAdmission,
-    MobileDenuoDirectTransportReport, MobileDenuoSessionController,
+    MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDenuoBitcoinFundingPermit,
+    MobileDenuoDirectAdmission, MobileDenuoDirectTransportReport, MobileDenuoSessionController,
 };
 
 use hns_primitives::BlockHash as ProtocolBlockHash;

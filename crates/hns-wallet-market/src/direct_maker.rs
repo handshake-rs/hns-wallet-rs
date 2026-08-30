@@ -336,6 +336,40 @@ pub fn load_denuo_btc_for_hns_maker_preimage(
         .transpose()
 }
 
+#[doc(hidden)]
+pub fn derive_local_btc_for_hns_maker_key(
+    store: &WalletStore,
+    policy: &crate::DenuoDirectSwapPolicy,
+    wallet_id: WalletId,
+    session_id: SessionId,
+) -> Result<(crate::CrossChainSwapKey, u64), MarketError> {
+    let record = load_denuo_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+    let local = load_local_offer(store, wallet_id, record.offer.offer_id)?;
+    if local.session_id != session_id
+        || record.offer.swap_session_id != session_id.into_bytes()
+        || record.offer.offered_asset != AssetId::BTC
+        || record.offer.received_asset != AssetId::HNS
+    {
+        return Err(MarketError::DenuoDirectSwapConflict);
+    }
+    let key = derive_cross_chain_swap_key_from_store(
+        store,
+        CrossChainSwapKeyRequest {
+            wallet_id,
+            session_id,
+            participant: SwapParticipant::Maker,
+            network: policy.network(),
+            intent_id: local.intent_id,
+        },
+    )
+    .map_err(|_| MarketError::Persistence)?;
+    if key.public_key() != record.offer.maker_settlement_public_key {
+        return Err(MarketError::DenuoDirectSwapConflict);
+    }
+    Ok((key, local.bitcoin_fee_reserve_sats))
+}
+
 pub fn cancel_denuo_local_direct_offer(
     store: &mut WalletStore,
     policy: &DenuoDirectOfferBoardPolicy,
@@ -448,6 +482,58 @@ pub fn list_local_denuo_direct_offers(
         }
     }
     Ok(offers)
+}
+
+/// Sum Bitcoin still committed by local maker offers. Once a countersigned
+/// execution exists, its durable state—not board expiry—controls reservation:
+/// funds remain reserved through pending first funding and are released only
+/// after locally verified first-chain funding has consumed them (or the
+/// execution reaches a terminal state).
+pub fn reserved_local_denuo_btc_maker_sats(
+    store: &WalletStore,
+    policy: &crate::DenuoDirectSwapPolicy,
+    wallet_id: WalletId,
+    now_unix: u64,
+) -> Result<u64, MarketError> {
+    let stored = store.list_entities_by_id_prefix::<PersistedLocalDirectOffer>(
+        EntityKind::DenuoBoardObject,
+        &local_record_prefix(wallet_id),
+        crate::MAX_DENUO_DIRECT_OFFERS + 1,
+    )?;
+    if stored.len() > crate::MAX_DENUO_DIRECT_OFFERS {
+        return Err(MarketError::DenuoDirectOfferCapacity);
+    }
+    let mut total = 0_u64;
+    for stored in stored {
+        let local = load_local_offer(store, wallet_id, stored.value.offer_id.into_bytes())?;
+        let offer = crate::load_denuo_direct_offer(
+            store,
+            &policy.board_policy(),
+            local.offer_id.into_bytes(),
+        )?
+        .ok_or(MarketError::CorruptDenuoDirectOfferBoard)?;
+        let execution = store.load_workflow::<crate::SwapSession>(
+            crate::denuo_execution_workflow_id(local.session_id),
+        )?;
+        let reserve = match execution.map(|stored| stored.state.state) {
+            Some(
+                crate::SwapState::TermsFrozen
+                | crate::SwapState::RefundsPrepared
+                | crate::SwapState::FirstFundingPending,
+            ) => true,
+            Some(_) => false,
+            None => offer.is_active_at(now_unix),
+        };
+        if reserve {
+            let amount = u64::try_from(offer.offer.offered_amount.get())
+                .map_err(|_| MarketError::InvalidDenuoDirectOffer)?;
+            total = total
+                .checked_add(amount)
+                .and_then(|value| value.checked_add(local.bitcoin_fee_reserve_sats))
+                .ok_or(MarketError::InvalidDenuoDirectOffer)?;
+        }
+    }
+    Ok(total)
 }
 
 fn validate_maker_proposal_request(

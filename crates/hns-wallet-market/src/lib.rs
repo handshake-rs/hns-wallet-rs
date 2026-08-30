@@ -33,7 +33,8 @@ pub use direct_maker::{
     DenuoBtcForHnsMakerProposal, DenuoBtcForHnsMakerProposalRequest, DenuoBtcForHnsOfferRequest,
     DenuoLocalDirectOffer, cancel_denuo_local_direct_offer,
     create_denuo_btc_for_hns_maker_proposal, create_denuo_btc_for_hns_offer,
-    list_local_denuo_direct_offers, load_denuo_btc_for_hns_maker_preimage,
+    derive_local_btc_for_hns_maker_key, list_local_denuo_direct_offers,
+    load_denuo_btc_for_hns_maker_preimage, reserved_local_denuo_btc_maker_sats,
 };
 pub use direct_taker::{
     DenuoHnsForBtcTakeRequest, DenuoLocalDirectTake, DenuoTakerAcceptedSession,
