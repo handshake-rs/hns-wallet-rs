@@ -3681,9 +3681,17 @@ fn validate_unix_ancestor_chain(
     for (index, ancestor) in ancestors[..trusted_suffix].iter().enumerate() {
         if ancestor.mode & 0o022 != 0 {
             let sticky = ancestor.mode & 0o1000 != 0;
-            let trusted_child = ancestors
-                .get(index + 1)
-                .is_some_and(|child| child.uid == 0 || child.uid == process_uid);
+            let trusted_child = ancestors.get(index + 1).is_some_and(|child| {
+                child.uid == 0
+                    || child.uid == process_uid
+                    // Android 9 devices can expose `/` as a root-owned sticky
+                    // directory followed by the uid-1000-owned `/data`
+                    // platform boundary. Sticky ownership prevents an app
+                    // from replacing that existing system-owned child.
+                    || (policy == UnixAncestorPolicy::AndroidSystemUid1000
+                        && ancestor.uid == 0
+                        && child.uid == 1_000)
+            });
             let android_platform_group_write = policy == UnixAncestorPolicy::AndroidSystemUid1000
                 && ancestor.uid == 1_000
                 && ancestor.mode & 0o020 != 0
@@ -5009,6 +5017,27 @@ mod tests {
             Err(StoreError::UnsafeFilesystemBoundary)
         ));
         assert!(validate_unix_ancestor_chain(&android_app_data_chain, UID, ANDROID).is_ok());
+        let android_9_app_data_chain = [
+            sticky_root,
+            UnixBoundaryMetadata {
+                uid: 1_000,
+                mode: 0o771,
+                ino: 4,
+                ..root
+            },
+            UnixBoundaryMetadata {
+                uid: 1_000,
+                mode: 0o771,
+                ino: 6,
+                ..root
+            },
+            private,
+        ];
+        assert!(matches!(
+            validate_unix_ancestor_chain(&android_9_app_data_chain, UID, STRICT),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+        assert!(validate_unix_ancestor_chain(&android_9_app_data_chain, UID, ANDROID).is_ok());
         for unsafe_android_prefix in [
             UnixBoundaryMetadata {
                 uid: 1_001,

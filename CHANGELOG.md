@@ -3,6 +3,13 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## Unreleased
+
+- Accept the Android 9 app-sandbox ancestor layout where a root-owned sticky
+  `/` is followed by the Android system-owned `/data` boundary. The wallet
+  directory and database must still be owned by the application with exact
+  `0700` and `0600` modes, respectively.
+
 ## 0.2.0 - 2026-08-30
 
 <!-- hns-wallet-release-state: 0.2.0 release -->
