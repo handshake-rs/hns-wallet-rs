@@ -1,4 +1,4 @@
-//! Wallet-owned Denuo name-market replication over direct Handshake peers.
+//! Wallet-owned Shakescape name-market replication over direct Handshake peers.
 //!
 //! This module intentionally has no relay cursor, endpoint acceptance receipt,
 //! RPC call, or indexer dependency. A direct peer only carries canonical,
@@ -7,29 +7,30 @@
 //! is committed or later used for a trade.
 
 use hns_marketplace_protocol::{
-    DenuoRegistryVersion, MAX_DENUO_MARKET_PAYLOAD, MAX_NAME_OFFERS_PER_MESSAGE, NameMarketHello,
-    NameMarketMessage,
+    MAX_NAME_OFFERS_PER_MESSAGE, MAX_SHAKESCAPE_MARKET_PAYLOAD, NameMarketHello, NameMarketMessage,
+    ShakescapeRegistryVersion,
 };
 use hns_wallet_hns::{
-    HnsBackend, HnsClock, HnsDirectDenuoPeer, HnsDirectPeerError, HnsWalletError, HnsWalletRuntime,
+    HnsBackend, HnsClock, HnsDirectPeerError, HnsDirectShakescapePeer, HnsWalletError,
+    HnsWalletRuntime,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::ObjectHash;
 use thiserror::Error;
 
 use crate::{
-    DenuoBoardRuntime, DenuoHandoffPreparation, ShakedexError,
-    board_runtime::CurrentDenuoBoardOffersResolution, load_denuo_publication_outbox,
-    prepare_next_denuo_handoff, record_denuo_handoff_direct_announcement,
+    ShakedexError, ShakescapeBoardRuntime, ShakescapeHandoffPreparation,
+    board_runtime::CurrentShakescapeBoardOffersResolution, load_shakescape_publication_outbox,
+    prepare_next_shakescape_handoff, record_shakescape_handoff_direct_announcement,
 };
 
 /// Hard upper bound for one caller-driven direct board exchange. A caller can
 /// invoke another exchange later; no peer can make one UI action unbounded.
-pub const MAX_DIRECT_DENUO_MESSAGES_PER_SYNC: usize = 256;
+pub const MAX_DIRECT_SHAKESCAPE_MESSAGES_PER_SYNC: usize = 256;
 
-/// Effects of one direct Denuo board exchange.
+/// Effects of one direct Shakescape board exchange.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DirectDenuoBoardSyncReport {
+pub struct DirectShakescapeBoardSyncReport {
     pub messages_received: usize,
     pub messages_sent: usize,
     pub inventory_hashes_requested: usize,
@@ -40,38 +41,38 @@ pub struct DirectDenuoBoardSyncReport {
 
 /// Failure at the wallet-owned direct marketplace boundary.
 #[derive(Debug, Error)]
-pub enum WalletNativeDenuoTransportError {
+pub enum WalletNativeShakescapeTransportError {
     #[error(transparent)]
     DirectPeer(#[from] HnsDirectPeerError),
     #[error(transparent)]
     Wallet(#[from] HnsWalletError),
     #[error(transparent)]
     Board(#[from] ShakedexError),
-    #[error("the requested direct Denuo exchange message limit is invalid")]
+    #[error("the requested direct Shakescape exchange message limit is invalid")]
     InvalidMessageLimit,
-    #[error("direct Denuo transport produced an invalid canonical envelope")]
+    #[error("direct Shakescape transport produced an invalid canonical envelope")]
     InvalidEnvelope,
 }
 
-/// Same-store direct Denuo board replicator for one full HNS wallet runtime.
+/// Same-store direct Shakescape board replicator for one full HNS wallet runtime.
 ///
 /// The runtime owns all authority and persistence. This object owns neither a
 /// hidden relay account nor a second board database; the caller supplies an
-/// already negotiated [`HnsDirectDenuoPeer`] for the lifetime of one exchange.
-pub struct WalletNativeDenuoTransport<'a, B, C> {
+/// already negotiated [`HnsDirectShakescapePeer`] for the lifetime of one exchange.
+pub struct WalletNativeShakescapeTransport<'a, B, C> {
     hns: &'a HnsWalletRuntime<B, C>,
     store: SharedWalletStore,
-    board: DenuoBoardRuntime<'a, B, C>,
+    board: ShakescapeBoardRuntime<'a, B, C>,
 }
 
-impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
+impl<'a, B: HnsBackend, C: HnsClock> WalletNativeShakescapeTransport<'a, B, C> {
     pub fn new(
         hns: &'a HnsWalletRuntime<B, C>,
         store: SharedWalletStore,
-    ) -> Result<Self, WalletNativeDenuoTransportError> {
+    ) -> Result<Self, WalletNativeShakescapeTransportError> {
         Ok(Self {
             hns,
-            board: DenuoBoardRuntime::new_value(hns, store.clone())?,
+            board: ShakescapeBoardRuntime::new_value(hns, store.clone())?,
             store,
         })
     }
@@ -80,9 +81,9 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
     /// A peer never becomes authority by answering either request.
     pub fn begin(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
-    ) -> Result<DirectDenuoBoardSyncReport, WalletNativeDenuoTransportError> {
-        let mut report = DirectDenuoBoardSyncReport::default();
+        peer: &mut HnsDirectShakescapePeer,
+    ) -> Result<DirectShakescapeBoardSyncReport, WalletNativeShakescapeTransportError> {
+        let mut report = DirectShakescapeBoardSyncReport::default();
         peer.send_name_market(&NameMarketMessage::Hello(self.market_hello()?))?;
         report.messages_sent = report.messages_sent.saturating_add(1);
         peer.send_name_market(&NameMarketMessage::GetOfferInventory)?;
@@ -97,33 +98,33 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
     /// outcome records only this wallet's write; it is not peer acceptance.
     pub fn announce_next_local_publication(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
-    ) -> Result<Option<ObjectHash>, WalletNativeDenuoTransportError> {
+        peer: &mut HnsDirectShakescapePeer,
+    ) -> Result<Option<ObjectHash>, WalletNativeShakescapeTransportError> {
         let now_unix = self.hns.trusted_now_unix()?;
         let revision = self
             .store
-            .try_with_store(load_denuo_publication_outbox)?
+            .try_with_store(load_shakescape_publication_outbox)?
             .revision;
-        let preparation = self
-            .store
-            .try_with_store_mut(|store| prepare_next_denuo_handoff(store, revision, now_unix))?;
+        let preparation = self.store.try_with_store_mut(|store| {
+            prepare_next_shakescape_handoff(store, revision, now_unix)
+        })?;
         let handoff = match preparation {
-            DenuoHandoffPreparation::NoDue { .. } => return Ok(None),
-            DenuoHandoffPreparation::Prepared(handoff)
-            | DenuoHandoffPreparation::Existing(handoff) => handoff,
+            ShakescapeHandoffPreparation::NoDue { .. } => return Ok(None),
+            ShakescapeHandoffPreparation::Prepared(handoff)
+            | ShakescapeHandoffPreparation::Existing(handoff) => handoff,
         };
         let (registry, request_id, message) =
             NameMarketMessage::decode_envelope(handoff.envelope_bytes())
-                .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?;
-        if registry != DenuoRegistryVersion::V2 || request_id != handoff.request_id() {
-            return Err(WalletNativeDenuoTransportError::InvalidEnvelope);
+                .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?;
+        if registry != ShakescapeRegistryVersion::V1 || request_id != handoff.request_id() {
+            return Err(WalletNativeShakescapeTransportError::InvalidEnvelope);
         }
         match &message {
             NameMarketMessage::Offer(listing) => {
                 let hash = ObjectHash::new(
                     listing
                         .listing_hash()
-                        .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?,
+                        .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?,
                 );
                 self.board.admit_offer(handoff.envelope_bytes(), hash)?;
             }
@@ -132,7 +133,7 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
                 let cancellation_hash = ObjectHash::new(
                     cancellation
                         .cancellation_hash()
-                        .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?,
+                        .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?,
                 );
                 self.board.admit_cancellation(
                     handoff.envelope_bytes(),
@@ -140,11 +141,11 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
                     cancellation_hash,
                 )?;
             }
-            _ => return Err(WalletNativeDenuoTransportError::InvalidEnvelope),
+            _ => return Err(WalletNativeShakescapeTransportError::InvalidEnvelope),
         }
         peer.send_name_market_with_request_id(request_id, &message)?;
         let announced = self.store.try_with_store_mut(|store| {
-            record_denuo_handoff_direct_announcement(store, &handoff, now_unix)
+            record_shakescape_handoff_direct_announcement(store, &handoff, now_unix)
         })?;
         Ok(Some(announced.envelope_id()))
     }
@@ -154,14 +155,14 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
     /// authority transitions and mobile lifecycle surprises.
     pub fn synchronize(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         now_unix: u64,
         message_limit: usize,
-    ) -> Result<DirectDenuoBoardSyncReport, WalletNativeDenuoTransportError> {
-        if message_limit == 0 || message_limit > MAX_DIRECT_DENUO_MESSAGES_PER_SYNC {
-            return Err(WalletNativeDenuoTransportError::InvalidMessageLimit);
+    ) -> Result<DirectShakescapeBoardSyncReport, WalletNativeShakescapeTransportError> {
+        if message_limit == 0 || message_limit > MAX_DIRECT_SHAKESCAPE_MESSAGES_PER_SYNC {
+            return Err(WalletNativeShakescapeTransportError::InvalidMessageLimit);
         }
-        let mut report = DirectDenuoBoardSyncReport::default();
+        let mut report = DirectShakescapeBoardSyncReport::default();
         for _ in 0..message_limit {
             let (request_id, message) = peer.receive_name_market(now_unix)?;
             merge_report(
@@ -173,17 +174,17 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
     }
 
     /// Process one already-demultiplexed canonical name-market message. This
-    /// lets a mobile peer service name offers alongside direct HNS/BTC Denuo
+    /// lets a mobile peer service name offers alongside direct HNS/BTC Shakescape
     /// traffic without a packet for one protocol being consumed by the other.
     pub fn handle_received_message(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         request_id: u64,
         message: NameMarketMessage,
-    ) -> Result<DirectDenuoBoardSyncReport, WalletNativeDenuoTransportError> {
-        let mut report = DirectDenuoBoardSyncReport {
+    ) -> Result<DirectShakescapeBoardSyncReport, WalletNativeShakescapeTransportError> {
+        let mut report = DirectShakescapeBoardSyncReport {
             messages_received: 1,
-            ..DirectDenuoBoardSyncReport::default()
+            ..DirectShakescapeBoardSyncReport::default()
         };
         self.handle_message(peer, request_id, message, &mut report)?;
         Ok(report)
@@ -191,11 +192,11 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
 
     fn handle_message(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         request_id: u64,
         message: NameMarketMessage,
-        report: &mut DirectDenuoBoardSyncReport,
-    ) -> Result<(), WalletNativeDenuoTransportError> {
+        report: &mut DirectShakescapeBoardSyncReport,
+    ) -> Result<(), WalletNativeShakescapeTransportError> {
         match message {
             NameMarketMessage::Hello(_) => {
                 peer.send_name_market_with_request_id(
@@ -235,11 +236,11 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
                     let listing_hash = ObjectHash::new(
                         listing
                             .listing_hash()
-                            .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?,
+                            .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?,
                     );
                     let envelope = NameMarketMessage::Offer(listing)
-                        .encode_envelope(DenuoRegistryVersion::V2, request_id)
-                        .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?;
+                        .encode_envelope(ShakescapeRegistryVersion::V1, request_id)
+                        .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?;
                     self.admit_offer(&envelope, listing_hash, report)?;
                 }
             }
@@ -259,11 +260,11 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
                 let listing_hash = ObjectHash::new(
                     listing
                         .listing_hash()
-                        .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?,
+                        .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?,
                 );
                 let envelope = NameMarketMessage::Offer(listing)
-                    .encode_envelope(DenuoRegistryVersion::V2, request_id)
-                    .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?;
+                    .encode_envelope(ShakescapeRegistryVersion::V1, request_id)
+                    .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?;
                 self.admit_offer(&envelope, listing_hash, report)?;
             }
             NameMarketMessage::Cancel(cancellation) => {
@@ -271,11 +272,11 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
                 let cancellation_hash = ObjectHash::new(
                     cancellation
                         .cancellation_hash()
-                        .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?,
+                        .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?,
                 );
                 let envelope = NameMarketMessage::Cancel(cancellation)
-                    .encode_envelope(DenuoRegistryVersion::V2, request_id)
-                    .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?;
+                    .encode_envelope(ShakescapeRegistryVersion::V1, request_id)
+                    .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?;
                 match self
                     .board
                     .admit_cancellation(&envelope, listing_hash, cancellation_hash)
@@ -297,13 +298,13 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
 
     fn reply_offers(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         request_id: u64,
         hashes: Vec<[u8; 32]>,
-        report: &mut DirectDenuoBoardSyncReport,
-    ) -> Result<(), WalletNativeDenuoTransportError> {
+        report: &mut DirectShakescapeBoardSyncReport,
+    ) -> Result<(), WalletNativeShakescapeTransportError> {
         let hashes = hashes.into_iter().map(ObjectHash::new).collect::<Vec<_>>();
-        let CurrentDenuoBoardOffersResolution::Current(current) =
+        let CurrentShakescapeBoardOffersResolution::Current(current) =
             self.board.current_offers(&hashes)?
         else {
             return Ok(());
@@ -326,8 +327,8 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
         &self,
         envelope: &[u8],
         listing_hash: ObjectHash,
-        report: &mut DirectDenuoBoardSyncReport,
-    ) -> Result<(), WalletNativeDenuoTransportError> {
+        report: &mut DirectShakescapeBoardSyncReport,
+    ) -> Result<(), WalletNativeShakescapeTransportError> {
         match self.board.admit_offer(envelope, listing_hash) {
             Ok(_) => report.offers_admitted = report.offers_admitted.saturating_add(1),
             Err(error) if rejected_marketplace_record(&error) => {
@@ -339,19 +340,19 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeDenuoTransport<'a, B, C> {
         Ok(())
     }
 
-    fn market_hello(&self) -> Result<NameMarketHello, WalletNativeDenuoTransportError> {
+    fn market_hello(&self) -> Result<NameMarketHello, WalletNativeShakescapeTransportError> {
         let network = self.hns.shakedex_network()?;
         Ok(NameMarketHello {
             hns_magic: network.magic,
             hns_genesis: network.genesis,
-            maximum_payload: u32::try_from(MAX_DENUO_MARKET_PAYLOAD)
-                .map_err(|_| WalletNativeDenuoTransportError::InvalidEnvelope)?,
+            maximum_payload: u32::try_from(MAX_SHAKESCAPE_MARKET_PAYLOAD)
+                .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?,
             feature_flags: 0,
         })
     }
 }
 
-fn merge_report(into: &mut DirectDenuoBoardSyncReport, next: DirectDenuoBoardSyncReport) {
+fn merge_report(into: &mut DirectShakescapeBoardSyncReport, next: DirectShakescapeBoardSyncReport) {
     into.messages_received = into
         .messages_received
         .saturating_add(next.messages_received);
@@ -374,8 +375,8 @@ fn rejected_marketplace_record(error: &ShakedexError) -> bool {
         ShakedexError::InvalidListing
             | ShakedexError::InvalidCancellation
             | ShakedexError::InvalidEvidence
-            | ShakedexError::InvalidDenuoEnvelope
-            | ShakedexError::DenuoRegistryMismatch
+            | ShakedexError::InvalidShakescapeEnvelope
+            | ShakedexError::ShakescapeRegistryMismatch
             | ShakedexError::NameMarketReplay
     )
 }

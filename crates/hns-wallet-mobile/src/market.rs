@@ -1,19 +1,20 @@
-//! Persisted direct Denuo HNS/BTC session admission for installed wallets.
+//! Persisted direct Shakescape HNS/BTC session admission for installed wallets.
 
 use hns_marketplace_protocol::{CrossChainMessage, SwapAssetSide, SwapSessionHello};
-use hns_wallet_bitcoin_kyoto::build_denuo_bitcoin_htlc;
-use hns_wallet_hns::HnsDirectDenuoPeer;
+use hns_wallet_bitcoin_kyoto::build_shakescape_bitcoin_htlc;
+use hns_wallet_hns::HnsDirectShakescapePeer;
 use hns_wallet_market::{
-    DenuoBtcForHnsOfferRequest, DenuoDirectOfferAdmission, DenuoDirectOfferCancellationAdmission,
-    DenuoDirectSwapAdmission, DenuoDirectSwapPolicy, DenuoLocalDirectOffer, SwapState,
-    VerifiedEvidence, WalletStoreJournal, admit_denuo_direct_offer,
-    admit_denuo_direct_offer_cancellation, admit_denuo_direct_offer_take,
-    admit_denuo_direct_swap_hello, admit_denuo_direct_swap_proposal,
-    admit_denuo_direct_swap_watch_ready, cancel_denuo_local_direct_offer,
-    create_denuo_btc_for_hns_offer, denuo_direct_offer_inventory, denuo_execution_workflow_id,
-    list_denuo_executions, list_local_denuo_direct_offers, list_local_denuo_direct_takes,
-    load_denuo_direct_offer, load_denuo_direct_swap, open_denuo_execution,
-    validate_denuo_direct_swap_peer_status,
+    ShakescapeBtcForHnsOfferRequest, ShakescapeDirectOfferAdmission,
+    ShakescapeDirectOfferCancellationAdmission, ShakescapeDirectSwapAdmission,
+    ShakescapeDirectSwapPolicy, ShakescapeLocalDirectOffer, SwapState, VerifiedEvidence,
+    WalletStoreJournal, admit_shakescape_direct_offer, admit_shakescape_direct_offer_cancellation,
+    admit_shakescape_direct_offer_take, admit_shakescape_direct_swap_hello,
+    admit_shakescape_direct_swap_proposal, admit_shakescape_direct_swap_watch_ready,
+    cancel_shakescape_local_direct_offer, create_shakescape_btc_for_hns_offer,
+    list_local_shakescape_direct_offers, list_local_shakescape_direct_takes,
+    list_shakescape_executions, load_shakescape_direct_offer, load_shakescape_direct_swap,
+    open_shakescape_execution, shakescape_direct_offer_inventory, shakescape_execution_workflow_id,
+    validate_shakescape_direct_swap_peer_status,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::WalletId;
@@ -21,64 +22,64 @@ use serde::{Deserialize, Serialize};
 
 use crate::MobileWalletError;
 
-/// One wallet-owned bridge from a direct Denuo packet to the existing durable
+/// One wallet-owned bridge from a direct Shakescape packet to the existing durable
 /// HNS/BTC handshake journal. It exposes neither generic message execution
 /// nor a signing authority; HTLC operations stay behind their chain-specific
 /// controllers and explicit native approvals.
-pub struct MobileDenuoSessionController {
+pub struct MobileShakescapeSessionController {
     store: SharedWalletStore,
-    policy: DenuoDirectSwapPolicy,
+    policy: ShakescapeDirectSwapPolicy,
     wallet_id: WalletId,
     pending_offer: Option<PendingBtcForHnsOffer>,
 }
 
-/// Rust-only authority passed from the accepted Denuo session controller to
+/// Rust-only authority passed from the accepted Shakescape session controller to
 /// the Bitcoin controller. Its fields remain private so Kotlin/Swift cannot
 /// replace signed terms, the session identifier, or the reserved fee cap.
-pub struct MobileDenuoBitcoinFundingPermit {
+pub struct MobileShakescapeBitcoinFundingPermit {
     hello: SwapSessionHello,
     bitcoin_fee_reserve_sats: u64,
 }
 
-pub struct MobileDenuoHnsFundingPermit {
+pub struct MobileShakescapeHnsFundingPermit {
     hello: SwapSessionHello,
     settlement_key: hns_wallet_market::CrossChainSwapKey,
     hns_fee_reserve_dollarydoos: u64,
 }
 
-pub struct MobileDenuoBitcoinWatchPermit {
+pub struct MobileShakescapeBitcoinWatchPermit {
     hello: SwapSessionHello,
     settlement_key: hns_wallet_market::CrossChainSwapKey,
 }
 
-pub struct MobileDenuoHnsVerificationPermit {
+pub struct MobileShakescapeHnsVerificationPermit {
     hello: SwapSessionHello,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum MobileDenuoSettlementAction {
+pub enum MobileShakescapeSettlementAction {
     Redeem,
     Refund,
 }
 
-pub struct MobileDenuoHnsSettlementPermit {
+pub struct MobileShakescapeHnsSettlementPermit {
     hello: SwapSessionHello,
     settlement_key: hns_wallet_market::CrossChainSwapKey,
     preimage: Option<hns_wallet_chain_api::Preimage>,
-    action: MobileDenuoSettlementAction,
+    action: MobileShakescapeSettlementAction,
     fee_reserve: u64,
 }
 
-pub struct MobileDenuoBitcoinSettlementPermit {
+pub struct MobileShakescapeBitcoinSettlementPermit {
     hello: SwapSessionHello,
     settlement_key: hns_wallet_market::CrossChainSwapKey,
     preimage: Option<hns_wallet_chain_api::Preimage>,
-    action: MobileDenuoSettlementAction,
+    action: MobileShakescapeSettlementAction,
     fee_reserve: u64,
 }
 
-impl MobileDenuoHnsSettlementPermit {
+impl MobileShakescapeHnsSettlementPermit {
     pub(crate) const fn hello(&self) -> &SwapSessionHello {
         &self.hello
     }
@@ -88,7 +89,7 @@ impl MobileDenuoHnsSettlementPermit {
     pub(crate) fn take_preimage(&mut self) -> Option<hns_wallet_chain_api::Preimage> {
         self.preimage.take()
     }
-    pub(crate) const fn action(&self) -> MobileDenuoSettlementAction {
+    pub(crate) const fn action(&self) -> MobileShakescapeSettlementAction {
         self.action
     }
     pub(crate) const fn fee_reserve(&self) -> u64 {
@@ -96,7 +97,7 @@ impl MobileDenuoHnsSettlementPermit {
     }
 }
 
-impl MobileDenuoBitcoinSettlementPermit {
+impl MobileShakescapeBitcoinSettlementPermit {
     pub(crate) const fn hello(&self) -> &SwapSessionHello {
         &self.hello
     }
@@ -106,7 +107,7 @@ impl MobileDenuoBitcoinSettlementPermit {
     pub(crate) fn take_preimage(&mut self) -> Option<hns_wallet_chain_api::Preimage> {
         self.preimage.take()
     }
-    pub(crate) const fn action(&self) -> MobileDenuoSettlementAction {
+    pub(crate) const fn action(&self) -> MobileShakescapeSettlementAction {
         self.action
     }
     pub(crate) const fn fee_reserve(&self) -> u64 {
@@ -114,7 +115,7 @@ impl MobileDenuoBitcoinSettlementPermit {
     }
 }
 
-impl MobileDenuoHnsVerificationPermit {
+impl MobileShakescapeHnsVerificationPermit {
     pub(crate) const fn hello(&self) -> &SwapSessionHello {
         &self.hello
     }
@@ -124,13 +125,13 @@ impl MobileDenuoHnsVerificationPermit {
     }
 }
 
-impl MobileDenuoBitcoinWatchPermit {
+impl MobileShakescapeBitcoinWatchPermit {
     pub(crate) const fn hello(&self) -> &SwapSessionHello {
         &self.hello
     }
 }
 
-impl MobileDenuoHnsFundingPermit {
+impl MobileShakescapeHnsFundingPermit {
     pub(crate) const fn hello(&self) -> &SwapSessionHello {
         &self.hello
     }
@@ -144,7 +145,7 @@ impl MobileDenuoHnsFundingPermit {
     }
 }
 
-impl MobileDenuoBitcoinFundingPermit {
+impl MobileShakescapeBitcoinFundingPermit {
     pub(crate) const fn hello(&self) -> &SwapSessionHello {
         &self.hello
     }
@@ -199,7 +200,7 @@ pub struct MobileBtcForHnsOfferSummary {
 /// private key material; chain actions remain behind explicit approvals.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct MobileDenuoExecutionSummary {
+pub struct MobileShakescapeExecutionSummary {
     pub session_id: String,
     pub revision: u64,
     pub state: SwapState,
@@ -223,26 +224,26 @@ pub struct MobileDenuoExecutionSummary {
 /// One locally admitted direct-board or direct-session event. The native
 /// controller intentionally exposes no oracle-derived pricing result.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MobileDenuoDirectAdmission {
-    Offer(DenuoDirectOfferAdmission),
-    OfferCancellation(DenuoDirectOfferCancellationAdmission),
-    Swap(DenuoDirectSwapAdmission),
+pub enum MobileShakescapeDirectAdmission {
+    Offer(ShakescapeDirectOfferAdmission),
+    OfferCancellation(ShakescapeDirectOfferCancellationAdmission),
+    Swap(ShakescapeDirectSwapAdmission),
 }
 
-/// Bounded effects of one direct HNS/BTC Denuo transport event. Discovery
+/// Bounded effects of one direct HNS/BTC Shakescape transport event. Discovery
 /// traffic has no settlement authority; `admission` is populated only after a
 /// signed offer or session message passes the durable local checks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MobileDenuoDirectTransportReport {
+pub struct MobileShakescapeDirectTransportReport {
     pub messages_received: usize,
     pub messages_sent: usize,
-    pub admission: Option<MobileDenuoDirectAdmission>,
+    pub admission: Option<MobileShakescapeDirectAdmission>,
 }
 
-impl MobileDenuoSessionController {
+impl MobileShakescapeSessionController {
     pub fn new(
         store: SharedWalletStore,
-        policy: DenuoDirectSwapPolicy,
+        policy: ShakescapeDirectSwapPolicy,
         wallet_id: WalletId,
     ) -> Self {
         Self {
@@ -334,10 +335,10 @@ impl MobileDenuoSessionController {
         let created = self
             .store
             .try_with_store_mut(|store| {
-                create_denuo_btc_for_hns_offer(
+                create_shakescape_btc_for_hns_offer(
                     store,
                     &self.policy.board_policy(),
-                    DenuoBtcForHnsOfferRequest {
+                    ShakescapeBtcForHnsOfferRequest {
                         wallet_id: self.wallet_id,
                         btc_amount_sats: pending.btc_amount_sats,
                         hns_amount_dollarydoos: pending.hns_amount_dollarydoos,
@@ -372,7 +373,7 @@ impl MobileDenuoSessionController {
     ) -> Result<Vec<MobileBtcForHnsOfferSummary>, MobileWalletError> {
         self.store
             .try_with_store(|store| {
-                list_local_denuo_direct_offers(
+                list_local_shakescape_direct_offers(
                     store,
                     &self.policy.board_policy(),
                     self.wallet_id,
@@ -388,7 +389,7 @@ impl MobileDenuoSessionController {
     pub fn reserved_bitcoin_sats(&self, now_unix: u64) -> Result<u64, MobileWalletError> {
         self.store
             .try_with_store(|store| {
-                hns_wallet_market::reserved_local_denuo_btc_maker_sats(
+                hns_wallet_market::reserved_local_shakescape_btc_maker_sats(
                     store,
                     &self.policy,
                     self.wallet_id,
@@ -400,9 +401,9 @@ impl MobileDenuoSessionController {
 
     pub fn durable_executions(
         &self,
-    ) -> Result<Vec<MobileDenuoExecutionSummary>, MobileWalletError> {
+    ) -> Result<Vec<MobileShakescapeExecutionSummary>, MobileWalletError> {
         self.store
-            .try_with_store(|store| list_denuo_executions(store, &self.policy))
+            .try_with_store(|store| list_shakescape_executions(store, &self.policy))
             .map_err(MobileWalletError::from)?
             .into_iter()
             .map(execution_summary)
@@ -417,7 +418,7 @@ impl MobileDenuoSessionController {
         &self,
     ) -> Result<Vec<hns_wallet_types::SessionId>, MobileWalletError> {
         self.store
-            .try_with_store(|store| list_denuo_executions(store, &self.policy))
+            .try_with_store(|store| list_shakescape_executions(store, &self.policy))
             .map_err(MobileWalletError::from)
             .map(|sessions| {
                 sessions
@@ -437,18 +438,21 @@ impl MobileDenuoSessionController {
     pub fn next_counterparty_bitcoin_watch(
         &mut self,
         now_unix: u64,
-    ) -> Result<Option<MobileDenuoBitcoinWatchPermit>, MobileWalletError> {
+    ) -> Result<Option<MobileShakescapeBitcoinWatchPermit>, MobileWalletError> {
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         let candidates = self
             .store
             .try_with_store(|store| {
-                let takes = list_local_denuo_direct_takes(store, &policy, wallet_id)?;
+                let takes = list_local_shakescape_direct_takes(store, &policy, wallet_id)?;
                 let mut sessions = Vec::new();
                 for take in takes {
-                    let record = load_denuo_direct_swap(store, &policy, take.session_id)?;
-                    let execution =
-                        hns_wallet_market::load_denuo_execution(store, &policy, take.session_id)?;
+                    let record = load_shakescape_direct_swap(store, &policy, take.session_id)?;
+                    let execution = hns_wallet_market::load_shakescape_execution(
+                        store,
+                        &policy,
+                        take.session_id,
+                    )?;
                     if record.is_some_and(|record| {
                         record.hello.is_some() && record.first_chain_watch_ready.is_none()
                     }) && execution.is_some_and(|execution| {
@@ -473,21 +477,21 @@ impl MobileDenuoSessionController {
 
     pub fn pending_second_hns_funding_verifications(
         &self,
-    ) -> Result<Vec<MobileDenuoHnsVerificationPermit>, MobileWalletError> {
+    ) -> Result<Vec<MobileShakescapeHnsVerificationPermit>, MobileWalletError> {
         let policy = self.policy;
         self.store
             .try_with_store(|store| {
-                list_denuo_executions(store, &policy)?
+                list_shakescape_executions(store, &policy)?
                     .into_iter()
                     .filter(|session| {
                         session.state == SwapState::SecondFundingPending
                             && session.second_module == hns_wallet_types::ModuleId::Handshake
                     })
                     .map(|session| {
-                        load_denuo_direct_swap(store, &policy, session.id)?
+                        load_shakescape_direct_swap(store, &policy, session.id)?
                             .and_then(|record| record.hello)
-                            .map(|hello| MobileDenuoHnsVerificationPermit { hello })
-                            .ok_or(hns_wallet_market::MarketError::CorruptDenuoDirectSwap)
+                            .map(|hello| MobileShakescapeHnsVerificationPermit { hello })
+                            .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -496,11 +500,11 @@ impl MobileDenuoSessionController {
 
     pub fn pending_hns_spend_verifications(
         &self,
-    ) -> Result<Vec<MobileDenuoHnsVerificationPermit>, MobileWalletError> {
+    ) -> Result<Vec<MobileShakescapeHnsVerificationPermit>, MobileWalletError> {
         let policy = self.policy;
         self.store
             .try_with_store(|store| {
-                list_denuo_executions(store, &policy)?
+                list_shakescape_executions(store, &policy)?
                     .into_iter()
                     .filter(|session| {
                         session.second_module == hns_wallet_types::ModuleId::Handshake
@@ -514,10 +518,10 @@ impl MobileDenuoSessionController {
                             )
                     })
                     .map(|session| {
-                        load_denuo_direct_swap(store, &policy, session.id)?
+                        load_shakescape_direct_swap(store, &policy, session.id)?
                             .and_then(|record| record.hello)
-                            .map(|hello| MobileDenuoHnsVerificationPermit { hello })
-                            .ok_or(hns_wallet_market::MarketError::CorruptDenuoDirectSwap)
+                            .map(|hello| MobileShakescapeHnsVerificationPermit { hello })
+                            .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -528,7 +532,7 @@ impl MobileDenuoSessionController {
         &self,
     ) -> Result<Vec<hns_wallet_types::SessionId>, MobileWalletError> {
         self.store
-            .try_with_store(|store| list_denuo_executions(store, &self.policy))
+            .try_with_store(|store| list_shakescape_executions(store, &self.policy))
             .map_err(MobileWalletError::from)
             .map(|sessions| {
                 sessions
@@ -555,7 +559,7 @@ impl MobileDenuoSessionController {
         let offer_id = decode_offer_id(offer_id)?;
         self.store
             .try_with_store_mut(|store| {
-                cancel_denuo_local_direct_offer(
+                cancel_shakescape_local_direct_offer(
                     store,
                     &self.policy.board_policy(),
                     self.wallet_id,
@@ -576,26 +580,26 @@ impl MobileDenuoSessionController {
         &mut self,
         session_id: hns_wallet_types::SessionId,
         now_unix: u64,
-    ) -> Result<MobileDenuoBitcoinFundingPermit, MobileWalletError> {
+    ) -> Result<MobileShakescapeBitcoinFundingPermit, MobileWalletError> {
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         self.store
             .try_with_store_mut(|store| {
-                let record = load_denuo_direct_swap(store, &policy, session_id)?
-                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let record = load_shakescape_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 let hello = record
                     .hello
                     .clone()
-                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 hello
                     .verify_new_funding_at(policy.network(), now_unix)
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if hello.offered_asset != hns_marketplace_protocol::AssetId::BTC
                     || hello.received_asset != hns_marketplace_protocol::AssetId::HNS
                     || hello.first_funding_chain != hns_marketplace_protocol::ChainId::BITCOIN
                     || hello.swap_session_id != session_id.into_bytes()
                 {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
                 let ready = record
                     .first_chain_watch_ready
@@ -603,17 +607,17 @@ impl MobileDenuoSessionController {
                     .ok_or(hns_wallet_market::MarketError::InvalidTransition)?;
                 ready
                     .verify_for_session(&hello, policy.network(), now_unix)
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 let (maker_key, bitcoin_fee_reserve_sats) =
                     hns_wallet_market::derive_local_btc_for_hns_maker_key(
                         store, &policy, wallet_id, session_id,
                     )?;
-                let bitcoin = build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered)
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                let bitcoin = build_shakescape_bitcoin_htlc(&hello, SwapAssetSide::Offered)
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if bitcoin.commitment.into_bytes() != hello.offered_lock_commitment
                     || bitcoin.htlc.refund_public_key != maker_key.public_key()
                 {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
                 let hns = hello
                     .build_hns_htlc(
@@ -621,13 +625,14 @@ impl MobileDenuoSessionController {
                         hello.maker_settlement_public_key,
                         hello.taker_settlement_public_key,
                     )
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if hns.descriptor_hash != hello.received_lock_commitment {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
-                let mut execution = open_denuo_execution(store, &policy, session_id, now_unix)?;
+                let mut execution =
+                    open_shakescape_execution(store, &policy, session_id, now_unix)?;
                 if execution.state == SwapState::TermsFrozen {
-                    let workflow_id = denuo_execution_workflow_id(session_id);
+                    let workflow_id = shakescape_execution_workflow_id(session_id);
                     let mut journal = WalletStoreJournal {
                         store,
                         workflow_id,
@@ -636,7 +641,7 @@ impl MobileDenuoSessionController {
                     execution.apply(VerifiedEvidence::RefundsValidated, now_unix, &mut journal)?;
                 }
                 if execution.state == SwapState::RefundsPrepared {
-                    let workflow_id = denuo_execution_workflow_id(session_id);
+                    let workflow_id = shakescape_execution_workflow_id(session_id);
                     let mut journal = WalletStoreJournal {
                         store,
                         workflow_id,
@@ -647,7 +652,7 @@ impl MobileDenuoSessionController {
                 if execution.state != SwapState::FirstFundingPending {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
-                Ok(MobileDenuoBitcoinFundingPermit {
+                Ok(MobileShakescapeBitcoinFundingPermit {
                     hello,
                     bitcoin_fee_reserve_sats,
                 })
@@ -663,32 +668,32 @@ impl MobileDenuoSessionController {
         &mut self,
         session_id: hns_wallet_types::SessionId,
         now_unix: u64,
-    ) -> Result<MobileDenuoBitcoinWatchPermit, MobileWalletError> {
+    ) -> Result<MobileShakescapeBitcoinWatchPermit, MobileWalletError> {
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         self.store
             .try_with_store_mut(|store| {
-                let record = load_denuo_direct_swap(store, &policy, session_id)?
-                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let record = load_shakescape_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 let hello = record
                     .hello
-                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 hello
                     .verify_new_funding_at(policy.network(), now_unix)
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if hello.offered_asset != hns_marketplace_protocol::AssetId::BTC
                     || hello.received_asset != hns_marketplace_protocol::AssetId::HNS
                     || hello.first_funding_chain != hns_marketplace_protocol::ChainId::BITCOIN
                 {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
                 let (taker_key, _) = hns_wallet_market::derive_local_hns_for_btc_taker_key(
                     store, &policy, wallet_id, session_id,
                 )?;
-                let bitcoin = build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered)
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                let bitcoin = build_shakescape_bitcoin_htlc(&hello, SwapAssetSide::Offered)
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if bitcoin.commitment.into_bytes() != hello.offered_lock_commitment {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
                 let hns = hello
                     .build_hns_htlc(
@@ -696,13 +701,13 @@ impl MobileDenuoSessionController {
                         hello.maker_settlement_public_key,
                         hello.taker_settlement_public_key,
                     )
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if hns.descriptor_hash != hello.received_lock_commitment
                     || hns.descriptor.refund_public_key != taker_key.public_key()
                 {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
-                let execution = open_denuo_execution(store, &policy, session_id, now_unix)?;
+                let execution = open_shakescape_execution(store, &policy, session_id, now_unix)?;
                 if !matches!(
                     execution.state,
                     SwapState::TermsFrozen
@@ -711,7 +716,7 @@ impl MobileDenuoSessionController {
                 ) {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
-                Ok(MobileDenuoBitcoinWatchPermit {
+                Ok(MobileShakescapeBitcoinWatchPermit {
                     hello,
                     settlement_key: taker_key,
                 })
@@ -725,8 +730,8 @@ impl MobileDenuoSessionController {
     /// used for inbound peer traffic.
     pub fn complete_counterparty_bitcoin_watch(
         &mut self,
-        permit: MobileDenuoBitcoinWatchPermit,
-        peer: &mut HnsDirectDenuoPeer,
+        permit: MobileShakescapeBitcoinWatchPermit,
+        peer: &mut HnsDirectShakescapePeer,
         now_unix: u64,
     ) -> Result<(), MobileWalletError> {
         let message = self.confirm_counterparty_bitcoin_watch(permit, now_unix)?;
@@ -739,7 +744,7 @@ impl MobileDenuoSessionController {
     /// settlement secret or chain evidence is embedded in it.
     pub fn confirm_counterparty_bitcoin_watch(
         &mut self,
-        permit: MobileDenuoBitcoinWatchPermit,
+        permit: MobileShakescapeBitcoinWatchPermit,
         now_unix: u64,
     ) -> Result<CrossChainMessage, MobileWalletError> {
         let hello = permit.hello;
@@ -753,7 +758,7 @@ impl MobileDenuoSessionController {
                     .header
                     .sequence
                     .checked_add(1)
-                    .ok_or(MobileWalletError::InvalidDenuoSessionMessage)?,
+                    .ok_or(MobileWalletError::InvalidShakescapeSessionMessage)?,
                 created_at: now_unix,
                 expires_at: hello.header.expires_at,
             },
@@ -766,21 +771,22 @@ impl MobileDenuoSessionController {
         permit
             .settlement_key
             .sign_watch_ready(&mut ready, &hello, now_unix)
-            .map_err(|_| MobileWalletError::InvalidDenuoSessionMessage)?;
+            .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
         let message = CrossChainMessage::SwapWatchReady(ready);
         let envelope = message
             .encode_envelope(0)
-            .map_err(|_| MobileWalletError::InvalidDenuoSessionMessage)?;
+            .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
         let policy = self.policy;
         let session_id = hns_wallet_types::SessionId::new(hello.swap_session_id);
         self.store
             .try_with_store_mut(|store| {
-                admit_denuo_direct_swap_watch_ready(store, &policy, &envelope, now_unix)?;
-                let mut execution = open_denuo_execution(store, &policy, session_id, now_unix)?;
+                admit_shakescape_direct_swap_watch_ready(store, &policy, &envelope, now_unix)?;
+                let mut execution =
+                    open_shakescape_execution(store, &policy, session_id, now_unix)?;
                 if execution.state == SwapState::TermsFrozen {
                     let mut journal = WalletStoreJournal {
                         store,
-                        workflow_id: denuo_execution_workflow_id(session_id),
+                        workflow_id: shakescape_execution_workflow_id(session_id),
                         updated_at_unix: now_unix,
                     };
                     execution.apply(VerifiedEvidence::RefundsValidated, now_unix, &mut journal)?;
@@ -788,7 +794,7 @@ impl MobileDenuoSessionController {
                 if execution.state == SwapState::RefundsPrepared {
                     let mut journal = WalletStoreJournal {
                         store,
-                        workflow_id: denuo_execution_workflow_id(session_id),
+                        workflow_id: shakescape_execution_workflow_id(session_id),
                         updated_at_unix: now_unix,
                     };
                     execution.apply(VerifiedEvidence::FundingReady, now_unix, &mut journal)?;
@@ -814,7 +820,7 @@ impl MobileDenuoSessionController {
         let policy = self.policy;
         self.store
             .try_with_store_mut(|store| {
-                hns_wallet_market::apply_locally_verified_denuo_funding(
+                hns_wallet_market::apply_locally_verified_shakescape_funding(
                     store,
                     &policy,
                     session_id,
@@ -835,7 +841,7 @@ impl MobileDenuoSessionController {
         let policy = self.policy;
         self.store
             .try_with_store_mut(|store| {
-                hns_wallet_market::apply_locally_verified_denuo_funding(
+                hns_wallet_market::apply_locally_verified_shakescape_funding(
                     store,
                     &policy,
                     session_id,
@@ -861,7 +867,7 @@ impl MobileDenuoSessionController {
                     hns_wallet_hns::VerifiedNativeHtlcSpend::Refund { .. }
                 );
                 if refund {
-                    hns_wallet_market::apply_locally_verified_denuo_refund(
+                    hns_wallet_market::apply_locally_verified_shakescape_refund(
                         store,
                         &policy,
                         session_id,
@@ -869,7 +875,7 @@ impl MobileDenuoSessionController {
                         now_unix,
                     )
                 } else {
-                    hns_wallet_market::apply_locally_verified_denuo_first_redemption(
+                    hns_wallet_market::apply_locally_verified_shakescape_first_redemption(
                         store,
                         &policy,
                         session_id,
@@ -894,7 +900,7 @@ impl MobileDenuoSessionController {
                 let refund =
                     spend.spend.branch == hns_wallet_bitcoin_kyoto::HtlcSpendBranch::Refund;
                 if refund {
-                    hns_wallet_market::apply_locally_verified_denuo_refund(
+                    hns_wallet_market::apply_locally_verified_shakescape_refund(
                         store,
                         &policy,
                         session_id,
@@ -902,7 +908,7 @@ impl MobileDenuoSessionController {
                         now_unix,
                     )
                 } else {
-                    hns_wallet_market::apply_locally_verified_denuo_second_redemption(
+                    hns_wallet_market::apply_locally_verified_shakescape_second_redemption(
                         store,
                         &policy,
                         session_id,
@@ -921,28 +927,28 @@ impl MobileDenuoSessionController {
         &mut self,
         session_id: hns_wallet_types::SessionId,
         now_unix: u64,
-    ) -> Result<MobileDenuoHnsFundingPermit, MobileWalletError> {
+    ) -> Result<MobileShakescapeHnsFundingPermit, MobileWalletError> {
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         self.store
             .try_with_store_mut(|store| {
                 let execution =
-                    hns_wallet_market::load_denuo_execution(store, &policy, session_id)?
-                        .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                    hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 if execution.state != SwapState::FirstFunded
                     || execution.first_module != hns_wallet_types::ModuleId::Bitcoin
                     || execution.second_module != hns_wallet_types::ModuleId::Handshake
                 {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
-                let record = load_denuo_direct_swap(store, &policy, session_id)?
-                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let record = load_shakescape_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 let hello = record
                     .hello
-                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 hello
                     .verify_agreement(policy.network())
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 let (settlement_key, hns_fee_reserve_dollarydoos) =
                     hns_wallet_market::derive_local_hns_for_btc_taker_key(
                         store, &policy, wallet_id, session_id,
@@ -953,13 +959,13 @@ impl MobileDenuoSessionController {
                         hello.maker_settlement_public_key,
                         hello.taker_settlement_public_key,
                     )
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if hns.descriptor_hash != hello.received_lock_commitment
                     || hns.descriptor.refund_public_key != settlement_key.public_key()
                 {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
-                let workflow_id = denuo_execution_workflow_id(session_id);
+                let workflow_id = shakescape_execution_workflow_id(session_id);
                 let mut execution = execution;
                 let mut journal = WalletStoreJournal {
                     store,
@@ -967,7 +973,7 @@ impl MobileDenuoSessionController {
                     updated_at_unix: now_unix,
                 };
                 execution.apply(VerifiedEvidence::SecondFundingReady, now_unix, &mut journal)?;
-                Ok(MobileDenuoHnsFundingPermit {
+                Ok(MobileShakescapeHnsFundingPermit {
                     hello,
                     settlement_key,
                     hns_fee_reserve_dollarydoos,
@@ -979,48 +985,49 @@ impl MobileDenuoSessionController {
     pub fn authorize_local_hns_redeem(
         &self,
         session_id: hns_wallet_types::SessionId,
-    ) -> Result<MobileDenuoHnsSettlementPermit, MobileWalletError> {
+    ) -> Result<MobileShakescapeHnsSettlementPermit, MobileWalletError> {
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         self.store
             .try_with_store(|store| {
                 let execution =
-                    hns_wallet_market::load_denuo_execution(store, &policy, session_id)?
-                        .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                    hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 if execution.state != SwapState::BothFunded
                     || execution.second_module != hns_wallet_types::ModuleId::Handshake
                 {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
-                let record = load_denuo_direct_swap(store, &policy, session_id)?
-                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let record = load_shakescape_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 let hello = record
                     .hello
-                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 let (key, _) = hns_wallet_market::derive_local_btc_for_hns_maker_key(
                     store, &policy, wallet_id, session_id,
                 )?;
-                let preimage =
-                    hns_wallet_market::load_denuo_btc_for_hns_maker_preimage(store, session_id)?
-                        .ok_or(hns_wallet_market::MarketError::InvalidEvidence)?;
+                let preimage = hns_wallet_market::load_shakescape_btc_for_hns_maker_preimage(
+                    store, session_id,
+                )?
+                .ok_or(hns_wallet_market::MarketError::InvalidEvidence)?;
                 let hns = hello
                     .build_hns_htlc(
                         SwapAssetSide::Received,
                         hello.maker_settlement_public_key,
                         hello.taker_settlement_public_key,
                     )
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if hns.descriptor.receiver_public_key != key.public_key()
                     || hns.descriptor.hashlock
                         != hns_swap::HnsHtlc::hash_preimage(preimage.expose_for_settlement())
                 {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
-                Ok(MobileDenuoHnsSettlementPermit {
+                Ok(MobileShakescapeHnsSettlementPermit {
                     hello,
                     settlement_key: key,
                     preimage: Some(preimage),
-                    action: MobileDenuoSettlementAction::Redeem,
+                    action: MobileShakescapeSettlementAction::Redeem,
                     fee_reserve: u64::MAX,
                 })
             })
@@ -1030,25 +1037,25 @@ impl MobileDenuoSessionController {
     pub fn authorize_local_hns_refund(
         &self,
         session_id: hns_wallet_types::SessionId,
-    ) -> Result<MobileDenuoHnsSettlementPermit, MobileWalletError> {
+    ) -> Result<MobileShakescapeHnsSettlementPermit, MobileWalletError> {
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         self.store
             .try_with_store(|store| {
                 let execution =
-                    hns_wallet_market::load_denuo_execution(store, &policy, session_id)?
-                        .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                    hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 if execution.second_funding.is_none()
                     || execution.second_module != hns_wallet_types::ModuleId::Handshake
                     || execution.state != SwapState::BothFunded
                 {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
-                let record = load_denuo_direct_swap(store, &policy, session_id)?
-                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let record = load_shakescape_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 let hello = record
                     .hello
-                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 let (key, fee_reserve) = hns_wallet_market::derive_local_hns_for_btc_taker_key(
                     store, &policy, wallet_id, session_id,
                 )?;
@@ -1058,15 +1065,15 @@ impl MobileDenuoSessionController {
                         hello.maker_settlement_public_key,
                         hello.taker_settlement_public_key,
                     )
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if hns.descriptor.refund_public_key != key.public_key() {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
-                Ok(MobileDenuoHnsSettlementPermit {
+                Ok(MobileShakescapeHnsSettlementPermit {
                     hello,
                     settlement_key: key,
                     preimage: None,
-                    action: MobileDenuoSettlementAction::Refund,
+                    action: MobileShakescapeSettlementAction::Refund,
                     fee_reserve,
                 })
             })
@@ -1076,43 +1083,44 @@ impl MobileDenuoSessionController {
     pub fn authorize_local_bitcoin_redeem(
         &self,
         session_id: hns_wallet_types::SessionId,
-    ) -> Result<MobileDenuoBitcoinSettlementPermit, MobileWalletError> {
+    ) -> Result<MobileShakescapeBitcoinSettlementPermit, MobileWalletError> {
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         self.store
             .try_with_store(|store| {
                 let execution =
-                    hns_wallet_market::load_denuo_execution(store, &policy, session_id)?
-                        .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                    hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 if execution.state != SwapState::SecretObserved
                     || execution.first_module != hns_wallet_types::ModuleId::Bitcoin
                 {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
-                let record = load_denuo_direct_swap(store, &policy, session_id)?
-                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let record = load_shakescape_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 let hello = record
                     .hello
-                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 let (key, _) = hns_wallet_market::derive_local_hns_for_btc_taker_key(
                     store, &policy, wallet_id, session_id,
                 )?;
-                let preimage =
-                    hns_wallet_market::load_locally_verified_denuo_preimage(store, session_id)?
-                        .ok_or(hns_wallet_market::MarketError::InvalidEvidence)?;
-                let bitcoin = build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered)
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                let preimage = hns_wallet_market::load_locally_verified_shakescape_preimage(
+                    store, session_id,
+                )?
+                .ok_or(hns_wallet_market::MarketError::InvalidEvidence)?;
+                let bitcoin = build_shakescape_bitcoin_htlc(&hello, SwapAssetSide::Offered)
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if bitcoin.htlc.receiver_public_key != key.public_key()
                     || bitcoin.htlc.hashlock
                         != hns_swap::HnsHtlc::hash_preimage(preimage.expose_for_settlement())
                 {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
-                Ok(MobileDenuoBitcoinSettlementPermit {
+                Ok(MobileShakescapeBitcoinSettlementPermit {
                     hello,
                     settlement_key: key,
                     preimage: Some(preimage),
-                    action: MobileDenuoSettlementAction::Redeem,
+                    action: MobileShakescapeSettlementAction::Redeem,
                     fee_reserve: u64::MAX,
                 })
             })
@@ -1122,14 +1130,14 @@ impl MobileDenuoSessionController {
     pub fn authorize_local_bitcoin_refund(
         &self,
         session_id: hns_wallet_types::SessionId,
-    ) -> Result<MobileDenuoBitcoinSettlementPermit, MobileWalletError> {
+    ) -> Result<MobileShakescapeBitcoinSettlementPermit, MobileWalletError> {
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         self.store
             .try_with_store(|store| {
                 let execution =
-                    hns_wallet_market::load_denuo_execution(store, &policy, session_id)?
-                        .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                    hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 if execution.first_funding.is_none()
                     || execution.first_module != hns_wallet_types::ModuleId::Bitcoin
                     || !matches!(
@@ -1143,24 +1151,24 @@ impl MobileDenuoSessionController {
                 {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
-                let record = load_denuo_direct_swap(store, &policy, session_id)?
-                    .ok_or(hns_wallet_market::MarketError::UnknownDenuoDirectSwap)?;
+                let record = load_shakescape_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 let hello = record
                     .hello
-                    .ok_or(hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                    .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 let (key, fee_reserve) = hns_wallet_market::derive_local_btc_for_hns_maker_key(
                     store, &policy, wallet_id, session_id,
                 )?;
-                let bitcoin = build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered)
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidDenuoDirectSwap)?;
+                let bitcoin = build_shakescape_bitcoin_htlc(&hello, SwapAssetSide::Offered)
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if bitcoin.htlc.refund_public_key != key.public_key() {
-                    return Err(hns_wallet_market::MarketError::InvalidDenuoDirectSwap);
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
-                Ok(MobileDenuoBitcoinSettlementPermit {
+                Ok(MobileShakescapeBitcoinSettlementPermit {
                     hello,
                     settlement_key: key,
                     preimage: None,
-                    action: MobileDenuoSettlementAction::Refund,
+                    action: MobileShakescapeSettlementAction::Refund,
                     fee_reserve,
                 })
             })
@@ -1169,14 +1177,14 @@ impl MobileDenuoSessionController {
 
     pub fn announce_direct_offer_cancellation(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         offer_id: &str,
     ) -> Result<(), MobileWalletError> {
         let offer_id = decode_offer_id(offer_id)?;
         let cancellation = self
             .store
             .try_with_store(|store| {
-                load_denuo_direct_offer(store, &self.policy.board_policy(), offer_id)
+                load_shakescape_direct_offer(store, &self.policy.board_policy(), offer_id)
             })
             .map_err(MobileWalletError::from)?
             .and_then(|record| record.cancellation)
@@ -1193,55 +1201,72 @@ impl MobileDenuoSessionController {
         &self,
         envelope: &[u8],
         now_unix: u64,
-    ) -> Result<Option<MobileDenuoDirectAdmission>, MobileWalletError> {
+    ) -> Result<Option<MobileShakescapeDirectAdmission>, MobileWalletError> {
         let (_, message) = CrossChainMessage::decode_envelope(envelope)
-            .map_err(|_| MobileWalletError::InvalidDenuoSessionMessage)?;
+            .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
         let canonical = message
             .encode_envelope(
                 CrossChainMessage::decode_envelope(envelope)
-                    .map_err(|_| MobileWalletError::InvalidDenuoSessionMessage)?
+                    .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?
                     .0,
             )
-            .map_err(|_| MobileWalletError::InvalidDenuoSessionMessage)?;
+            .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
         if canonical != envelope {
-            return Err(MobileWalletError::InvalidDenuoSessionMessage);
+            return Err(MobileWalletError::InvalidShakescapeSessionMessage);
         }
         self.store
             .try_with_store_mut(|store| match message {
-                CrossChainMessage::DirectOffer(_) => {
-                    admit_denuo_direct_offer(store, &self.policy.board_policy(), envelope, now_unix)
-                        .map(|admission| Some(MobileDenuoDirectAdmission::Offer(admission)))
-                }
-                CrossChainMessage::CancelDirectOffer(_) => admit_denuo_direct_offer_cancellation(
+                CrossChainMessage::DirectOffer(_) => admit_shakescape_direct_offer(
                     store,
                     &self.policy.board_policy(),
                     envelope,
                     now_unix,
                 )
-                .map(|admission| Some(MobileDenuoDirectAdmission::OfferCancellation(admission))),
+                .map(|admission| Some(MobileShakescapeDirectAdmission::Offer(admission))),
+                CrossChainMessage::CancelDirectOffer(_) => {
+                    admit_shakescape_direct_offer_cancellation(
+                        store,
+                        &self.policy.board_policy(),
+                        envelope,
+                        now_unix,
+                    )
+                    .map(|admission| {
+                        Some(MobileShakescapeDirectAdmission::OfferCancellation(
+                            admission,
+                        ))
+                    })
+                }
                 CrossChainMessage::TakeDirectOffer(_) => {
-                    admit_denuo_direct_offer_take(store, &self.policy, envelope, now_unix)
-                        .map(|admission| Some(MobileDenuoDirectAdmission::Swap(admission)))
+                    admit_shakescape_direct_offer_take(store, &self.policy, envelope, now_unix)
+                        .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
                 }
                 CrossChainMessage::SwapSessionProposal(_) => {
-                    admit_denuo_direct_swap_proposal(store, &self.policy, envelope, now_unix)
-                        .map(|admission| Some(MobileDenuoDirectAdmission::Swap(admission)))
+                    admit_shakescape_direct_swap_proposal(store, &self.policy, envelope, now_unix)
+                        .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
                 }
                 CrossChainMessage::SwapSessionHello(_) => {
-                    admit_denuo_direct_swap_hello(store, &self.policy, envelope, now_unix)
-                        .map(|admission| Some(MobileDenuoDirectAdmission::Swap(admission)))
+                    admit_shakescape_direct_swap_hello(store, &self.policy, envelope, now_unix)
+                        .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
                 }
                 CrossChainMessage::SwapFundingStatus(_)
                 | CrossChainMessage::SwapRedeemStatus(_)
                 | CrossChainMessage::SwapRefundStatus(_) => {
-                    validate_denuo_direct_swap_peer_status(store, &self.policy, envelope, now_unix)
-                        .map(|_| None)
+                    validate_shakescape_direct_swap_peer_status(
+                        store,
+                        &self.policy,
+                        envelope,
+                        now_unix,
+                    )
+                    .map(|_| None)
                 }
-                CrossChainMessage::SwapWatchReady(_) => {
-                    admit_denuo_direct_swap_watch_ready(store, &self.policy, envelope, now_unix)
-                        .map(|admission| Some(MobileDenuoDirectAdmission::Swap(admission)))
-                }
-                _ => Err(hns_wallet_market::MarketError::InvalidDenuoPeerMessage),
+                CrossChainMessage::SwapWatchReady(_) => admit_shakescape_direct_swap_watch_ready(
+                    store,
+                    &self.policy,
+                    envelope,
+                    now_unix,
+                )
+                .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission))),
+                _ => Err(hns_wallet_market::MarketError::InvalidShakescapePeerMessage),
             })
             .map_err(MobileWalletError::from)
     }
@@ -1251,13 +1276,13 @@ impl MobileDenuoSessionController {
     /// a price policy or change which exact signed terms the wallet will use.
     pub fn announce_direct_offer_inventory(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         now_unix: u64,
     ) -> Result<(), MobileWalletError> {
         let inventory = self
             .store
             .try_with_store(|store| {
-                denuo_direct_offer_inventory(store, &self.policy.board_policy(), now_unix)
+                shakescape_direct_offer_inventory(store, &self.policy.board_policy(), now_unix)
             })
             .map_err(MobileWalletError::from)?;
         peer.send_cross_chain_message(&CrossChainMessage::DirectOfferInventory(inventory))?;
@@ -1270,19 +1295,19 @@ impl MobileDenuoSessionController {
     /// before it can affect durable state.
     pub fn service_direct_envelope(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         envelope: &[u8],
         now_unix: u64,
-    ) -> Result<MobileDenuoDirectTransportReport, MobileWalletError> {
+    ) -> Result<MobileShakescapeDirectTransportReport, MobileWalletError> {
         let (request_id, message) = CrossChainMessage::decode_envelope(envelope)
-            .map_err(|_| MobileWalletError::InvalidDenuoSessionMessage)?;
+            .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
         let canonical = message
             .encode_envelope(request_id)
-            .map_err(|_| MobileWalletError::InvalidDenuoSessionMessage)?;
+            .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
         if canonical != envelope {
-            return Err(MobileWalletError::InvalidDenuoSessionMessage);
+            return Err(MobileWalletError::InvalidShakescapeSessionMessage);
         }
-        let mut report = MobileDenuoDirectTransportReport {
+        let mut report = MobileShakescapeDirectTransportReport {
             messages_received: 1,
             messages_sent: 0,
             admission: None,
@@ -1293,7 +1318,11 @@ impl MobileDenuoSessionController {
                     let known = self
                         .store
                         .try_with_store(|store| {
-                            load_denuo_direct_offer(store, &self.policy.board_policy(), offer_id)
+                            load_shakescape_direct_offer(
+                                store,
+                                &self.policy.board_policy(),
+                                offer_id,
+                            )
                         })
                         .map_err(MobileWalletError::from)?
                         .is_some();
@@ -1309,7 +1338,7 @@ impl MobileDenuoSessionController {
                 let offer = self
                     .store
                     .try_with_store(|store| {
-                        load_denuo_direct_offer(store, &self.policy.board_policy(), offer_id)
+                        load_shakescape_direct_offer(store, &self.policy.board_policy(), offer_id)
                     })
                     .map_err(MobileWalletError::from)?;
                 if let Some(offer) = offer.filter(|offer| offer.is_active_at(now_unix)) {
@@ -1336,7 +1365,9 @@ impl MobileDenuoSessionController {
     }
 }
 
-fn summary(offer: DenuoLocalDirectOffer) -> Result<MobileBtcForHnsOfferSummary, MobileWalletError> {
+fn summary(
+    offer: ShakescapeLocalDirectOffer,
+) -> Result<MobileBtcForHnsOfferSummary, MobileWalletError> {
     Ok(MobileBtcForHnsOfferSummary {
         offer_id: super::lowercase_hex(offer.offer.offer_id.as_bytes()),
         session_id: super::lowercase_hex(offer.offer.session_id.as_bytes()),
@@ -1352,13 +1383,13 @@ fn summary(offer: DenuoLocalDirectOffer) -> Result<MobileBtcForHnsOfferSummary, 
 
 fn execution_summary(
     session: hns_wallet_market::SwapSession,
-) -> Result<MobileDenuoExecutionSummary, MobileWalletError> {
+) -> Result<MobileShakescapeExecutionSummary, MobileWalletError> {
     let chain = |module| -> Result<String, MobileWalletError> {
         match module {
             hns_wallet_types::ModuleId::Bitcoin => Ok("bitcoin".to_owned()),
             hns_wallet_types::ModuleId::Handshake => Ok("handshake".to_owned()),
             hns_wallet_types::ModuleId::Ethereum => {
-                Err(MobileWalletError::InvalidDenuoSessionMessage)
+                Err(MobileWalletError::InvalidShakescapeSessionMessage)
             }
         }
     };
@@ -1367,11 +1398,11 @@ fn execution_summary(
             hns_wallet_types::WalletAsset::Btc => Ok("btc".to_owned()),
             hns_wallet_types::WalletAsset::Hns => Ok("hns".to_owned()),
             hns_wallet_types::WalletAsset::Eth => {
-                Err(MobileWalletError::InvalidDenuoSessionMessage)
+                Err(MobileWalletError::InvalidShakescapeSessionMessage)
             }
         }
     };
-    Ok(MobileDenuoExecutionSummary {
+    Ok(MobileShakescapeExecutionSummary {
         session_id: super::lowercase_hex(session.id.as_bytes()),
         revision: session.revision,
         state: session.state,
@@ -1421,13 +1452,14 @@ mod tests {
     use hns_marketplace_protocol::{ChainId, CrossChainMessage, NetworkBinding};
     use hns_primitives::BlockHash;
     use hns_wallet_market::{
-        DenuoBtcForHnsMakerProposalRequest, DenuoBtcForHnsOfferRequest,
-        DenuoDirectOfferBoardPolicy, DenuoHnsForBtcTakeRequest, VerifiedEvidence,
-        WalletStoreJournal, accept_denuo_hns_for_btc_maker_proposal, admit_denuo_direct_offer,
-        admit_denuo_direct_offer_take, admit_denuo_direct_swap_hello,
-        admit_denuo_direct_swap_proposal, create_denuo_btc_for_hns_maker_proposal,
-        create_denuo_btc_for_hns_offer, create_denuo_hns_for_btc_take, denuo_execution_workflow_id,
-        load_denuo_direct_offer, open_denuo_execution,
+        ShakescapeBtcForHnsMakerProposalRequest, ShakescapeBtcForHnsOfferRequest,
+        ShakescapeDirectOfferBoardPolicy, ShakescapeHnsForBtcTakeRequest, VerifiedEvidence,
+        WalletStoreJournal, accept_shakescape_hns_for_btc_maker_proposal,
+        admit_shakescape_direct_offer, admit_shakescape_direct_offer_take,
+        admit_shakescape_direct_swap_hello, admit_shakescape_direct_swap_proposal,
+        create_shakescape_btc_for_hns_maker_proposal, create_shakescape_btc_for_hns_offer,
+        create_shakescape_hns_for_btc_take, load_shakescape_direct_offer,
+        open_shakescape_execution, shakescape_execution_workflow_id,
     };
     use hns_wallet_store::{RECOVERY_SEED_BYTES, SecretKind, WalletStore};
 
@@ -1436,9 +1468,9 @@ mod tests {
     const PASSPHRASE: &str = "mobile direct funding authorization test";
     const START: u64 = 1_700_000_000;
 
-    fn policy() -> DenuoDirectSwapPolicy {
-        DenuoDirectSwapPolicy::new(
-            DenuoDirectOfferBoardPolicy::new(NetworkBinding {
+    fn policy() -> ShakescapeDirectSwapPolicy {
+        ShakescapeDirectSwapPolicy::new(
+            ShakescapeDirectOfferBoardPolicy::new(NetworkBinding {
                 hns_magic: 0x5b6e_c393,
                 hns_genesis: BlockHash::new([1; 32]),
                 counterchain: ChainId::BITCOIN,
@@ -1470,10 +1502,10 @@ mod tests {
         let taker_id = WalletId::new([0x22; 16]);
         let mut maker = seeded_store(maker_id, 0x31);
         let mut taker = seeded_store(taker_id, 0x41);
-        let offer = create_denuo_btc_for_hns_offer(
+        let offer = create_shakescape_btc_for_hns_offer(
             &mut maker,
             &policy.board_policy(),
-            DenuoBtcForHnsOfferRequest {
+            ShakescapeBtcForHnsOfferRequest {
                 wallet_id: maker_id,
                 btc_amount_sats: 9_000,
                 hns_amount_dollarydoos: 2_000_000,
@@ -1484,7 +1516,7 @@ mod tests {
             },
         )
         .expect("offer");
-        let signed_offer = load_denuo_direct_offer(
+        let signed_offer = load_shakescape_direct_offer(
             &maker,
             &policy.board_policy(),
             offer.offer.offer_id.into_bytes(),
@@ -1495,12 +1527,12 @@ mod tests {
         let offer_envelope = CrossChainMessage::DirectOffer(signed_offer)
             .encode_envelope(1)
             .expect("offer envelope");
-        admit_denuo_direct_offer(&mut taker, &policy.board_policy(), &offer_envelope, START)
+        admit_shakescape_direct_offer(&mut taker, &policy.board_policy(), &offer_envelope, START)
             .expect("admit offer");
-        let take = create_denuo_hns_for_btc_take(
+        let take = create_shakescape_hns_for_btc_take(
             &mut taker,
             &policy,
-            DenuoHnsForBtcTakeRequest {
+            ShakescapeHnsForBtcTakeRequest {
                 wallet_id: taker_id,
                 offer_id: offer.offer.offer_id,
                 hns_fee_reserve_dollarydoos: 10_000,
@@ -1510,12 +1542,12 @@ mod tests {
             },
         )
         .expect("take");
-        admit_denuo_direct_offer_take(&mut maker, &policy, &take.envelope, START + 10)
+        admit_shakescape_direct_offer_take(&mut maker, &policy, &take.envelope, START + 10)
             .expect("maker admits take");
-        let proposal = create_denuo_btc_for_hns_maker_proposal(
+        let proposal = create_shakescape_btc_for_hns_maker_proposal(
             &mut maker,
             &policy,
-            DenuoBtcForHnsMakerProposalRequest {
+            ShakescapeBtcForHnsMakerProposalRequest {
                 wallet_id: maker_id,
                 session_id: offer.offer.session_id,
                 now_unix: START + 20,
@@ -1527,9 +1559,9 @@ mod tests {
             },
         )
         .expect("proposal");
-        admit_denuo_direct_swap_proposal(&mut taker, &policy, &proposal.envelope, START + 20)
+        admit_shakescape_direct_swap_proposal(&mut taker, &policy, &proposal.envelope, START + 20)
             .expect("taker admits proposal");
-        let accepted = accept_denuo_hns_for_btc_maker_proposal(
+        let accepted = accept_shakescape_hns_for_btc_maker_proposal(
             &mut taker,
             &policy,
             taker_id,
@@ -1537,12 +1569,12 @@ mod tests {
             START + 30,
         )
         .expect("accept");
-        admit_denuo_direct_swap_hello(&mut maker, &policy, &accepted.envelope, START + 30)
+        admit_shakescape_direct_swap_hello(&mut maker, &policy, &accepted.envelope, START + 30)
             .expect("maker admits hello");
 
         let taker_shared = SharedWalletStore::new(taker);
         let mut taker_controller =
-            MobileDenuoSessionController::new(taker_shared.clone(), policy, taker_id);
+            MobileShakescapeSessionController::new(taker_shared.clone(), policy, taker_id);
         let watch_permit = taker_controller
             .authorize_counterparty_bitcoin_watch(offer.offer.session_id, START + 34)
             .expect("taker watch permit");
@@ -1554,16 +1586,16 @@ mod tests {
             .confirm_counterparty_bitcoin_watch(watch_permit, START + 34)
             .expect("persist taker watch readiness");
         let ready_envelope = ready.encode_envelope(0).expect("watch-ready envelope");
-        admit_denuo_direct_swap_watch_ready(&mut maker, &policy, &ready_envelope, START + 34)
+        admit_shakescape_direct_swap_watch_ready(&mut maker, &policy, &ready_envelope, START + 34)
             .expect("maker admits receiver watch readiness");
 
         // Simulate termination after only the first durable funding gate.
         let mut interrupted =
-            open_denuo_execution(&mut maker, &policy, offer.offer.session_id, START + 35)
+            open_shakescape_execution(&mut maker, &policy, offer.offer.session_id, START + 35)
                 .expect("execution");
         let mut journal = WalletStoreJournal {
             store: &mut maker,
-            workflow_id: denuo_execution_workflow_id(offer.offer.session_id),
+            workflow_id: shakescape_execution_workflow_id(offer.offer.session_id),
             updated_at_unix: START + 35,
         };
         interrupted
@@ -1572,7 +1604,8 @@ mod tests {
         assert_eq!(interrupted.state, SwapState::RefundsPrepared);
 
         let shared = SharedWalletStore::new(maker);
-        let mut controller = MobileDenuoSessionController::new(shared.clone(), policy, maker_id);
+        let mut controller =
+            MobileShakescapeSessionController::new(shared.clone(), policy, maker_id);
         let resumed = controller.durable_executions().expect("durable executions");
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0].state, SwapState::RefundsPrepared);
@@ -1595,7 +1628,7 @@ mod tests {
                 .try_with_store(|store| {
                     store
                         .load_workflow::<hns_wallet_market::SwapSession>(
-                            denuo_execution_workflow_id(offer.offer.session_id),
+                            shakescape_execution_workflow_id(offer.offer.session_id),
                         )
                         .map(|stored| stored.expect("execution").state.state)
                 })
@@ -1611,7 +1644,7 @@ mod tests {
         controller
             .authorize_local_btc_first_funding(offer.offer.session_id, START + 41)
             .expect("idempotent permit");
-        let binding = build_denuo_bitcoin_htlc(
+        let binding = build_shakescape_bitcoin_htlc(
             permit.hello(),
             hns_marketplace_protocol::SwapAssetSide::Offered,
         )
@@ -1721,7 +1754,7 @@ mod tests {
             .expect("maker HNS redeem permit");
         assert_eq!(
             maker_hns_redeem.action(),
-            MobileDenuoSettlementAction::Redeem
+            MobileShakescapeSettlementAction::Redeem
         );
         assert!(maker_hns_redeem.preimage.is_some());
         let known_preimage = *maker_hns_redeem

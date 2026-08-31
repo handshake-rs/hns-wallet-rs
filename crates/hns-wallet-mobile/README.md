@@ -81,10 +81,10 @@ qualification remain separate work.
 value runtime. Its native façade schedules configured-peer connection, one
 header round, a bounded filtered-block scan, mempool refresh, and restore-gap
 growth with the exact value-runtime clock; a host cannot substitute a timestamp
-or watch set. Direct Denuo listeners and outbound peers use that same retained
+or watch set. Direct Shakescape listeners and outbound peers use that same retained
 coordinator, so they inherit the exact network, address-policy, deadline, and
 explicit-peer constraints already used for the wallet's chain, fee, and
-broadcast transport. The Denuo façade likewise binds listeners, connects, and
+broadcast transport. The Shakescape façade likewise binds listeners, connects, and
 accepts with the value-runtime clock. Its listener wrapper intentionally
 exposes only the local socket locator, so peer admission must return through
 the same direct value controller. Binding a listener does not unlock the

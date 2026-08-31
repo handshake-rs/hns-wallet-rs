@@ -3,6 +3,23 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## 0.2.0 - 2026-08-30
+
+<!-- hns-wallet-release-state: 0.2.0 release -->
+Breaking clean-break migration of the wallet and atomic-swap boundary:
+
+- replaced every Denuo registry, wire, storage-domain, controller, FFI, and
+  diagnostic identifier with the single canonical Shakescape V1 boundary from
+  `hns-p2p-experimental 0.4.0` and `hns-marketplace-protocol 0.4.0`;
+- removed the former V2 profile and all Denuo compatibility aliases, decoding
+  paths, and test fixtures; unknown registry versions now fail closed;
+- retained the complete direct BTC/HNS atomic-swap state machine, recoverable
+  board publication and taker/maker execution under the renamed protocol;
+- updated HNS wallet synchronization, bulk-name operations, Bitcoin birthday
+  handling, native mobile controllers, and minimized projections to use the
+  same clean Shakescape boundary without exposing protocol branding in normal
+  user-facing swap controls.
+
 ## 0.1.1 - 2026-08-23
 
 <!-- hns-wallet-release-state: 0.1.1 release -->
@@ -29,7 +46,7 @@ Initial release source for the independent Handshake wallet boundary:
   settlement flags. The flags remain identity only; ordinary/full constructors
   still reject them, while the distinct recovery service exposes exactly six
   non-signing reads with no provider, persistent-permission, current-lock,
-  Denuo, signing, workflow, lifecycle, or value capability;
+  Shakescape, signing, workflow, lifecycle, or value capability;
 - atomic single-account mobile create, restore, open, unlock, lock, and status
   control without a WebView or value surface;
 - an injectable `MobileHnsReadController` which transfers or opens one exact
@@ -58,7 +75,7 @@ Initial release source for the independent Handshake wallet boundary:
   changes neither fixed HNS value gate;
 - persistence-first Shakedex and chain-neutral market state machines whose live
   product and value gates remain disabled, including a bounded encrypted/CAS
-  offline Denuo V2 offer/cancellation outbox with exact-envelope restart
+  offline Shakescape V1 offer/cancellation outbox with exact-envelope restart
   validation, persist-before-return single-flight handoff journaling, explicit
   crash-as-retry recovery, and monotonic bounded failure state, plus a bounded
   encrypted canonical V2 price-round zero-ID gossip cache with exact local-
@@ -69,7 +86,7 @@ Initial release source for the independent Handshake wallet boundary:
   high-watermarks but removes
   its round hash and ID from duplicate detection; the cache provides no quote
   conversion and does not itself confer quote or live-chain authority. A
-  separate offline board runtime now authenticates canonical Denuo V2 offers,
+  separate offline board runtime now authenticates canonical Shakescape V1 offers,
   requires the identical encrypted-store authority as a non-value HNS account
   read runtime, obtains runtime-owned time/network plus exact current and
   unspent Shakedex-lock evidence before each CAS admission, keeps exact retries
@@ -126,7 +143,8 @@ product gates.
 Version `0.1.1` is the current shared release line. Its complete resolved
 Handshake protocol cohort is the published registry `hns-rs` `0.3.1` release
 source `0e99addca59778b7b7c6fc56291333a97c4c8815`, pinned by
-`release/hns-rs-0.3.1-crates.sha256`. Its light-wallet cohort is the published
+`release/hns-rs-core-0.3.1-crates.sha256`; the Shakescape `0.4.0` pair is
+recorded in `release/hns-rs-shakescape-0.4.0-crates.sha256`. Its light-wallet cohort is the published
 registry `hns-dane-engine` `0.2.2` release source
 `b7fdf8826c81b77650a0f740d1f05314b74969f9`, pinned by
 `release/hns-dane-engine-0.2.2-crates.sha256`. Execute mode downloads and

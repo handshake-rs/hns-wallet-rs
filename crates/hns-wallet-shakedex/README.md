@@ -2,7 +2,7 @@
 
 `hns-wallet-shakedex` contains persistence-first fixed-price seller, buyer,
 funding, and recovery workflow boundaries. It also supplies a bounded,
-encrypted/CAS offline Denuo V2 offer/cancellation outbox. The outbox preserves
+encrypted/CAS offline Shakescape V1 offer/cancellation outbox. The outbox preserves
 exact canonical envelope bytes, persists one deterministic single-flight
 handoff before exposing those bytes, and retains monotonic local retry state.
 Schema v3 can terminally retain a bounded, canonical, endpoint-signed receipt
@@ -13,13 +13,13 @@ Network identity is the exact `(u32 magic, nonzero genesis)` pair: magic zero
 is a valid configured value, never a wildcard, and must match the handoff.
 
 The wallet-defined receipt binds an `hns.named-service/v1` HRM resource. That
-resource-profile identifier is defined by the draft, but no Denuo application
+resource-profile identifier is defined by the draft, but no Shakescape application
 profile identifier is currently assigned, so integrators must provide a
 non-zero caller-owned identifier. The receipt does not prove board inclusion
 or currentness, chain/quote authority, or permission to move value. The crate
 performs no network I/O and does not turn on any product release gate.
 
-An independent offline board runtime now composes the canonical Denuo V2 offer
+An independent offline board runtime now composes the canonical Shakescape V1 offer
 decoder with one exact non-value HNS account-read runtime and the literal same
 `SharedWalletStore` authority. It accepts an offer into the encrypted CAS board
 only after runtime-owned time/network and a fresh exact current, unspent

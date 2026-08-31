@@ -513,7 +513,7 @@ impl WalletService<SharedWalletStore, RecoveryProfileBackedNativeHnsReadRuntime>
     /// This does not provision a profile or account, and it rejects an absent,
     /// non-flagged, structurally invalid, mismatched, stale, or revoked record.
     /// The selected value/settlement bits remain exact identity only. Provider
-    /// dispatch, current-lock/Denuo authority, signing, import/export,
+    /// dispatch, current-lock/Shakescape authority, signing, import/export,
     /// workflows, value movement, and lifecycle requests remain unreachable.
     pub fn new_recovery_read_only_profile_backed_native_hns_reads(
         store: SharedWalletStore,

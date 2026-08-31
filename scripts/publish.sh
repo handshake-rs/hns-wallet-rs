@@ -19,8 +19,12 @@ release_manifest=release/public-crates.txt
 protocol_repository=https://github.com/handshake-rs/hns-rs.git
 protocol_revision=0e99addca59778b7b7c6fc56291333a97c4c8815
 protocol_version=0.3.1
-protocol_crates='hns-encoding hns-rollback-journal hns-hrm hns-primitives hns-covenants hns-dns-relay-protocol hns-header-consensus hns-service-authority hns-odoh-protocol hns-p2p-experimental hns-urkel-proof hns-transaction hns-chat-protocol hns-hnsr-protocol hns-script hns-mining hns-swap hns-marketplace-protocol hns-p2p-wire'
-protocol_checksum_manifest=release/hns-rs-0.3.1-crates.sha256
+protocol_crates='hns-encoding hns-rollback-journal hns-hrm hns-primitives hns-covenants hns-dns-relay-protocol hns-header-consensus hns-service-authority hns-odoh-protocol hns-urkel-proof hns-transaction hns-chat-protocol hns-hnsr-protocol hns-script hns-mining hns-swap hns-p2p-wire'
+protocol_checksum_manifest=release/hns-rs-core-0.3.1-crates.sha256
+shakescape_protocol_revision=c8feb6f90f3e03efbb982a5e33192dda6fd2f37a
+shakescape_protocol_version=0.4.0
+shakescape_protocol_crates='hns-p2p-experimental hns-marketplace-protocol'
+shakescape_protocol_checksum_manifest=release/hns-rs-shakescape-0.4.0-crates.sha256
 engine_repository=https://github.com/handshake-rs/hns-dane-engine.git
 engine_revision=b7fdf8826c81b77650a0f740d1f05314b74969f9
 engine_version=0.2.2
@@ -597,6 +601,13 @@ verify_protocol_packages_published() {
         "$protocol_version" \
         "$protocol_crates" \
         "$protocol_checksum_manifest"
+    verify_published_cohort \
+        hns-rs-shakescape \
+        "$protocol_repository" \
+        "$shakescape_protocol_revision" \
+        "$shakescape_protocol_version" \
+        "$shakescape_protocol_crates" \
+        "$shakescape_protocol_checksum_manifest"
 }
 
 verify_engine_packages_published() {

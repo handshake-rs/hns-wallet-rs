@@ -7,13 +7,13 @@ use hns_wallet_types::{ApprovalId, BaseUnits, ObjectHash, WorkflowId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::board_runtime::CurrentDenuoBoardOffersResolution;
+use crate::board_runtime::CurrentShakescapeBoardOffersResolution;
 use crate::seller_offer::SellerOfferRuntime;
 use crate::{
-    BuyerLockPlan, DenuoBoardRuntime, MAX_SHAKEDEX_FUNDING_INPUTS, PrepareSellerOffer,
-    SellerLockPlan, SellerOfferPreview, ShakedexError, ShakedexScriptFinalizeParent,
-    ShakedexSellerPolicy, ShakedexValueAction, ShakedexValueRuntime, ShakedexValueStage,
-    ShakedexValueWorkflow, StoredShakedexValueWorkflow, VerifiedBuyerFulfillment,
+    BuyerLockPlan, MAX_SHAKEDEX_FUNDING_INPUTS, PrepareSellerOffer, SellerLockPlan,
+    SellerOfferPreview, ShakedexError, ShakedexScriptFinalizeParent, ShakedexSellerPolicy,
+    ShakedexValueAction, ShakedexValueRuntime, ShakedexValueStage, ShakedexValueWorkflow,
+    ShakescapeBoardRuntime, StoredShakedexValueWorkflow, VerifiedBuyerFulfillment,
     VerifiedSellerRecovery, VerifiedShakedexTransfer, prepare_current_buyer_fulfillment,
     prepare_current_script_finalize, prepare_current_seller_recovery, shakedex_value_workflow_id,
     verify_signed_buyer_fulfillment, verify_signed_seller_recovery,
@@ -134,7 +134,7 @@ pub struct ShakedexStartupRecoveryReport {
 /// script FINALIZE, exact approval, broadcast, and startup recovery.
 pub struct ShakedexTradeRuntime<'a, B, C> {
     hns: &'a HnsWalletRuntime<B, C>,
-    board: DenuoBoardRuntime<'a, B, C>,
+    board: ShakescapeBoardRuntime<'a, B, C>,
     seller: SellerOfferRuntime<'a, B, C>,
     value: ShakedexValueRuntime<'a, B, C>,
 }
@@ -147,7 +147,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         if !hns.shares_store_authority(&store) {
             return Err(ShakedexError::StoreAuthorityMismatch);
         }
-        let board = DenuoBoardRuntime::new_value(hns, store.clone())?;
+        let board = ShakescapeBoardRuntime::new_value(hns, store.clone())?;
         let seller = SellerOfferRuntime::new(hns, store.clone())?;
         let value = ShakedexValueRuntime::new(store.clone(), hns)?;
         Ok(Self {
@@ -250,7 +250,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
             });
         }
         let current = match self.board.current_offers(&selected)? {
-            CurrentDenuoBoardOffersResolution::Absent { board_revision } => {
+            CurrentShakescapeBoardOffersResolution::Absent { board_revision } => {
                 if board_revision != inventory.board_revision() {
                     return Err(ShakedexError::StaleRevision);
                 }
@@ -260,7 +260,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
                     next_cursor: None,
                 });
             }
-            CurrentDenuoBoardOffersResolution::Current(current) => current,
+            CurrentShakescapeBoardOffersResolution::Current(current) => current,
         };
         if current.board_revision() != inventory.board_revision()
             || current.listings().len() != selected.len()

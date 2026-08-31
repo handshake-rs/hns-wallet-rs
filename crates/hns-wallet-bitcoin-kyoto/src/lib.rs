@@ -36,7 +36,8 @@ use bdk_wallet::{KeychainKind, SignOptions, Wallet};
 use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
 use hns_marketplace_protocol::{
-    AssetId, MarketPair, NetworkBinding as DenuoNetworkBinding, SwapAssetSide, SwapSessionHello,
+    AssetId, MarketPair, NetworkBinding as ShakescapeNetworkBinding, SwapAssetSide,
+    SwapSessionHello,
 };
 use hns_wallet_chain_api::SettlementSigner;
 use hns_wallet_types::{
@@ -50,7 +51,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 pub const MIN_HTLC_DUST_SATS: u64 = 330;
 /// Bitcoin's consensus boundary between height and Unix-time absolute
-/// locktimes. Denuo `UnixTime` deadlines must never silently become heights.
+/// locktimes. Shakescape `UnixTime` deadlines must never silently become heights.
 pub const BITCOIN_TIMESTAMP_LOCKTIME_THRESHOLD: u64 = 500_000_000;
 pub const MAX_HTLC_SCRIPT_BYTES: usize = 256;
 pub const MAX_BITCOIN_TRANSACTION_BYTES: usize = 400_000;
@@ -68,9 +69,10 @@ pub const DEFAULT_REQUIRED_PEERS: u8 = 3;
 pub const MAX_KYOTO_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_KYOTO_SYNC_TIMEOUT: Duration = Duration::from_secs(86_400);
 /// Domain-separated commitment to an exact Bitcoin P2WSH HTLC as it appears
-/// in a signed Denuo HNS/BTC session. It binds the bilateral network, amount,
+/// in a signed Shakescape HNS/BTC session. It binds the bilateral network, amount,
 /// and full witness script—not merely the script hash advertised by a peer.
-pub const DENUO_BITCOIN_HTLC_COMMITMENT_DOMAIN: &[u8] = b"hns-wallet-rs/denuo-bitcoin-htlc/v1";
+pub const SHAKESCAPE_BITCOIN_HTLC_COMMITMENT_DOMAIN: &[u8] =
+    b"hns-wallet-rs/shakescape-bitcoin-htlc/v1";
 /// Wallet-private HKDF-SHA256 salt for Bitcoin atomic-swap keys. This is not a
 /// registered BIP-32 purpose or an interoperable descriptor path.
 pub const BITCOIN_SWAP_DERIVATION_DOMAIN: &[u8] = b"hns-wallet-rs/bitcoin-atomic-swap-key/v1";
@@ -571,9 +573,9 @@ pub struct BitcoinHtlc {
 }
 
 /// Exact Bitcoin descriptor and commitment implied by one side of an accepted
-/// Denuo HNS/BTC agreement.
+/// Shakescape HNS/BTC agreement.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoBitcoinHtlcBinding {
+pub struct ShakescapeBitcoinHtlcBinding {
     pub htlc: BitcoinHtlc,
     pub commitment: ObjectHash,
     pub value_sats: u64,
@@ -777,15 +779,15 @@ impl BitcoinHtlc {
     }
 }
 
-/// Build the Bitcoin HTLC that the signed Denuo terms require for `side`.
+/// Build the Bitcoin HTLC that the signed Shakescape terms require for `side`.
 /// The party offering that Bitcoin side owns its refund branch; the other
 /// settlement key owns the redeem branch. The result's commitment must equal
-/// the corresponding lock commitment in the accepted Denuo session before a
+/// the corresponding lock commitment in the accepted Shakescape session before a
 /// caller funds, accepts, or spends it.
-pub fn build_denuo_bitcoin_htlc(
+pub fn build_shakescape_bitcoin_htlc(
     hello: &SwapSessionHello,
     side: SwapAssetSide,
-) -> Result<DenuoBitcoinHtlcBinding, BitcoinWalletError> {
+) -> Result<ShakescapeBitcoinHtlcBinding, BitcoinWalletError> {
     let (asset, amount, deadline, receiver_bytes, refund_bytes) = match side {
         SwapAssetSide::Offered => (
             hello.offered_asset,
@@ -815,8 +817,8 @@ pub fn build_denuo_bitcoin_htlc(
     let refund =
         PublicKey::from_slice(&refund_bytes).map_err(|_| BitcoinWalletError::InvalidHtlc)?;
     let htlc = BitcoinHtlc::new(hello.hashlock, receiver, refund, refund_locktime)?;
-    let commitment = denuo_bitcoin_htlc_commitment(hello.header.network, &htlc, value_sats)?;
-    Ok(DenuoBitcoinHtlcBinding {
+    let commitment = shakescape_bitcoin_htlc_commitment(hello.header.network, &htlc, value_sats)?;
+    Ok(ShakescapeBitcoinHtlcBinding {
         htlc,
         commitment,
         value_sats,
@@ -1391,12 +1393,12 @@ pub fn htlc_commitment(htlc: &BitcoinHtlc) -> ObjectHash {
 }
 
 /// Produce the exact Bitcoin lock commitment which may be placed into the
-/// Bitcoin side of a signed Denuo HNS/BTC session. A funding status still
+/// Bitcoin side of a signed Shakescape HNS/BTC session. A funding status still
 /// carries its independently verified outpoint and amount; this commitment
 /// ensures that the outpoint's P2WSH program is for the same hashlock, keys,
 /// refund locktime, and chain network that both parties accepted.
-pub fn denuo_bitcoin_htlc_commitment(
-    network: DenuoNetworkBinding,
+pub fn shakescape_bitcoin_htlc_commitment(
+    network: ShakescapeNetworkBinding,
     htlc: &BitcoinHtlc,
     value_sats: u64,
 ) -> Result<ObjectHash, BitcoinWalletError> {
@@ -1413,7 +1415,7 @@ pub fn denuo_bitcoin_htlc_commitment(
     let script_length =
         u16::try_from(htlc.witness_script.len()).map_err(|_| BitcoinWalletError::InvalidHtlc)?;
     let mut hasher = Sha256::new();
-    hasher.update(DENUO_BITCOIN_HTLC_COMMITMENT_DOMAIN);
+    hasher.update(SHAKESCAPE_BITCOIN_HTLC_COMMITMENT_DOMAIN);
     hasher.update(network);
     hasher.update(value_sats.to_le_bytes());
     hasher.update(script_length.to_le_bytes());
@@ -1421,15 +1423,15 @@ pub fn denuo_bitcoin_htlc_commitment(
     Ok(ObjectHash::new(hasher.finalize().into()))
 }
 
-/// Verify a Bitcoin descriptor against the commitment frozen in a Denuo
+/// Verify a Bitcoin descriptor against the commitment frozen in a Shakescape
 /// session before funding or accepting a claimed funding transaction.
-pub fn verify_denuo_bitcoin_htlc_commitment(
+pub fn verify_shakescape_bitcoin_htlc_commitment(
     expected: ObjectHash,
-    network: DenuoNetworkBinding,
+    network: ShakescapeNetworkBinding,
     htlc: &BitcoinHtlc,
     value_sats: u64,
 ) -> Result<(), BitcoinWalletError> {
-    if denuo_bitcoin_htlc_commitment(network, htlc, value_sats)? != expected {
+    if shakescape_bitcoin_htlc_commitment(network, htlc, value_sats)? != expected {
         return Err(BitcoinWalletError::InvalidEvidence);
     }
     Ok(())
@@ -1622,8 +1624,8 @@ mod tests {
         }
     }
 
-    fn denuo_network(counterchain_network: u64) -> DenuoNetworkBinding {
-        DenuoNetworkBinding {
+    fn shakescape_network(counterchain_network: u64) -> ShakescapeNetworkBinding {
+        ShakescapeNetworkBinding {
             hns_magic: 0x5b6e_c393,
             hns_genesis: BlockHash::new([1; 32]),
             counterchain: ChainId::BITCOIN,
@@ -1642,7 +1644,7 @@ mod tests {
         bitcoin_value_runtime_permit().expect("qualified value-runtime permit");
     }
 
-    fn denuo_hello(bitcoin_side: SwapAssetSide) -> SwapSessionHello {
+    fn shakescape_hello(bitcoin_side: SwapAssetSide) -> SwapSessionHello {
         let (offered_asset, received_asset) = match bitcoin_side {
             SwapAssetSide::Offered => (AssetId::BTC, AssetId::HNS),
             SwapAssetSide::Received => (AssetId::HNS, AssetId::BTC),
@@ -1650,7 +1652,7 @@ mod tests {
         SwapSessionHello {
             header: SignedObjectHeader {
                 version: hns_marketplace_protocol::MARKETPLACE_PROTOCOL_VERSION,
-                network: denuo_network(1),
+                network: shakescape_network(1),
                 pair: MarketPair::HNS_BTC,
                 signer_public_key: key(9).to_bytes().try_into().expect("signer SEC1"),
                 sequence: 1,
@@ -1685,43 +1687,52 @@ mod tests {
     }
 
     #[test]
-    fn denuo_bitcoin_descriptor_assigns_redeem_and_refund_to_signed_parties() {
-        let hello = denuo_hello(SwapAssetSide::Received);
-        let binding =
-            build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Received).expect("Bitcoin descriptor");
+    fn shakescape_bitcoin_descriptor_assigns_redeem_and_refund_to_signed_parties() {
+        let hello = shakescape_hello(SwapAssetSide::Received);
+        let binding = build_shakescape_bitcoin_htlc(&hello, SwapAssetSide::Received)
+            .expect("Bitcoin descriptor");
         assert_eq!(binding.value_sats, 1_000);
         assert_eq!(binding.htlc.receiver_public_key, key(3).to_bytes());
         assert_eq!(binding.htlc.refund_public_key, key(4).to_bytes());
-        verify_denuo_bitcoin_htlc_commitment(
+        verify_shakescape_bitcoin_htlc_commitment(
             binding.commitment,
             hello.header.network,
             &binding.htlc,
             binding.value_sats,
         )
-        .expect("same Denuo binding");
-        assert!(build_denuo_bitcoin_htlc(&hello, SwapAssetSide::Offered).is_err());
+        .expect("same Shakescape binding");
+        assert!(build_shakescape_bitcoin_htlc(&hello, SwapAssetSide::Offered).is_err());
         let mut height_like_deadline = hello;
         height_like_deadline.received_refund_deadline.value = 500;
-        assert!(build_denuo_bitcoin_htlc(&height_like_deadline, SwapAssetSide::Received).is_err());
+        assert!(
+            build_shakescape_bitcoin_htlc(&height_like_deadline, SwapAssetSide::Received).is_err()
+        );
     }
 
     #[test]
-    fn denuo_bitcoin_commitment_binds_network_amount_and_exact_htlc_script() {
+    fn shakescape_bitcoin_commitment_binds_network_amount_and_exact_htlc_script() {
         let htlc = htlc();
-        let network = denuo_network(1);
-        let commitment = denuo_bitcoin_htlc_commitment(network, &htlc, 50_000)
-            .expect("canonical Denuo Bitcoin commitment");
-        verify_denuo_bitcoin_htlc_commitment(commitment, network, &htlc, 50_000)
+        let network = shakescape_network(1);
+        let commitment = shakescape_bitcoin_htlc_commitment(network, &htlc, 50_000)
+            .expect("canonical Shakescape Bitcoin commitment");
+        verify_shakescape_bitcoin_htlc_commitment(commitment, network, &htlc, 50_000)
             .expect("same descriptor verifies");
-        assert!(verify_denuo_bitcoin_htlc_commitment(commitment, network, &htlc, 50_001).is_err());
         assert!(
-            verify_denuo_bitcoin_htlc_commitment(commitment, denuo_network(2), &htlc, 50_000,)
-                .is_err()
+            verify_shakescape_bitcoin_htlc_commitment(commitment, network, &htlc, 50_001).is_err()
+        );
+        assert!(
+            verify_shakescape_bitcoin_htlc_commitment(
+                commitment,
+                shakescape_network(2),
+                &htlc,
+                50_000,
+            )
+            .is_err()
         );
         let changed_script =
             BitcoinHtlc::new(htlc.hashlock, key(3), key(5), 500).expect("different refund key");
         assert!(
-            verify_denuo_bitcoin_htlc_commitment(commitment, network, &changed_script, 50_000,)
+            verify_shakescape_bitcoin_htlc_commitment(commitment, network, &changed_script, 50_000,)
                 .is_err()
         );
     }

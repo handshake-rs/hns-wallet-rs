@@ -49,8 +49,8 @@ pub use native_read_profile::{
     provision_native_hns_read_profile, revoke_native_hns_read_profile,
 };
 pub use native_value_runtime::{
-    NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE, NativeHnsValueSnapshot, PersistentDenuoTransport,
-    PersistentHnsValueConfig, PersistentHnsValueRuntime, PersistentShakedexConfig,
+    NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE, NativeHnsValueSnapshot, PersistentHnsValueConfig,
+    PersistentHnsValueRuntime, PersistentShakedexConfig, PersistentShakescapeTransport,
     TRUSTED_NATIVE_HNS_VALUE_ORIGIN, TrustedNativeHnsValueAction,
 };
 
@@ -1098,7 +1098,7 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         if !capabilities.contains(&ServiceCapability::ProviderDispatch) {
             capabilities.remove(&ServiceCapability::ValueMovement);
             capabilities.remove(&ServiceCapability::HnsValueOperationsV1);
-            capabilities.remove(&ServiceCapability::DenuoShakedexV1);
+            capabilities.remove(&ServiceCapability::ShakescapeShakedexV1);
         }
         if !capabilities.contains(&ServiceCapability::WalletOperations) {
             capabilities.remove(&ServiceCapability::HnsReadOperationsV1);
@@ -1108,10 +1108,10 @@ impl<S: ProviderStateStore, R: ServiceRuntime> WalletService<S, R> {
         {
             capabilities.remove(&ServiceCapability::HnsWalletAuthorityContextV1);
             capabilities.remove(&ServiceCapability::HnsValueOperationsV1);
-            capabilities.remove(&ServiceCapability::DenuoShakedexV1);
+            capabilities.remove(&ServiceCapability::ShakescapeShakedexV1);
         }
         if !capabilities.contains(&ServiceCapability::HnsValueOperationsV1) {
-            capabilities.remove(&ServiceCapability::DenuoShakedexV1);
+            capabilities.remove(&ServiceCapability::ShakescapeShakedexV1);
         }
         Ok(Self {
             provider: ProviderCore::new(state, wallet_session_id, true),

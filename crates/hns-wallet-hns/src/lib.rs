@@ -32,9 +32,9 @@ pub use name_workflow::{
 };
 pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
 pub use peer_coordinator::{
-    ConnectedHnsPeer, HnsBlockScanBatchTelemetry, HnsBlockScanProgress, HnsDirectDenuoListener,
-    HnsDirectDenuoMessage, HnsDirectDenuoPeer, HnsDirectPeerConfig, HnsDirectPeerCoordinator,
-    HnsDirectPeerError, HnsHeaderRoundProgress, NativeHnsPeerPool,
+    ConnectedHnsPeer, HnsBlockScanBatchTelemetry, HnsBlockScanProgress, HnsDirectPeerConfig,
+    HnsDirectPeerCoordinator, HnsDirectPeerError, HnsDirectShakescapeListener,
+    HnsDirectShakescapeMessage, HnsDirectShakescapePeer, HnsHeaderRoundProgress, NativeHnsPeerPool,
     open_wallet_direct_hns_peer_coordinator, open_wallet_direct_hns_peer_coordinator_with_floor,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap,
 };
@@ -222,10 +222,12 @@ fn shakedex_network_binding(network: HnsNetwork) -> Result<NetworkBinding, HnsWa
     })
 }
 
-/// Reconstruct the exact local Handshake binding used by the direct Denuo
+/// Reconstruct the exact local Handshake binding used by the direct Shakescape
 /// HNS/BTC protocol. This is derived only from the selected wallet network;
 /// it has no relay, peer, indexer, or price-policy input.
-pub fn direct_denuo_network_binding(network: HnsNetwork) -> Result<NetworkBinding, HnsWalletError> {
+pub fn direct_shakescape_network_binding(
+    network: HnsNetwork,
+) -> Result<NetworkBinding, HnsWalletError> {
     shakedex_network_binding(network)
 }
 
@@ -515,19 +517,19 @@ pub struct CoinSelection {
     pub change: BaseUnits,
 }
 
-pub const MAX_DENUO_NAME_MARKET_TRANSPORT_PAGE: usize = 256;
-pub const MAX_DENUO_NAME_MARKET_ENVELOPE_BYTES: usize = 16 * 1024;
+pub const MAX_SHAKESCAPE_NAME_MARKET_TRANSPORT_PAGE: usize = 256;
+pub const MAX_SHAKESCAPE_NAME_MARKET_ENVELOPE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum DenuoTransportMessageKind {
+pub enum ShakescapeTransportMessageKind {
     Offer,
     Cancellation,
 }
 
 /// Exact durable publication attempt sent to the authenticated local node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DenuoPublicationHandoff {
+pub struct ShakescapePublicationHandoff {
     pub network_magic: u32,
     pub network_genesis: [u8; 32],
     pub attempt_id: [u8; 32],
@@ -536,14 +538,14 @@ pub struct DenuoPublicationHandoff {
     pub envelope_id: [u8; 32],
     pub envelope_digest: [u8; 32],
     pub content_id: [u8; 32],
-    pub message_kind: DenuoTransportMessageKind,
+    pub message_kind: ShakescapeTransportMessageKind,
     pub request_id: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoPublicationAcceptance {
+pub struct ShakescapePublicationAcceptance {
     pub relay_revision: u64,
-    pub kind: DenuoTransportMessageKind,
+    pub kind: ShakescapeTransportMessageKind,
     pub content_id: [u8; 32],
     pub inserted: bool,
     pub accepted_at_unix: u64,
@@ -554,36 +556,36 @@ pub struct DenuoPublicationAcceptance {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoTransportEvent {
+pub struct ShakescapeTransportEvent {
     pub revision: u64,
     pub received_at_unix: u64,
-    pub kind: DenuoTransportMessageKind,
+    pub kind: ShakescapeTransportMessageKind,
     pub content_id: [u8; 32],
     pub envelope_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoTransportEventPage {
+pub struct ShakescapeTransportEventPage {
     pub instance_nonce: [u8; 32],
     pub cursor_reset: bool,
     pub oldest_revision: u64,
     pub head_revision: u64,
-    pub events: Vec<DenuoTransportEvent>,
+    pub events: Vec<ShakescapeTransportEvent>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoTransportSnapshotRecord {
-    pub kind: DenuoTransportMessageKind,
+pub struct ShakescapeTransportSnapshotRecord {
+    pub kind: ShakescapeTransportMessageKind,
     pub content_id: [u8; 32],
     pub envelope_bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoTransportSnapshotPage {
+pub struct ShakescapeTransportSnapshotPage {
     pub instance_nonce: [u8; 32],
     pub snapshot_revision: u64,
     pub next_offset: Option<usize>,
-    pub records: Vec<DenuoTransportSnapshotRecord>,
+    pub records: Vec<ShakescapeTransportSnapshotRecord>,
 }
 
 pub trait HnsBackend {
@@ -703,34 +705,34 @@ pub trait HnsBackend {
         Err(HnsWalletError::RuntimeIntegrationUnavailable)
     }
 
-    /// Hand one exact durably prepared Denuo publication to the authenticated
+    /// Hand one exact durably prepared Shakescape publication to the authenticated
     /// local node and require its endpoint-signed acceptance receipt.
-    fn publish_denuo_name_market(
+    fn publish_shakescape_name_market(
         &self,
         _envelope_bytes: &[u8],
-        _handoff: DenuoPublicationHandoff,
-    ) -> Result<DenuoPublicationAcceptance, HnsWalletError> {
+        _handoff: ShakescapePublicationHandoff,
+    ) -> Result<ShakescapePublicationAcceptance, HnsWalletError> {
         Err(HnsWalletError::RuntimeIntegrationUnavailable)
     }
 
     /// Read one process-instance-bound page of untrusted marketplace events.
-    fn get_denuo_name_market_events(
+    fn get_shakescape_name_market_events(
         &self,
         _expected_instance_nonce: Option<[u8; 32]>,
         _after_revision: u64,
         _limit: usize,
-    ) -> Result<DenuoTransportEventPage, HnsWalletError> {
+    ) -> Result<ShakescapeTransportEventPage, HnsWalletError> {
         Err(HnsWalletError::RuntimeIntegrationUnavailable)
     }
 
     /// Rebuild from a coherent latest-state snapshot after a node restart or
     /// retained-event-window gap.
-    fn get_denuo_name_market_snapshot(
+    fn get_shakescape_name_market_snapshot(
         &self,
         _expected_revision: Option<u64>,
         _offset: usize,
         _limit: usize,
-    ) -> Result<DenuoTransportSnapshotPage, HnsWalletError> {
+    ) -> Result<ShakescapeTransportSnapshotPage, HnsWalletError> {
         Err(HnsWalletError::RuntimeIntegrationUnavailable)
     }
 }
@@ -2069,7 +2071,7 @@ pub struct HnsAccountReadSnapshot {
 }
 
 /// Query-scoped selected-account, network, and trusted-time authority for one
-/// Denuo board metadata read or negative cancellation admission.
+/// Shakescape board metadata read or negative cancellation admission.
 ///
 /// This object is deliberately non-cloneable and non-serializable. It proves
 /// no current chain state, name ownership, locking coin, publication, signing,
@@ -2203,7 +2205,7 @@ impl fmt::Debug for VerifiedHnsBoardCancellationContext {
 }
 
 /// Generalized name for the purpose-minimized account/network/time context
-/// shared by closed Denuo board metadata reads and cancellation admission.
+/// shared by closed Shakescape board metadata reads and cancellation admission.
 pub type VerifiedHnsBoardContext = VerifiedHnsBoardCancellationContext;
 
 /// Synchronized, non-value HNS runtime for product/provider compositions that
@@ -2394,7 +2396,7 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
     }
 
     /// Observe the exact selected account, its Shakedex network binding, and
-    /// trusted wall time for one Denuo board metadata operation.
+    /// trusted wall time for one Shakescape board metadata operation.
     /// Selected account state is fenced on both sides of the clock call and no
     /// backend or node method is invoked.
     pub fn observe_board_context(&self) -> Result<VerifiedHnsBoardContext, HnsWalletError> {
@@ -2432,7 +2434,7 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
         })
     }
 
-    /// Observe the purpose-minimized context used by negative Denuo board
+    /// Observe the purpose-minimized context used by negative Shakescape board
     /// cancellation admission. This preserves the established cancellation
     /// API while sharing the exact account/network/time fencing implementation
     /// with closed board metadata reads.
@@ -2580,7 +2582,7 @@ impl<B: HnsBackend, C: HnsClock> HnsAccountReadRuntime<B, C> {
 /// The flags remain authenticated identity facts. They are never converted to
 /// a permit or capability, and missing or non-exact persisted state fails on
 /// selection. This wrapper exposes only exact selection and synchronized read
-/// projection; its inner runtime is private, so current Shakedex-lock, Denuo,
+/// projection; its inner runtime is private, so current Shakedex-lock, Shakescape,
 /// signing, import/export, workflow, broadcast, and value APIs are unreachable.
 /// Synchronization may update WalletAccount scan/index metadata (never its
 /// configuration), create or replace derived-address, coin, transaction, name,
@@ -3125,7 +3127,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     }
 
     /// Open the full HNS runtime over the exact Arc-backed store/key authority
-    /// shared with provider, browser-service, and Denuo components.
+    /// shared with provider, browser-service, and Shakescape components.
     ///
     /// The supplied store must already be unlocked. Every clone observes the
     /// same lock transition, and [`Self::shares_store_authority`] lets the
@@ -3260,7 +3262,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         self.clock.now_unix()
     }
 
-    /// Exact canonical network binding for adjacent Shakedex/Denuo runtime
+    /// Exact canonical network binding for adjacent Shakedex/Shakescape runtime
     /// composition.
     pub fn shakedex_network(&self) -> Result<NetworkBinding, HnsWalletError> {
         shakedex_network_binding(self.configured_runtime_config()?.network)

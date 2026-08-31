@@ -1,16 +1,18 @@
 use hns_marketplace_protocol::{
-    DenuoRegistryVersion, MAX_NAME_OFFERS_PER_MESSAGE, NameMarketMessage,
+    MAX_NAME_OFFERS_PER_MESSAGE, NameMarketMessage, ShakescapeRegistryVersion,
 };
 use hns_wallet_hns::{HnsBackend, HnsClock, MAX_CURRENT_SHAKEDEX_LOCK_BATCH};
 use hns_wallet_types::ObjectHash;
 
 use crate::board_runtime::{
-    CurrentDenuoBoardInventory, CurrentDenuoBoardOffers, CurrentDenuoBoardOffersResolution,
+    CurrentShakescapeBoardInventory, CurrentShakescapeBoardOffers,
+    CurrentShakescapeBoardOffersResolution,
 };
 use crate::{
-    CurrentDenuoBoardOffer, DenuoBoardRuntime, DenuoNameMarketRequest, ShakedexError,
-    decode_denuo_authenticated_offer, decode_denuo_inventory, decode_denuo_request,
-    encode_denuo_inventory, encode_denuo_offer,
+    CurrentShakescapeBoardOffer, ShakedexError, ShakescapeBoardRuntime,
+    ShakescapeNameMarketRequest, decode_shakescape_authenticated_offer,
+    decode_shakescape_inventory, decode_shakescape_request, encode_shakescape_inventory,
+    encode_shakescape_offer,
 };
 
 /// Closed query-scoped plan for the nonempty current subset of one exact
@@ -19,13 +21,13 @@ use crate::{
 /// Exact request hashes, verified listings, current locks, and temporary wire
 /// bytes remain private. This object is non-cloneable and non-serializable and
 /// exposes no signing, transport, provider, or value capability.
-#[must_use = "a Denuo board offers plan is point-in-time evidence, not transport authority"]
-pub struct PreparedDenuoBoardOffersResponse {
+#[must_use = "a Shakescape board offers plan is point-in-time evidence, not transport authority"]
+pub struct PreparedShakescapeBoardOffersResponse {
     request_id: u64,
-    current: Box<CurrentDenuoBoardOffers>,
+    current: Box<CurrentShakescapeBoardOffers>,
 }
 
-impl PreparedDenuoBoardOffersResponse {
+impl PreparedShakescapeBoardOffersResponse {
     pub const fn request_id(&self) -> u64 {
         self.request_id
     }
@@ -43,10 +45,10 @@ impl PreparedDenuoBoardOffersResponse {
     }
 }
 
-impl core::fmt::Debug for PreparedDenuoBoardOffersResponse {
+impl core::fmt::Debug for PreparedShakescapeBoardOffersResponse {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
-            .debug_struct("PreparedDenuoBoardOffersResponse")
+            .debug_struct("PreparedShakescapeBoardOffersResponse")
             .field("request_id", &self.request_id)
             .field("board_revision", &self.current.board_revision())
             .field(
@@ -64,17 +66,17 @@ impl core::fmt::Debug for PreparedDenuoBoardOffersResponse {
 /// means every requested row was missing or cancelled and deliberately
 /// carries no wire response, because canonical type-5 `Offers` cannot be
 /// empty. `Current` retains one private coherent current-lock batch.
-#[must_use = "a Denuo board offers response plan must be handled explicitly"]
-pub enum DenuoBoardOffersResponsePlan {
+#[must_use = "a Shakescape board offers response plan must be handled explicitly"]
+pub enum ShakescapeBoardOffersResponsePlan {
     Absent {
         request_id: u64,
         requested_count: usize,
         board_revision: u64,
     },
-    Current(Box<PreparedDenuoBoardOffersResponse>),
+    Current(Box<PreparedShakescapeBoardOffersResponse>),
 }
 
-impl DenuoBoardOffersResponsePlan {
+impl ShakescapeBoardOffersResponsePlan {
     pub const fn request_id(&self) -> u64 {
         match self {
             Self::Absent { request_id, .. } => *request_id,
@@ -106,7 +108,7 @@ impl DenuoBoardOffersResponsePlan {
     }
 }
 
-impl core::fmt::Debug for DenuoBoardOffersResponsePlan {
+impl core::fmt::Debug for ShakescapeBoardOffersResponsePlan {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Absent {
@@ -130,13 +132,13 @@ impl core::fmt::Debug for DenuoBoardOffersResponsePlan {
 /// non-cloneable and non-serializable and exposes no response bytes, listing,
 /// current lock, signing, transport, provider, or value capability. A future
 /// transport boundary must reacquire and fence current authority again.
-#[must_use = "a Denuo board inventory plan is point-in-time evidence, not transport authority"]
-pub struct PreparedDenuoBoardInventoryResponse {
+#[must_use = "a Shakescape board inventory plan is point-in-time evidence, not transport authority"]
+pub struct PreparedShakescapeBoardInventoryResponse {
     request_id: u64,
-    current: CurrentDenuoBoardInventory,
+    current: CurrentShakescapeBoardInventory,
 }
 
-impl PreparedDenuoBoardInventoryResponse {
+impl PreparedShakescapeBoardInventoryResponse {
     pub const fn request_id(&self) -> u64 {
         self.request_id
     }
@@ -150,10 +152,10 @@ impl PreparedDenuoBoardInventoryResponse {
     }
 }
 
-impl core::fmt::Debug for PreparedDenuoBoardInventoryResponse {
+impl core::fmt::Debug for PreparedShakescapeBoardInventoryResponse {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
-            .debug_struct("PreparedDenuoBoardInventoryResponse")
+            .debug_struct("PreparedShakescapeBoardInventoryResponse")
             .field("request_id", &self.request_id)
             .field("board_revision", &self.current.board_revision())
             .field("listing_count", &self.current.listing_hashes().len())
@@ -168,14 +170,14 @@ impl core::fmt::Debug for PreparedDenuoBoardInventoryResponse {
 /// listing, lock, signing, transport, provider, or value capability. A future
 /// transport boundary must reacquire and fence current authority again before
 /// it encodes or sends any response.
-#[must_use = "a Denuo board response plan is point-in-time evidence, not transport authority"]
-pub struct PreparedDenuoBoardOfferResponse {
+#[must_use = "a Shakescape board response plan is point-in-time evidence, not transport authority"]
+pub struct PreparedShakescapeBoardOfferResponse {
     request_id: u64,
     listing_hash: ObjectHash,
-    current: CurrentDenuoBoardOffer,
+    current: CurrentShakescapeBoardOffer,
 }
 
-impl PreparedDenuoBoardOfferResponse {
+impl PreparedShakescapeBoardOfferResponse {
     pub const fn request_id(&self) -> u64 {
         self.request_id
     }
@@ -189,10 +191,10 @@ impl PreparedDenuoBoardOfferResponse {
     }
 }
 
-impl core::fmt::Debug for PreparedDenuoBoardOfferResponse {
+impl core::fmt::Debug for PreparedShakescapeBoardOfferResponse {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
-            .debug_struct("PreparedDenuoBoardOfferResponse")
+            .debug_struct("PreparedShakescapeBoardOfferResponse")
             .field("request_id", &self.request_id)
             .field("listing_hash", &self.listing_hash)
             .field("board_revision", &self.current.board_revision())
@@ -206,16 +208,16 @@ impl core::fmt::Debug for PreparedDenuoBoardOfferResponse {
 /// `Absent` covers both a missing row and a persisted cancellation tombstone.
 /// `Current` retains private query-scoped authority but still carries no bytes
 /// that a caller could send. This enum is non-cloneable and non-serializable.
-#[must_use = "a Denuo board response plan must be handled explicitly"]
-pub enum DenuoBoardOfferResponsePlan {
+#[must_use = "a Shakescape board response plan must be handled explicitly"]
+pub enum ShakescapeBoardOfferResponsePlan {
     Absent {
         request_id: u64,
         listing_hash: ObjectHash,
     },
-    Current(Box<PreparedDenuoBoardOfferResponse>),
+    Current(Box<PreparedShakescapeBoardOfferResponse>),
 }
 
-impl DenuoBoardOfferResponsePlan {
+impl ShakescapeBoardOfferResponsePlan {
     pub const fn request_id(&self) -> u64 {
         match self {
             Self::Absent { request_id, .. } => *request_id,
@@ -238,7 +240,7 @@ impl DenuoBoardOfferResponsePlan {
     }
 }
 
-impl core::fmt::Debug for DenuoBoardOfferResponsePlan {
+impl core::fmt::Debug for ShakescapeBoardOfferResponsePlan {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Absent {
@@ -254,7 +256,7 @@ impl core::fmt::Debug for DenuoBoardOfferResponsePlan {
     }
 }
 
-/// Prepare a closed response plan for one canonical Denuo V2 `GetOffers`
+/// Prepare a closed response plan for one canonical Shakescape V1 `GetOffers`
 /// request containing at most 64 exact sorted, unique, nonzero hashes.
 ///
 /// The row limit is checked after canonical request decoding but before any
@@ -265,13 +267,14 @@ impl core::fmt::Debug for DenuoBoardOfferResponsePlan {
 /// unchanged selected account plus exact board revision/rows. The canonical
 /// response is encoded and decoded internally under the exact request ID and
 /// exact ordered subset, then all temporary wire objects are discarded.
-pub fn prepare_denuo_board_offers_response<B: HnsBackend, C: HnsClock>(
+pub fn prepare_shakescape_board_offers_response<B: HnsBackend, C: HnsClock>(
     encoded_request: &[u8],
-    board: &DenuoBoardRuntime<'_, B, C>,
-) -> Result<DenuoBoardOffersResponsePlan, ShakedexError> {
-    let (request_id, request) = decode_denuo_request(encoded_request, DenuoRegistryVersion::V2)?;
-    let DenuoNameMarketRequest::Offers(listing_hashes) = request else {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+    board: &ShakescapeBoardRuntime<'_, B, C>,
+) -> Result<ShakescapeBoardOffersResponsePlan, ShakedexError> {
+    let (request_id, request) =
+        decode_shakescape_request(encoded_request, ShakescapeRegistryVersion::V1)?;
+    let ShakescapeNameMarketRequest::Offers(listing_hashes) = request else {
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     };
     if listing_hashes.is_empty()
         || listing_hashes.len() > MAX_NAME_OFFERS_PER_MESSAGE
@@ -281,18 +284,18 @@ pub fn prepare_denuo_board_offers_response<B: HnsBackend, C: HnsClock>(
             .any(|listing_hash| *listing_hash.as_bytes() == [0; 32])
         || listing_hashes.windows(2).any(|pair| pair[0] >= pair[1])
     {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     }
     let requested_count = listing_hashes.len();
     let current = match board.current_offers(&listing_hashes)? {
-        CurrentDenuoBoardOffersResolution::Absent { board_revision } => {
-            return Ok(DenuoBoardOffersResponsePlan::Absent {
+        CurrentShakescapeBoardOffersResolution::Absent { board_revision } => {
+            return Ok(ShakescapeBoardOffersResponsePlan::Absent {
                 request_id,
                 requested_count,
                 board_revision,
             });
         }
-        CurrentDenuoBoardOffersResolution::Current(current) => current,
+        CurrentShakescapeBoardOffersResolution::Current(current) => current,
     };
 
     let response_bytes = NameMarketMessage::Offers(
@@ -302,29 +305,29 @@ pub fn prepare_denuo_board_offers_response<B: HnsBackend, C: HnsClock>(
             .map(|listing| listing.authenticated().canonical().clone())
             .collect(),
     )
-    .encode_envelope(DenuoRegistryVersion::V2, request_id)
-    .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+    .encode_envelope(ShakescapeRegistryVersion::V1, request_id)
+    .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?;
     let (decoded_registry, decoded_request_id, decoded_message) =
         NameMarketMessage::decode_envelope(&response_bytes)
-            .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+            .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?;
     let NameMarketMessage::Offers(decoded_listings) = decoded_message else {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     };
-    if decoded_registry != DenuoRegistryVersion::V2
+    if decoded_registry != ShakescapeRegistryVersion::V1
         || decoded_request_id != request_id
         || decoded_listings.len() != current.listings().len()
     {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     }
     for (decoded, expected) in decoded_listings.iter().zip(current.listings()) {
         let decoded_hash = ObjectHash::new(
             decoded
                 .listing_hash()
-                .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?,
+                .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?,
         );
         let decoded_bytes = decoded
             .encode()
-            .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+            .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?;
         if decoded_hash != expected.listing_hash()
             || decoded_bytes != expected.encoded()
             || current
@@ -332,63 +335,67 @@ pub fn prepare_denuo_board_offers_response<B: HnsBackend, C: HnsClock>(
                 .binary_search(&decoded_hash)
                 .is_err()
         {
-            return Err(ShakedexError::InvalidDenuoEnvelope);
+            return Err(ShakedexError::InvalidShakescapeEnvelope);
         }
     }
     drop(decoded_listings);
     drop(response_bytes);
 
-    Ok(DenuoBoardOffersResponsePlan::Current(Box::new(
-        PreparedDenuoBoardOffersResponse {
+    Ok(ShakescapeBoardOffersResponsePlan::Current(Box::new(
+        PreparedShakescapeBoardOffersResponse {
             request_id,
             current,
         },
     )))
 }
 
-/// Prepare a closed response plan for exactly one canonical Denuo V2
+/// Prepare a closed response plan for exactly one canonical Shakescape V1
 /// `GetOffer` request.
 ///
-/// The canonical Denuo envelope requires a nonzero correlation ID for both
+/// The canonical Shakescape envelope requires a nonzero correlation ID for both
 /// `GetOffer` and `Offer`; zero is rejected during decoding before board or
-/// node access. The function calls only `DenuoBoardRuntime::current_offer`
+/// node access. The function calls only `ShakescapeBoardRuntime::current_offer`
 /// after decoding the request. A current offer is encoded and authenticated
 /// back internally under the exact request ID/hash/listing bytes, after which
 /// both temporary response objects are discarded. No encoded response is
 /// retained or returned.
-pub fn prepare_denuo_board_offer_response<B: HnsBackend, C: HnsClock>(
+pub fn prepare_shakescape_board_offer_response<B: HnsBackend, C: HnsClock>(
     encoded_request: &[u8],
-    board: &DenuoBoardRuntime<'_, B, C>,
-) -> Result<DenuoBoardOfferResponsePlan, ShakedexError> {
-    let (request_id, request) = decode_denuo_request(encoded_request, DenuoRegistryVersion::V2)?;
-    let DenuoNameMarketRequest::Offer(listing_hash) = request else {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+    board: &ShakescapeBoardRuntime<'_, B, C>,
+) -> Result<ShakescapeBoardOfferResponsePlan, ShakedexError> {
+    let (request_id, request) =
+        decode_shakescape_request(encoded_request, ShakescapeRegistryVersion::V1)?;
+    let ShakescapeNameMarketRequest::Offer(listing_hash) = request else {
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     };
     let Some(current) = board.current_offer(listing_hash)? else {
-        return Ok(DenuoBoardOfferResponsePlan::Absent {
+        return Ok(ShakescapeBoardOfferResponsePlan::Absent {
             request_id,
             listing_hash,
         });
     };
 
-    let response_bytes = encode_denuo_offer(
-        DenuoRegistryVersion::V2,
+    let response_bytes = encode_shakescape_offer(
+        ShakescapeRegistryVersion::V1,
         request_id,
         current.listing().authenticated(),
     )?;
-    let (decoded_request_id, decoded_listing) =
-        decode_denuo_authenticated_offer(&response_bytes, DenuoRegistryVersion::V2, listing_hash)?;
+    let (decoded_request_id, decoded_listing) = decode_shakescape_authenticated_offer(
+        &response_bytes,
+        ShakescapeRegistryVersion::V1,
+        listing_hash,
+    )?;
     if decoded_request_id != request_id
         || decoded_listing.listing_hash() != listing_hash
         || decoded_listing.encoded() != current.listing().encoded()
     {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     }
     drop(decoded_listing);
     drop(response_bytes);
 
-    Ok(DenuoBoardOfferResponsePlan::Current(Box::new(
-        PreparedDenuoBoardOfferResponse {
+    Ok(ShakescapeBoardOfferResponsePlan::Current(Box::new(
+        PreparedShakescapeBoardOfferResponse {
             request_id,
             listing_hash,
             current,
@@ -396,7 +403,7 @@ pub fn prepare_denuo_board_offer_response<B: HnsBackend, C: HnsClock>(
     )))
 }
 
-/// Prepare a closed response plan for exactly one canonical Denuo V2
+/// Prepare a closed response plan for exactly one canonical Shakescape V1
 /// `GetOfferInventory` request.
 ///
 /// Both the inventory request and its type-3 response require the same nonzero
@@ -406,31 +413,32 @@ pub fn prepare_denuo_board_offer_response<B: HnsBackend, C: HnsClock>(
 /// write. A canonical response is encoded and decoded internally to verify its
 /// exact request ID and ordered hashes, after which both temporary response
 /// objects are discarded. An empty inventory is a valid response plan.
-pub fn prepare_denuo_board_inventory_response<B: HnsBackend, C: HnsClock>(
+pub fn prepare_shakescape_board_inventory_response<B: HnsBackend, C: HnsClock>(
     encoded_request: &[u8],
-    board: &DenuoBoardRuntime<'_, B, C>,
-) -> Result<PreparedDenuoBoardInventoryResponse, ShakedexError> {
-    let (request_id, request) = decode_denuo_request(encoded_request, DenuoRegistryVersion::V2)?;
-    if request != DenuoNameMarketRequest::Inventory {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+    board: &ShakescapeBoardRuntime<'_, B, C>,
+) -> Result<PreparedShakescapeBoardInventoryResponse, ShakedexError> {
+    let (request_id, request) =
+        decode_shakescape_request(encoded_request, ShakescapeRegistryVersion::V1)?;
+    if request != ShakescapeNameMarketRequest::Inventory {
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     }
     let current = board.current_inventory()?;
-    let response_bytes = encode_denuo_inventory(
-        DenuoRegistryVersion::V2,
+    let response_bytes = encode_shakescape_inventory(
+        ShakescapeRegistryVersion::V1,
         request_id,
         current.listing_hashes(),
     )?;
     let (decoded_request_id, decoded_listing_hashes) =
-        decode_denuo_inventory(&response_bytes, DenuoRegistryVersion::V2)?;
+        decode_shakescape_inventory(&response_bytes, ShakescapeRegistryVersion::V1)?;
     if decoded_request_id != request_id
         || decoded_listing_hashes.as_slice() != current.listing_hashes()
     {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     }
     drop(decoded_listing_hashes);
     drop(response_bytes);
 
-    Ok(PreparedDenuoBoardInventoryResponse {
+    Ok(PreparedShakescapeBoardInventoryResponse {
         request_id,
         current,
     })

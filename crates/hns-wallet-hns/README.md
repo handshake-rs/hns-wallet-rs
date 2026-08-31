@@ -16,7 +16,7 @@ the wallet's header, Merkle, watch-set, or Urkel verification authority.
 
 `HnsNodeRpcBackend` remains an optional compatibility adapter for existing
 desktop/node deployments. It is not a prerequisite for the mobile, browser,
-extension, Denuo, or Shakedex architecture.
+extension, Shakescape, or Shakedex architecture.
 
 The crate also owns the encrypted publisher-counter boundary required by the
 HNSA/HNSR adapter. Endpoint-delegation and named-route counters are independent,

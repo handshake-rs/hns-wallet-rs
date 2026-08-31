@@ -40,6 +40,6 @@ coordination metadata only; execution still requires independently verified
 local chain evidence.
 
 TCP, QUIC, WebSocket, WebRTC, HNSA/HRM rendezvous, or a native companion may
-carry the canonical Denuo frames; none is pricing, market, or chain authority.
+carry the canonical Shakescape frames; none is pricing, market, or chain authority.
 The crate supplies no discovery service or product UI. Release gates for real
 value execution remain owned by the application layer.

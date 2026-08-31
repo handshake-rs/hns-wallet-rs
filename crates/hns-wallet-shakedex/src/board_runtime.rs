@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketMessage};
+use hns_marketplace_protocol::{NameMarketMessage, ShakescapeRegistryVersion};
 use hns_wallet_hns::{
     CurrentShakedexLockQuery, HnsAccountReadRuntime, HnsBackend, HnsClock, HnsWalletRuntime,
     MAX_CURRENT_SHAKEDEX_LOCK_BATCH, SystemClock, VerifiedCurrentShakedexLock,
@@ -15,13 +15,13 @@ use crate::board::{
 };
 use crate::{
     AuthenticatedFixedPriceListing, BoardOfferStatus, ShakedexError, VerifiedFixedPriceListing,
-    authenticate_fixed_price_listing, decode_denuo_authenticated_cancellation,
-    decode_denuo_authenticated_offer, verify_authenticated_fixed_price_listing,
+    authenticate_fixed_price_listing, decode_shakescape_authenticated_cancellation,
+    decode_shakescape_authenticated_offer, verify_authenticated_fixed_price_listing,
     verify_authenticated_listing_cancellation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DenuoBoardOfferAdmission {
+pub enum ShakescapeBoardOfferAdmission {
     Inserted {
         request_id: u64,
         listing_hash: ObjectHash,
@@ -39,7 +39,7 @@ pub enum DenuoBoardOfferAdmission {
     },
 }
 
-impl DenuoBoardOfferAdmission {
+impl ShakescapeBoardOfferAdmission {
     pub const fn request_id(self) -> u64 {
         match self {
             Self::Inserted { request_id, .. }
@@ -66,7 +66,7 @@ impl DenuoBoardOfferAdmission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DenuoBoardCancellationAdmission {
+pub enum ShakescapeBoardCancellationAdmission {
     Applied {
         request_id: u64,
         listing_hash: ObjectHash,
@@ -81,7 +81,7 @@ pub enum DenuoBoardCancellationAdmission {
     },
 }
 
-impl DenuoBoardCancellationAdmission {
+impl ShakescapeBoardCancellationAdmission {
     pub const fn request_id(self) -> u64 {
         match self {
             Self::Applied { request_id, .. } | Self::Existing { request_id, .. } => request_id,
@@ -116,13 +116,13 @@ impl DenuoBoardCancellationAdmission {
 
 /// Fresh non-serializable authority for one still-active persisted board
 /// offer. A restart or later use must call `current_offer` again.
-pub struct CurrentDenuoBoardOffer {
+pub struct CurrentShakescapeBoardOffer {
     board_revision: u64,
     listing: VerifiedFixedPriceListing,
     current_lock: VerifiedCurrentShakedexLock,
 }
 
-impl CurrentDenuoBoardOffer {
+impl CurrentShakescapeBoardOffer {
     pub const fn board_revision(&self) -> u64 {
         self.board_revision
     }
@@ -136,10 +136,10 @@ impl CurrentDenuoBoardOffer {
     }
 }
 
-impl core::fmt::Debug for CurrentDenuoBoardOffer {
+impl core::fmt::Debug for CurrentShakescapeBoardOffer {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
-            .debug_struct("CurrentDenuoBoardOffer")
+            .debug_struct("CurrentShakescapeBoardOffer")
             .field("board_revision", &self.board_revision)
             .field("listing_hash", &self.listing.listing_hash())
             .field("current_lock", &self.current_lock)
@@ -152,13 +152,13 @@ impl core::fmt::Debug for CurrentDenuoBoardOffer {
 ///
 /// The hashes and account context remain crate-private so this object cannot
 /// be mistaken for a transport response or current-lock/value authority.
-pub(crate) struct CurrentDenuoBoardInventory {
+pub(crate) struct CurrentShakescapeBoardInventory {
     board_revision: u64,
     listing_hashes: Vec<ObjectHash>,
     _context: VerifiedHnsBoardContext,
 }
 
-impl CurrentDenuoBoardInventory {
+impl CurrentShakescapeBoardInventory {
     pub(crate) const fn board_revision(&self) -> u64 {
         self.board_revision
     }
@@ -174,19 +174,19 @@ impl CurrentDenuoBoardInventory {
 /// Request hashes, listings, and current locks remain crate-private. Keeping
 /// the non-cloneable batch alive prevents an individual listing from being
 /// mistaken for independent current-lock or value authority.
-pub(crate) struct CurrentDenuoBoardOffers {
+pub(crate) struct CurrentShakescapeBoardOffers {
     board_revision: u64,
     requested_listing_hashes: Vec<ObjectHash>,
     listings: Vec<VerifiedFixedPriceListing>,
     _current_locks: VerifiedCurrentShakedexLockBatch,
 }
 
-pub(crate) enum CurrentDenuoBoardOffersResolution {
+pub(crate) enum CurrentShakescapeBoardOffersResolution {
     Absent { board_revision: u64 },
-    Current(Box<CurrentDenuoBoardOffers>),
+    Current(Box<CurrentShakescapeBoardOffers>),
 }
 
-impl CurrentDenuoBoardOffers {
+impl CurrentShakescapeBoardOffers {
     pub(crate) const fn board_revision(&self) -> u64 {
         self.board_revision
     }
@@ -200,7 +200,7 @@ impl CurrentDenuoBoardOffers {
     }
 }
 
-/// Offline Denuo board composition bound to one exact HNS account read
+/// Offline Shakescape board composition bound to one exact HNS account read
 /// runtime and its identical Arc-backed encrypted store authority.
 ///
 /// This type performs no transport I/O and does not consult or alter any
@@ -210,12 +210,12 @@ impl CurrentDenuoBoardOffers {
 /// Cancellation admission is a separate negative-authority path: it binds an
 /// authenticated tombstone to the exact persisted listing plus selected
 /// account network/time, but deliberately performs no current-lock query.
-enum DenuoHnsRuntime<'a, B, C> {
+enum ShakescapeHnsRuntime<'a, B, C> {
     AccountRead(&'a HnsAccountReadRuntime<B, C>),
     Value(&'a HnsWalletRuntime<B, C>),
 }
 
-impl<B: HnsBackend, C: HnsClock> DenuoHnsRuntime<'_, B, C> {
+impl<B: HnsBackend, C: HnsClock> ShakescapeHnsRuntime<'_, B, C> {
     fn shares_store_authority(&self, store: &SharedWalletStore) -> bool {
         match self {
             Self::AccountRead(runtime) => runtime.shares_store_authority(store),
@@ -273,12 +273,12 @@ impl<B: HnsBackend, C: HnsClock> DenuoHnsRuntime<'_, B, C> {
     }
 }
 
-pub struct DenuoBoardRuntime<'a, B, C = SystemClock> {
-    hns: DenuoHnsRuntime<'a, B, C>,
+pub struct ShakescapeBoardRuntime<'a, B, C = SystemClock> {
+    hns: ShakescapeHnsRuntime<'a, B, C>,
     store: SharedWalletStore,
 }
 
-impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
+impl<'a, B: HnsBackend, C: HnsClock> ShakescapeBoardRuntime<'a, B, C> {
     pub fn new(
         hns: &'a HnsAccountReadRuntime<B, C>,
         store: SharedWalletStore,
@@ -287,7 +287,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
             return Err(ShakedexError::StoreAuthorityMismatch);
         }
         Ok(Self {
-            hns: DenuoHnsRuntime::AccountRead(hns),
+            hns: ShakescapeHnsRuntime::AccountRead(hns),
             store,
         })
     }
@@ -304,7 +304,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
             return Err(ShakedexError::StoreAuthorityMismatch);
         }
         Ok(Self {
-            hns: DenuoHnsRuntime::Value(hns),
+            hns: ShakescapeHnsRuntime::Value(hns),
             store,
         })
     }
@@ -320,10 +320,13 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
         &self,
         envelope: &[u8],
         expected_hash: ObjectHash,
-    ) -> Result<DenuoBoardOfferAdmission, ShakedexError> {
+    ) -> Result<ShakescapeBoardOfferAdmission, ShakedexError> {
         self.require_store_authority()?;
-        let (request_id, authenticated) =
-            decode_denuo_authenticated_offer(envelope, DenuoRegistryVersion::V2, expected_hash)?;
+        let (request_id, authenticated) = decode_shakescape_authenticated_offer(
+            envelope,
+            ShakescapeRegistryVersion::V1,
+            expected_hash,
+        )?;
         let (listing, current_lock) = self.bind_current_listing(authenticated)?;
         let listing_hash = listing.listing_hash();
         let network = listing.network();
@@ -345,7 +348,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                     && offer.seller_public_key == seller_public_key
             });
             if !board.apply_offer(&listing)? {
-                return Ok(DenuoBoardOfferAdmission::Existing {
+                return Ok(ShakescapeBoardOfferAdmission::Existing {
                     request_id,
                     listing_hash,
                     revision: loaded.logical_revision,
@@ -361,13 +364,13 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                 account_prefix_lease,
             )?;
             if replaced_identity {
-                Ok(DenuoBoardOfferAdmission::Updated {
+                Ok(ShakescapeBoardOfferAdmission::Updated {
                     request_id,
                     listing_hash,
                     revision,
                 })
             } else {
-                Ok(DenuoBoardOfferAdmission::Inserted {
+                Ok(ShakescapeBoardOfferAdmission::Inserted {
                     request_id,
                     listing_hash,
                     revision,
@@ -390,11 +393,11 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
         envelope: &[u8],
         expected_listing_hash: ObjectHash,
         expected_cancellation_hash: ObjectHash,
-    ) -> Result<DenuoBoardCancellationAdmission, ShakedexError> {
+    ) -> Result<ShakescapeBoardCancellationAdmission, ShakedexError> {
         self.require_store_authority()?;
-        let (request_id, authenticated) = decode_denuo_authenticated_cancellation(
+        let (request_id, authenticated) = decode_shakescape_authenticated_cancellation(
             envelope,
-            DenuoRegistryVersion::V2,
+            ShakescapeRegistryVersion::V1,
             expected_listing_hash,
             expected_cancellation_hash,
         )?;
@@ -422,7 +425,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                 && persisted.cancellation_bytes.as_deref() == Some(authenticated.encoded())
                 && persisted.cancellation_sequence == Some(authenticated.sequence())
             {
-                return Ok(DenuoBoardCancellationAdmission::Existing {
+                return Ok(ShakescapeBoardCancellationAdmission::Existing {
                     request_id,
                     listing_hash: expected_listing_hash,
                     cancellation_hash: expected_cancellation_hash,
@@ -437,7 +440,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                 context.observed_at_unix(),
             )?;
             if !board.apply_cancellation(&cancellation)? {
-                return Ok(DenuoBoardCancellationAdmission::Existing {
+                return Ok(ShakescapeBoardCancellationAdmission::Existing {
                     request_id,
                     listing_hash: expected_listing_hash,
                     cancellation_hash: expected_cancellation_hash,
@@ -454,7 +457,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                 loaded,
                 account_prefix_lease,
             )?;
-            Ok(DenuoBoardCancellationAdmission::Applied {
+            Ok(ShakescapeBoardCancellationAdmission::Applied {
                 request_id,
                 listing_hash: expected_listing_hash,
                 cancellation_hash: expected_cancellation_hash,
@@ -500,7 +503,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
     pub fn current_offer(
         &self,
         listing_hash: ObjectHash,
-    ) -> Result<Option<CurrentDenuoBoardOffer>, ShakedexError> {
+    ) -> Result<Option<CurrentShakescapeBoardOffer>, ShakedexError> {
         self.require_store_authority()?;
         let (board_revision, persisted) = self.store.try_with_store(|store| {
             let mut stored = load_name_market_board_offers(store, &[listing_hash])?;
@@ -533,7 +536,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                 Ok::<_, ShakedexError>(current_lock)
             })
         })?;
-        Ok(Some(CurrentDenuoBoardOffer {
+        Ok(Some(CurrentShakescapeBoardOffer {
             board_revision,
             listing,
             current_lock,
@@ -546,7 +549,9 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
     /// Inventory is discovery metadata only. The retained account context is
     /// not chain, current-lock, publication, transport, or value authority.
     /// Any later response emitter must reacquire and fence a fresh view.
-    pub(crate) fn current_inventory(&self) -> Result<CurrentDenuoBoardInventory, ShakedexError> {
+    pub(crate) fn current_inventory(
+        &self,
+    ) -> Result<CurrentShakescapeBoardInventory, ShakedexError> {
         self.require_store_authority()?;
         let context = self.hns.observe_board_context()?;
         let (context, board_revision, listing_hashes) = self.store.try_with_store(|store| {
@@ -571,7 +576,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                 Ok::<_, ShakedexError>((context, stored.logical_revision, listing_hashes))
             })
         })?;
-        Ok(CurrentDenuoBoardInventory {
+        Ok(CurrentShakescapeBoardInventory {
             board_revision,
             listing_hashes,
             _context: context,
@@ -594,7 +599,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
     pub(crate) fn current_offers(
         &self,
         listing_hashes: &[ObjectHash],
-    ) -> Result<CurrentDenuoBoardOffersResolution, ShakedexError> {
+    ) -> Result<CurrentShakescapeBoardOffersResolution, ShakedexError> {
         validate_current_offer_request_hashes(listing_hashes)?;
         self.require_store_authority()?;
         let (board_revision, requested_rows) = self.store.try_with_store(|store| {
@@ -613,7 +618,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
             )?);
         }
         if authenticated.is_empty() {
-            return Ok(CurrentDenuoBoardOffersResolution::Absent { board_revision });
+            return Ok(CurrentShakescapeBoardOffersResolution::Absent { board_revision });
         }
 
         // The type-5 envelope has an aggregate payload bound in addition to
@@ -626,8 +631,8 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
                 .map(|listing| listing.canonical().clone())
                 .collect(),
         )
-        .encode_envelope(DenuoRegistryVersion::V2, 1)
-        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+        .encode_envelope(ShakescapeRegistryVersion::V1, 1)
+        .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?;
         drop(response_probe);
 
         let queries: Vec<_> = authenticated
@@ -667,8 +672,8 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoBoardRuntime<'a, B, C> {
             })
         })?;
 
-        Ok(CurrentDenuoBoardOffersResolution::Current(Box::new(
-            CurrentDenuoBoardOffers {
+        Ok(CurrentShakescapeBoardOffersResolution::Current(Box::new(
+            CurrentShakescapeBoardOffers {
                 board_revision,
                 requested_listing_hashes: listing_hashes.to_vec(),
                 listings,
@@ -715,7 +720,7 @@ fn validate_current_offer_request_hashes(
             .any(|listing_hash| *listing_hash.as_bytes() == [0; 32])
         || listing_hashes.windows(2).any(|pair| pair[0] >= pair[1])
     {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     }
     Ok(())
 }

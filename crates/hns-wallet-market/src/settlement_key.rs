@@ -1,6 +1,6 @@
 //! Wallet-owned cross-chain settlement authority.
 //!
-//! A participant allocates one secp256k1 key for one Denuo swap session. The
+//! A participant allocates one secp256k1 key for one Shakescape swap session. The
 //! encrypted allocation stores only the immutable public binding. The secret
 //! scalar is re-derived from the wallet recovery seed when an in-process
 //! signing handle is requested and is never serialized or returned.
@@ -271,7 +271,7 @@ impl CrossChainSwapKey {
 
     /// Sign a locally derived funding observation for the chain this
     /// participant is required to fund, then re-verify it against the accepted
-    /// session before it may be sent to a Denuo peer.
+    /// session before it may be sent to a Shakescape peer.
     pub fn sign_funding_status(
         &self,
         status: &mut SwapFundingStatus,

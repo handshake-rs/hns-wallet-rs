@@ -234,12 +234,12 @@ locktime is the Bitcoin consensus `nLockTime` value: a height below
 templates enforce the branch, hashlock, dust, fee, and exact locktime. Refund
 eligibility comes from the wallet's Kyoto-validated next-block height and
 median-time-past over the canonical header chain; it never estimates a height
-from wall time or accepts a Denuo peer's timing claim. Preimage observation
+from wall time or accepts a Shakescape peer's timing claim. Preimage observation
 requires the expected outpoint and exact witness script. The local signer is
 bound to its HTLC script position and signs an exact spend template; the
 chain-neutral session signer can be used by both native adapters without
 exporting a private scalar. The combined Kyoto subscriber watches the script
-itself, so neither a Denuo peer nor the counterparty supplies chain authority
+itself, so neither a Shakescape peer nor the counterparty supplies chain authority
 or block locations. The mobile cross-chain coordinator binds these primitives
 to the signed bilateral session, ordered funding, explicit approvals, durable
 state, and independently verified spend observations.

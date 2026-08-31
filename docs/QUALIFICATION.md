@@ -61,7 +61,7 @@ recorded only after its own locked CI, CodeQL, and normalized preflight pass.
 | Encrypted store/schema v3 | exact `2229be8` CI passed, including atomic bootstrap, rollback, migrations, encrypted CRUD/CAS, and Unix filesystem regressions | source reopen/restart tests; no installed Android/iOS secure-store runtime evidence in this package boundary | downstream mobile candidate source contains Keystore/Keychain wrapping, but device filesystem/runtime qualification remains external | platform qualification pending |
 | HNS wallet and names | exact historical `bc5901f` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, dedicated name targets, trusted exact-text import, name workflows, and fail-closed value-evidence checks | source restart/reorg paths; no multi-process regtest | script-free wallet RPC remains compatible with node `2b267ffe`; pruning-safe wallet-owned name actions pair with selected node main `4275b4e`; the release graph uses published registry `hns-rs` `0.3.1` source `0e99addca59778b7b7c6fc56291333a97c4c8815` and `hns-dane-engine` `0.2.2` source `b7fdf8826c81b77650a0f740d1f05314b74969f9`, with archive manifests in `release/` | HNS funding, value, and fee source gates enabled; exact wallet hosted qualification and live product qualification remain pending |
 | Provider core | exact `2229be8` CI passed, including account binding, scoped reads, exact Names consent, and unavailable-method ordering | grants persist; pending approval/UI authority remains process-local | no installed-browser wallet consent or backend E2E | browser and value exposure unavailable |
-| Fixed-price Shakedex | exact `2229be8` CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Denuo, provider, trusted UI, or product coin selection | Shakedex and dependent HNS value source gates enabled; live product integration pending |
+| Fixed-price Shakedex | exact `2229be8` CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Shakescape, provider, trusted UI, or product coin selection | Shakedex and dependent HNS value source gates enabled; live product integration pending |
 | Market sessions | exact `2229be8` workspace CI passed | CAS journal source; recovery evidence incomplete | no pair E2E, rendezvous, or relay transport | unavailable |
 | Bitcoin Kyoto | historical `2229be8` CI plus current candidate coverage for encrypted BDK persistence, allocation, bilateral HTLC funding/settlement, restart resumption, and conflicting-input exclusion | exact source restart resume and reorg tests; no installed multi-process rollback run | Android/iOS product wiring present; installed live P2P swap not recorded here | send and atomic settlement enabled through the private trusted-mobile permit; normalized or chunked backend remains future capacity work |
 | Ethereum | exact `2229be8` CI and deterministic contract check passed | offline derivation and dormant primitives only | no embedded Helios/local-chain run; no contract audit | synchronization, history, send, signing, settlement, and mainnet unavailable |
@@ -103,7 +103,7 @@ launcher, installed extension, signed artifact, live node, or availability
 qualification. Closed-enum ABI-v2 consumers must adopt the marker in lockstep.
 
 Exact local source commit `77d891cf320f83ecb580e378d1987b3048c5c9ad`
-adds schema-v3 Denuo relay-acceptance persistence. Its 24 Shakedex library
+adds schema-v3 Shakescape relay-acceptance persistence. Its 24 Shakedex library
 tests passed again from an isolated clean checkout with the concurrent wallet
 publisher files absent; focused warning-denied Clippy and rustdoc also passed.
 That evidence covers canonical endpoint signatures, exact receipt replay and
@@ -195,7 +195,7 @@ the second ciphertext-fingerprinted write guard, and the read-only/non-atomic
 unchanged-account diagnostic distinction.
 
 Local final-source runs passed 38 Store library tests, 73 HNS library tests, 42
-Shakedex library tests with one ignored, and 26 Denuo board-runtime integration
+Shakedex library tests with one ignored, and 26 Shakescape board-runtime integration
 tests. The focused normalized-storage run passed 18 tests with the same one
 ignored; it is an overlapping subset/re-run, not 18 additional independent
 tests. The ignored case was then run explicitly in optimized release mode: the

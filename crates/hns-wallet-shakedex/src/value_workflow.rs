@@ -4099,7 +4099,7 @@ mod tests {
         let value = ShakedexValueRuntime::new(store.clone(), &runtime)
             .expect("same-store value controller");
         assert!(value.shares_store_authority(&store));
-        let board = crate::DenuoBoardRuntime::new_value(&runtime, store.clone())
+        let board = crate::ShakescapeBoardRuntime::new_value(&runtime, store.clone())
             .expect("same-store board controller");
         assert!(board.shares_store_authority(&store));
 
@@ -4112,7 +4112,7 @@ mod tests {
             Err(ShakedexError::StoreAuthorityMismatch)
         ));
         assert!(matches!(
-            crate::DenuoBoardRuntime::new_value(&runtime, different),
+            crate::ShakescapeBoardRuntime::new_value(&runtime, different),
             Err(ShakedexError::StoreAuthorityMismatch)
         ));
     }

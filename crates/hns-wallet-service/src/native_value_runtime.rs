@@ -21,20 +21,21 @@ use hns_wallet_ffi::{
 };
 use hns_wallet_hns::{
     HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED, HNS_VALUE_RUNTIME_RELEASE_QUALIFIED, HnsBackend,
-    HnsClock, HnsDirectDenuoPeer, HnsNetwork, HnsRuntimeConfig, HnsWalletError, HnsWalletRuntime,
-    KnownName, NameOperation, NameOperationState, PrepareNameFinalize, PrepareNameTransfer,
+    HnsClock, HnsDirectShakescapePeer, HnsNetwork, HnsRuntimeConfig, HnsWalletError,
+    HnsWalletRuntime, KnownName, NameOperation, NameOperationState, PrepareNameFinalize,
+    PrepareNameTransfer,
 };
 use hns_wallet_provider::{
     APPROVAL_LIFETIME_SECONDS, ApprovedCall, PendingApproval, ProviderMethod, SelectedNamespace,
 };
 use hns_wallet_shakedex::{
-    DenuoPublicationAcceptancePolicy, DenuoTransportRuntime, DirectDenuoBoardSyncReport,
-    MAX_DIRECT_DENUO_MESSAGES_PER_SYNC, MAX_SHAKEDEX_OFFER_PAGE_SIZE, PrepareBuyerTrade,
-    PrepareScriptFinalize, PrepareSellerOffer, SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED,
-    SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED, SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED,
-    SellerOfferPreview, SellerOfferStage, ShakedexError, ShakedexOfferPage, ShakedexSellerPolicy,
-    ShakedexTradePreview, ShakedexTradeRuntime, ShakedexValueAction, ShakedexValueStage,
-    WalletNativeDenuoTransport,
+    DirectShakescapeBoardSyncReport, MAX_DIRECT_SHAKESCAPE_MESSAGES_PER_SYNC,
+    MAX_SHAKEDEX_OFFER_PAGE_SIZE, PrepareBuyerTrade, PrepareScriptFinalize, PrepareSellerOffer,
+    SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED, SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED,
+    SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, SellerOfferPreview, SellerOfferStage, ShakedexError,
+    ShakedexOfferPage, ShakedexSellerPolicy, ShakedexTradePreview, ShakedexTradeRuntime,
+    ShakedexValueAction, ShakedexValueStage, ShakescapePublicationAcceptancePolicy,
+    ShakescapeTransportRuntime, WalletNativeShakescapeTransport,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::{
@@ -129,10 +130,10 @@ pub struct PersistentHnsValueConfig<B, C> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PersistentShakedexConfig {
     pub seller_policy: ShakedexSellerPolicy,
-    pub transport: PersistentDenuoTransport,
+    pub transport: PersistentShakescapeTransport,
 }
 
-/// Transport policy for the native Denuo board.
+/// Transport policy for the native Shakescape board.
 ///
 /// `WalletPeers` keeps discovery, replication, and board admission in the
 /// participating wallets. It deliberately has no endpoint receipt or
@@ -143,9 +144,9 @@ pub struct PersistentShakedexConfig {
 // wallet mode's explicit alternative.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PersistentDenuoTransport {
+pub enum PersistentShakescapeTransport {
     WalletPeers,
-    RelayAcceptance(DenuoPublicationAcceptancePolicy),
+    RelayAcceptance(ShakescapePublicationAcceptancePolicy),
 }
 
 /// Provider-capable HNS runtime with one exact account and one exact encrypted
@@ -399,19 +400,19 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
             && HNS_VALUE_RUNTIME_RELEASE_QUALIFIED
             && HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED
             && SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED
-            && SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED
+            && SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED
             && SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED
     }
 
     fn require_shakedex(&self) -> Result<&PersistentShakedexConfig, ServiceFailure> {
         if !self.shakedex_available() {
             return Err(ServiceFailure::unsupported(
-                ServiceCapability::DenuoShakedexV1,
+                ServiceCapability::ShakescapeShakedexV1,
             ));
         }
         self.shakedex
             .as_ref()
-            .ok_or_else(|| ServiceFailure::unsupported(ServiceCapability::DenuoShakedexV1))
+            .ok_or_else(|| ServiceFailure::unsupported(ServiceCapability::ShakescapeShakedexV1))
     }
 
     fn shakedex_runtime(&self) -> Result<ShakedexTradeRuntime<'_, B, C>, ServiceFailure> {
@@ -421,14 +422,14 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
 
     fn direct_shakedex_transport(
         &self,
-    ) -> Result<WalletNativeDenuoTransport<'_, B, C>, ServiceFailure> {
+    ) -> Result<WalletNativeShakescapeTransport<'_, B, C>, ServiceFailure> {
         match &self.require_shakedex()?.transport {
-            PersistentDenuoTransport::WalletPeers => {
-                WalletNativeDenuoTransport::new(&self.runtime, self.store.clone())
-                    .map_err(direct_denuo_failure)
+            PersistentShakescapeTransport::WalletPeers => {
+                WalletNativeShakescapeTransport::new(&self.runtime, self.store.clone())
+                    .map_err(direct_shakescape_failure)
             }
-            PersistentDenuoTransport::RelayAcceptance(_) => Err(ServiceFailure::unsupported(
-                ServiceCapability::DenuoShakedexV1,
+            PersistentShakescapeTransport::RelayAcceptance(_) => Err(ServiceFailure::unsupported(
+                ServiceCapability::ShakescapeShakedexV1,
             )),
         }
     }
@@ -439,9 +440,9 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
             // Wallet-peer replication is driven by an owned, negotiated P2P
             // session. A provider/UI call must never silently make an RPC or
             // relay request in that mode.
-            PersistentDenuoTransport::WalletPeers => Ok(()),
-            PersistentDenuoTransport::RelayAcceptance(acceptance_policy) => {
-                DenuoTransportRuntime::new(
+            PersistentShakescapeTransport::WalletPeers => Ok(()),
+            PersistentShakescapeTransport::RelayAcceptance(acceptance_policy) => {
+                ShakescapeTransportRuntime::new(
                     &self.runtime,
                     self.store.clone(),
                     acceptance_policy.clone(),
@@ -987,7 +988,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
             ServiceCapability::ValueMovement,
         ]);
         if self.shakedex_available() {
-            capabilities.insert(ServiceCapability::DenuoShakedexV1);
+            capabilities.insert(ServiceCapability::ShakescapeShakedexV1);
         }
         capabilities
     }
@@ -1556,31 +1557,33 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         self.runtime.rebroadcast_dropped_pending_sends()
     }
 
-    /// Begin one wallet-owned direct Denuo board exchange. The supplied peer
-    /// has already completed the standard HNS and exact Denuo V2 handshake;
+    /// Begin one wallet-owned direct Shakescape board exchange. The supplied peer
+    /// has already completed the standard HNS and exact Shakescape V1 handshake;
     /// this method has no relay, RPC, indexer, or endpoint-receipt fallback.
     pub fn begin_wallet_owned_direct_shakedex(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
-    ) -> Result<DirectDenuoBoardSyncReport, ServiceFailure> {
+        peer: &mut HnsDirectShakescapePeer,
+    ) -> Result<DirectShakescapeBoardSyncReport, ServiceFailure> {
         self.runtime.exact_account()?;
         self.runtime
             .direct_shakedex_transport()?
             .begin(peer)
-            .map_err(direct_denuo_failure)
+            .map_err(direct_shakescape_failure)
     }
 
     /// Process a bounded set of messages received from one negotiated,
-    /// wallet-owned direct Denuo peer. The caller owns socket scheduling and
+    /// wallet-owned direct Shakescape peer. The caller owns socket scheduling and
     /// may call again later; one peer can never turn this into an unbounded
     /// native/UI operation.
     pub fn synchronize_wallet_owned_direct_shakedex(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         message_limit: usize,
-    ) -> Result<DirectDenuoBoardSyncReport, ServiceFailure> {
-        if message_limit == 0 || message_limit > MAX_DIRECT_DENUO_MESSAGES_PER_SYNC {
-            return Err(invalid_request("direct Denuo message limit is invalid"));
+    ) -> Result<DirectShakescapeBoardSyncReport, ServiceFailure> {
+        if message_limit == 0 || message_limit > MAX_DIRECT_SHAKESCAPE_MESSAGES_PER_SYNC {
+            return Err(invalid_request(
+                "direct Shakescape message limit is invalid",
+            ));
         }
         self.runtime.exact_account()?;
         let now_unix = self
@@ -1591,7 +1594,7 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         self.runtime
             .direct_shakedex_transport()?
             .synchronize(peer, now_unix, message_limit)
-            .map_err(direct_denuo_failure)
+            .map_err(direct_shakescape_failure)
     }
 
     /// Process one name-market message that the direct peer multiplexer has
@@ -1600,15 +1603,15 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
     /// offer/session messages in adjacent service ticks.
     pub fn service_wallet_owned_direct_shakedex_message(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         request_id: u64,
         message: NameMarketMessage,
-    ) -> Result<DirectDenuoBoardSyncReport, ServiceFailure> {
+    ) -> Result<DirectShakescapeBoardSyncReport, ServiceFailure> {
         self.runtime.exact_account()?;
         self.runtime
             .direct_shakedex_transport()?
             .handle_received_message(peer, request_id, message)
-            .map_err(direct_denuo_failure)
+            .map_err(direct_shakescape_failure)
     }
 
     /// Persist and write one due local listing/cancellation publication to a
@@ -1616,13 +1619,13 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
     /// a peer receipt or inclusion proof.
     pub fn announce_wallet_owned_direct_shakedex(
         &self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
     ) -> Result<Option<ObjectHash>, ServiceFailure> {
         self.runtime.exact_account()?;
         self.runtime
             .direct_shakedex_transport()?
             .announce_next_local_publication(peer)
-            .map_err(direct_denuo_failure)
+            .map_err(direct_shakescape_failure)
     }
 
     /// Perform one full reconciliation and return the bounded native value
@@ -1670,7 +1673,7 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
     }
 
     /// Return the ordinary payment receive target derivable from the exact
-    /// unlocked local account. This performs no HNS reconciliation, Denuo
+    /// unlocked local account. This performs no HNS reconciliation, Shakescape
     /// recovery, Bitcoin activation, peer exchange, or value operation.
     /// Balances, history, and spending continue to require synchronization.
     pub fn local_trusted_native_hns_value_receive_target(
@@ -1886,7 +1889,7 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
                 || shakedex.seller_policy.validate().is_err()
                 || matches!(
                     &shakedex.transport,
-                    PersistentDenuoTransport::RelayAcceptance(acceptance_policy)
+                    PersistentShakescapeTransport::RelayAcceptance(acceptance_policy)
                         if config.runtime.shakedex_network().ok()
                             != Some(acceptance_policy.network())
                 )
@@ -1986,17 +1989,17 @@ fn seller_stage(stage: SellerOfferStage) -> &'static str {
     }
 }
 
-fn publication_state(state: hns_wallet_shakedex::DenuoOutboxState) -> &'static str {
-    use hns_wallet_shakedex::DenuoOutboxState;
+fn publication_state(state: hns_wallet_shakedex::ShakescapeOutboxState) -> &'static str {
+    use hns_wallet_shakedex::ShakescapeOutboxState;
 
     match state {
-        DenuoOutboxState::Pending => "pending",
-        DenuoOutboxState::HandoffPrepared { .. } => "handoffPrepared",
-        DenuoOutboxState::RetryScheduled { .. } => "retryScheduled",
-        DenuoOutboxState::RelayAccepted { .. } => "relayAccepted",
-        DenuoOutboxState::DirectAnnounced { .. } => "directAnnounced",
-        DenuoOutboxState::Acknowledged { .. } => "acknowledged",
-        DenuoOutboxState::Exhausted { .. } => "exhausted",
+        ShakescapeOutboxState::Pending => "pending",
+        ShakescapeOutboxState::HandoffPrepared { .. } => "handoffPrepared",
+        ShakescapeOutboxState::RetryScheduled { .. } => "retryScheduled",
+        ShakescapeOutboxState::RelayAccepted { .. } => "relayAccepted",
+        ShakescapeOutboxState::DirectAnnounced { .. } => "directAnnounced",
+        ShakescapeOutboxState::Acknowledged { .. } => "acknowledged",
+        ShakescapeOutboxState::Exhausted { .. } => "exhausted",
     }
 }
 
@@ -2103,9 +2106,9 @@ fn shakedex_purchase_payment(preview: &ShakedexTradePreview) -> Result<BaseUnits
 fn shakedex_failure(error: ShakedexError) -> ServiceFailure {
     match error {
         ShakedexError::CanonicalProtocolUnavailable
-        | ShakedexError::DenuoProtocolUnavailable
+        | ShakedexError::ShakescapeProtocolUnavailable
         | ShakedexError::ValueRuntimeUnavailable => {
-            ServiceFailure::unsupported(ServiceCapability::DenuoShakedexV1)
+            ServiceFailure::unsupported(ServiceCapability::ShakescapeShakedexV1)
         }
         ShakedexError::ApprovalRequired => ServiceFailure {
             code: ServiceErrorCode::ApprovalStale,
@@ -2115,14 +2118,14 @@ fn shakedex_failure(error: ShakedexError) -> ServiceFailure {
         ShakedexError::InvalidName
         | ShakedexError::InvalidListing
         | ShakedexError::InvalidCancellation
-        | ShakedexError::InvalidDenuoEnvelope
-        | ShakedexError::DenuoRegistryMismatch
+        | ShakedexError::InvalidShakescapeEnvelope
+        | ShakedexError::ShakescapeRegistryMismatch
         | ShakedexError::InvalidTransition => {
             invalid_request("name-market request or current state is invalid")
         }
         ShakedexError::Persistence
         | ShakedexError::CorruptNameMarketBoard
-        | ShakedexError::CorruptDenuoOutbox => ServiceFailure {
+        | ShakedexError::CorruptShakescapeOutbox => ServiceFailure {
             code: ServiceErrorCode::PersistenceFailure,
             message: "persisted Shakedex state failed authentication".to_owned(),
             unsupported_capability: None,
@@ -2135,23 +2138,25 @@ fn shakedex_failure(error: ShakedexError) -> ServiceFailure {
     }
 }
 
-fn direct_denuo_failure(
-    error: hns_wallet_shakedex::WalletNativeDenuoTransportError,
+fn direct_shakescape_failure(
+    error: hns_wallet_shakedex::WalletNativeShakescapeTransportError,
 ) -> ServiceFailure {
     match error {
-        hns_wallet_shakedex::WalletNativeDenuoTransportError::Board(error) => {
+        hns_wallet_shakedex::WalletNativeShakescapeTransportError::Board(error) => {
             shakedex_failure(error)
         }
-        hns_wallet_shakedex::WalletNativeDenuoTransportError::Wallet(error) => {
+        hns_wallet_shakedex::WalletNativeShakescapeTransportError::Wallet(error) => {
             hns_runtime_failure(error)
         }
-        hns_wallet_shakedex::WalletNativeDenuoTransportError::DirectPeer(_)
-        | hns_wallet_shakedex::WalletNativeDenuoTransportError::InvalidMessageLimit
-        | hns_wallet_shakedex::WalletNativeDenuoTransportError::InvalidEnvelope => ServiceFailure {
-            code: ServiceErrorCode::RuntimeFailure,
-            message: "wallet-owned Denuo peer exchange could not complete".to_owned(),
-            unsupported_capability: None,
-        },
+        hns_wallet_shakedex::WalletNativeShakescapeTransportError::DirectPeer(_)
+        | hns_wallet_shakedex::WalletNativeShakescapeTransportError::InvalidMessageLimit
+        | hns_wallet_shakedex::WalletNativeShakescapeTransportError::InvalidEnvelope => {
+            ServiceFailure {
+                code: ServiceErrorCode::RuntimeFailure,
+                message: "wallet-owned Shakescape peer exchange could not complete".to_owned(),
+                unsupported_capability: None,
+            }
+        }
     }
 }
 

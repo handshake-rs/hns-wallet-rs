@@ -25,14 +25,15 @@ use hns_light_wallet::{
     BloomUpdate, HsdBloomFilter, VerifiedWalletBlock, WalletBlockEvidence, WalletHeaderAnchor,
 };
 use hns_marketplace_protocol::{
-    CrossChainMessage, DenuoRegistryVersion, MAX_DENUO_MARKET_PAYLOAD, NameMarketHello,
-    NameMarketMessage,
+    CrossChainMessage, MAX_SHAKESCAPE_MARKET_PAYLOAD, NameMarketHello, NameMarketMessage,
+    ShakescapeRegistryVersion,
 };
 use hns_p2p_experimental::{
-    ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION, DENUO_EXTENSION_MAX_PACKET_PAYLOAD,
-    DENUO_EXTENSION_PACKET, DENUO_EXTENSION_SERVICE, DENUO_V2_REGISTRY_FINGERPRINT,
-    DENUO_V2_REGISTRY_VERSION, DenuoExtensionEnvelope, NegotiatedRegistry,
+    ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION, NegotiatedRegistry,
     Network as ExperimentalNetwork, ProtocolRange, RegistryHello,
+    SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD, SHAKESCAPE_EXTENSION_PACKET,
+    SHAKESCAPE_EXTENSION_SERVICE, SHAKESCAPE_V1_REGISTRY_FINGERPRINT,
+    SHAKESCAPE_V1_REGISTRY_VERSION, ShakescapeExtensionEnvelope,
 };
 use hns_p2p_wire::{
     Inventory, InventoryKind, NetAddress, NetworkMagic, Packet, ProofPacket, SERVICE_BLOOM,
@@ -75,8 +76,8 @@ const BLOCK_SCAN_PEER_LATENCY_OLD_WEIGHT: u64 = 3;
 const BLOCK_SCAN_PEER_LATENCY_WEIGHT: u64 = BLOCK_SCAN_PEER_LATENCY_OLD_WEIGHT + 1;
 const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 const BLOOM_GROWTH_RESERVE: usize = 1_024;
-const DENUO_MAX_RESPONSE_EVENTS: usize = 256;
-const DENUO_MAXIMUM_LIVE_REQUESTS: u16 = 64;
+const SHAKESCAPE_MAX_RESPONSE_EVENTS: usize = 256;
+const SHAKESCAPE_MAXIMUM_LIVE_REQUESTS: u16 = 64;
 /// A direct index only grows after it has authenticated a trailing-gap
 /// discovery. Eight complete extra gaps fit comfortably under the direct
 /// watch-set bound for reviewed wallet defaults while preventing unbounded
@@ -224,13 +225,13 @@ struct NativePeer {
     deferred_wallet: VecDeque<WalletPeerEvent>,
 }
 
-/// One direct Denuo Experimental V2 session owned by the wallet.
+/// One direct Shakescape Experimental V2 session owned by the wallet.
 ///
 /// The peer is an ordinary Handshake TCP peer. It is not an RPC endpoint or a
 /// trusted marketplace service: registry negotiation binds the wire profile
 /// and every offer remains subject to the wallet's independent board and
 /// current-lock validation.
-pub struct HnsDirectDenuoPeer {
+pub struct HnsDirectShakescapePeer {
     address: SocketAddr,
     network: HnsNetwork,
     connection: PeerConnection<TcpStream>,
@@ -238,7 +239,7 @@ pub struct HnsDirectDenuoPeer {
     next_request_id: u64,
 }
 
-/// One canonical Denuo application message received on a negotiated direct
+/// One canonical Shakescape application message received on a negotiated direct
 /// peer. Name-market replication and direct HNS/BTC offers share only the
 /// socket; they retain separate protocol identities and validation paths.
 // `NameMarketMessage` is intentionally carried by value: this is a public
@@ -246,7 +247,7 @@ pub struct HnsDirectDenuoPeer {
 // and API change on the hot receive path.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HnsDirectDenuoMessage {
+pub enum HnsDirectShakescapeMessage {
     NameMarket {
         request_id: u64,
         message: NameMarketMessage,
@@ -256,21 +257,21 @@ pub enum HnsDirectDenuoMessage {
     },
 }
 
-/// A wallet-owned, nonblocking TCP admission point for direct Denuo peers.
+/// A wallet-owned, nonblocking TCP admission point for direct Shakescape peers.
 ///
 /// This listener is deliberately narrower than a Handshake node listener. It
 /// accepts no chain, wallet-filter, RPC, indexing, or arbitrary experimental
-/// traffic. A caller obtains a negotiated [`HnsDirectDenuoPeer`] only after
-/// the standard Handshake handshake and the exact Denuo V2 registry agreement
+/// traffic. A caller obtains a negotiated [`HnsDirectShakescapePeer`] only after
+/// the standard Handshake handshake and the exact Shakescape V1 registry agreement
 /// have both completed. The caller remains responsible for deciding when an
 /// unlocked wallet may service a bounded board exchange.
-pub struct HnsDirectDenuoListener {
+pub struct HnsDirectShakescapeListener {
     listener: TcpListener,
     config: HnsDirectPeerConfig,
 }
 
-impl HnsDirectDenuoListener {
-    /// Bind one explicit local socket for direct wallet-to-wallet Denuo
+impl HnsDirectShakescapeListener {
+    /// Bind one explicit local socket for direct wallet-to-wallet Shakescape
     /// sessions. A port of zero is useful for deterministic local pairing
     /// tests; an installed wallet supplies its user-visible listening port.
     pub fn bind(
@@ -295,7 +296,7 @@ impl HnsDirectDenuoListener {
     }
 
     /// Accept at most one pending TCP connection and bind it to the direct
-    /// Denuo protocol. `Ok(None)` means there is no pending connection.
+    /// Shakescape protocol. `Ok(None)` means there is no pending connection.
     ///
     /// The accepted handshake is bounded by the peer configuration's socket
     /// deadlines. Callers should invoke this from their owned I/O worker and
@@ -304,7 +305,7 @@ impl HnsDirectDenuoListener {
         &self,
         local_height: u32,
         now_unix: u64,
-    ) -> Result<Option<HnsDirectDenuoPeer>, HnsDirectPeerError> {
+    ) -> Result<Option<HnsDirectShakescapePeer>, HnsDirectPeerError> {
         let (stream, _) = match self.listener.accept() {
             Ok(accepted) => accepted,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
@@ -316,12 +317,12 @@ impl HnsDirectDenuoListener {
         stream
             .set_write_timeout(Some(self.config.connect_timeout))
             .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
-        HnsDirectDenuoPeer::accept(&self.config, stream, local_height, now_unix).map(Some)
+        HnsDirectShakescapePeer::accept(&self.config, stream, local_height, now_unix).map(Some)
     }
 }
 
-impl HnsDirectDenuoPeer {
-    /// Establish the standard peer session and exact Denuo V2 registry
+impl HnsDirectShakescapePeer {
+    /// Establish the standard peer session and exact Shakescape V1 registry
     /// agreement with one configured direct peer.
     pub fn connect(
         config: &HnsDirectPeerConfig,
@@ -334,9 +335,9 @@ impl HnsDirectDenuoPeer {
         if !direct_address_allowed(config, address, explicit) {
             return Err(HnsDirectPeerError::AddressNotAllowed);
         }
-        let request_id = nonzero_denuo_request_id()?;
+        let request_id = nonzero_shakescape_request_id()?;
         let local_version =
-            direct_denuo_version(address, request_id.to_be_bytes(), local_height, now_unix);
+            direct_shakescape_version(address, request_id.to_be_bytes(), local_height, now_unix);
         let mut connection = PeerConnection::connect(
             address,
             PeerConfig::for_network(network_magic(config.network)),
@@ -345,17 +346,17 @@ impl HnsDirectDenuoPeer {
             config.connect_timeout,
         )?;
         let metadata = connection.complete_handshake(|| now_unix_or(now_unix))?;
-        if metadata.services & DENUO_EXTENSION_SERVICE.value() == 0 {
-            return Err(HnsDirectPeerError::DenuoPeerNotAdvertised);
+        if metadata.services & SHAKESCAPE_EXTENSION_SERVICE.value() == 0 {
+            return Err(HnsDirectPeerError::ShakescapePeerNotAdvertised);
         }
-        let local_hello = denuo_registry_hello(config.network)?;
-        let outbound = DenuoExtensionEnvelope::registry_hello_v2(request_id, &local_hello)
-            .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?
+        let local_hello = shakescape_registry_hello(config.network)?;
+        let outbound = ShakescapeExtensionEnvelope::registry_hello(request_id, &local_hello)
+            .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?
             .encode_canonical()
-            .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
-        connection.send_experimental_packet(DENUO_EXTENSION_PACKET.value(), outbound)?;
+            .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
+        connection.send_experimental_packet(SHAKESCAPE_EXTENSION_PACKET.value(), outbound)?;
         let negotiated =
-            receive_denuo_hello_ack(&mut connection, config.network, request_id, now_unix)?;
+            receive_shakescape_hello_ack(&mut connection, config.network, request_id, now_unix)?;
         Ok(Self {
             address,
             network: config.network,
@@ -366,7 +367,7 @@ impl HnsDirectDenuoPeer {
     }
 
     /// Bind one socket accepted by a wallet-hosted listener to the exact
-    /// Denuo V2 atomic-market profile.
+    /// Shakescape V1 atomic-market profile.
     ///
     /// The accepted remote's source port is necessarily ephemeral, so inbound
     /// admission applies the network's public/private-address policy but does
@@ -383,12 +384,12 @@ impl HnsDirectDenuoPeer {
         let address = stream
             .peer_addr()
             .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
-        if !inbound_denuo_address_allowed(config, address) {
+        if !inbound_shakescape_address_allowed(config, address) {
             return Err(HnsDirectPeerError::AddressNotAllowed);
         }
-        let request_id = nonzero_denuo_request_id()?;
+        let request_id = nonzero_shakescape_request_id()?;
         let local_version =
-            direct_denuo_version(address, request_id.to_be_bytes(), local_height, now_unix);
+            direct_shakescape_version(address, request_id.to_be_bytes(), local_height, now_unix);
         let mut connection = PeerConnection::accept(
             stream,
             PeerConfig::for_network(network_magic(config.network)),
@@ -399,10 +400,11 @@ impl HnsDirectDenuoPeer {
         let metadata = connection
             .complete_handshake(|| now_unix_or(now_unix))
             .map_err(|error| HnsDirectPeerError::Peer(error.to_string()))?;
-        if metadata.services & DENUO_EXTENSION_SERVICE.value() == 0 {
-            return Err(HnsDirectPeerError::DenuoPeerNotAdvertised);
+        if metadata.services & SHAKESCAPE_EXTENSION_SERVICE.value() == 0 {
+            return Err(HnsDirectPeerError::ShakescapePeerNotAdvertised);
         }
-        let negotiated = respond_denuo_registry_hello(&mut connection, config.network, now_unix)?;
+        let negotiated =
+            respond_shakescape_registry_hello(&mut connection, config.network, now_unix)?;
         Ok(Self {
             address,
             network: config.network,
@@ -419,13 +421,13 @@ impl HnsDirectDenuoPeer {
         self.address
     }
 
-    /// The exact negotiated Denuo registry evidence for this connection.
+    /// The exact negotiated Shakescape registry evidence for this connection.
     #[must_use]
     pub const fn negotiated_registry(&self) -> &NegotiatedRegistry {
         &self.negotiated
     }
 
-    /// Send one canonical Denuo name-market message over this negotiated
+    /// Send one canonical Shakescape name-market message over this negotiated
     /// direct peer session and return its nonzero correlation id.
     pub fn send_name_market(
         &mut self,
@@ -447,15 +449,15 @@ impl HnsDirectDenuoPeer {
         message: &NameMarketMessage,
     ) -> Result<(), HnsDirectPeerError> {
         if request_id == 0 {
-            return Err(HnsDirectPeerError::Denuo(
-                "Denuo name-market request id must be nonzero".to_owned(),
+            return Err(HnsDirectPeerError::Shakescape(
+                "Shakescape name-market request id must be nonzero".to_owned(),
             ));
         }
         let payload = message
-            .encode_envelope(DenuoRegistryVersion::V2, request_id)
-            .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+            .encode_envelope(ShakescapeRegistryVersion::V1, request_id)
+            .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
         self.connection
-            .send_experimental_packet(DENUO_EXTENSION_PACKET.value(), payload)?;
+            .send_experimental_packet(SHAKESCAPE_EXTENSION_PACKET.value(), payload)?;
         Ok(())
     }
 
@@ -468,48 +470,51 @@ impl HnsDirectDenuoPeer {
         &mut self,
         now_unix: u64,
     ) -> Result<(u64, NameMarketMessage), HnsDirectPeerError> {
-        match self.receive_denuo_message(now_unix)? {
-            HnsDirectDenuoMessage::NameMarket {
+        match self.receive_shakescape_message(now_unix)? {
+            HnsDirectShakescapeMessage::NameMarket {
                 request_id,
                 message,
             } => Ok((request_id, message)),
-            HnsDirectDenuoMessage::CrossChain { .. } => Err(HnsDirectPeerError::Denuo(
-                "received a cross-chain Denuo envelope in a name-market-only exchange".to_owned(),
+            HnsDirectShakescapeMessage::CrossChain { .. } => Err(HnsDirectPeerError::Shakescape(
+                "received a cross-chain Shakescape envelope in a name-market-only exchange"
+                    .to_owned(),
             )),
         }
     }
 
-    /// Receive one canonical Denuo application envelope and classify it by
+    /// Receive one canonical Shakescape application envelope and classify it by
     /// protocol identity. This performs no market admission or swap state
     /// transition; the caller routes the typed message to its local authority.
-    pub fn receive_denuo_message(
+    pub fn receive_shakescape_message(
         &mut self,
         now_unix: u64,
-    ) -> Result<HnsDirectDenuoMessage, HnsDirectPeerError> {
-        for _ in 0..DENUO_MAX_RESPONSE_EVENTS {
+    ) -> Result<HnsDirectShakescapeMessage, HnsDirectPeerError> {
+        for _ in 0..SHAKESCAPE_MAX_RESPONSE_EVENTS {
             match self.connection.receive_event(now_unix)? {
                 PeerEvent::Experimental {
                     packet_type,
                     payload,
-                } if packet_type == DENUO_EXTENSION_PACKET.value() => {
-                    let envelope =
-                        DenuoExtensionEnvelope::decode(&payload, MAX_DENUO_MARKET_PAYLOAD)
-                            .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+                } if packet_type == SHAKESCAPE_EXTENSION_PACKET.value() => {
+                    let envelope = ShakescapeExtensionEnvelope::decode(
+                        &payload,
+                        MAX_SHAKESCAPE_MARKET_PAYLOAD,
+                    )
+                    .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
                     if envelope.protocol_id == hns_p2p_experimental::CROSS_CHAIN_MARKET_PROTOCOL_ID
                     {
                         validate_cross_chain_envelope(&payload)?;
-                        return Ok(HnsDirectDenuoMessage::CrossChain { envelope: payload });
+                        return Ok(HnsDirectShakescapeMessage::CrossChain { envelope: payload });
                     }
                     let (registry, request_id, message) =
                         NameMarketMessage::decode_envelope(&payload)
-                            .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
-                    if registry != DenuoRegistryVersion::V2 || request_id == 0 {
-                        return Err(HnsDirectPeerError::Denuo(
-                            "invalid Denuo V2 name-market envelope".to_owned(),
+                            .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
+                    if registry != ShakescapeRegistryVersion::V1 || request_id == 0 {
+                        return Err(HnsDirectPeerError::Shakescape(
+                            "invalid Shakescape V1 name-market envelope".to_owned(),
                         ));
                     }
-                    validate_denuo_market_hello(self.network, &message)?;
-                    return Ok(HnsDirectDenuoMessage::NameMarket {
+                    validate_shakescape_market_hello(self.network, &message)?;
+                    return Ok(HnsDirectShakescapeMessage::NameMarket {
                         request_id,
                         message,
                     });
@@ -531,14 +536,14 @@ impl HnsDirectDenuoPeer {
         Err(HnsDirectPeerError::ResponseEventLimit)
     }
 
-    /// Send one exact canonical Denuo HNS/BTC session envelope over the
+    /// Send one exact canonical Shakescape HNS/BTC session envelope over the
     /// already-negotiated direct socket. The peer remains transport only: the
     /// mobile market controller admits the specific message, correlation, and
     /// session state before any durable mutation or HTLC action.
     pub fn send_cross_chain_envelope(&mut self, envelope: &[u8]) -> Result<(), HnsDirectPeerError> {
         validate_cross_chain_envelope(envelope)?;
         self.connection
-            .send_experimental_packet(DENUO_EXTENSION_PACKET.value(), envelope.to_vec())?;
+            .send_experimental_packet(SHAKESCAPE_EXTENSION_PACKET.value(), envelope.to_vec())?;
         Ok(())
     }
 
@@ -565,11 +570,11 @@ impl HnsDirectDenuoPeer {
     ) -> Result<(), HnsDirectPeerError> {
         let envelope = message
             .encode_envelope(request_id)
-            .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+            .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
         self.send_cross_chain_envelope(&envelope)
     }
 
-    /// Receive one canonical HNS/BTC Denuo envelope from the direct socket.
+    /// Receive one canonical HNS/BTC Shakescape envelope from the direct socket.
     /// This never accepts a generic experimental payload or performs a market
     /// state transition; callers must route it to the persisted market
     /// handshake controller for its exact expected stage.
@@ -577,16 +582,17 @@ impl HnsDirectDenuoPeer {
         &mut self,
         now_unix: u64,
     ) -> Result<Vec<u8>, HnsDirectPeerError> {
-        match self.receive_denuo_message(now_unix)? {
-            HnsDirectDenuoMessage::CrossChain { envelope } => Ok(envelope),
-            HnsDirectDenuoMessage::NameMarket { .. } => Err(HnsDirectPeerError::Denuo(
-                "received a name-market Denuo envelope in a cross-chain-only exchange".to_owned(),
+        match self.receive_shakescape_message(now_unix)? {
+            HnsDirectShakescapeMessage::CrossChain { envelope } => Ok(envelope),
+            HnsDirectShakescapeMessage::NameMarket { .. } => Err(HnsDirectPeerError::Shakescape(
+                "received a name-market Shakescape envelope in a cross-chain-only exchange"
+                    .to_owned(),
             )),
         }
     }
 }
 
-fn nonzero_denuo_request_id() -> Result<u64, HnsDirectPeerError> {
+fn nonzero_shakescape_request_id() -> Result<u64, HnsDirectPeerError> {
     for _ in 0..16 {
         let mut bytes = [0_u8; 8];
         getrandom::fill(&mut bytes).map_err(|_| HnsDirectPeerError::Randomness)?;
@@ -599,24 +605,24 @@ fn nonzero_denuo_request_id() -> Result<u64, HnsDirectPeerError> {
 }
 
 /// Construct the standard Handshake peer advertisement for a wallet-hosted
-/// Denuo exchange. The extension service augments, rather than replaces, the
-/// mandatory standard `NETWORK` bit: a Denuo wallet remains a Handshake peer
+/// Shakescape exchange. The extension service augments, rather than replaces, the
+/// mandatory standard `NETWORK` bit: a Shakescape wallet remains a Handshake peer
 /// on the ordinary wire and interoperates with peers that enforce the normal
 /// service admission rule.
-fn direct_denuo_version(
+fn direct_shakescape_version(
     remote: SocketAddr,
     nonce: [u8; 8],
     local_height: u32,
     now_unix: u64,
 ) -> hns_p2p_wire::VersionPacket {
     let mut version = light_wallet_version(remote, nonce, local_height, now_unix);
-    version.services = SERVICE_NETWORK | DENUO_EXTENSION_SERVICE.value();
+    version.services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
     version
 }
 
-fn denuo_registry_hello(network: HnsNetwork) -> Result<RegistryHello, HnsDirectPeerError> {
+fn shakescape_registry_hello(network: HnsNetwork) -> Result<RegistryHello, HnsDirectPeerError> {
     let binding = crate::shakedex_network_binding(network)?;
-    RegistryHello::denuo_v2(
+    RegistryHello::shakescape_v1(
         experimental_network(network),
         *binding.genesis.as_bytes(),
         vec![ProtocolRange {
@@ -624,36 +630,36 @@ fn denuo_registry_hello(network: HnsNetwork) -> Result<RegistryHello, HnsDirectP
             minimum_version: ATOMIC_MARKET_PROTOCOL_VERSION,
             maximum_version: ATOMIC_MARKET_PROTOCOL_VERSION,
         }],
-        u32::try_from(DENUO_EXTENSION_MAX_PACKET_PAYLOAD.min(MAX_DENUO_MARKET_PAYLOAD))
+        u32::try_from(SHAKESCAPE_EXTENSION_MAX_PACKET_PAYLOAD.min(MAX_SHAKESCAPE_MARKET_PAYLOAD))
             .map_err(|_| HnsDirectPeerError::Arithmetic)?,
-        DENUO_MAXIMUM_LIVE_REQUESTS,
+        SHAKESCAPE_MAXIMUM_LIVE_REQUESTS,
         0,
     )
-    .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))
+    .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))
 }
 
-fn receive_denuo_hello_ack(
+fn receive_shakescape_hello_ack(
     connection: &mut PeerConnection<TcpStream>,
     network: HnsNetwork,
     request_id: u64,
     now_unix: u64,
 ) -> Result<NegotiatedRegistry, HnsDirectPeerError> {
-    let local = denuo_registry_hello(network)?;
-    for _ in 0..DENUO_MAX_RESPONSE_EVENTS {
+    let local = shakescape_registry_hello(network)?;
+    for _ in 0..SHAKESCAPE_MAX_RESPONSE_EVENTS {
         match connection.receive_event(now_unix)? {
             PeerEvent::Experimental {
                 packet_type,
                 payload,
-            } if packet_type == DENUO_EXTENSION_PACKET.value() => {
+            } if packet_type == SHAKESCAPE_EXTENSION_PACKET.value() => {
                 let (received_request_id, remote) =
-                    DenuoExtensionEnvelope::decode_registry_hello_ack_v2(&payload)
-                        .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+                    ShakescapeExtensionEnvelope::decode_registry_hello_ack(&payload)
+                        .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
                 if received_request_id != request_id {
-                    return Err(HnsDirectPeerError::Denuo(
-                        "Denuo registry hello acknowledgement correlation mismatch".to_owned(),
+                    return Err(HnsDirectPeerError::Shakescape(
+                        "Shakescape registry hello acknowledgement correlation mismatch".to_owned(),
                     ));
                 }
-                return exact_denuo_v2_atomic_market(&local, &remote);
+                return exact_shakescape_v1_atomic_market(&local, &remote);
             }
             PeerEvent::Experimental { .. }
             | PeerEvent::Ignored(_)
@@ -672,33 +678,33 @@ fn receive_denuo_hello_ack(
     Err(HnsDirectPeerError::ResponseEventLimit)
 }
 
-fn respond_denuo_registry_hello(
+fn respond_shakescape_registry_hello(
     connection: &mut PeerConnection<TcpStream>,
     network: HnsNetwork,
     now_unix: u64,
 ) -> Result<NegotiatedRegistry, HnsDirectPeerError> {
-    let local = denuo_registry_hello(network)?;
-    for _ in 0..DENUO_MAX_RESPONSE_EVENTS {
+    let local = shakescape_registry_hello(network)?;
+    for _ in 0..SHAKESCAPE_MAX_RESPONSE_EVENTS {
         match connection.receive_event(now_unix)? {
             PeerEvent::Experimental {
                 packet_type,
                 payload,
-            } if packet_type == DENUO_EXTENSION_PACKET.value() => {
+            } if packet_type == SHAKESCAPE_EXTENSION_PACKET.value() => {
                 let (request_id, remote) =
-                    DenuoExtensionEnvelope::decode_registry_hello_v2(&payload)
-                        .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+                    ShakescapeExtensionEnvelope::decode_registry_hello(&payload)
+                        .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
                 if request_id == 0 {
-                    return Err(HnsDirectPeerError::Denuo(
-                        "Denuo registry hello request id must be nonzero".to_owned(),
+                    return Err(HnsDirectPeerError::Shakescape(
+                        "Shakescape registry hello request id must be nonzero".to_owned(),
                     ));
                 }
-                let negotiated = exact_denuo_v2_atomic_market(&local, &remote)?;
-                let ack = DenuoExtensionEnvelope::registry_hello_ack_v2(request_id, &local)
-                    .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?
+                let negotiated = exact_shakescape_v1_atomic_market(&local, &remote)?;
+                let ack = ShakescapeExtensionEnvelope::registry_hello_ack(request_id, &local)
+                    .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?
                     .encode_canonical()
-                    .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+                    .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
                 connection
-                    .send_experimental_packet(DENUO_EXTENSION_PACKET.value(), ack)
+                    .send_experimental_packet(SHAKESCAPE_EXTENSION_PACKET.value(), ack)
                     .map_err(|error| HnsDirectPeerError::Peer(error.to_string()))?;
                 return Ok(negotiated);
             }
@@ -719,26 +725,26 @@ fn respond_denuo_registry_hello(
     Err(HnsDirectPeerError::ResponseEventLimit)
 }
 
-fn exact_denuo_v2_atomic_market(
+fn exact_shakescape_v1_atomic_market(
     local: &RegistryHello,
     remote: &RegistryHello,
 ) -> Result<NegotiatedRegistry, HnsDirectPeerError> {
     let negotiated = NegotiatedRegistry::negotiate(local, remote)
-        .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
-    if negotiated.registry_version != DENUO_V2_REGISTRY_VERSION
-        || negotiated.fingerprint != DENUO_V2_REGISTRY_FINGERPRINT
+        .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
+    if negotiated.registry_version != SHAKESCAPE_V1_REGISTRY_VERSION
+        || negotiated.fingerprint != SHAKESCAPE_V1_REGISTRY_FINGERPRINT
         || !negotiated
             .protocols
             .contains(&(ATOMIC_MARKET_PROTOCOL_ID, ATOMIC_MARKET_PROTOCOL_VERSION))
     {
-        return Err(HnsDirectPeerError::Denuo(
-            "Denuo peer lacks exact V2 atomic-market admission".to_owned(),
+        return Err(HnsDirectPeerError::Shakescape(
+            "Shakescape peer lacks exact V2 atomic-market admission".to_owned(),
         ));
     }
     Ok(negotiated)
 }
 
-fn validate_denuo_market_hello(
+fn validate_shakescape_market_hello(
     network: HnsNetwork,
     message: &NameMarketMessage,
 ) -> Result<(), HnsDirectPeerError> {
@@ -752,27 +758,27 @@ fn validate_denuo_market_hello(
     };
     let binding = crate::shakedex_network_binding(network)?;
     if *hns_magic != binding.magic || hns_genesis.as_bytes() != binding.genesis.as_bytes() {
-        return Err(HnsDirectPeerError::Denuo(
-            "Denuo name-market hello has wrong Handshake network binding".to_owned(),
+        return Err(HnsDirectPeerError::Shakescape(
+            "Shakescape name-market hello has wrong Handshake network binding".to_owned(),
         ));
     }
     Ok(())
 }
 
 fn validate_cross_chain_envelope(envelope: &[u8]) -> Result<(), HnsDirectPeerError> {
-    if envelope.is_empty() || envelope.len() > MAX_DENUO_MARKET_PAYLOAD {
-        return Err(HnsDirectPeerError::Denuo(
-            "Denuo cross-chain envelope exceeds its exact bound".to_owned(),
+    if envelope.is_empty() || envelope.len() > MAX_SHAKESCAPE_MARKET_PAYLOAD {
+        return Err(HnsDirectPeerError::Shakescape(
+            "Shakescape cross-chain envelope exceeds its exact bound".to_owned(),
         ));
     }
     let (request_id, message) = CrossChainMessage::decode_envelope(envelope)
-        .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+        .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
     let canonical = message
         .encode_envelope(request_id)
-        .map_err(|error| HnsDirectPeerError::Denuo(error.to_string()))?;
+        .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
     if canonical != envelope {
-        return Err(HnsDirectPeerError::Denuo(
-            "Denuo cross-chain envelope is not canonical".to_owned(),
+        return Err(HnsDirectPeerError::Shakescape(
+            "Shakescape cross-chain envelope is not canonical".to_owned(),
         ));
     }
     Ok(())
@@ -797,7 +803,7 @@ fn direct_address_allowed(
         && (config.allow_private_addresses || is_public_peer_ip(address.ip()))
 }
 
-fn inbound_denuo_address_allowed(config: &HnsDirectPeerConfig, address: SocketAddr) -> bool {
+fn inbound_shakescape_address_allowed(config: &HnsDirectPeerConfig, address: SocketAddr) -> bool {
     address.port() != 0 && (config.allow_private_addresses || is_public_peer_ip(address.ip()))
 }
 
@@ -1180,33 +1186,33 @@ impl HnsDirectPeerCoordinator {
         &self.backend
     }
 
-    /// Bind one wallet-owned direct Denuo listener with the exact validated
+    /// Bind one wallet-owned direct Shakescape listener with the exact validated
     /// peer policy already used by this coordinator.
     ///
     /// The listener inherits the selected Handshake network, private-address
     /// policy, deadlines, and peer policy. A caller cannot accidentally bind
-    /// a Denuo transport on a network or policy that differs from the direct
+    /// a Shakescape transport on a network or policy that differs from the direct
     /// backend providing this wallet's chain and value evidence.
-    pub fn bind_denuo_listener(
+    pub fn bind_shakescape_listener(
         &self,
         address: SocketAddr,
-    ) -> Result<HnsDirectDenuoListener, HnsDirectPeerError> {
-        HnsDirectDenuoListener::bind(self.config.clone(), address)
+    ) -> Result<HnsDirectShakescapeListener, HnsDirectPeerError> {
+        HnsDirectShakescapeListener::bind(self.config.clone(), address)
     }
 
-    /// Connect one direct Denuo peer with the exact validated peer policy
+    /// Connect one direct Shakescape peer with the exact validated peer policy
     /// already used by this coordinator.
     ///
     /// The socket remains an untrusted, explicitly scheduled transport. This
     /// method does not synchronize the wallet, service a board exchange, or
     /// authorize any value operation.
-    pub fn connect_denuo_peer(
+    pub fn connect_shakescape_peer(
         &self,
         address: SocketAddr,
         local_height: u32,
         now_unix: u64,
-    ) -> Result<HnsDirectDenuoPeer, HnsDirectPeerError> {
-        HnsDirectDenuoPeer::connect(&self.config, address, local_height, now_unix)
+    ) -> Result<HnsDirectShakescapePeer, HnsDirectPeerError> {
+        HnsDirectShakescapePeer::connect(&self.config, address, local_height, now_unix)
     }
 
     /// Extend the wallet-owned direct watch set to the largest bounded restore
@@ -3036,10 +3042,10 @@ pub enum HnsDirectPeerError {
     PeerRejected(String),
     #[error("peer could not provide the requested filtered block")]
     FilteredBlockUnavailable,
-    #[error("the standard peer does not advertise the Denuo extension service")]
-    DenuoPeerNotAdvertised,
-    #[error("wallet-native Denuo negotiation or message validation failed: {0}")]
-    Denuo(String),
+    #[error("the standard peer does not advertise the Shakescape extension service")]
+    ShakescapePeerNotAdvertised,
+    #[error("wallet-native Shakescape negotiation or message validation failed: {0}")]
+    Shakescape(String),
     #[error("wallet block evidence failed: {0}")]
     WalletEvidence(String),
     #[error("Bloom-filter construction failed: {0}")]
@@ -3528,11 +3534,14 @@ mod tests {
     }
 
     #[test]
-    fn direct_denuo_registry_is_pinned_to_the_wallet_network_and_atomic_market() {
-        let hello = denuo_registry_hello(HnsNetwork::Regtest).unwrap();
+    fn direct_shakescape_registry_is_pinned_to_the_wallet_network_and_atomic_market() {
+        let hello = shakescape_registry_hello(HnsNetwork::Regtest).unwrap();
         assert_eq!(hello.network, ExperimentalNetwork::Regtest);
-        assert_eq!(hello.registry_versions, vec![DENUO_V2_REGISTRY_VERSION]);
-        assert_eq!(hello.fingerprint, DENUO_V2_REGISTRY_FINGERPRINT);
+        assert_eq!(
+            hello.registry_versions,
+            vec![SHAKESCAPE_V1_REGISTRY_VERSION]
+        );
+        assert_eq!(hello.fingerprint, SHAKESCAPE_V1_REGISTRY_FINGERPRINT);
         assert!(hello.protocols.contains(&ProtocolRange {
             protocol_id: ATOMIC_MARKET_PROTOCOL_ID,
             minimum_version: ATOMIC_MARKET_PROTOCOL_VERSION,
@@ -3540,25 +3549,25 @@ mod tests {
         }));
         assert_eq!(
             hello.maximum_receive_size as usize,
-            MAX_DENUO_MARKET_PAYLOAD
+            MAX_SHAKESCAPE_MARKET_PAYLOAD
         );
     }
 
     #[test]
-    fn direct_denuo_wallet_advertises_standard_network_and_extension_services() {
-        let version = direct_denuo_version(
+    fn direct_shakescape_wallet_advertises_standard_network_and_extension_services() {
+        let version = direct_shakescape_version(
             "127.0.0.1:12038".parse().unwrap(),
             [9; 8],
             42,
             Network::Regtest.parameters().genesis_time.get() + 1,
         );
         assert_ne!(version.services & SERVICE_NETWORK, 0);
-        assert_ne!(version.services & DENUO_EXTENSION_SERVICE.value(), 0);
+        assert_ne!(version.services & SHAKESCAPE_EXTENSION_SERVICE.value(), 0);
     }
 
     #[test]
-    fn direct_denuo_wallet_accepts_and_negotiates_an_inbound_wallet_peer() {
-        let listener = HnsDirectDenuoListener::bind(
+    fn direct_shakescape_wallet_accepts_and_negotiates_an_inbound_wallet_peer() {
+        let listener = HnsDirectShakescapeListener::bind(
             HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
             (Ipv4Addr::LOCALHOST, 0).into(),
         )
@@ -3575,12 +3584,12 @@ mod tests {
                 }
                 thread::sleep(Duration::from_millis(5));
             }
-            panic!("wallet-hosted Denuo listener did not receive the client")
+            panic!("wallet-hosted Shakescape listener did not receive the client")
         });
 
         let mut client_config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
         client_config.static_peers.push(address);
-        let client = HnsDirectDenuoPeer::connect(&client_config, address, 42, now).unwrap();
+        let client = HnsDirectShakescapePeer::connect(&client_config, address, 42, now).unwrap();
         let server = server.join().unwrap();
 
         assert_eq!(client.negotiated_registry(), server.negotiated_registry());

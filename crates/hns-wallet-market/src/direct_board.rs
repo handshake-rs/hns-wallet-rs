@@ -17,31 +17,31 @@ use crate::MarketError;
 
 const DIRECT_OFFER_BOARD_SCHEMA_VERSION: u16 = 1;
 const DIRECT_OFFER_BOARD_POLICY_DOMAIN: &[u8] = b"hns-wallet-direct-offer-board-policy-v1\0";
-const DIRECT_OFFER_BOARD_RECORD_PREFIX: &[u8] = b"denuo-v2-direct-offer\0";
+const DIRECT_OFFER_BOARD_RECORD_PREFIX: &[u8] = b"shakescape-v2-direct-offer\0";
 
 /// A full board fits into the protocol inventory bound. The wallet fails
 /// closed rather than silently dropping live offers.
-pub const MAX_DENUO_DIRECT_OFFERS: usize = hns_marketplace_protocol::MAX_INVENTORY_ENTRIES;
+pub const MAX_SHAKESCAPE_DIRECT_OFFERS: usize = hns_marketplace_protocol::MAX_INVENTORY_ENTRIES;
 
 /// The exact local network binding for direct HNS/BTC offers. This has no
 /// price-policy fields: a signed offer owns its exact amounts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DenuoDirectOfferBoardPolicy {
+pub struct ShakescapeDirectOfferBoardPolicy {
     network: NetworkBinding,
     fingerprint: ObjectHash,
 }
 
-impl DenuoDirectOfferBoardPolicy {
+impl ShakescapeDirectOfferBoardPolicy {
     pub fn new(network: NetworkBinding) -> Result<Self, MarketError> {
         network
             .validate_for_pair(MarketPair::HNS_BTC)
-            .map_err(|_| MarketError::InvalidDenuoDirectOfferPolicy)?;
+            .map_err(|_| MarketError::InvalidShakescapeDirectOfferPolicy)?;
         let mut hasher = Sha256::new();
         hasher.update(DIRECT_OFFER_BOARD_POLICY_DOMAIN);
         hasher.update(
             network
                 .encode()
-                .map_err(|_| MarketError::InvalidDenuoDirectOfferPolicy)?,
+                .map_err(|_| MarketError::InvalidShakescapeDirectOfferPolicy)?,
         );
         Ok(Self {
             network,
@@ -77,7 +77,7 @@ struct PersistedDirectOffer {
 /// Fully re-authenticated board material. It is retained locally to let a
 /// later take/session bind to precisely the same signed maker terms.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoDirectOfferRecord {
+pub struct ShakescapeDirectOfferRecord {
     pub store_revision: u64,
     pub accepted_at_unix: u64,
     pub cancelled_at_unix: Option<u64>,
@@ -85,9 +85,9 @@ pub struct DenuoDirectOfferRecord {
     pub cancellation: Option<DirectOfferCancellation>,
 }
 
-impl DenuoDirectOfferRecord {
-    pub fn snapshot(&self) -> DenuoDirectOfferSnapshot {
-        DenuoDirectOfferSnapshot {
+impl ShakescapeDirectOfferRecord {
+    pub fn snapshot(&self) -> ShakescapeDirectOfferSnapshot {
+        ShakescapeDirectOfferSnapshot {
             store_revision: self.store_revision,
             offer_id: ObjectHash::new(self.offer.offer_id),
             session_id: SessionId::new(self.offer.swap_session_id),
@@ -112,7 +112,7 @@ impl DenuoDirectOfferRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DenuoDirectOfferSnapshot {
+pub struct ShakescapeDirectOfferSnapshot {
     pub store_revision: u64,
     pub offer_id: ObjectHash,
     pub session_id: SessionId,
@@ -129,13 +129,13 @@ pub struct DenuoDirectOfferSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DenuoDirectOfferAdmission {
-    Inserted(DenuoDirectOfferSnapshot),
-    Existing(DenuoDirectOfferSnapshot),
+pub enum ShakescapeDirectOfferAdmission {
+    Inserted(ShakescapeDirectOfferSnapshot),
+    Existing(ShakescapeDirectOfferSnapshot),
 }
 
-impl DenuoDirectOfferAdmission {
-    pub const fn snapshot(self) -> DenuoDirectOfferSnapshot {
+impl ShakescapeDirectOfferAdmission {
+    pub const fn snapshot(self) -> ShakescapeDirectOfferSnapshot {
         match self {
             Self::Inserted(snapshot) | Self::Existing(snapshot) => snapshot,
         }
@@ -147,13 +147,13 @@ impl DenuoDirectOfferAdmission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DenuoDirectOfferCancellationAdmission {
-    Applied(DenuoDirectOfferSnapshot),
-    Existing(DenuoDirectOfferSnapshot),
+pub enum ShakescapeDirectOfferCancellationAdmission {
+    Applied(ShakescapeDirectOfferSnapshot),
+    Existing(ShakescapeDirectOfferSnapshot),
 }
 
-impl DenuoDirectOfferCancellationAdmission {
-    pub const fn snapshot(self) -> DenuoDirectOfferSnapshot {
+impl ShakescapeDirectOfferCancellationAdmission {
+    pub const fn snapshot(self) -> ShakescapeDirectOfferSnapshot {
         match self {
             Self::Applied(snapshot) | Self::Existing(snapshot) => snapshot,
         }
@@ -164,7 +164,7 @@ impl DenuoDirectOfferCancellationAdmission {
 /// satoshis per HNS base unit, reduced before grouping. It is UI metadata;
 /// taking an offer always reuses its signed exact amounts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DenuoDirectOfferLevel {
+pub struct ShakescapeDirectOfferLevel {
     pub maker_sells_hns: bool,
     pub btc_per_hns_numerator: u128,
     pub btc_per_hns_denominator: u128,
@@ -173,18 +173,18 @@ pub struct DenuoDirectOfferLevel {
     pub offer_count: usize,
 }
 
-pub fn load_denuo_direct_offers(
+pub fn load_shakescape_direct_offers(
     store: &WalletStore,
-    policy: &DenuoDirectOfferBoardPolicy,
+    policy: &ShakescapeDirectOfferBoardPolicy,
     now_unix: u64,
-) -> Result<Vec<DenuoDirectOfferRecord>, MarketError> {
+) -> Result<Vec<ShakescapeDirectOfferRecord>, MarketError> {
     let stored = store.list_entities_by_id_prefix::<PersistedDirectOffer>(
-        EntityKind::DenuoBoardObject,
+        EntityKind::ShakescapeBoardObject,
         &record_prefix(policy),
-        MAX_DENUO_DIRECT_OFFERS + 1,
+        MAX_SHAKESCAPE_DIRECT_OFFERS + 1,
     )?;
-    if stored.len() > MAX_DENUO_DIRECT_OFFERS {
-        return Err(MarketError::DenuoDirectOfferCapacity);
+    if stored.len() > MAX_SHAKESCAPE_DIRECT_OFFERS {
+        return Err(MarketError::ShakescapeDirectOfferCapacity);
     }
     let mut records = stored
         .into_iter()
@@ -201,30 +201,30 @@ pub fn load_denuo_direct_offers(
     Ok(records)
 }
 
-pub fn load_denuo_direct_offer(
+pub fn load_shakescape_direct_offer(
     store: &WalletStore,
-    policy: &DenuoDirectOfferBoardPolicy,
+    policy: &ShakescapeDirectOfferBoardPolicy,
     offer_id: [u8; 32],
-) -> Result<Option<DenuoDirectOfferRecord>, MarketError> {
+) -> Result<Option<ShakescapeDirectOfferRecord>, MarketError> {
     if offer_id == [0; 32] {
-        return Err(MarketError::InvalidDenuoDirectOffer);
+        return Err(MarketError::InvalidShakescapeDirectOffer);
     }
     store
         .load_entity::<PersistedDirectOffer>(
-            EntityKind::DenuoBoardObject,
+            EntityKind::ShakescapeBoardObject,
             &record_id(policy, offer_id),
         )?
         .map(|stored| decode_stored_offer(policy, stored))
         .transpose()
 }
 
-pub fn live_denuo_direct_offer_levels(
+pub fn live_shakescape_direct_offer_levels(
     store: &WalletStore,
-    policy: &DenuoDirectOfferBoardPolicy,
+    policy: &ShakescapeDirectOfferBoardPolicy,
     now_unix: u64,
-) -> Result<Vec<DenuoDirectOfferLevel>, MarketError> {
-    let mut grouped = BTreeMap::<(bool, u128, u128), DenuoDirectOfferLevel>::new();
-    for record in load_denuo_direct_offers(store, policy, now_unix)? {
+) -> Result<Vec<ShakescapeDirectOfferLevel>, MarketError> {
+    let mut grouped = BTreeMap::<(bool, u128, u128), ShakescapeDirectOfferLevel>::new();
+    for record in load_shakescape_direct_offers(store, policy, now_unix)? {
         if !record.is_active_at(now_unix) {
             continue;
         }
@@ -243,7 +243,7 @@ pub fn live_denuo_direct_offer_levels(
         };
         let divisor = gcd(btc, hns);
         let key = (maker_sells_hns, btc / divisor, hns / divisor);
-        let entry = grouped.entry(key).or_insert(DenuoDirectOfferLevel {
+        let entry = grouped.entry(key).or_insert(ShakescapeDirectOfferLevel {
             maker_sells_hns,
             btc_per_hns_numerator: key.1,
             btc_per_hns_denominator: key.2,
@@ -267,31 +267,35 @@ pub fn live_denuo_direct_offer_levels(
     Ok(grouped.into_values().collect())
 }
 
-/// Admit one direct offer from a canonical Denuo envelope. The same entry
+/// Admit one direct offer from a canonical Shakescape envelope. The same entry
 /// point is also used for a wallet's own offer before it is sent, ensuring a
 /// later inbound take can only reference local exact terms.
-pub fn admit_denuo_direct_offer(
+pub fn admit_shakescape_direct_offer(
     store: &mut WalletStore,
-    policy: &DenuoDirectOfferBoardPolicy,
+    policy: &ShakescapeDirectOfferBoardPolicy,
     envelope_bytes: &[u8],
     accepted_at_unix: u64,
-) -> Result<DenuoDirectOfferAdmission, MarketError> {
+) -> Result<ShakescapeDirectOfferAdmission, MarketError> {
     let (_, message) = decode_canonical_envelope(envelope_bytes)?;
     let CrossChainMessage::DirectOffer(offer) = message else {
-        return Err(MarketError::InvalidDenuoDirectOffer);
+        return Err(MarketError::InvalidShakescapeDirectOffer);
     };
     offer
         .verify_at(policy.network(), accepted_at_unix)
-        .map_err(|_| MarketError::InvalidDenuoDirectOffer)?;
+        .map_err(|_| MarketError::InvalidShakescapeDirectOffer)?;
     let offer_id = offer.offer_id;
-    if let Some(existing) = load_denuo_direct_offer(store, policy, offer_id)? {
+    if let Some(existing) = load_shakescape_direct_offer(store, policy, offer_id)? {
         if existing.offer == offer {
-            return Ok(DenuoDirectOfferAdmission::Existing(existing.snapshot()));
+            return Ok(ShakescapeDirectOfferAdmission::Existing(
+                existing.snapshot(),
+            ));
         }
-        return Err(MarketError::DenuoDirectOfferConflict);
+        return Err(MarketError::ShakescapeDirectOfferConflict);
     }
-    if load_denuo_direct_offers(store, policy, accepted_at_unix)?.len() >= MAX_DENUO_DIRECT_OFFERS {
-        return Err(MarketError::DenuoDirectOfferCapacity);
+    if load_shakescape_direct_offers(store, policy, accepted_at_unix)?.len()
+        >= MAX_SHAKESCAPE_DIRECT_OFFERS
+    {
+        return Err(MarketError::ShakescapeDirectOfferCapacity);
     }
     let persisted = PersistedDirectOffer {
         schema_version: DIRECT_OFFER_BOARD_SCHEMA_VERSION,
@@ -303,44 +307,44 @@ pub fn admit_denuo_direct_offer(
         cancelled_at_unix: None,
     };
     let revision = store.save_entity(
-        EntityKind::DenuoBoardObject,
+        EntityKind::ShakescapeBoardObject,
         &record_id(policy, offer_id),
         0,
         &persisted,
         accepted_at_unix,
     )?;
-    let record = DenuoDirectOfferRecord {
+    let record = ShakescapeDirectOfferRecord {
         store_revision: revision,
         accepted_at_unix,
         cancelled_at_unix: None,
         offer,
         cancellation: None,
     };
-    Ok(DenuoDirectOfferAdmission::Inserted(record.snapshot()))
+    Ok(ShakescapeDirectOfferAdmission::Inserted(record.snapshot()))
 }
 
-pub fn admit_denuo_direct_offer_cancellation(
+pub fn admit_shakescape_direct_offer_cancellation(
     store: &mut WalletStore,
-    policy: &DenuoDirectOfferBoardPolicy,
+    policy: &ShakescapeDirectOfferBoardPolicy,
     envelope_bytes: &[u8],
     accepted_at_unix: u64,
-) -> Result<DenuoDirectOfferCancellationAdmission, MarketError> {
+) -> Result<ShakescapeDirectOfferCancellationAdmission, MarketError> {
     let (_, message) = decode_canonical_envelope(envelope_bytes)?;
     let CrossChainMessage::CancelDirectOffer(cancellation) = message else {
-        return Err(MarketError::InvalidDenuoDirectOffer);
+        return Err(MarketError::InvalidShakescapeDirectOffer);
     };
-    let mut record = load_denuo_direct_offer(store, policy, cancellation.offer_id)?
-        .ok_or(MarketError::UnknownDenuoDirectOffer)?;
+    let mut record = load_shakescape_direct_offer(store, policy, cancellation.offer_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectOffer)?;
     cancellation
         .verify_for_offer(&record.offer, policy.network(), accepted_at_unix)
-        .map_err(|_| MarketError::InvalidDenuoDirectOffer)?;
+        .map_err(|_| MarketError::InvalidShakescapeDirectOffer)?;
     if let Some(existing) = &record.cancellation {
         if existing == &cancellation {
-            return Ok(DenuoDirectOfferCancellationAdmission::Existing(
+            return Ok(ShakescapeDirectOfferCancellationAdmission::Existing(
                 record.snapshot(),
             ));
         }
-        return Err(MarketError::DenuoDirectOfferConflict);
+        return Err(MarketError::ShakescapeDirectOfferConflict);
     }
     let persisted = PersistedDirectOffer {
         schema_version: DIRECT_OFFER_BOARD_SCHEMA_VERSION,
@@ -352,7 +356,7 @@ pub fn admit_denuo_direct_offer_cancellation(
         cancelled_at_unix: Some(accepted_at_unix),
     };
     let next_revision = store.save_entity(
-        EntityKind::DenuoBoardObject,
+        EntityKind::ShakescapeBoardObject,
         &record_id(policy, record.offer.offer_id),
         record.store_revision,
         &persisted,
@@ -361,24 +365,25 @@ pub fn admit_denuo_direct_offer_cancellation(
     record.store_revision = next_revision;
     record.cancelled_at_unix = Some(accepted_at_unix);
     record.cancellation = Some(cancellation);
-    Ok(DenuoDirectOfferCancellationAdmission::Applied(
+    Ok(ShakescapeDirectOfferCancellationAdmission::Applied(
         record.snapshot(),
     ))
 }
 
-pub fn denuo_direct_offer_inventory(
+pub fn shakescape_direct_offer_inventory(
     store: &WalletStore,
-    policy: &DenuoDirectOfferBoardPolicy,
+    policy: &ShakescapeDirectOfferBoardPolicy,
     now_unix: u64,
 ) -> Result<Vec<[u8; 32]>, MarketError> {
-    let ids = load_denuo_direct_offers(store, policy, now_unix)?
+    let ids = load_shakescape_direct_offers(store, policy, now_unix)?
         .into_iter()
         .filter(|record| record.is_active_at(now_unix))
         .map(|record| record.offer.offer_id)
         .collect::<Vec<_>>();
-    if ids.len() > MAX_DENUO_DIRECT_OFFERS || ids.iter().collect::<BTreeSet<_>>().len() != ids.len()
+    if ids.len() > MAX_SHAKESCAPE_DIRECT_OFFERS
+        || ids.iter().collect::<BTreeSet<_>>().len() != ids.len()
     {
-        return Err(MarketError::CorruptDenuoDirectOfferBoard);
+        return Err(MarketError::CorruptShakescapeDirectOfferBoard);
     }
     Ok(ids)
 }
@@ -387,24 +392,24 @@ pub(crate) fn decode_canonical_envelope(
     envelope_bytes: &[u8],
 ) -> Result<(u64, CrossChainMessage), MarketError> {
     if envelope_bytes.is_empty() {
-        return Err(MarketError::InvalidDenuoPeerMessage);
+        return Err(MarketError::InvalidShakescapePeerMessage);
     }
     let (request_id, message) = CrossChainMessage::decode_envelope(envelope_bytes)
-        .map_err(|_| MarketError::InvalidDenuoPeerMessage)?;
+        .map_err(|_| MarketError::InvalidShakescapePeerMessage)?;
     if message
         .encode_envelope(request_id)
-        .map_err(|_| MarketError::InvalidDenuoPeerMessage)?
+        .map_err(|_| MarketError::InvalidShakescapePeerMessage)?
         != envelope_bytes
     {
-        return Err(MarketError::InvalidDenuoPeerMessage);
+        return Err(MarketError::InvalidShakescapePeerMessage);
     }
     Ok((request_id, message))
 }
 
 fn decode_stored_offer(
-    policy: &DenuoDirectOfferBoardPolicy,
+    policy: &ShakescapeDirectOfferBoardPolicy,
     stored: StoredEntity<PersistedDirectOffer>,
-) -> Result<DenuoDirectOfferRecord, MarketError> {
+) -> Result<ShakescapeDirectOfferRecord, MarketError> {
     let value = stored.value;
     if value.schema_version != DIRECT_OFFER_BOARD_SCHEMA_VERSION
         || value.policy_fingerprint != policy.fingerprint()
@@ -412,18 +417,18 @@ fn decode_stored_offer(
         || stored.id != record_id(policy, value.offer_id.into_bytes())
         || value.cancellation_hex.is_some() != value.cancelled_at_unix.is_some()
     {
-        return Err(MarketError::CorruptDenuoDirectOfferBoard);
+        return Err(MarketError::CorruptShakescapeDirectOfferBoard);
     }
     let offer_bytes = decode_hex_bytes(&value.offer_hex)?;
-    let offer =
-        DirectOffer::decode(&offer_bytes).map_err(|_| MarketError::CorruptDenuoDirectOfferBoard)?;
+    let offer = DirectOffer::decode(&offer_bytes)
+        .map_err(|_| MarketError::CorruptShakescapeDirectOfferBoard)?;
     if offer.offer_id != value.offer_id.into_bytes()
         || offer
             .verify_at(policy.network(), value.accepted_at_unix)
             .is_err()
         || offer.encode().ok().as_deref() != Some(offer_bytes.as_slice())
     {
-        return Err(MarketError::CorruptDenuoDirectOfferBoard);
+        return Err(MarketError::CorruptShakescapeDirectOfferBoard);
     }
     let cancellation = value
         .cancellation_hex
@@ -432,25 +437,25 @@ fn decode_stored_offer(
         .transpose()?
         .map(|bytes| {
             let cancellation = DirectOfferCancellation::decode(&bytes)
-                .map_err(|_| MarketError::CorruptDenuoDirectOfferBoard)?;
+                .map_err(|_| MarketError::CorruptShakescapeDirectOfferBoard)?;
             let cancelled_at = value
                 .cancelled_at_unix
-                .ok_or(MarketError::CorruptDenuoDirectOfferBoard)?;
+                .ok_or(MarketError::CorruptShakescapeDirectOfferBoard)?;
             if cancelled_at < value.accepted_at_unix
                 || cancellation
                     .verify_for_offer(&offer, policy.network(), cancelled_at)
                     .is_err()
                 || cancellation.encode().ok().as_deref() != Some(bytes.as_slice())
             {
-                return Err(MarketError::CorruptDenuoDirectOfferBoard);
+                return Err(MarketError::CorruptShakescapeDirectOfferBoard);
             }
             Ok(cancellation)
         })
         .transpose()?;
     if stored.updated_at_unix != value.cancelled_at_unix.unwrap_or(value.accepted_at_unix) {
-        return Err(MarketError::CorruptDenuoDirectOfferBoard);
+        return Err(MarketError::CorruptShakescapeDirectOfferBoard);
     }
-    Ok(DenuoDirectOfferRecord {
+    Ok(ShakescapeDirectOfferRecord {
         store_revision: stored.revision,
         accepted_at_unix: value.accepted_at_unix,
         cancelled_at_unix: value.cancelled_at_unix,
@@ -463,13 +468,13 @@ fn encode_hex<T: CanonicalDirectObject>(value: &T) -> Result<String, MarketError
     value
         .encode_canonical()
         .map(hex::encode)
-        .map_err(|_| MarketError::InvalidDenuoDirectOffer)
+        .map_err(|_| MarketError::InvalidShakescapeDirectOffer)
 }
 
 fn decode_hex_bytes(encoded: &str) -> Result<Vec<u8>, MarketError> {
-    let bytes = hex::decode(encoded).map_err(|_| MarketError::CorruptDenuoDirectOfferBoard)?;
+    let bytes = hex::decode(encoded).map_err(|_| MarketError::CorruptShakescapeDirectOfferBoard)?;
     if hex::encode(&bytes) != encoded {
-        return Err(MarketError::CorruptDenuoDirectOfferBoard);
+        return Err(MarketError::CorruptShakescapeDirectOfferBoard);
     }
     Ok(bytes)
 }
@@ -490,14 +495,14 @@ impl CanonicalDirectObject for DirectOfferCancellation {
     }
 }
 
-fn record_prefix(policy: &DenuoDirectOfferBoardPolicy) -> Vec<u8> {
+fn record_prefix(policy: &ShakescapeDirectOfferBoardPolicy) -> Vec<u8> {
     let mut id = Vec::with_capacity(DIRECT_OFFER_BOARD_RECORD_PREFIX.len() + 32);
     id.extend_from_slice(DIRECT_OFFER_BOARD_RECORD_PREFIX);
     id.extend_from_slice(policy.fingerprint().as_bytes());
     id
 }
 
-fn record_id(policy: &DenuoDirectOfferBoardPolicy, offer_id: [u8; 32]) -> Vec<u8> {
+fn record_id(policy: &ShakescapeDirectOfferBoardPolicy, offer_id: [u8; 32]) -> Vec<u8> {
     let mut id = record_prefix(policy);
     id.extend_from_slice(&offer_id);
     id
@@ -558,7 +563,7 @@ mod tests {
 
     #[test]
     fn exact_offers_are_persisted_and_grouped_without_an_oracle_or_history() {
-        let policy = DenuoDirectOfferBoardPolicy::new(network()).expect("board policy");
+        let policy = ShakescapeDirectOfferBoardPolicy::new(network()).expect("board policy");
         let mut store = WalletStore::create(":memory:", PASSPHRASE).expect("wallet store");
         let mut offer = DirectOffer {
             header: header(1),
@@ -576,10 +581,11 @@ mod tests {
             .encode_envelope(1)
             .expect("canonical offer envelope");
         assert!(matches!(
-            admit_denuo_direct_offer(&mut store, &policy, &offer_envelope, 150),
-            Ok(DenuoDirectOfferAdmission::Inserted(_))
+            admit_shakescape_direct_offer(&mut store, &policy, &offer_envelope, 150),
+            Ok(ShakescapeDirectOfferAdmission::Inserted(_))
         ));
-        let levels = live_denuo_direct_offer_levels(&store, &policy, 150).expect("live levels");
+        let levels =
+            live_shakescape_direct_offer_levels(&store, &policy, 150).expect("live levels");
         assert_eq!(levels.len(), 1);
         assert_eq!(levels[0].offer_count, 1);
         assert_eq!(levels[0].total_hns_amount, 10_000_000);
@@ -598,11 +604,16 @@ mod tests {
             .encode_envelope(0)
             .expect("canonical cancellation envelope");
         assert!(matches!(
-            admit_denuo_direct_offer_cancellation(&mut store, &policy, &cancellation_envelope, 151),
-            Ok(DenuoDirectOfferCancellationAdmission::Applied(_))
+            admit_shakescape_direct_offer_cancellation(
+                &mut store,
+                &policy,
+                &cancellation_envelope,
+                151
+            ),
+            Ok(ShakescapeDirectOfferCancellationAdmission::Applied(_))
         ));
         assert!(
-            live_denuo_direct_offer_levels(&store, &policy, 151)
+            live_shakescape_direct_offer_levels(&store, &policy, 151)
                 .expect("cancelled levels")
                 .is_empty()
         );

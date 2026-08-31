@@ -10,17 +10,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::direct_maker::derive_board_identity;
 use crate::{
-    CrossChainSwapKeyRequest, DenuoDirectSwapPolicy, MarketError, SwapParticipant, SwapSession,
-    admit_denuo_direct_offer_take, admit_denuo_direct_swap_hello, allocate_cross_chain_swap_key,
-    derive_cross_chain_swap_key_from_store, load_denuo_direct_offer, load_denuo_direct_swap,
-    open_denuo_execution,
+    CrossChainSwapKeyRequest, MarketError, ShakescapeDirectSwapPolicy, SwapParticipant,
+    SwapSession, admit_shakescape_direct_offer_take, admit_shakescape_direct_swap_hello,
+    allocate_cross_chain_swap_key, derive_cross_chain_swap_key_from_store,
+    load_shakescape_direct_offer, load_shakescape_direct_swap, open_shakescape_execution,
 };
 
 const STORAGE_VERSION: u16 = 1;
 const RECORD_PREFIX: &[u8] = b"local-direct-take/v1/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DenuoHnsForBtcTakeRequest {
+pub struct ShakescapeHnsForBtcTakeRequest {
     pub wallet_id: WalletId,
     pub offer_id: ObjectHash,
     pub hns_fee_reserve_dollarydoos: u64,
@@ -30,7 +30,7 @@ pub struct DenuoHnsForBtcTakeRequest {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoLocalDirectTake {
+pub struct ShakescapeLocalDirectTake {
     pub offer_id: ObjectHash,
     pub session_id: SessionId,
     pub btc_amount_sats: u64,
@@ -42,7 +42,7 @@ pub struct DenuoLocalDirectTake {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoTakerAcceptedSession {
+pub struct ShakescapeTakerAcceptedSession {
     pub hello: SwapSessionHello,
     pub execution: SwapSession,
     pub envelope: Vec<u8>,
@@ -61,30 +61,30 @@ struct PersistedLocalDirectTake {
 
 /// Sign and durably admit one exact take. The session identifier comes from
 /// the signed offer; the taker has no authority to replace it.
-pub fn create_denuo_hns_for_btc_take(
+pub fn create_shakescape_hns_for_btc_take(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
-    request: DenuoHnsForBtcTakeRequest,
-) -> Result<DenuoLocalDirectTake, MarketError> {
+    policy: &ShakescapeDirectSwapPolicy,
+    request: ShakescapeHnsForBtcTakeRequest,
+) -> Result<ShakescapeLocalDirectTake, MarketError> {
     validate_request(request)?;
     let offer =
-        load_denuo_direct_offer(store, &policy.board_policy(), request.offer_id.into_bytes())?
-            .ok_or(MarketError::UnknownDenuoDirectOffer)?;
+        load_shakescape_direct_offer(store, &policy.board_policy(), request.offer_id.into_bytes())?
+            .ok_or(MarketError::UnknownShakescapeDirectOffer)?;
     if !offer.is_active_at(request.created_at_unix)
         || offer.offer.swap_session_id == [0; 32]
         || request.expires_at_unix > offer.offer.header.expires_at
     {
-        return Err(MarketError::InvalidDenuoDirectSwap);
+        return Err(MarketError::InvalidShakescapeDirectSwap);
     }
     let session_id = SessionId::new(offer.offer.swap_session_id);
     if let Some(existing) = load_local_take(store, request.wallet_id, session_id)? {
         if existing.offer_id != request.offer_id {
-            return Err(MarketError::DenuoDirectSwapConflict);
+            return Err(MarketError::ShakescapeDirectSwapConflict);
         }
         return project_local_take(store, policy, existing);
     }
-    if load_denuo_direct_swap(store, policy, session_id)?.is_some() {
-        return Err(MarketError::DenuoDirectSwapConflict);
+    if load_shakescape_direct_swap(store, policy, session_id)?.is_some() {
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     let settlement = allocate_cross_chain_swap_key(
         store,
@@ -118,12 +118,12 @@ pub fn create_denuo_hns_for_btc_take(
         signature: [0; 64],
     };
     take.sign(&identity)
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let request_id = sequence.max(1);
     let envelope = CrossChainMessage::TakeDirectOffer(take)
         .encode_envelope(request_id)
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
-    admit_denuo_direct_offer_take(store, policy, &envelope, request.created_at_unix)?;
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
+    admit_shakescape_direct_offer_take(store, policy, &envelope, request.created_at_unix)?;
     let persisted = PersistedLocalDirectTake {
         storage_version: STORAGE_VERSION,
         wallet_id: request.wallet_id,
@@ -133,7 +133,7 @@ pub fn create_denuo_hns_for_btc_take(
         created_at_unix: request.created_at_unix,
     };
     store.save_entity(
-        EntityKind::DenuoBoardObject,
+        EntityKind::ShakescapeBoardObject,
         &record_id(request.wallet_id, session_id),
         0,
         &persisted,
@@ -144,41 +144,43 @@ pub fn create_denuo_hns_for_btc_take(
 
 /// Verify and countersign the maker proposal, admit the accepted hello, and
 /// open the restart-safe execution journal before returning bytes to send.
-pub fn accept_denuo_hns_for_btc_maker_proposal(
+pub fn accept_shakescape_hns_for_btc_maker_proposal(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     wallet_id: WalletId,
     session_id: SessionId,
     now_unix: u64,
-) -> Result<DenuoTakerAcceptedSession, MarketError> {
+) -> Result<ShakescapeTakerAcceptedSession, MarketError> {
     if now_unix == 0 {
-        return Err(MarketError::InvalidDenuoDirectSwap);
+        return Err(MarketError::InvalidShakescapeDirectSwap);
     }
     let local = load_local_take(store, wallet_id, session_id)?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
-    let record = load_denuo_direct_swap(store, policy, session_id)?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
+    let record = load_shakescape_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     if local.offer_id != ObjectHash::new(record.offer.offer_id) {
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     if let Some(hello) = record.hello {
-        let execution = open_denuo_execution(store, policy, session_id, now_unix)?;
+        let execution = open_shakescape_execution(store, policy, session_id, now_unix)?;
         let request_id = record
             .proposal_request_id
-            .ok_or(MarketError::CorruptDenuoDirectSwap)?;
+            .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
         let envelope = CrossChainMessage::SwapSessionHello(hello.clone())
             .encode_envelope(request_id)
-            .map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
-        return Ok(DenuoTakerAcceptedSession {
+            .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
+        return Ok(ShakescapeTakerAcceptedSession {
             hello,
             execution,
             envelope,
         });
     }
-    let proposal = record.proposal.ok_or(MarketError::InvalidDenuoDirectSwap)?;
+    let proposal = record
+        .proposal
+        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
     let request_id = record
         .proposal_request_id
-        .ok_or(MarketError::CorruptDenuoDirectSwap)?;
+        .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
     let settlement = derive_cross_chain_swap_key_from_store(
         store,
         CrossChainSwapKeyRequest {
@@ -191,33 +193,33 @@ pub fn accept_denuo_hns_for_btc_maker_proposal(
     )
     .map_err(|_| MarketError::Persistence)?;
     if settlement.public_key() != record.take.taker_settlement_public_key {
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     let hello = settlement
         .accept_taker(proposal, now_unix)
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let envelope = CrossChainMessage::SwapSessionHello(hello.clone())
         .encode_envelope(request_id)
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
-    admit_denuo_direct_swap_hello(store, policy, &envelope, now_unix)?;
-    let execution = open_denuo_execution(store, policy, session_id, now_unix)?;
-    Ok(DenuoTakerAcceptedSession {
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
+    admit_shakescape_direct_swap_hello(store, policy, &envelope, now_unix)?;
+    let execution = open_shakescape_execution(store, policy, session_id, now_unix)?;
+    Ok(ShakescapeTakerAcceptedSession {
         hello,
         execution,
         envelope,
     })
 }
 
-pub fn list_local_denuo_direct_takes(
+pub fn list_local_shakescape_direct_takes(
     store: &WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     wallet_id: WalletId,
-) -> Result<Vec<DenuoLocalDirectTake>, MarketError> {
+) -> Result<Vec<ShakescapeLocalDirectTake>, MarketError> {
     store
         .list_entities_by_id_prefix::<PersistedLocalDirectTake>(
-            EntityKind::DenuoBoardObject,
+            EntityKind::ShakescapeBoardObject,
             &record_prefix(wallet_id),
-            crate::MAX_DENUO_DIRECT_SWAPS + 1,
+            crate::MAX_SHAKESCAPE_DIRECT_SWAPS + 1,
         )?
         .into_iter()
         .map(|stored| {
@@ -230,14 +232,14 @@ pub fn list_local_denuo_direct_takes(
 #[doc(hidden)]
 pub fn derive_local_hns_for_btc_taker_key(
     store: &WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     wallet_id: WalletId,
     session_id: SessionId,
 ) -> Result<(crate::CrossChainSwapKey, u64), MarketError> {
     let local = load_local_take(store, wallet_id, session_id)?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
-    let record = load_denuo_direct_swap(store, policy, session_id)?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
+    let record = load_shakescape_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     if record.offer.offer_id != local.offer_id.into_bytes()
         || record.hello.as_ref().is_none_or(|hello| {
             hello.swap_session_id != session_id.into_bytes()
@@ -245,7 +247,7 @@ pub fn derive_local_hns_for_btc_taker_key(
                 || hello.received_asset != hns_marketplace_protocol::AssetId::HNS
         })
     {
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     let key = derive_cross_chain_swap_key_from_store(
         store,
@@ -259,12 +261,12 @@ pub fn derive_local_hns_for_btc_taker_key(
     )
     .map_err(|_| MarketError::Persistence)?;
     if key.public_key() != record.take.taker_settlement_public_key {
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     Ok((key, local.hns_fee_reserve_dollarydoos))
 }
 
-fn validate_request(request: DenuoHnsForBtcTakeRequest) -> Result<(), MarketError> {
+fn validate_request(request: ShakescapeHnsForBtcTakeRequest) -> Result<(), MarketError> {
     if request.wallet_id.as_bytes().iter().all(|byte| *byte == 0)
         || request.offer_id.as_bytes().iter().all(|byte| *byte == 0)
         || request.hns_fee_reserve_dollarydoos == 0
@@ -272,32 +274,32 @@ fn validate_request(request: DenuoHnsForBtcTakeRequest) -> Result<(), MarketErro
         || request.expires_at_unix <= request.created_at_unix
         || request.nonce.iter().all(|byte| *byte == 0)
     {
-        return Err(MarketError::InvalidDenuoDirectSwap);
+        return Err(MarketError::InvalidShakescapeDirectSwap);
     }
     Ok(())
 }
 
 fn project_local_take(
     store: &WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     local: PersistedLocalDirectTake,
-) -> Result<DenuoLocalDirectTake, MarketError> {
-    let record = load_denuo_direct_swap(store, policy, local.session_id)?
-        .ok_or(MarketError::CorruptDenuoDirectSwap)?;
+) -> Result<ShakescapeLocalDirectTake, MarketError> {
+    let record = load_shakescape_direct_swap(store, policy, local.session_id)?
+        .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
     if record.offer.offer_id != local.offer_id.into_bytes()
         || record.offer.swap_session_id != local.session_id.into_bytes()
         || record.take.swap_session_id != local.session_id.into_bytes()
     {
-        return Err(MarketError::CorruptDenuoDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwap);
     }
     let btc_amount_sats = u64::try_from(record.offer.offered_amount.get())
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let hns_amount_dollarydoos = u64::try_from(record.offer.received_amount.get())
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let envelope = CrossChainMessage::TakeDirectOffer(record.take.clone())
         .encode_envelope(record.take_request_id)
-        .map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
-    Ok(DenuoLocalDirectTake {
+        .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
+    Ok(ShakescapeLocalDirectTake {
         offer_id: local.offer_id,
         session_id: local.session_id,
         btc_amount_sats,
@@ -316,7 +318,7 @@ fn load_local_take(
 ) -> Result<Option<PersistedLocalDirectTake>, MarketError> {
     store
         .load_entity::<PersistedLocalDirectTake>(
-            EntityKind::DenuoBoardObject,
+            EntityKind::ShakescapeBoardObject,
             &record_id(wallet_id, session_id),
         )?
         .map(|stored| validate_stored(wallet_id, stored))
@@ -337,7 +339,7 @@ fn validate_stored(
         || row.created_at_unix != stored.updated_at_unix
         || stored.id != record_id(wallet_id, row.session_id)
     {
-        return Err(MarketError::CorruptDenuoDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwap);
     }
     Ok(row)
 }
@@ -363,17 +365,17 @@ mod tests {
 
     use super::*;
     use crate::{
-        DenuoBtcForHnsMakerProposalRequest, DenuoBtcForHnsOfferRequest,
-        DenuoDirectOfferBoardPolicy, create_denuo_btc_for_hns_maker_proposal,
-        create_denuo_btc_for_hns_offer,
+        ShakescapeBtcForHnsMakerProposalRequest, ShakescapeBtcForHnsOfferRequest,
+        ShakescapeDirectOfferBoardPolicy, create_shakescape_btc_for_hns_maker_proposal,
+        create_shakescape_btc_for_hns_offer,
     };
 
     const PASSPHRASE: &str = "two-party direct atomic swap test";
     const START: u64 = 1_700_000_000;
 
-    fn policy() -> DenuoDirectSwapPolicy {
-        DenuoDirectSwapPolicy::new(
-            DenuoDirectOfferBoardPolicy::new(NetworkBinding {
+    fn policy() -> ShakescapeDirectSwapPolicy {
+        ShakescapeDirectSwapPolicy::new(
+            ShakescapeDirectOfferBoardPolicy::new(NetworkBinding {
                 hns_magic: 0x5b6e_c393,
                 hns_genesis: BlockHash::new([1; 32]),
                 counterchain: ChainId::BITCOIN,
@@ -405,10 +407,10 @@ mod tests {
         let taker_id = WalletId::new([4; 16]);
         let mut maker_store = store(maker_id, 0x31);
         let mut taker_store = store(taker_id, 0x41);
-        let offer = create_denuo_btc_for_hns_offer(
+        let offer = create_shakescape_btc_for_hns_offer(
             &mut maker_store,
             &policy.board_policy(),
-            DenuoBtcForHnsOfferRequest {
+            ShakescapeBtcForHnsOfferRequest {
                 wallet_id: maker_id,
                 btc_amount_sats: 9_000,
                 hns_amount_dollarydoos: 2_000_000,
@@ -419,7 +421,7 @@ mod tests {
             },
         )
         .expect("maker offer");
-        let signed_offer = load_denuo_direct_offer(
+        let signed_offer = load_shakescape_direct_offer(
             &maker_store,
             &policy.board_policy(),
             offer.offer.offer_id.into_bytes(),
@@ -430,7 +432,7 @@ mod tests {
         let offer_envelope = CrossChainMessage::DirectOffer(signed_offer)
             .encode_envelope(1)
             .expect("offer envelope");
-        crate::admit_denuo_direct_offer(
+        crate::admit_shakescape_direct_offer(
             &mut taker_store,
             &policy.board_policy(),
             &offer_envelope,
@@ -438,10 +440,10 @@ mod tests {
         )
         .expect("taker admits offer");
 
-        let take = create_denuo_hns_for_btc_take(
+        let take = create_shakescape_hns_for_btc_take(
             &mut taker_store,
             &policy,
-            DenuoHnsForBtcTakeRequest {
+            ShakescapeHnsForBtcTakeRequest {
                 wallet_id: taker_id,
                 offer_id: offer.offer.offer_id,
                 hns_fee_reserve_dollarydoos: 10_000,
@@ -451,13 +453,18 @@ mod tests {
             },
         )
         .expect("taker signs take");
-        crate::admit_denuo_direct_offer_take(&mut maker_store, &policy, &take.envelope, START + 10)
-            .expect("maker admits take");
-
-        let proposal = create_denuo_btc_for_hns_maker_proposal(
+        crate::admit_shakescape_direct_offer_take(
             &mut maker_store,
             &policy,
-            DenuoBtcForHnsMakerProposalRequest {
+            &take.envelope,
+            START + 10,
+        )
+        .expect("maker admits take");
+
+        let proposal = create_shakescape_btc_for_hns_maker_proposal(
+            &mut maker_store,
+            &policy,
+            ShakescapeBtcForHnsMakerProposalRequest {
                 wallet_id: maker_id,
                 session_id: offer.offer.session_id,
                 now_unix: START + 20,
@@ -469,14 +476,14 @@ mod tests {
             },
         )
         .expect("maker proposal");
-        crate::admit_denuo_direct_swap_proposal(
+        crate::admit_shakescape_direct_swap_proposal(
             &mut taker_store,
             &policy,
             &proposal.envelope,
             START + 20,
         )
         .expect("taker admits proposal");
-        let accepted = accept_denuo_hns_for_btc_maker_proposal(
+        let accepted = accept_shakescape_hns_for_btc_maker_proposal(
             &mut taker_store,
             &policy,
             taker_id,
@@ -484,14 +491,14 @@ mod tests {
             START + 30,
         )
         .expect("taker accepts proposal");
-        crate::admit_denuo_direct_swap_hello(
+        crate::admit_shakescape_direct_swap_hello(
             &mut maker_store,
             &policy,
             &accepted.envelope,
             START + 30,
         )
         .expect("maker admits hello");
-        let maker_execution = open_denuo_execution(
+        let maker_execution = open_shakescape_execution(
             &mut maker_store,
             &policy,
             offer.offer.session_id,
@@ -501,10 +508,11 @@ mod tests {
         assert_eq!(accepted.execution, maker_execution);
         assert_eq!(accepted.execution.state, crate::SwapState::TermsFrozen);
         assert_eq!(
-            list_local_denuo_direct_takes(&taker_store, &policy, taker_id).expect("local takes"),
+            list_local_shakescape_direct_takes(&taker_store, &policy, taker_id)
+                .expect("local takes"),
             vec![take]
         );
-        let retried = accept_denuo_hns_for_btc_maker_proposal(
+        let retried = accept_shakescape_hns_for_btc_maker_proposal(
             &mut taker_store,
             &policy,
             taker_id,

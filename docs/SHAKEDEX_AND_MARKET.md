@@ -12,7 +12,7 @@ boundary consumes canonical V2 `hns-swap` and `hns-marketplace-protocol` as exac
 published registry `hns-rs` `0.3.1` source
 `0e99addca59778b7b7c6fc56291333a97c4c8815`, with all upstream archive checksums
 recorded in `release/hns-rs-0.3.1-crates.sha256`. The wallet does not reproduce
-listing hashes, signatures, Shakedex scripts, presigns, cancellations, or Denuo
+listing hashes, signatures, Shakedex scripts, presigns, cancellations, or Shakescape
 envelopes.
 
 The canonical protocol-verification boundary decodes a bounded fixed-price
@@ -28,7 +28,7 @@ spender, the exact chain/mempool snapshot, network/genesis, and the tip's
 HSD-compatible median time past. A cancellation is accepted only through
 `ListingCancellation::verify_for_listing`. Its signed listing target can be
 re-authenticated from persisted canonical bytes after restart or a lock spend,
-without pretending those bytes prove current ownership. Denuo offer and
+without pretending those bytes prove current ownership. Shakescape offer and
 cancellation decoders return typed protocol results rather than
 unauthenticated wire objects.
 
@@ -158,7 +158,7 @@ rebroadcast path. Reconciliation also recovers an `Authorized` row when its
 persisted bytes were broadcast outside the recorded submit path. There is no
 submission polling loop and no caller-authored clock or chain status input.
 
-The name-market portion of the encrypted `DenuoBoardObject` namespace now writes
+The name-market portion of the encrypted `ShakescapeBoardObject` namespace now writes
 normalized `HeadV2Indexed` persistence. Its encrypted head carries the logical
 board revision and compact row selectors. Each selector binds the identity-row
 digest, physical revision and update time, row-value commitment, and listing
@@ -215,7 +215,7 @@ seller/name identity; bounded archival/admission policy is still required
 before live relay enablement. Persisted board state remains cache data: every
 purchase or value action must reacquire fresh locking-coin and chain evidence.
 
-The offline `DenuoBoardRuntime` now supplies that admission/reacquisition join
+The offline `ShakescapeBoardRuntime` now supplies that admission/reacquisition join
 without enabling live discovery. A non-value composition may use an
 `HnsAccountReadRuntime`; the production value composition instead uses the
 full `HnsWalletRuntime` so it does not maintain a second mutable account cache.
@@ -257,15 +257,15 @@ On indexed storage, both board projections use the targeted path above when the
 hash hits; a missing index, the legacy aggregate, or historical pre-index
 `HeadV2` uses the full semantic fallback.
 Its non-serializable result is evidence for an enclosing, still-gated value
-workflow, not permission to sign or broadcast. This join performs no Denuo
+workflow, not permission to sign or broadcast. This join performs no Shakescape
 transport or relay I/O. The HRM draft supplies the current manifest root and
 HNSA is an HRM `hns.named-service/v1` profile; neither an HRM/HNSA lineage nor
 an endpoint-signed relay receipt substitutes for current HNS locking-coin
-authority. Every canonical Denuo and Shakedex value product gate remains
+authority. Every canonical Shakescape and Shakedex value product gate remains
 `false`.
 
 The board also accepts exactly one canonical V2 `GetOffer` envelope through a
-closed read boundary. Denuo requires a nonzero correlation ID for both this
+closed read boundary. Shakescape requires a nonzero correlation ID for both this
 type-6 request and its singular type-7 `Offer` response; this differs from the
 zero-ID cancellation/tombstone case. Inventory, batch, response-family, V1,
 zero-ID, malformed, and noncanonical inputs are rejected before current-lock
@@ -281,7 +281,7 @@ survive into the plan. The non-cloneable, non-serializable plan exposes
 only correlation ID, hash, and board revision. It carries no response bytes or
 transport/value capability, and a future emitter must reacquire authority
 again immediately at use time because neither the plan nor
-`CurrentDenuoBoardOffer` is a lease.
+`CurrentShakescapeBoardOffer` is a lease.
 
 The adjacent closed inventory boundary accepts only canonical V2
 `GetOfferInventory` with a nonzero correlation ID; other request and response
@@ -328,12 +328,12 @@ exposes only request ID, board revision, requested count, and returned count;
 it provides no hashes, listings, locks, response bytes, transport, signing,
 provider, publication, or value capability.
 
-A separate encrypted `DenuoBoardObject` record holds a dormant, offline-only
+A separate encrypted `ShakescapeBoardObject` record holds a dormant, offline-only
 publication outbox. It accepts only exact canonical V2 `Offer` and `Cancel`
 envelopes with nonzero request IDs. Each row binds the canonical listing or
 cancellation content hash and a wallet-local, domain-separated SHA-256
 `envelope_id` over the exact envelope bytes. The latter is local persistence
-identity, not a Denuo protocol content identifier. Exact enqueue retries are
+identity, not a Shakescape protocol content identifier. Exact enqueue retries are
 idempotent; request-ID churn, duplicate message identity under different
 envelope bytes, registry substitution, malformed bytes, and non-publication
 message families fail closed.
@@ -374,7 +374,7 @@ Schema v3 can move one exact prepared handoff to terminal `RelayAccepted` only
 with a bounded, canonically encoded, strict-DER low-S secp256k1 receipt signed
 by the configured HNSA endpoint key. The receipt binds the network, exact HRM
 root tuple, HNSA service/delegation/endpoint identifiers, caller-owned nonzero
-Denuo application-profile ID, endpoint validity, maximum receipt lifetime,
+Shakescape application-profile ID, endpoint validity, maximum receipt lifetime,
 attempt, request, content identity, and exact-envelope digest. The complete
 network identity is `(u32 magic, nonzero genesis)`; magic zero is a valid
 configured value, never a wildcard, and must exactly match the handoff. The
@@ -394,7 +394,7 @@ listing/lock/network/time authority before any dependent use.
 
 Three Shakedex source gates are enabled:
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
-`SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`, and
+`SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED`, and
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`. `SellerSession::new`,
 `SellerSession::apply`, `BuyerSession::discover`, and `BuyerSession::apply`
 still validate the complete canonical, evidence, and persistence boundary
@@ -404,7 +404,7 @@ Aggregate authorization and submission also require
 `HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED`,
 `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` and
 `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED`; all three source gates are enabled.
-The Denuo gate governs live transport, relay publication, and product
+The Shakescape gate governs live transport, relay publication, and product
 discovery. Offline canonical envelope parsing and encrypted cache reduction do
 not bypass required runtime evidence or advertise a browser/provider product.
 Typed transaction planning, encrypted plan CAS, and the durable aggregate do
@@ -419,7 +419,7 @@ reservations, final-byte approval and fee evidence, persist-before-broadcast,
 and chain-state reconciliation are present in source for buyer fulfillment,
 seller recovery, and seller-script FINALIZE. The fixed release gates remain
 `false`. Product-owned coin selection, product/startup orchestration, live
-Denuo/provider/trusted-UI integration, and complete
+Shakescape/provider/trusted-UI integration, and complete
 regtest/restart/reorg/product qualification are still required before any gate
 can change. The current regressions are covered by the exact CI evidence in
 `QUALIFICATION.md`; focused historical runs do not replace product or network
@@ -437,7 +437,7 @@ composition work does not alter any release gate.
 
 ## Direct HNS/BTC offers and sessions
 
-The cross-chain Denuo path is a direct, signed fixed-terms HNS/BTC board. A
+The cross-chain Shakescape path is a direct, signed fixed-terms HNS/BTC board. A
 maker chooses one indivisible pair of integer amounts; a taker selects that
 specific offer. The protocol carries no price round, price reporter, source,
 oracle, external feed, historical rate, partial-fill reservation, or matching

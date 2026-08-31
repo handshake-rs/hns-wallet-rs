@@ -16,47 +16,51 @@ mod transport;
 mod value_workflow;
 
 pub use acceptance::{
-    DenuoHnsaEndpointBinding, DenuoHrmRootBinding, DenuoPublicationAcceptancePolicy,
-    DenuoPublicationAcceptanceSnapshot, HNSA_NAMED_SERVICE_RESOURCE_PROFILE,
-    MAX_DENUO_PUBLICATION_ACCEPTANCE_BYTES,
+    HNSA_NAMED_SERVICE_RESOURCE_PROFILE, MAX_SHAKESCAPE_PUBLICATION_ACCEPTANCE_BYTES,
+    ShakescapeHnsaEndpointBinding, ShakescapeHrmRootBinding, ShakescapePublicationAcceptancePolicy,
+    ShakescapePublicationAcceptanceSnapshot,
 };
 pub use board::{
     BoardOfferStatus, NameMarketBoard, PersistedBoardOffer, StoredNameMarketBoard,
     load_name_market_board, save_name_market_board,
 };
 pub use board_read::{
-    DenuoBoardOfferResponsePlan, DenuoBoardOffersResponsePlan, PreparedDenuoBoardInventoryResponse,
-    PreparedDenuoBoardOfferResponse, PreparedDenuoBoardOffersResponse,
-    prepare_denuo_board_inventory_response, prepare_denuo_board_offer_response,
-    prepare_denuo_board_offers_response,
+    PreparedShakescapeBoardInventoryResponse, PreparedShakescapeBoardOfferResponse,
+    PreparedShakescapeBoardOffersResponse, ShakescapeBoardOfferResponsePlan,
+    ShakescapeBoardOffersResponsePlan, prepare_shakescape_board_inventory_response,
+    prepare_shakescape_board_offer_response, prepare_shakescape_board_offers_response,
 };
 pub use board_runtime::{
-    CurrentDenuoBoardOffer, DenuoBoardCancellationAdmission, DenuoBoardOfferAdmission,
-    DenuoBoardRuntime,
+    CurrentShakescapeBoardOffer, ShakescapeBoardCancellationAdmission,
+    ShakescapeBoardOfferAdmission, ShakescapeBoardRuntime,
 };
 pub use canonical::{
-    AuthenticatedFixedPriceListing, AuthenticatedListingCancellation, DenuoNameMarketRequest,
+    AuthenticatedFixedPriceListing, AuthenticatedListingCancellation, ShakescapeNameMarketRequest,
     VerifiedFixedPriceListing, VerifiedListingCancellation, authenticate_fixed_price_listing,
-    authenticate_listing_cancellation, decode_denuo_authenticated_cancellation,
-    decode_denuo_authenticated_offer, decode_denuo_cancellation, decode_denuo_inventory,
-    decode_denuo_offer, decode_denuo_request, encode_denuo_cancellation, encode_denuo_inventory,
-    encode_denuo_offer, encode_denuo_request, verify_authenticated_fixed_price_listing,
+    authenticate_listing_cancellation, decode_shakescape_authenticated_cancellation,
+    decode_shakescape_authenticated_offer, decode_shakescape_cancellation,
+    decode_shakescape_inventory, decode_shakescape_offer, decode_shakescape_request,
+    encode_shakescape_cancellation, encode_shakescape_inventory, encode_shakescape_offer,
+    encode_shakescape_request, verify_authenticated_fixed_price_listing,
     verify_authenticated_listing_cancellation, verify_fixed_price_listing,
     verify_listing_cancellation,
 };
 pub use native_transport::{
-    DirectDenuoBoardSyncReport, MAX_DIRECT_DENUO_MESSAGES_PER_SYNC, WalletNativeDenuoTransport,
-    WalletNativeDenuoTransportError,
+    DirectShakescapeBoardSyncReport, MAX_DIRECT_SHAKESCAPE_MESSAGES_PER_SYNC,
+    WalletNativeShakescapeTransport, WalletNativeShakescapeTransportError,
 };
 pub use outbox::{
-    DenuoHandoffAcceptanceResult, DenuoHandoffDirectAnnouncement, DenuoHandoffFailureResult,
-    DenuoHandoffPreparation, DenuoOutboxEnqueue, DenuoOutboxMessageKind, DenuoOutboxState,
-    DenuoPreparedHandoff, DenuoPublicationOutbox, MAX_DENUO_OUTBOX_ENTRIES,
-    MAX_DENUO_OUTBOX_ENVELOPE_BYTES, MAX_DENUO_OUTBOX_RETRY_ATTEMPTS,
-    MAX_DENUO_OUTBOX_SERIALIZED_BYTES, StoredDenuoPublicationOutbox, denuo_outbox_envelope_id,
-    load_denuo_publication_outbox, load_prepared_denuo_handoff, prepare_next_denuo_handoff,
-    record_denuo_handoff_acceptance, record_denuo_handoff_direct_announcement,
-    record_denuo_handoff_failure, recover_denuo_handoff_as_retry, save_denuo_publication_outbox,
+    MAX_SHAKESCAPE_OUTBOX_ENTRIES, MAX_SHAKESCAPE_OUTBOX_ENVELOPE_BYTES,
+    MAX_SHAKESCAPE_OUTBOX_RETRY_ATTEMPTS, MAX_SHAKESCAPE_OUTBOX_SERIALIZED_BYTES,
+    ShakescapeHandoffAcceptanceResult, ShakescapeHandoffDirectAnnouncement,
+    ShakescapeHandoffFailureResult, ShakescapeHandoffPreparation, ShakescapeOutboxEnqueue,
+    ShakescapeOutboxMessageKind, ShakescapeOutboxState, ShakescapePreparedHandoff,
+    ShakescapePublicationOutbox, StoredShakescapePublicationOutbox,
+    load_prepared_shakescape_handoff, load_shakescape_publication_outbox,
+    prepare_next_shakescape_handoff, record_shakescape_handoff_acceptance,
+    record_shakescape_handoff_direct_announcement, record_shakescape_handoff_failure,
+    recover_shakescape_handoff_as_retry, save_shakescape_publication_outbox,
+    shakescape_outbox_envelope_id,
 };
 pub use plans::{
     BuyerLockPlan, BuyerLockPlanState, MAX_SHAKEDEX_TRANSACTION_PLANS, SellerLockPlan,
@@ -84,7 +88,7 @@ pub use transactions::{
     verify_signed_seller_recovery,
 };
 pub use transport::{
-    DenuoTransportCursorSnapshot, DenuoTransportRuntime, DenuoTransportSyncReport,
+    ShakescapeTransportCursorSnapshot, ShakescapeTransportRuntime, ShakescapeTransportSyncReport,
 };
 pub use value_workflow::{
     MAX_SHAKEDEX_VALUE_WORKFLOWS, ShakedexChainObservation, ShakedexReservationReleaseEvidence,
@@ -106,9 +110,9 @@ pub const MAX_NAME_MARKET_BOARD_OFFERS: usize = 4_096;
 
 /// Canonical Shakedex protocol integration is enabled for the assembled product flow.
 pub const SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED: bool = true;
-/// Live Denuo transport, relay publication, and product discovery are enabled
+/// Live Shakescape transport, relay publication, and product discovery are enabled
 /// for integrated product testing.
-pub const SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED: bool = true;
+pub const SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED: bool = true;
 /// Shakedex transaction construction and value movement are enabled for integrated testing.
 pub const SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED: bool = true;
 
@@ -240,7 +244,7 @@ impl SellerSession {
                 self.listing_hash = Some(listing_hash);
                 SellerState::OfferSigned
             }
-            (SellerState::OfferSigned, SellerEvidence::DenuoPublicationPersisted) => {
+            (SellerState::OfferSigned, SellerEvidence::ShakescapePublicationPersisted) => {
                 SellerState::Published
             }
             (SellerState::Published, SellerEvidence::CancellationVerified) => {
@@ -308,7 +312,7 @@ pub enum SellerEvidence {
         listing: Vec<u8>,
         listing_hash: ObjectHash,
     },
-    DenuoPublicationPersisted,
+    ShakescapePublicationPersisted,
     CancellationVerified,
     FulfillmentVerified {
         txid: TransactionHash,
@@ -569,8 +573,8 @@ fn require_release_qualified() -> Result<(), ShakedexError> {
     if !SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED {
         return Err(ShakedexError::CanonicalProtocolUnavailable);
     }
-    if !SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED {
-        return Err(ShakedexError::DenuoProtocolUnavailable);
+    if !SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED {
+        return Err(ShakedexError::ShakescapeProtocolUnavailable);
     }
     if !SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED {
         return Err(ShakedexError::ValueRuntimeUnavailable);
@@ -611,8 +615,8 @@ fn require_listing_hash(
 pub enum ShakedexError {
     #[error("canonical Shakedex V2 protocol is not release-qualified")]
     CanonicalProtocolUnavailable,
-    #[error("Denuo V2 publication and discovery are not release-qualified")]
-    DenuoProtocolUnavailable,
+    #[error("Shakescape V1 publication and discovery are not release-qualified")]
+    ShakescapeProtocolUnavailable,
     #[error("Shakedex value runtime is not release-qualified")]
     ValueRuntimeUnavailable,
     #[error("invalid Handshake name")]
@@ -621,38 +625,38 @@ pub enum ShakedexError {
     InvalidListing,
     #[error("invalid, oversized, or mismatched Shakedex cancellation")]
     InvalidCancellation,
-    #[error("invalid or unexpected Denuo name-market envelope")]
-    InvalidDenuoEnvelope,
-    #[error("Denuo registry version differs from the requested version")]
-    DenuoRegistryMismatch,
-    #[error("Denuo name-market object was replayed or rolled back")]
+    #[error("invalid or unexpected Shakescape name-market envelope")]
+    InvalidShakescapeEnvelope,
+    #[error("Shakescape registry version differs from the requested version")]
+    ShakescapeRegistryMismatch,
+    #[error("Shakescape name-market object was replayed or rolled back")]
     NameMarketReplay,
-    #[error("Denuo name-market board reached its explicit capacity")]
+    #[error("Shakescape name-market board reached its explicit capacity")]
     NameMarketBoardCapacity,
-    #[error("persisted Denuo name-market board is corrupt or noncanonical")]
+    #[error("persisted Shakescape name-market board is corrupt or noncanonical")]
     CorruptNameMarketBoard,
-    #[error("Denuo board runtime does not share the HNS account store authority")]
+    #[error("Shakescape board runtime does not share the HNS account store authority")]
     StoreAuthorityMismatch,
-    #[error("invalid, noncanonical, or unsupported Denuo publication outbox envelope")]
-    InvalidDenuoOutboxEnvelope,
-    #[error("Denuo publication outbox identity or request correlation conflicts")]
-    DenuoOutboxConflict,
-    #[error("Denuo publication outbox reached its explicit capacity")]
-    DenuoOutboxCapacity,
-    #[error("persisted Denuo publication outbox is corrupt or noncanonical")]
-    CorruptDenuoOutbox,
-    #[error("Denuo publication outbox handoff attempt does not match durable state")]
-    DenuoOutboxHandoffMismatch,
-    #[error("Denuo publication outbox transition is not monotonic")]
-    InvalidDenuoOutboxTransition,
-    #[error("Denuo publication outbox retry limit was reached")]
-    DenuoOutboxRetryLimit,
-    #[error("Denuo relay acceptance policy is invalid")]
-    InvalidDenuoPublicationAcceptancePolicy,
-    #[error("Denuo relay acceptance is invalid, noncanonical, or mismatched")]
-    InvalidDenuoPublicationAcceptance,
-    #[error("Denuo relay acceptance conflicts with the durable terminal receipt")]
-    DenuoPublicationAcceptanceConflict,
+    #[error("invalid, noncanonical, or unsupported Shakescape publication outbox envelope")]
+    InvalidShakescapeOutboxEnvelope,
+    #[error("Shakescape publication outbox identity or request correlation conflicts")]
+    ShakescapeOutboxConflict,
+    #[error("Shakescape publication outbox reached its explicit capacity")]
+    ShakescapeOutboxCapacity,
+    #[error("persisted Shakescape publication outbox is corrupt or noncanonical")]
+    CorruptShakescapeOutbox,
+    #[error("Shakescape publication outbox handoff attempt does not match durable state")]
+    ShakescapeOutboxHandoffMismatch,
+    #[error("Shakescape publication outbox transition is not monotonic")]
+    InvalidShakescapeOutboxTransition,
+    #[error("Shakescape publication outbox retry limit was reached")]
+    ShakescapeOutboxRetryLimit,
+    #[error("Shakescape relay acceptance policy is invalid")]
+    InvalidShakescapePublicationAcceptancePolicy,
+    #[error("Shakescape relay acceptance is invalid, noncanonical, or mismatched")]
+    InvalidShakescapePublicationAcceptance,
+    #[error("Shakescape relay acceptance conflicts with the durable terminal receipt")]
+    ShakescapePublicationAcceptanceConflict,
     #[error("verified evidence does not permit this transition")]
     InvalidTransition,
     #[error("name or transaction evidence is invalid")]
@@ -723,7 +727,7 @@ mod tests {
     )]
     fn canonical_hns_seller_entrypoints_are_enabled_and_journaled() {
         assert!(SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
-        assert!(SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+        assert!(SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED);
         assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
         let created = SellerSession::new(
             WorkflowId::new([1; 16]),

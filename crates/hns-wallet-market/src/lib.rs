@@ -10,7 +10,7 @@ mod settlement_key;
 use hns_marketplace_protocol::{AssetId, ChainId, DeadlineKind, SwapAssetSide, SwapSessionHello};
 use hns_wallet_bitcoin_kyoto::{
     HtlcSpendBranch, VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock,
-    build_denuo_bitcoin_htlc,
+    build_shakescape_bitcoin_htlc,
 };
 use hns_wallet_chain_api::{Preimage, VerifiedLock};
 use hns_wallet_hns::VerifiedNativeHtlcSpend;
@@ -23,30 +23,32 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub use direct_board::{
-    DenuoDirectOfferAdmission, DenuoDirectOfferBoardPolicy, DenuoDirectOfferCancellationAdmission,
-    DenuoDirectOfferLevel, DenuoDirectOfferRecord, DenuoDirectOfferSnapshot,
-    MAX_DENUO_DIRECT_OFFERS, admit_denuo_direct_offer, admit_denuo_direct_offer_cancellation,
-    denuo_direct_offer_inventory, live_denuo_direct_offer_levels, load_denuo_direct_offer,
-    load_denuo_direct_offers,
+    MAX_SHAKESCAPE_DIRECT_OFFERS, ShakescapeDirectOfferAdmission, ShakescapeDirectOfferBoardPolicy,
+    ShakescapeDirectOfferCancellationAdmission, ShakescapeDirectOfferLevel,
+    ShakescapeDirectOfferRecord, ShakescapeDirectOfferSnapshot, admit_shakescape_direct_offer,
+    admit_shakescape_direct_offer_cancellation, live_shakescape_direct_offer_levels,
+    load_shakescape_direct_offer, load_shakescape_direct_offers, shakescape_direct_offer_inventory,
 };
 pub use direct_maker::{
-    DenuoBtcForHnsMakerProposal, DenuoBtcForHnsMakerProposalRequest, DenuoBtcForHnsOfferRequest,
-    DenuoLocalDirectOffer, cancel_denuo_local_direct_offer,
-    create_denuo_btc_for_hns_maker_proposal, create_denuo_btc_for_hns_offer,
-    derive_local_btc_for_hns_maker_key, list_local_denuo_direct_offers,
-    load_denuo_btc_for_hns_maker_preimage, reserved_local_denuo_btc_maker_sats,
+    ShakescapeBtcForHnsMakerProposal, ShakescapeBtcForHnsMakerProposalRequest,
+    ShakescapeBtcForHnsOfferRequest, ShakescapeLocalDirectOffer,
+    cancel_shakescape_local_direct_offer, create_shakescape_btc_for_hns_maker_proposal,
+    create_shakescape_btc_for_hns_offer, derive_local_btc_for_hns_maker_key,
+    list_local_shakescape_direct_offers, load_shakescape_btc_for_hns_maker_preimage,
+    reserved_local_shakescape_btc_maker_sats,
 };
 pub use direct_taker::{
-    DenuoHnsForBtcTakeRequest, DenuoLocalDirectTake, DenuoTakerAcceptedSession,
-    accept_denuo_hns_for_btc_maker_proposal, create_denuo_hns_for_btc_take,
-    derive_local_hns_for_btc_taker_key, list_local_denuo_direct_takes,
+    ShakescapeHnsForBtcTakeRequest, ShakescapeLocalDirectTake, ShakescapeTakerAcceptedSession,
+    accept_shakescape_hns_for_btc_maker_proposal, create_shakescape_hns_for_btc_take,
+    derive_local_hns_for_btc_taker_key, list_local_shakescape_direct_takes,
 };
 pub use session_board::{
-    DenuoDirectSwapAdmission, DenuoDirectSwapPeerStatus, DenuoDirectSwapPolicy,
-    DenuoDirectSwapRecord, DenuoDirectSwapSnapshot, DenuoDirectSwapStage, MAX_DENUO_DIRECT_SWAPS,
-    admit_denuo_direct_offer_take, admit_denuo_direct_swap_hello, admit_denuo_direct_swap_proposal,
-    admit_denuo_direct_swap_watch_ready, load_denuo_direct_swap, load_denuo_direct_swaps,
-    validate_denuo_direct_swap_peer_status,
+    MAX_SHAKESCAPE_DIRECT_SWAPS, ShakescapeDirectSwapAdmission, ShakescapeDirectSwapPeerStatus,
+    ShakescapeDirectSwapPolicy, ShakescapeDirectSwapRecord, ShakescapeDirectSwapSnapshot,
+    ShakescapeDirectSwapStage, admit_shakescape_direct_offer_take,
+    admit_shakescape_direct_swap_hello, admit_shakescape_direct_swap_proposal,
+    admit_shakescape_direct_swap_watch_ready, load_shakescape_direct_swap,
+    load_shakescape_direct_swaps, validate_shakescape_direct_swap_peer_status,
 };
 pub use settlement_key::{
     CrossChainSwapKey, CrossChainSwapKeyAllocation, CrossChainSwapKeyError,
@@ -56,8 +58,9 @@ pub use settlement_key::{
 
 pub const MAX_CONCURRENT_SWAP_SESSIONS: usize = 16;
 
-const DENUO_EXECUTION_WORKFLOW_DOMAIN: &[u8] = b"hns-wallet-rs/denuo-execution-workflow/v1";
-const DENUO_OBSERVED_PREIMAGE_DOMAIN: &[u8] = b"hns-wallet-rs/denuo-observed-preimage/v1";
+const SHAKESCAPE_EXECUTION_WORKFLOW_DOMAIN: &[u8] =
+    b"hns-wallet-rs/shakescape-execution-workflow/v1";
+const SHAKESCAPE_OBSERVED_PREIMAGE_DOMAIN: &[u8] = b"hns-wallet-rs/shakescape-observed-preimage/v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedQuote {
@@ -137,12 +140,12 @@ pub struct SwapSession {
     pub received: Amount,
     pub terms_id: ObjectHash,
     pub hashlock: ObjectHash,
-    /// Canonical encoded, jointly signed Denuo `SwapSessionHello` for an
-    /// execution opened from the Denuo board. Generic non-Denuo sessions keep
-    /// this empty; a Denuo execution never relies on a board record surviving
+    /// Canonical encoded, jointly signed Shakescape `SwapSessionHello` for an
+    /// execution opened from the Shakescape board. Generic non-Shakescape sessions keep
+    /// this empty; a Shakescape execution never relies on a board record surviving
     /// independently of its durable recovery journal.
     #[serde(default)]
-    pub accepted_denuo_terms: Option<Vec<u8>>,
+    pub accepted_shakescape_terms: Option<Vec<u8>>,
     pub timeouts: TimeoutPlan,
     pub first_funding: Option<ObjectHash>,
     pub second_funding: Option<ObjectHash>,
@@ -181,7 +184,7 @@ impl SwapSession {
             received: quote.received,
             terms_id: quote.terms_id,
             hashlock,
-            accepted_denuo_terms: None,
+            accepted_shakescape_terms: None,
             timeouts,
             first_funding: None,
             second_funding: None,
@@ -303,12 +306,12 @@ impl SwapSession {
 }
 
 /// Return the deterministic workflow identity for the executable side of one
-/// accepted Denuo session. The bilateral session ID is already a 256-bit
+/// accepted Shakescape session. The bilateral session ID is already a 256-bit
 /// signed protocol identity; hashing it again domain-separates its local
 /// durable execution record from every other workflow namespace.
-pub fn denuo_execution_workflow_id(session_id: SessionId) -> WorkflowId {
+pub fn shakescape_execution_workflow_id(session_id: SessionId) -> WorkflowId {
     let mut hasher = Sha256::new();
-    hasher.update(DENUO_EXECUTION_WORKFLOW_DOMAIN);
+    hasher.update(SHAKESCAPE_EXECUTION_WORKFLOW_DOMAIN);
     hasher.update(session_id.as_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     let mut id = [0_u8; 16];
@@ -316,7 +319,7 @@ pub fn denuo_execution_workflow_id(session_id: SessionId) -> WorkflowId {
     WorkflowId::new(id)
 }
 
-/// Promote one already admitted, fully countersigned Denuo HNS/BTC session
+/// Promote one already admitted, fully countersigned Shakescape HNS/BTC session
 /// into the durable execution journal.  This is deliberately a local-store
 /// operation: the board and the counterparty are not consulted, and no
 /// transaction is funded or broadcast here.
@@ -324,48 +327,48 @@ pub fn denuo_execution_workflow_id(session_id: SessionId) -> WorkflowId {
 /// The returned session is at `TermsFrozen`, so the next permitted action is
 /// local refund preparation. A restart can call this function again: the
 /// exact existing journal is returned, while any mismatch fails closed.
-pub fn open_denuo_execution(
+pub fn open_shakescape_execution(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     session_id: SessionId,
     now_unix: u64,
 ) -> Result<SwapSession, MarketError> {
-    let record = load_denuo_direct_swap(store, policy, session_id)?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+    let record = load_shakescape_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     let hello = record
         .hello
         .as_ref()
-        .ok_or(MarketError::InvalidDenuoDirectSwap)?;
+        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
     let expected_accepted_at = record
         .hello_accepted_at_unix
-        .ok_or(MarketError::CorruptDenuoDirectSwap)?;
+        .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
     // Re-authenticate the retained record at its original admission moment.
     // This permits recovery after a funding deadline, but does not let this
     // constructor authorize new funding after that deadline.
     hello
         .verify_agreement(policy.network())
-        .map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
-    verify_canonical_denuo_lock_commitments(hello)?;
+        .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
+    verify_canonical_shakescape_lock_commitments(hello)?;
     if now_unix < expected_accepted_at {
         return Err(MarketError::InvalidEvidence);
     }
     let encoded_terms = hello
         .encode()
-        .map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
-    let workflow_id = denuo_execution_workflow_id(session_id);
+        .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
+    let workflow_id = shakescape_execution_workflow_id(session_id);
     if let Some(existing) = store.load_workflow::<SwapSession>(workflow_id)? {
         if existing.kind != WorkflowKind::AtomicSwap
             || existing.state.id != session_id
-            || existing.state.accepted_denuo_terms.as_deref() != Some(encoded_terms.as_slice())
+            || existing.state.accepted_shakescape_terms.as_deref() != Some(encoded_terms.as_slice())
         {
-            return Err(MarketError::DenuoDirectSwapConflict);
+            return Err(MarketError::ShakescapeDirectSwapConflict);
         }
         return Ok(existing.state);
     }
     // A new execution must still be inside the signed new-funding window.
     // Existing execution journals deliberately remain recoverable afterwards.
     let mut expected = swap_session_from_accepted_hello(hello, now_unix)?;
-    expected.accepted_denuo_terms = Some(encoded_terms);
+    expected.accepted_shakescape_terms = Some(encoded_terms);
     let saved_revision = store.save_workflow(
         workflow_id,
         WorkflowKind::AtomicSwap,
@@ -380,38 +383,41 @@ pub fn open_denuo_execution(
     Ok(expected)
 }
 
-/// Load one durable accepted Denuo execution without consulting the peer or
+/// Load one durable accepted Shakescape execution without consulting the peer or
 /// reopening its funding window. Every persisted identity, revision, workflow
 /// identifier, and countersigned term is re-authenticated before projection.
-pub fn load_denuo_execution(
+pub fn load_shakescape_execution(
     store: &WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     session_id: SessionId,
 ) -> Result<Option<SwapSession>, MarketError> {
-    let workflow_id = denuo_execution_workflow_id(session_id);
+    let workflow_id = shakescape_execution_workflow_id(session_id);
     store
         .load_workflow::<SwapSession>(workflow_id)?
-        .map(|stored| validate_denuo_execution(policy, session_id, workflow_id, stored))
+        .map(|stored| validate_shakescape_execution(policy, session_id, workflow_id, stored))
         .transpose()
 }
 
-/// Return every durable Denuo execution within the protocol capacity. This is
+/// Return every durable Shakescape execution within the protocol capacity. This is
 /// the recovery/UI source of truth: active board listings may expire or be
 /// cancelled after bilateral terms are frozen, but their execution journals
 /// remain independently discoverable and resumable.
-pub fn list_denuo_executions(
+pub fn list_shakescape_executions(
     store: &WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
 ) -> Result<Vec<SwapSession>, MarketError> {
     store
-        .list_workflows_complete::<SwapSession>(WorkflowKind::AtomicSwap, MAX_DENUO_DIRECT_SWAPS)?
+        .list_workflows_complete::<SwapSession>(
+            WorkflowKind::AtomicSwap,
+            MAX_SHAKESCAPE_DIRECT_SWAPS,
+        )?
         .into_iter()
         .map(|stored| {
             let session_id = stored.state.id;
-            validate_denuo_execution(
+            validate_shakescape_execution(
                 policy,
                 session_id,
-                denuo_execution_workflow_id(session_id),
+                shakescape_execution_workflow_id(session_id),
                 stored,
             )
         })
@@ -440,7 +446,7 @@ impl LocallyVerifiedSwapFunding {
 /// A redeem or refund proved by one wallet's own chain verifier. HNS evidence
 /// is obtained from the native proof-bound transaction verifier; Bitcoin
 /// evidence is obtained from a compact-filter watch that is bound to the
-/// wallet's current checkpoint. Denuo peer messages are never accepted here.
+/// wallet's current checkpoint. Shakescape peer messages are never accepted here.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocallyVerifiedSwapSpend {
     Hns(VerifiedNativeHtlcSpend),
@@ -498,37 +504,38 @@ impl LocallyVerifiedSwapSpend {
     }
 }
 
-/// Advance a durable Denuo execution only with locally verified funding
-/// evidence. The peer's Denuo funding status is intentionally not accepted as
+/// Advance a durable Shakescape execution only with locally verified funding
+/// evidence. The peer's Shakescape funding status is intentionally not accepted as
 /// an argument here: it can inform UI/transport state, but cannot cause this
 /// state transition.
-pub fn apply_locally_verified_denuo_funding(
+pub fn apply_locally_verified_shakescape_funding(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     session_id: SessionId,
     funding: LocallyVerifiedSwapFunding,
     now_unix: u64,
 ) -> Result<SwapSession, MarketError> {
-    let workflow_id = denuo_execution_workflow_id(session_id);
+    let workflow_id = shakescape_execution_workflow_id(session_id);
     let stored = store
         .load_workflow::<SwapSession>(workflow_id)?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     if stored.kind != WorkflowKind::AtomicSwap || stored.state.id != session_id {
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     let terms = stored
         .state
-        .accepted_denuo_terms
+        .accepted_shakescape_terms
         .as_deref()
-        .ok_or(MarketError::InvalidDenuoDirectSwap)?;
-    let hello = SwapSessionHello::decode(terms).map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
+        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
+    let hello =
+        SwapSessionHello::decode(terms).map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
     if hello.encode().ok().as_deref() != Some(terms)
         || SessionId::new(hello.swap_session_id) != session_id
         || hello.verify_agreement(policy.network()).is_err()
     {
-        return Err(MarketError::CorruptDenuoDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwap);
     }
-    verify_local_funding_against_denuo_terms(&hello, &funding)?;
+    verify_local_funding_against_shakescape_terms(&hello, &funding)?;
     let evidence = match stored.state.state {
         SwapState::FirstFundingPending if funding.module() == stored.state.first_module => {
             vec![VerifiedEvidence::FirstFundingConfirmed {
@@ -566,21 +573,22 @@ pub fn apply_locally_verified_denuo_funding(
     Ok(session)
 }
 
-/// Advance a funded Denuo execution through both the first observed redeem
+/// Advance a funded Shakescape execution through both the first observed redeem
 /// and its secret extraction, using only one wallet's independently verified
 /// chain observation. In the agreed HTLC ordering, the second-funded chain is
 /// redeemed first; that transaction reveals the preimage needed to redeem the
 /// first-funded chain. The preimage is encrypted in the local wallet before
 /// the durable state transition, so an interruption cannot strand recovery.
-pub fn apply_locally_verified_denuo_first_redemption(
+pub fn apply_locally_verified_shakescape_first_redemption(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     session_id: SessionId,
     spend: LocallyVerifiedSwapSpend,
     now_unix: u64,
 ) -> Result<SwapSession, MarketError> {
-    let workflow_id = denuo_execution_workflow_id(session_id);
-    let stored = load_denuo_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
+    let workflow_id = shakescape_execution_workflow_id(session_id);
+    let stored =
+        load_shakescape_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
     if stored.state.state != SwapState::BothFunded
         || spend.module() != stored.state.second_module
         || spend.confirmation_count() == 0
@@ -594,7 +602,7 @@ pub fn apply_locally_verified_denuo_first_redemption(
         return Err(MarketError::InvalidEvidence);
     }
     store.put_secret(
-        &denuo_observed_preimage_id(session_id),
+        &shakescape_observed_preimage_id(session_id),
         SecretKind::HtlcPreimage,
         preimage.expose_for_settlement(),
         now_unix,
@@ -621,19 +629,20 @@ pub fn apply_locally_verified_denuo_first_redemption(
     Ok(session)
 }
 
-/// Advance a Denuo execution after the locally verified redeem of the
+/// Advance a Shakescape execution after the locally verified redeem of the
 /// first-funded chain. The preceding first redeem must already have persisted
 /// the matching preimage, so this cannot be used to skip the recovery-safe
 /// secret handoff step.
-pub fn apply_locally_verified_denuo_second_redemption(
+pub fn apply_locally_verified_shakescape_second_redemption(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     session_id: SessionId,
     spend: LocallyVerifiedSwapSpend,
     now_unix: u64,
 ) -> Result<SwapSession, MarketError> {
-    let workflow_id = denuo_execution_workflow_id(session_id);
-    let stored = load_denuo_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
+    let workflow_id = shakescape_execution_workflow_id(session_id);
+    let stored =
+        load_shakescape_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
     if stored.state.state != SwapState::SecretObserved
         || spend.module() != stored.state.first_module
         || spend.confirmation_count() == 0
@@ -648,7 +657,7 @@ pub fn apply_locally_verified_denuo_second_redemption(
     }
     if store
         .get_secret(
-            &denuo_observed_preimage_id(session_id),
+            &shakescape_observed_preimage_id(session_id),
             SecretKind::HtlcPreimage,
         )?
         .is_none_or(|stored| stored.as_slice() != preimage.expose_for_settlement().as_slice())
@@ -679,15 +688,16 @@ pub fn apply_locally_verified_denuo_second_redemption(
 /// Each chain verifier is responsible for consensus maturity and the exact
 /// descriptor/signature branch; the coordinator records the resulting
 /// confirmed observation rather than trusting a peer refund status.
-pub fn apply_locally_verified_denuo_refund(
+pub fn apply_locally_verified_shakescape_refund(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     session_id: SessionId,
     spend: LocallyVerifiedSwapSpend,
     now_unix: u64,
 ) -> Result<SwapSession, MarketError> {
-    let workflow_id = denuo_execution_workflow_id(session_id);
-    let stored = load_denuo_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
+    let workflow_id = shakescape_execution_workflow_id(session_id);
+    let stored =
+        load_shakescape_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
     if !spend.is_refund()
         || (spend.module() != stored.state.first_module
             && spend.module() != stored.state.second_module)
@@ -723,13 +733,13 @@ pub fn apply_locally_verified_denuo_refund(
 /// Load the locally retained preimage that was authenticated by a first
 /// redemption. This never returns a peer-provided value and requires the
 /// encrypted wallet store to be unlocked.
-pub fn load_locally_verified_denuo_preimage(
+pub fn load_locally_verified_shakescape_preimage(
     store: &WalletStore,
     session_id: SessionId,
 ) -> Result<Option<Preimage>, MarketError> {
     store
         .get_secret(
-            &denuo_observed_preimage_id(session_id),
+            &shakescape_observed_preimage_id(session_id),
             SecretKind::HtlcPreimage,
         )?
         .map(|value| {
@@ -740,31 +750,31 @@ pub fn load_locally_verified_denuo_preimage(
         .transpose()
 }
 
-fn load_denuo_execution_for_local_evidence(
+fn load_shakescape_execution_for_local_evidence(
     store: &WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     session_id: SessionId,
     workflow_id: WorkflowId,
 ) -> Result<hns_wallet_store::StoredWorkflow<SwapSession>, MarketError> {
     let stored = store
         .load_workflow::<SwapSession>(workflow_id)?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
-    validate_denuo_execution_record(policy, session_id, workflow_id, &stored)?;
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
+    validate_shakescape_execution_record(policy, session_id, workflow_id, &stored)?;
     Ok(stored)
 }
 
-fn validate_denuo_execution(
-    policy: &DenuoDirectSwapPolicy,
+fn validate_shakescape_execution(
+    policy: &ShakescapeDirectSwapPolicy,
     session_id: SessionId,
     workflow_id: WorkflowId,
     stored: StoredWorkflow<SwapSession>,
 ) -> Result<SwapSession, MarketError> {
-    validate_denuo_execution_record(policy, session_id, workflow_id, &stored)?;
+    validate_shakescape_execution_record(policy, session_id, workflow_id, &stored)?;
     Ok(stored.state)
 }
 
-fn validate_denuo_execution_record(
-    policy: &DenuoDirectSwapPolicy,
+fn validate_shakescape_execution_record(
+    policy: &ShakescapeDirectSwapPolicy,
     session_id: SessionId,
     workflow_id: WorkflowId,
     stored: &StoredWorkflow<SwapSession>,
@@ -775,34 +785,35 @@ fn validate_denuo_execution_record(
         || stored.revision != stored.state.revision
         || stored.updated_at_unix != stored.state.last_verified_at_unix
     {
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     let terms = stored
         .state
-        .accepted_denuo_terms
+        .accepted_shakescape_terms
         .as_deref()
-        .ok_or(MarketError::InvalidDenuoDirectSwap)?;
-    let hello = SwapSessionHello::decode(terms).map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
+        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
+    let hello =
+        SwapSessionHello::decode(terms).map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
     if hello.encode().ok().as_deref() != Some(terms)
         || SessionId::new(hello.swap_session_id) != session_id
         || hello.verify_agreement(policy.network()).is_err()
     {
-        return Err(MarketError::CorruptDenuoDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwap);
     }
     Ok(())
 }
 
-fn denuo_observed_preimage_id(session_id: SessionId) -> Vec<u8> {
+fn shakescape_observed_preimage_id(session_id: SessionId) -> Vec<u8> {
     let mut id =
-        Vec::with_capacity(DENUO_OBSERVED_PREIMAGE_DOMAIN.len() + session_id.as_bytes().len());
-    id.extend_from_slice(DENUO_OBSERVED_PREIMAGE_DOMAIN);
+        Vec::with_capacity(SHAKESCAPE_OBSERVED_PREIMAGE_DOMAIN.len() + session_id.as_bytes().len());
+    id.extend_from_slice(SHAKESCAPE_OBSERVED_PREIMAGE_DOMAIN);
     id.extend_from_slice(session_id.as_bytes());
     id
 }
 
 fn spend_evidence_id(spend: &LocallyVerifiedSwapSpend) -> ObjectHash {
     let mut hasher = Sha256::new();
-    hasher.update(b"hns-wallet-rs/verified-denuo-spend/v1");
+    hasher.update(b"hns-wallet-rs/verified-shakescape-spend/v1");
     match spend {
         LocallyVerifiedSwapSpend::Hns(VerifiedNativeHtlcSpend::Redeem { transaction, .. }) => {
             hasher.update([0, 0]);
@@ -825,7 +836,7 @@ fn spend_evidence_id(spend: &LocallyVerifiedSwapSpend) -> ObjectHash {
     ObjectHash::new(hasher.finalize().into())
 }
 
-fn verify_local_funding_against_denuo_terms(
+fn verify_local_funding_against_shakescape_terms(
     hello: &SwapSessionHello,
     funding: &LocallyVerifiedSwapFunding,
 ) -> Result<(), MarketError> {
@@ -847,8 +858,8 @@ fn verify_local_funding_against_denuo_terms(
         }
         LocallyVerifiedSwapFunding::Bitcoin(lock) => {
             let side = bitcoin_side(hello)?;
-            let descriptor = build_denuo_bitcoin_htlc(hello, side)
-                .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+            let descriptor = build_shakescape_bitcoin_htlc(hello, side)
+                .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
             let minimum_confirmations = confirmation_minimum(hello, side);
             if lock.value_sats != descriptor.value_sats
                 || lock.confirmation_count < minimum_confirmations
@@ -863,7 +874,7 @@ fn verify_local_funding_against_denuo_terms(
 
 fn funding_evidence_id(funding: &LocallyVerifiedSwapFunding) -> ObjectHash {
     let mut hasher = Sha256::new();
-    hasher.update(b"hns-wallet-rs/verified-denuo-funding/v1");
+    hasher.update(b"hns-wallet-rs/verified-shakescape-funding/v1");
     match funding {
         LocallyVerifiedSwapFunding::Hns(lock) => {
             hasher.update([0]);
@@ -916,7 +927,7 @@ fn canonical_hns_descriptor(
             },
         )
         .map(|binding| binding.descriptor)
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)
 }
 
 fn confirmation_minimum(hello: &SwapSessionHello, side: SwapAssetSide) -> u32 {
@@ -928,15 +939,17 @@ fn confirmation_minimum(hello: &SwapSessionHello, side: SwapAssetSide) -> u32 {
 
 /// Reconstruct both lock descriptors from the mutually signed terms.  The
 /// HNS protocol owns its descriptor format; the Kyoto adapter owns the
-/// Bitcoin P2WSH format and its domain-separated Denuo commitment.  Keeping
+/// Bitcoin P2WSH format and its domain-separated Shakescape commitment.  Keeping
 /// this check at the durable-execution boundary means a board record cannot
 /// turn an opaque or substituted 32-byte lock claim into a fundable swap.
-fn verify_canonical_denuo_lock_commitments(hello: &SwapSessionHello) -> Result<(), MarketError> {
-    verify_canonical_denuo_lock_commitment(hello, SwapAssetSide::Offered)?;
-    verify_canonical_denuo_lock_commitment(hello, SwapAssetSide::Received)
+fn verify_canonical_shakescape_lock_commitments(
+    hello: &SwapSessionHello,
+) -> Result<(), MarketError> {
+    verify_canonical_shakescape_lock_commitment(hello, SwapAssetSide::Offered)?;
+    verify_canonical_shakescape_lock_commitment(hello, SwapAssetSide::Received)
 }
 
-fn verify_canonical_denuo_lock_commitment(
+fn verify_canonical_shakescape_lock_commitment(
     hello: &SwapSessionHello,
     side: SwapAssetSide,
 ) -> Result<(), MarketError> {
@@ -958,17 +971,17 @@ fn verify_canonical_denuo_lock_commitment(
                         SwapAssetSide::Received => hello.taker_settlement_public_key,
                     },
                 )
-                .map_err(|_| MarketError::InvalidDenuoDirectSwap)?
+                .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?
                 .descriptor_hash
         }
-        AssetId::BTC => build_denuo_bitcoin_htlc(hello, side)
-            .map_err(|_| MarketError::InvalidDenuoDirectSwap)?
+        AssetId::BTC => build_shakescape_bitcoin_htlc(hello, side)
+            .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?
             .commitment
             .into_bytes(),
         _ => return Err(MarketError::InvalidPair),
     };
     if computed != commitment {
-        return Err(MarketError::InvalidDenuoDirectSwap);
+        return Err(MarketError::InvalidShakescapeDirectSwap);
     }
     Ok(())
 }
@@ -1032,7 +1045,7 @@ fn swap_session_from_accepted_hello(
         },
         now_unix,
     )?;
-    // The Denuo board has already admitted the exact direct offer, its take,
+    // The Shakescape board has already admitted the exact direct offer, its take,
     // and the exact double-signed terms. Persist one execution baseline instead of
     // replaying those historic state transitions after a restart.
     session.state = SwapState::TermsFrozen;
@@ -1148,31 +1161,31 @@ pub enum MarketError {
     #[error("invalid or stale verified quote")]
     InvalidQuote,
     #[error("invalid direct HNS/BTC offer-board policy")]
-    InvalidDenuoDirectOfferPolicy,
+    InvalidShakescapeDirectOfferPolicy,
     #[error("invalid or unexpected canonical direct HNS/BTC offer envelope")]
-    InvalidDenuoDirectOffer,
+    InvalidShakescapeDirectOffer,
     #[error("direct HNS/BTC offer conflicts with retained signed terms")]
-    DenuoDirectOfferConflict,
+    ShakescapeDirectOfferConflict,
     #[error("persisted direct HNS/BTC offer board is corrupt or noncanonical")]
-    CorruptDenuoDirectOfferBoard,
+    CorruptShakescapeDirectOfferBoard,
     #[error("direct HNS/BTC offer board reached its bounded capacity")]
-    DenuoDirectOfferCapacity,
+    ShakescapeDirectOfferCapacity,
     #[error("requested direct HNS/BTC offer is unknown")]
-    UnknownDenuoDirectOffer,
+    UnknownShakescapeDirectOffer,
     #[error("invalid direct HNS/BTC swap policy")]
-    InvalidDenuoDirectSwapPolicy,
+    InvalidShakescapeDirectSwapPolicy,
     #[error("invalid or unexpected canonical direct HNS/BTC swap message")]
-    InvalidDenuoDirectSwap,
+    InvalidShakescapeDirectSwap,
     #[error("the referenced direct HNS/BTC swap is unknown")]
-    UnknownDenuoDirectSwap,
+    UnknownShakescapeDirectSwap,
     #[error("direct HNS/BTC swap conflicts with accepted state")]
-    DenuoDirectSwapConflict,
+    ShakescapeDirectSwapConflict,
     #[error("direct HNS/BTC swap capacity reached")]
-    DenuoDirectSwapCapacity,
+    ShakescapeDirectSwapCapacity,
     #[error("persisted direct HNS/BTC swap is corrupt or noncanonical")]
-    CorruptDenuoDirectSwap,
-    #[error("invalid, unexpected, or resource-exhausting Denuo peer message")]
-    InvalidDenuoPeerMessage,
+    CorruptShakescapeDirectSwap,
+    #[error("invalid, unexpected, or resource-exhausting Shakescape peer message")]
+    InvalidShakescapePeerMessage,
     #[error("unsupported or inconsistent asset pair")]
     InvalidPair,
     #[error("unsafe settlement timeouts")]
@@ -1365,7 +1378,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_denuo_terms_open_a_resumable_execution_in_signed_chain_order() {
+    fn accepted_shakescape_terms_open_a_resumable_execution_in_signed_chain_order() {
         let hns_first = swap_session_from_accepted_hello(&accepted_terms(ChainId::HANDSHAKE), 100)
             .expect("HNS first terms");
         assert_eq!(hns_first.state, SwapState::TermsFrozen);
@@ -1385,8 +1398,8 @@ mod tests {
         assert_eq!(btc_first.timeouts.first_chain_refund_at, 800);
         assert_eq!(btc_first.timeouts.second_chain_refund_at, 500);
         assert_eq!(
-            denuo_execution_workflow_id(hns_first.id),
-            denuo_execution_workflow_id(btc_first.id),
+            shakescape_execution_workflow_id(hns_first.id),
+            shakescape_execution_workflow_id(btc_first.id),
             "workflow identity is session-bound, not chain-order-bound"
         );
     }

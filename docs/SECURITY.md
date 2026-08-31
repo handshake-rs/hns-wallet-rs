@@ -28,7 +28,7 @@ independently disabled.
 - The wallet database and keys live in a native/mobile wallet process. Website
   JavaScript, extension local storage, and native-messaging frames never carry
   seed or raw private-key bytes.
-- Denuo/Brontide authenticates a connection, not a listing, live-board level,
+- Shakescape/Brontide authenticates a connection, not a listing, live-board level,
   swap take, chain
   state, or peer claim. Fixed-price discovery checks the exact registry/message
   family, canonical signature/content hash, monotonic seller/name sequence,
@@ -269,7 +269,7 @@ set omits `providerDispatch`, `persistentPermissions`, `valueMovement`, and
 method and wallet-authority request is unsupported, and only the six
 non-signing `hnsReadOperationsV1` wallet reads are admitted. Structural config
 validation in this path is explicitly inert: it never authorizes current
-Shakedex-lock/Denuo access, allocation, signing, import/export, workflows,
+Shakedex-lock/Shakescape access, allocation, signing, import/export, workflows,
 lifecycle, broadcast, settlement, or value. Ordinary/full constructors still
 perform authority and release-gate validation. A synchronized recovery read is
 not physically read-only: under the same revision fences it may create or
@@ -609,11 +609,11 @@ transaction release requires matching spender evidence for every exact input
 position; a sufficiently final authenticated competitor on any exact input may
 release the now-unspendable competing transaction. Released rows are never
 recreated, and later finality disagreement remains read-only
-`RecoveryRequired`. Product coin selection, live Denuo/provider/trusted-UI
+`RecoveryRequired`. Product coin selection, live Shakescape/provider/trusted-UI
 integration, and complete restart/reorg/regtest product qualification remain
 pending. The focused FINALIZE tests are included in exact `2229be8` source CI.
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
-`SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED`,
+`SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED`,
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`,
 `HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED`,
 `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED`, and

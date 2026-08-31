@@ -14,7 +14,7 @@ the HNS/BTC swap path:
   learns a redeem preimage without trusting the counterparty to reveal it.
 
 Peers supply chain data and transactions, but no explorer, hosted API, relay,
-or third-party node is a wallet authority. Denuo owns peer-to-peer offer and
+or third-party node is a wallet authority. Shakescape owns peer-to-peer offer and
 swap-session exchange; Kyoto independently verifies and settles the Bitcoin
 side. A reorganization can roll back funding or spend confirmations, but it
 cannot erase a preimage that has already become public.

@@ -824,7 +824,7 @@ fn normalized_listing_index_metadata(
     Ok(indexes
         .iter()
         .map(|index| StoredEntityMetadata {
-            kind: EntityKind::DenuoBoardObject,
+            kind: EntityKind::ShakescapeBoardObject,
             id: index.id.clone(),
             revision: index.store_revision,
             updated_at_unix: index.updated_at_unix,
@@ -840,7 +840,7 @@ fn normalized_listing_index_set_commitment(
             .windows(2)
             .any(|window| window[0].id >= window[1].id)
         || metadata.iter().any(|entry| {
-            entry.kind != EntityKind::DenuoBoardObject
+            entry.kind != EntityKind::ShakescapeBoardObject
                 || entry.revision == 0
                 || entry.id.len() != NORMALIZED_NAME_MARKET_BOARD_LISTING_INDEX_PREFIX.len() + 32
                 || !entry
@@ -921,7 +921,7 @@ fn normalized_row_from_stored(
     let PersistedNameMarketBoardEntity::RowV2 { offer, watermark } = stored.value else {
         return Err(ShakedexError::CorruptNameMarketBoard);
     };
-    if stored.kind != EntityKind::DenuoBoardObject
+    if stored.kind != EntityKind::ShakescapeBoardObject
         || stored.id.len() != NORMALIZED_NAME_MARKET_BOARD_ROW_PREFIX.len() + 32
         || !stored
             .id
@@ -957,7 +957,7 @@ fn normalized_listing_index_from_stored(
         listing_hash,
         row_id_digest,
     };
-    if stored.kind != EntityKind::DenuoBoardObject
+    if stored.kind != EntityKind::ShakescapeBoardObject
         || index.store_revision == 0
         || index.id.len() != NORMALIZED_NAME_MARKET_BOARD_LISTING_INDEX_PREFIX.len() + 32
         || index.id != normalized_listing_index_id(index.listing_hash)
@@ -973,7 +973,11 @@ fn list_normalized_metadata(
     limit: usize,
 ) -> Result<Vec<StoredEntityMetadata>, ShakedexError> {
     snapshot
-        .list_untrusted_entity_metadata_by_id_prefix(EntityKind::DenuoBoardObject, prefix, limit)
+        .list_untrusted_entity_metadata_by_id_prefix(
+            EntityKind::ShakescapeBoardObject,
+            prefix,
+            limit,
+        )
         .map_err(|error| {
             if matches!(error, StoreError::ListCapacity) {
                 ShakedexError::CorruptNameMarketBoard
@@ -988,7 +992,7 @@ fn load_snapshot_entity<T: for<'de> Deserialize<'de>>(
     id: &[u8],
 ) -> Result<Option<StoredEntity<T>>, ShakedexError> {
     snapshot
-        .load_entity(EntityKind::DenuoBoardObject, id)
+        .load_entity(EntityKind::ShakescapeBoardObject, id)
         .map_err(ShakedexError::from)
 }
 
@@ -1012,7 +1016,7 @@ fn normalized_metadata_from_index(
     Ok(indexes
         .iter()
         .map(|index| StoredEntityMetadata {
-            kind: EntityKind::DenuoBoardObject,
+            kind: EntityKind::ShakescapeBoardObject,
             id: normalized_row_id_from_digest(index.id_digest),
             revision: index.store_revision,
             updated_at_unix: index.updated_at_unix,
@@ -1049,7 +1053,7 @@ fn normalized_metadata_from_v2_index(
     Ok(indexes
         .iter()
         .map(|index| StoredEntityMetadata {
-            kind: EntityKind::DenuoBoardObject,
+            kind: EntityKind::ShakescapeBoardObject,
             id: normalized_row_id_from_digest(index.id_digest),
             revision: index.store_revision,
             updated_at_unix: index.updated_at_unix,
@@ -1160,7 +1164,7 @@ fn validate_normalized_namespace_metadata(
             .windows(2)
             .any(|window| window[0].id >= window[1].id)
         || metadata.iter().any(|entry| {
-            if entry.kind != EntityKind::DenuoBoardObject
+            if entry.kind != EntityKind::ShakescapeBoardObject
                 || !entry
                     .id
                     .starts_with(NORMALIZED_NAME_MARKET_BOARD_NAMESPACE_PREFIX)
@@ -1211,7 +1215,7 @@ pub(crate) fn load_name_market_board_state_from_snapshot(
 ) -> Result<LoadedNameMarketBoard, ShakedexError> {
     let namespace_lease = snapshot
         .entity_prefix_set_lease(
-            EntityKind::DenuoBoardObject,
+            EntityKind::ShakescapeBoardObject,
             NORMALIZED_NAME_MARKET_BOARD_NAMESPACE_PREFIX,
             MAX_NORMALIZED_NAME_MARKET_BOARD_NAMESPACE_RECORDS,
         )
@@ -1269,7 +1273,7 @@ pub(crate) fn load_name_market_board_state_from_snapshot(
             })
         }
         (Some(head), None, _) => {
-            if head.kind != EntityKind::DenuoBoardObject
+            if head.kind != EntityKind::ShakescapeBoardObject
                 || head.id != NORMALIZED_NAME_MARKET_BOARD_HEAD_ID
             {
                 return Err(ShakedexError::CorruptNameMarketBoard);
@@ -1434,7 +1438,7 @@ pub(crate) fn load_name_market_board_offers_from_snapshot(
     };
     let expected_row_metadata = normalized_metadata_from_index(rows)?;
     let expected_listing_index_ids = normalized_listing_index_ids_from_row_index(rows)?;
-    if head.kind != EntityKind::DenuoBoardObject
+    if head.kind != EntityKind::ShakescapeBoardObject
         || head.id != NORMALIZED_NAME_MARKET_BOARD_HEAD_ID
         || *schema_version != NORMALIZED_NAME_MARKET_BOARD_SCHEMA_VERSION
         || *logical_revision == 0
@@ -1752,7 +1756,7 @@ fn save_loaded_name_market_board(
     });
     if let Some(account_prefix_lease) = account_prefix_lease {
         store.apply_entity_batch_with_assertions_and_prefix_lease_guard(
-            EntityKind::DenuoBoardObject,
+            EntityKind::ShakescapeBoardObject,
             &saves,
             &deletes,
             &assertions,
@@ -1761,7 +1765,7 @@ fn save_loaded_name_market_board(
         )?;
     } else {
         store.apply_entity_batch_with_assertions_and_prefix_lease(
-            EntityKind::DenuoBoardObject,
+            EntityKind::ShakescapeBoardObject,
             &saves,
             &deletes,
             &assertions,
@@ -1933,7 +1937,7 @@ mod normalized_storage_tests {
     ) -> Vec<StoredEntity<PersistedNameMarketBoardEntity>> {
         store
             .list_entities_by_id_prefix(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 NORMALIZED_NAME_MARKET_BOARD_ROW_PREFIX,
                 MAX_NAME_MARKET_BOARD_OFFERS,
             )
@@ -1945,7 +1949,7 @@ mod normalized_storage_tests {
     ) -> Vec<StoredEntity<PersistedNameMarketBoardEntity>> {
         store
             .list_entities_by_id_prefix(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 NORMALIZED_NAME_MARKET_BOARD_LISTING_INDEX_PREFIX,
                 MAX_NAME_MARKET_BOARD_OFFERS,
             )
@@ -2072,14 +2076,19 @@ mod normalized_storage_tests {
         let mut store = WalletStore::create(":memory:", PASSPHRASE).expect("wallet store");
         assert_eq!(
             store
-                .save_denuo_board_object(NAME_MARKET_BOARD_RECORD_ID, 0, &legacy, UPDATED_AT - 1)
+                .save_shakescape_board_object(
+                    NAME_MARKET_BOARD_RECORD_ID,
+                    0,
+                    &legacy,
+                    UPDATED_AT - 1
+                )
                 .expect("legacy board"),
             1
         );
         let outbox_sentinel = json!({"outbox_sentinel": true});
         assert_eq!(
             store
-                .save_denuo_board_object(OUTBOX_RECORD_ID, 0, &outbox_sentinel, UPDATED_AT - 1)
+                .save_shakescape_board_object(OUTBOX_RECORD_ID, 0, &outbox_sentinel, UPDATED_AT - 1)
                 .expect("outbox sentinel"),
             1
         );
@@ -2090,13 +2099,13 @@ mod normalized_storage_tests {
         ));
         assert!(
             store
-                .denuo_board_object::<NameMarketBoard>(NAME_MARKET_BOARD_RECORD_ID)
+                .shakescape_board_object::<NameMarketBoard>(NAME_MARKET_BOARD_RECORD_ID)
                 .expect("legacy lookup")
                 .is_some()
         );
         assert!(
             store
-                .denuo_board_object::<PersistedNameMarketBoardEntity>(
+                .shakescape_board_object::<PersistedNameMarketBoardEntity>(
                     NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
                 )
                 .expect("head lookup")
@@ -2111,7 +2120,7 @@ mod normalized_storage_tests {
         );
         assert!(
             store
-                .denuo_board_object::<NameMarketBoard>(NAME_MARKET_BOARD_RECORD_ID)
+                .shakescape_board_object::<NameMarketBoard>(NAME_MARKET_BOARD_RECORD_ID)
                 .expect("legacy lookup after migration")
                 .is_none()
         );
@@ -2120,7 +2129,7 @@ mod normalized_storage_tests {
         assert_eq!(loaded.revision, 2);
         assert_eq!(loaded.board, updated);
         let retained = store
-            .denuo_board_object::<serde_json::Value>(OUTBOX_RECORD_ID)
+            .shakescape_board_object::<serde_json::Value>(OUTBOX_RECORD_ID)
             .expect("outbox lookup")
             .expect("retained outbox sentinel");
         assert_eq!(retained.revision, 1);
@@ -2137,7 +2146,12 @@ mod normalized_storage_tests {
             row.updated_at_unix = UPDATED_AT;
             assert_eq!(
                 store
-                    .save_denuo_board_object(&row.id, 0, &normalized_row_entity(row), UPDATED_AT,)
+                    .save_shakescape_board_object(
+                        &row.id,
+                        0,
+                        &normalized_row_entity(row),
+                        UPDATED_AT,
+                    )
                     .expect("pre-index row"),
                 1
             );
@@ -2150,7 +2164,7 @@ mod normalized_storage_tests {
             PersistedNameMarketBoardEntity::HeadV2 { .. }
         ));
         store
-            .save_denuo_board_object(
+            .save_shakescape_board_object(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
                 0,
                 &frozen_head,
@@ -2179,7 +2193,7 @@ mod normalized_storage_tests {
                 .all(|row| row.revision == 1 && row.updated_at_unix == UPDATED_AT)
         );
         let migrated_head = store
-            .denuo_board_object::<PersistedNameMarketBoardEntity>(
+            .shakescape_board_object::<PersistedNameMarketBoardEntity>(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
             )
             .expect("migrated head lookup")
@@ -2198,7 +2212,7 @@ mod normalized_storage_tests {
         let missing_row = stored_normalized_rows(&missing).pop().expect("one row");
         assert!(
             missing
-                .delete_denuo_board_object(&missing_row.id, missing_row.revision)
+                .delete_shakescape_board_object(&missing_row.id, missing_row.revision)
                 .expect("delete row")
         );
         assert_corrupt(&missing);
@@ -2211,7 +2225,7 @@ mod normalized_storage_tests {
             .find(|row| row.offer.network_magic == 2)
             .expect("extra identity");
         extra
-            .save_denuo_board_object(
+            .save_shakescape_board_object(
                 &extra_row.id,
                 0,
                 &normalized_row_entity(&extra_row),
@@ -2225,7 +2239,7 @@ mod normalized_storage_tests {
             .pop()
             .expect("one row");
         wrong_revision
-            .save_denuo_board_object(&row.id, row.revision, &row.value, UPDATED_AT + 1)
+            .save_shakescape_board_object(&row.id, row.revision, &row.value, UPDATED_AT + 1)
             .expect("advance row without head");
         assert_corrupt(&wrong_revision);
 
@@ -2236,7 +2250,7 @@ mod normalized_storage_tests {
         assert_ne!(substituted_id, row.id);
         wrong_id
             .apply_entity_batch(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: substituted_id,
                     expected_revision: 0,
@@ -2252,7 +2266,7 @@ mod normalized_storage_tests {
         assert_corrupt(&wrong_id);
 
         let mut torn = normalized_store(&board);
-        torn.save_denuo_board_object(NAME_MARKET_BOARD_RECORD_ID, 0, &board, UPDATED_AT + 1)
+        torn.save_shakescape_board_object(NAME_MARKET_BOARD_RECORD_ID, 0, &board, UPDATED_AT + 1)
             .expect("inject torn legacy coexistence");
         assert_corrupt(&torn);
     }
@@ -2338,7 +2352,7 @@ mod normalized_storage_tests {
             })
             .expect("unselected row");
         store
-            .save_denuo_board_object(
+            .save_shakescape_board_object(
                 &unselected.id,
                 unselected.revision,
                 &json!({"record": "row_v2", "malformed": true}),
@@ -2347,7 +2361,7 @@ mod normalized_storage_tests {
             .expect("authenticated malformed unselected row");
 
         let head = store
-            .denuo_board_object::<PersistedNameMarketBoardEntity>(
+            .shakescape_board_object::<PersistedNameMarketBoardEntity>(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
             )
             .expect("head lookup")
@@ -2371,7 +2385,7 @@ mod normalized_storage_tests {
         index.store_revision = unselected.revision + 1;
         index.updated_at_unix = UPDATED_AT + 1;
         store
-            .save_denuo_board_object(
+            .save_shakescape_board_object(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
                 head.revision,
                 &PersistedNameMarketBoardEntity::HeadV2Indexed {
@@ -2444,19 +2458,19 @@ mod normalized_storage_tests {
         let selected_row = stored_normalized_rows(&store).pop().expect("selected row");
         let metadata_before = store
             .list_untrusted_entity_metadata_by_id_prefix(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 NORMALIZED_NAME_MARKET_BOARD_ROW_PREFIX,
                 1,
             )
             .expect("selected metadata before ABA");
         assert!(
             store
-                .delete_denuo_board_object(&selected_row.id, selected_row.revision)
+                .delete_shakescape_board_object(&selected_row.id, selected_row.revision)
                 .expect("delete selected row")
         );
         assert_eq!(
             store
-                .save_denuo_board_object(
+                .save_shakescape_board_object(
                     &selected_row.id,
                     0,
                     &normalized_row_entity(&cancelled_row),
@@ -2468,7 +2482,7 @@ mod normalized_storage_tests {
         assert_eq!(
             store
                 .list_untrusted_entity_metadata_by_id_prefix(
-                    EntityKind::DenuoBoardObject,
+                    EntityKind::ShakescapeBoardObject,
                     NORMALIZED_NAME_MARKET_BOARD_ROW_PREFIX,
                     1,
                 )
@@ -2502,7 +2516,7 @@ mod normalized_storage_tests {
         };
         let substitute_id = normalized_listing_index_id(substitute_hash);
         let substitute_metadata = vec![StoredEntityMetadata {
-            kind: EntityKind::DenuoBoardObject,
+            kind: EntityKind::ShakescapeBoardObject,
             id: substitute_id.clone(),
             revision: 1,
             updated_at_unix: UPDATED_AT + 1,
@@ -2512,7 +2526,7 @@ mod normalized_storage_tests {
                 .expect("substituted listing-index set commitment");
 
         let head = store
-            .denuo_board_object::<PersistedNameMarketBoardEntity>(
+            .shakescape_board_object::<PersistedNameMarketBoardEntity>(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
             )
             .expect("head lookup")
@@ -2532,7 +2546,7 @@ mod normalized_storage_tests {
         rows[0].listing_hash = substitute_hash;
         store
             .apply_entity_batch(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[
                     EntityBatchSave {
                         id: substitute_id,
@@ -2581,7 +2595,7 @@ mod normalized_storage_tests {
         let target_hash = board.offers()[0].listing_hash;
         let mut store = normalized_store(&board);
         let head = store
-            .denuo_board_object::<PersistedNameMarketBoardEntity>(
+            .shakescape_board_object::<PersistedNameMarketBoardEntity>(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
             )
             .expect("head lookup")
@@ -2602,7 +2616,7 @@ mod normalized_storage_tests {
         rows[0].listing_hash = rows[1].listing_hash;
         rows[1].listing_hash = first_listing_hash;
         store
-            .save_denuo_board_object(
+            .save_shakescape_board_object(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
                 head.revision,
                 &PersistedNameMarketBoardEntity::HeadV2Indexed {
@@ -2635,7 +2649,7 @@ mod normalized_storage_tests {
             .expect("one listing index");
         assert!(
             missing
-                .delete_denuo_board_object(&index.id, index.revision)
+                .delete_shakescape_board_object(&index.id, index.revision)
                 .expect("delete listing index")
         );
         assert_corrupt(&missing);
@@ -2653,7 +2667,7 @@ mod normalized_storage_tests {
             .expect("extra row");
         let extra_index = normalized_listing_index_from_row(&extra_row).expect("extra index");
         extra
-            .save_denuo_board_object(
+            .save_shakescape_board_object(
                 &extra_index.id,
                 0,
                 &normalized_listing_index_entity(&extra_index),
@@ -2671,7 +2685,7 @@ mod normalized_storage_tests {
             row_id_digest: ObjectHash::new([0xa5; 32]),
         };
         substituted
-            .save_denuo_board_object(&index.id, index.revision, &wrong, UPDATED_AT + 1)
+            .save_shakescape_board_object(&index.id, index.revision, &wrong, UPDATED_AT + 1)
             .expect("substitute listing mapping");
         assert_corrupt(&substituted);
     }
@@ -2683,11 +2697,11 @@ mod normalized_storage_tests {
         let row = stored_normalized_rows(&store).pop().expect("one row");
         let malformed_row = json!({"record": "row_v2", "malformed": true});
         store
-            .save_denuo_board_object(&row.id, row.revision, &malformed_row, UPDATED_AT + 1)
+            .save_shakescape_board_object(&row.id, row.revision, &malformed_row, UPDATED_AT + 1)
             .expect("authenticated malformed row");
 
         let head = store
-            .denuo_board_object::<PersistedNameMarketBoardEntity>(
+            .shakescape_board_object::<PersistedNameMarketBoardEntity>(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
             )
             .expect("head lookup")
@@ -2715,7 +2729,7 @@ mod normalized_storage_tests {
             listing_index_set_commitment,
         };
         store
-            .save_denuo_board_object(
+            .save_shakescape_board_object(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
                 head.revision,
                 &malformed_head,
@@ -2736,11 +2750,11 @@ mod normalized_storage_tests {
         let mut value = serde_json::to_value(&row.value).expect("row JSON");
         value["offer"]["unexpected_v2_field"] = json!(true);
         store
-            .save_denuo_board_object(&row.id, row.revision, &value, UPDATED_AT + 1)
+            .save_shakescape_board_object(&row.id, row.revision, &value, UPDATED_AT + 1)
             .expect("authenticated row with nested unknown field");
 
         let head = store
-            .denuo_board_object::<PersistedNameMarketBoardEntity>(
+            .shakescape_board_object::<PersistedNameMarketBoardEntity>(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
             )
             .expect("head lookup")
@@ -2759,7 +2773,7 @@ mod normalized_storage_tests {
         rows[0].store_revision = row.revision + 1;
         rows[0].updated_at_unix = UPDATED_AT + 1;
         store
-            .save_denuo_board_object(
+            .save_shakescape_board_object(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
                 head.revision,
                 &PersistedNameMarketBoardEntity::HeadV2Indexed {
@@ -2996,7 +3010,7 @@ mod normalized_storage_tests {
 
         let store = normalized_store(&board);
         let head = store
-            .denuo_board_object::<PersistedNameMarketBoardEntity>(
+            .shakescape_board_object::<PersistedNameMarketBoardEntity>(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
             )
             .expect("head lookup")

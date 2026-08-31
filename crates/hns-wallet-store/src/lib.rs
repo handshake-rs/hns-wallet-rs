@@ -67,7 +67,7 @@ pub enum EntityKind {
     Shakedex,
     HnsShakedexKeyAllocation,
     HnsaHnsrPublisherSequence,
-    DenuoBoardObject,
+    ShakescapeBoardObject,
     BitcoinHeader,
     BitcoinFilterHeader,
     BitcoinPeer,
@@ -104,7 +104,7 @@ impl EntityKind {
             Self::Shakedex => "shakedex",
             Self::HnsShakedexKeyAllocation => "hns_shakedex_key_allocation",
             Self::HnsaHnsrPublisherSequence => "hnsa_hnsr_publisher_sequence",
-            Self::DenuoBoardObject => "denuo_board_object",
+            Self::ShakescapeBoardObject => "shakescape_board_object",
             Self::BitcoinHeader => "bitcoin_header",
             Self::BitcoinFilterHeader => "bitcoin_filter_header",
             Self::BitcoinPeer => "bitcoin_peer",
@@ -1441,11 +1441,11 @@ impl WalletStore {
             Shakedex
         ),
         (
-            save_denuo_board_object,
-            denuo_board_object,
-            denuo_board_objects,
-            delete_denuo_board_object,
-            DenuoBoardObject
+            save_shakescape_board_object,
+            shakescape_board_object,
+            shakescape_board_objects,
+            delete_shakescape_board_object,
+            ShakescapeBoardObject
         ),
         (
             save_bitcoin_header,
@@ -4135,7 +4135,7 @@ CREATE TABLE name_transfer_state(name_hash BLOB PRIMARY KEY, workflow_id BLOB NO
     state_json BLOB NOT NULL) STRICT;
 CREATE TABLE shakedex_state(id BLOB PRIMARY KEY, state_json BLOB NOT NULL,
     updated_at_unix INTEGER NOT NULL) STRICT;
-CREATE TABLE denuo_board_cache(object_hash BLOB PRIMARY KEY, protocol INTEGER NOT NULL,
+CREATE TABLE shakescape_board_cache(object_hash BLOB PRIMARY KEY, protocol INTEGER NOT NULL,
     expires_at_unix INTEGER NOT NULL, payload BLOB NOT NULL) STRICT;
 CREATE TABLE bitcoin_headers(height INTEGER PRIMARY KEY, block_hash BLOB NOT NULL,
     header BLOB NOT NULL, chainwork BLOB NOT NULL) STRICT;
@@ -4230,7 +4230,7 @@ const LEGACY_ENTITY_TABLES: &[&str] = &[
     "name_owner_outpoints",
     "name_transfer_state",
     "shakedex_state",
-    "denuo_board_cache",
+    "shakescape_board_cache",
     "bitcoin_headers",
     "bitcoin_filter_headers",
     "bitcoin_peers",
@@ -5998,7 +5998,7 @@ mod tests {
         let mut writer = WalletStore::create_with_kdf(&database, PASSPHRASE, KdfConfig::testing())
             .expect("writer store");
         writer
-            .save_denuo_board_object(&id, 0, &json!({"generation": 1}), 10)
+            .save_shakescape_board_object(&id, 0, &json!({"generation": 1}), 10)
             .expect("initial row");
         let mut reader = WalletStore::open(&database).expect("reader store");
         reader.unlock(PASSPHRASE).expect("unlock reader");
@@ -6006,20 +6006,20 @@ mod tests {
         reader
             .try_with_entity_read_snapshot(|snapshot| {
                 let first: StoredEntity<serde_json::Value> = snapshot
-                    .load_entity(EntityKind::DenuoBoardObject, &id)?
+                    .load_entity(EntityKind::ShakescapeBoardObject, &id)?
                     .expect("first snapshot row");
                 assert_eq!(first.revision, 1);
                 assert_eq!(first.value, json!({"generation": 1}));
 
                 writer
-                    .save_denuo_board_object(&id, 1, &json!({"generation": 2}), 11)
+                    .save_shakescape_board_object(&id, 1, &json!({"generation": 2}), 11)
                     .expect("concurrent committed row");
 
                 let second: StoredEntity<serde_json::Value> = snapshot
-                    .load_entity(EntityKind::DenuoBoardObject, &id)?
+                    .load_entity(EntityKind::ShakescapeBoardObject, &id)?
                     .expect("second snapshot row");
                 let metadata = snapshot.list_untrusted_entity_metadata_by_id_prefix(
-                    EntityKind::DenuoBoardObject,
+                    EntityKind::ShakescapeBoardObject,
                     prefix,
                     1,
                 )?;
@@ -6032,7 +6032,7 @@ mod tests {
             .expect("coherent snapshot");
 
         let current: StoredEntity<serde_json::Value> = reader
-            .denuo_board_object(&id)
+            .shakescape_board_object(&id)
             .expect("current row lookup")
             .expect("current row");
         assert_eq!(current.revision, 2);
@@ -6047,18 +6047,18 @@ mod tests {
         let mut store =
             WalletStore::create_in_memory("entity prefix lease success").expect("store");
         store
-            .save_denuo_board_object(&stable_id, 0, &json!({"stable": true}), 20)
+            .save_shakescape_board_object(&stable_id, 0, &json!({"stable": true}), 20)
             .expect("stable row");
         let lease = store
             .try_with_entity_read_snapshot(|snapshot| {
-                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 2)
+                snapshot.entity_prefix_set_lease(EntityKind::ShakescapeBoardObject, prefix, 2)
             })
             .expect("prefix lease");
         assert_eq!(lease.metadata().len(), 1);
 
         store
             .apply_entity_batch_with_assertions_and_prefix_lease(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: saved_id.clone(),
                     expected_revision: 0,
@@ -6075,13 +6075,13 @@ mod tests {
             .expect("lease-gated batch");
         assert!(
             store
-                .denuo_board_object::<serde_json::Value>(&saved_id)
+                .shakescape_board_object::<serde_json::Value>(&saved_id)
                 .expect("saved lookup")
                 .is_some()
         );
         assert_eq!(
             store
-                .denuo_board_object::<serde_json::Value>(&stable_id)
+                .shakescape_board_object::<serde_json::Value>(&stable_id)
                 .expect("stable lookup")
                 .expect("stable row")
                 .revision,
@@ -6097,34 +6097,39 @@ mod tests {
         let planned_id = b"lease/aba/planned".to_vec();
         let mut store = WalletStore::create_in_memory("entity prefix lease aba").expect("store");
         store
-            .save_denuo_board_object(&substituted_id, 0, &json!({"value": "original"}), 50)
+            .save_shakescape_board_object(&substituted_id, 0, &json!({"value": "original"}), 50)
             .expect("original row");
         store
-            .save_denuo_board_object(&retained_id, 0, &json!({"retained": true}), 51)
+            .save_shakescape_board_object(&retained_id, 0, &json!({"retained": true}), 51)
             .expect("retained row");
 
         let lease = store
             .try_with_entity_read_snapshot(|snapshot| {
-                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 3)
+                snapshot.entity_prefix_set_lease(EntityKind::ShakescapeBoardObject, prefix, 3)
             })
             .expect("prefix lease");
         let leased_metadata = lease.metadata().to_vec();
 
         assert!(
             store
-                .delete_denuo_board_object(&substituted_id, 1)
+                .delete_shakescape_board_object(&substituted_id, 1)
                 .expect("delete original row")
         );
         assert_eq!(
             store
-                .save_denuo_board_object(&substituted_id, 0, &json!({"value": "substituted"}), 50,)
+                .save_shakescape_board_object(
+                    &substituted_id,
+                    0,
+                    &json!({"value": "substituted"}),
+                    50,
+                )
                 .expect("recreate substituted row"),
             1
         );
         assert_eq!(
             store
                 .list_untrusted_entity_metadata_by_id_prefix(
-                    EntityKind::DenuoBoardObject,
+                    EntityKind::ShakescapeBoardObject,
                     prefix,
                     3,
                 )
@@ -6135,7 +6140,7 @@ mod tests {
 
         assert!(matches!(
             store.apply_entity_batch_with_assertions_and_prefix_lease(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: planned_id.clone(),
                     expected_revision: 0,
@@ -6156,20 +6161,20 @@ mod tests {
         ));
         assert!(
             store
-                .denuo_board_object::<serde_json::Value>(&planned_id)
+                .shakescape_board_object::<serde_json::Value>(&planned_id)
                 .expect("rolled-back save lookup")
                 .is_none()
         );
         assert_eq!(
             store
-                .denuo_board_object::<serde_json::Value>(&retained_id)
+                .shakescape_board_object::<serde_json::Value>(&retained_id)
                 .expect("rolled-back delete lookup")
                 .expect("retained row")
                 .value,
             json!({"retained": true})
         );
         let substituted: StoredEntity<serde_json::Value> = store
-            .denuo_board_object(&substituted_id)
+            .shakescape_board_object(&substituted_id)
             .expect("substituted row lookup")
             .expect("substituted row");
         assert_eq!(substituted.revision, 1);
@@ -6184,7 +6189,7 @@ mod tests {
         let mut store =
             WalletStore::create_in_memory("entity prefix lease oversized").expect("store");
         store
-            .save_denuo_board_object(&id, 0, &json!({"valid": true}), 50)
+            .save_shakescape_board_object(&id, 0, &json!({"valid": true}), 50)
             .expect("valid row");
         store
             .connection
@@ -6195,7 +6200,7 @@ mod tests {
                 params![
                     i64::try_from(MAX_ENCRYPTED_RECORD_BYTES + 1)
                         .expect("encrypted record bound fits SQLite"),
-                    EntityKind::DenuoBoardObject.label(),
+                    EntityKind::ShakescapeBoardObject.label(),
                     &id,
                 ],
             )
@@ -6203,7 +6208,7 @@ mod tests {
 
         assert!(matches!(
             store.try_with_entity_read_snapshot(|snapshot| {
-                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 1)
+                snapshot.entity_prefix_set_lease(EntityKind::ShakescapeBoardObject, prefix, 1)
             }),
             Err(StoreError::Encryption)
         ));
@@ -6248,7 +6253,7 @@ mod tests {
                         2,
                     )?,
                     snapshot.entity_prefix_set_lease(
-                        EntityKind::DenuoBoardObject,
+                        EntityKind::ShakescapeBoardObject,
                         board_prefix,
                         1,
                     )?,
@@ -6281,7 +6286,7 @@ mod tests {
         ));
         assert!(matches!(
             reader.apply_entity_batch_with_assertions_and_prefix_lease_guard(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: planned_id.clone(),
                     expected_revision: 0,
@@ -6297,7 +6302,7 @@ mod tests {
         ));
         assert!(
             reader
-                .denuo_board_object::<serde_json::Value>(&planned_id)
+                .shakescape_board_object::<serde_json::Value>(&planned_id)
                 .expect("ABA rollback lookup")
                 .is_none()
         );
@@ -6311,7 +6316,7 @@ mod tests {
                         2,
                     )?,
                     snapshot.entity_prefix_set_lease(
-                        EntityKind::DenuoBoardObject,
+                        EntityKind::ShakescapeBoardObject,
                         board_prefix,
                         1,
                     )?,
@@ -6329,7 +6334,7 @@ mod tests {
             .expect("insert duplicate account");
         assert!(matches!(
             reader.apply_entity_batch_with_assertions_and_prefix_lease_guard(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: planned_id.clone(),
                     expected_revision: 0,
@@ -6345,7 +6350,7 @@ mod tests {
         ));
         assert!(
             reader
-                .denuo_board_object::<serde_json::Value>(&planned_id)
+                .shakescape_board_object::<serde_json::Value>(&planned_id)
                 .expect("insertion rollback lookup")
                 .is_none()
         );
@@ -6365,22 +6370,22 @@ mod tests {
         let mut store = WalletStore::create_with_kdf(&database, PASSPHRASE, KdfConfig::testing())
             .expect("leased store");
         store
-            .save_denuo_board_object(&stable_id, 0, &json!({"revision": 1}), 30)
+            .save_shakescape_board_object(&stable_id, 0, &json!({"revision": 1}), 30)
             .expect("stable row");
         let mut concurrent = WalletStore::open(&database).expect("concurrent store");
         concurrent.unlock(PASSPHRASE).expect("unlock concurrent");
 
         let insertion_lease = store
             .try_with_entity_read_snapshot(|snapshot| {
-                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 4)
+                snapshot.entity_prefix_set_lease(EntityKind::ShakescapeBoardObject, prefix, 4)
             })
             .expect("insertion lease");
         concurrent
-            .save_denuo_board_object(&injected_id, 0, &json!({"injected": true}), 31)
+            .save_shakescape_board_object(&injected_id, 0, &json!({"injected": true}), 31)
             .expect("concurrent insertion");
         assert!(matches!(
             store.apply_entity_batch_with_assertions_and_prefix_lease(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: planned_id.clone(),
                     expected_revision: 0,
@@ -6398,22 +6403,22 @@ mod tests {
         ));
         assert!(
             store
-                .denuo_board_object::<serde_json::Value>(&planned_id)
+                .shakescape_board_object::<serde_json::Value>(&planned_id)
                 .expect("rolled-back planned lookup")
                 .is_none()
         );
 
         let revision_lease = store
             .try_with_entity_read_snapshot(|snapshot| {
-                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 4)
+                snapshot.entity_prefix_set_lease(EntityKind::ShakescapeBoardObject, prefix, 4)
             })
             .expect("revision lease");
         concurrent
-            .save_denuo_board_object(&stable_id, 1, &json!({"revision": 2}), 33)
+            .save_shakescape_board_object(&stable_id, 1, &json!({"revision": 2}), 33)
             .expect("concurrent revision");
         assert!(matches!(
             store.apply_entity_batch_with_assertions_and_prefix_lease::<serde_json::Value>(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[],
                 &[],
                 &[],
@@ -6424,15 +6429,15 @@ mod tests {
 
         let capacity_lease = store
             .try_with_entity_read_snapshot(|snapshot| {
-                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 2)
+                snapshot.entity_prefix_set_lease(EntityKind::ShakescapeBoardObject, prefix, 2)
             })
             .expect("capacity lease");
         concurrent
-            .save_denuo_board_object(&overflow_id, 0, &json!({"overflow": true}), 34)
+            .save_shakescape_board_object(&overflow_id, 0, &json!({"overflow": true}), 34)
             .expect("capacity-crossing insertion");
         assert!(matches!(
             store.apply_entity_batch_with_assertions_and_prefix_lease::<serde_json::Value>(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[],
                 &[],
                 &[],
@@ -6451,27 +6456,27 @@ mod tests {
         let mut second =
             WalletStore::create_in_memory("entity prefix lease second").expect("second");
         first
-            .save_denuo_board_object(&first_id, 0, &json!({"first": true}), 40)
+            .save_shakescape_board_object(&first_id, 0, &json!({"first": true}), 40)
             .expect("first row");
         first
-            .save_denuo_board_object(&second_id, 0, &json!({"second": true}), 41)
+            .save_shakescape_board_object(&second_id, 0, &json!({"second": true}), 41)
             .expect("second row");
 
         assert!(matches!(
             first.try_with_entity_read_snapshot(|snapshot| {
-                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 1)
+                snapshot.entity_prefix_set_lease(EntityKind::ShakescapeBoardObject, prefix, 1)
             }),
             Err(StoreError::ListCapacity)
         ));
 
         let wrong_database = first
             .try_with_entity_read_snapshot(|snapshot| {
-                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 2)
+                snapshot.entity_prefix_set_lease(EntityKind::ShakescapeBoardObject, prefix, 2)
             })
             .expect("wrong-database lease");
         assert!(matches!(
             second.apply_entity_batch_with_assertions_and_prefix_lease::<serde_json::Value>(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[],
                 &[],
                 &[],
@@ -6482,7 +6487,7 @@ mod tests {
 
         let wrong_kind = first
             .try_with_entity_read_snapshot(|snapshot| {
-                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 2)
+                snapshot.entity_prefix_set_lease(EntityKind::ShakescapeBoardObject, prefix, 2)
             })
             .expect("wrong-kind lease");
         assert!(matches!(
@@ -6498,12 +6503,12 @@ mod tests {
 
         let wrong_prefix = first
             .try_with_entity_read_snapshot(|snapshot| {
-                snapshot.entity_prefix_set_lease(EntityKind::DenuoBoardObject, prefix, 2)
+                snapshot.entity_prefix_set_lease(EntityKind::ShakescapeBoardObject, prefix, 2)
             })
             .expect("wrong-prefix lease");
         assert!(matches!(
             first.apply_entity_batch_with_assertions_and_prefix_lease(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: b"outside/leased/prefix".to_vec(),
                     expected_revision: 0,
@@ -6525,19 +6530,19 @@ mod tests {
         let deleted_id = b"assertion/deleted".to_vec();
         let saved_id = b"assertion/saved".to_vec();
         store
-            .save_denuo_board_object(&asserted_id, 0, &json!({"stable": true}), 11)
+            .save_shakescape_board_object(&asserted_id, 0, &json!({"stable": true}), 11)
             .expect("asserted fixture");
         store
-            .save_denuo_board_object(&deleted_id, 0, &json!({"delete": true}), 12)
+            .save_shakescape_board_object(&deleted_id, 0, &json!({"delete": true}), 12)
             .expect("delete fixture");
         let before: StoredEntity<serde_json::Value> = store
-            .denuo_board_object(&asserted_id)
+            .shakescape_board_object(&asserted_id)
             .expect("read asserted fixture")
             .expect("asserted fixture present");
 
         store
             .apply_entity_batch_with_assertions(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: saved_id.clone(),
                     expected_revision: 0,
@@ -6556,19 +6561,19 @@ mod tests {
             .expect("assertion-gated batch");
 
         let after: StoredEntity<serde_json::Value> = store
-            .denuo_board_object(&asserted_id)
+            .shakescape_board_object(&asserted_id)
             .expect("read asserted entity")
             .expect("asserted entity present");
         assert_eq!(after, before);
         assert!(
             store
-                .denuo_board_object::<serde_json::Value>(&saved_id)
+                .shakescape_board_object::<serde_json::Value>(&saved_id)
                 .expect("read saved entity")
                 .is_some()
         );
         assert!(
             store
-                .denuo_board_object::<serde_json::Value>(&deleted_id)
+                .shakescape_board_object::<serde_json::Value>(&deleted_id)
                 .expect("read deleted entity")
                 .is_none()
         );
@@ -6583,10 +6588,10 @@ mod tests {
             let deleted_id = b"assertion/retained".to_vec();
             let saved_id = b"assertion/not-written".to_vec();
             store
-                .save_denuo_board_object(&asserted_id, 0, &json!({"current": true}), 20)
+                .save_shakescape_board_object(&asserted_id, 0, &json!({"current": true}), 20)
                 .expect("asserted fixture");
             store
-                .save_denuo_board_object(&deleted_id, 0, &json!({"retained": true}), 21)
+                .save_shakescape_board_object(&deleted_id, 0, &json!({"retained": true}), 21)
                 .expect("delete fixture");
 
             let assertion = match case {
@@ -6604,7 +6609,7 @@ mod tests {
                         .query_row(
                             "SELECT encrypted_value FROM encrypted_entities
                              WHERE entity_kind=?1 AND record_id=?2",
-                            params![EntityKind::DenuoBoardObject.label(), &asserted_id],
+                            params![EntityKind::ShakescapeBoardObject.label(), &asserted_id],
                             |row| row.get(0),
                         )
                         .expect("asserted ciphertext");
@@ -6616,7 +6621,7 @@ mod tests {
                              WHERE entity_kind=?2 AND record_id=?3",
                             params![
                                 ciphertext,
-                                EntityKind::DenuoBoardObject.label(),
+                                EntityKind::ShakescapeBoardObject.label(),
                                 &asserted_id
                             ],
                         )
@@ -6629,7 +6634,7 @@ mod tests {
                 _ => unreachable!(),
             };
             let result = store.apply_entity_batch_with_assertions(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: saved_id.clone(),
                     expected_revision: 0,
@@ -6651,13 +6656,13 @@ mod tests {
             }
             assert!(
                 store
-                    .denuo_board_object::<serde_json::Value>(&saved_id)
+                    .shakescape_board_object::<serde_json::Value>(&saved_id)
                     .expect("read rolled-back save")
                     .is_none()
             );
             assert_eq!(
                 store
-                    .denuo_board_object::<serde_json::Value>(&deleted_id)
+                    .shakescape_board_object::<serde_json::Value>(&deleted_id)
                     .expect("read rolled-back delete")
                     .expect("delete rolled back")
                     .value,
@@ -6671,12 +6676,12 @@ mod tests {
         let mut store = WalletStore::create_in_memory("entity assertion shape").expect("store");
         let id = b"assertion/overlap".to_vec();
         store
-            .save_denuo_board_object(&id, 0, &json!({"present": true}), 30)
+            .save_shakescape_board_object(&id, 0, &json!({"present": true}), 30)
             .expect("fixture");
 
         assert!(matches!(
             store.apply_entity_batch_with_assertions::<serde_json::Value>(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[],
                 &[],
                 &[EntityRevisionAssertion {
@@ -6688,7 +6693,7 @@ mod tests {
         ));
         assert!(matches!(
             store.apply_entity_batch_with_assertions::<serde_json::Value>(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[],
                 &[],
                 &[
@@ -6706,7 +6711,7 @@ mod tests {
         ));
         assert!(matches!(
             store.apply_entity_batch_with_assertions(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: id.clone(),
                     expected_revision: 1,
@@ -6723,7 +6728,7 @@ mod tests {
         ));
         assert!(matches!(
             store.apply_entity_batch_with_assertions(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[EntityBatchSave {
                     id: id.clone(),
                     expected_revision: 1,
@@ -6740,7 +6745,7 @@ mod tests {
         ));
         assert!(matches!(
             store.apply_entity_batch_with_assertions::<serde_json::Value>(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 &[],
                 &[EntityBatchDelete {
                     id: id.clone(),
@@ -6800,7 +6805,7 @@ mod tests {
         });
         for (updated_at_unix, id) in ids.iter().rev().enumerate() {
             store
-                .save_denuo_board_object(
+                .save_shakescape_board_object(
                     id,
                     0,
                     &json!({"order": updated_at_unix}),
@@ -6811,7 +6816,7 @@ mod tests {
         ids.sort();
         let metadata = store
             .list_untrusted_entity_metadata_by_id_prefix(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 prefix,
                 ids.len(),
             )
@@ -6823,7 +6828,7 @@ mod tests {
         assert!(metadata.iter().all(|entry| entry.revision == 1));
         assert!(matches!(
             store.list_untrusted_entity_metadata_by_id_prefix(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 prefix,
                 ids.len() - 1,
             ),
@@ -6832,7 +6837,7 @@ mod tests {
         store.lock();
         assert!(matches!(
             store.list_untrusted_entity_metadata_by_id_prefix(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 prefix,
                 ids.len(),
             ),
@@ -6843,7 +6848,7 @@ mod tests {
             WalletStore::create_in_memory("metadata is not authority").expect("store");
         let tampered_id = b"metadata/tampered/row".to_vec();
         tampered
-            .save_denuo_board_object(&tampered_id, 0, &json!({"authentic": true}), 41)
+            .save_shakescape_board_object(&tampered_id, 0, &json!({"authentic": true}), 41)
             .expect("tamper fixture");
         tampered
             .connection
@@ -6853,14 +6858,14 @@ mod tests {
                  WHERE entity_kind=?2 AND record_id=?3",
                 params![
                     vec![0x42_u8; NONCE_BYTES + TAG_BYTES + 1],
-                    EntityKind::DenuoBoardObject.label(),
+                    EntityKind::ShakescapeBoardObject.label(),
                     &tampered_id
                 ],
             )
             .expect("malformed untrusted row");
         let projected = tampered
             .list_untrusted_entity_metadata_by_id_prefix(
-                EntityKind::DenuoBoardObject,
+                EntityKind::ShakescapeBoardObject,
                 b"metadata/tampered/",
                 1,
             )
@@ -6868,7 +6873,7 @@ mod tests {
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].revision, 0);
         assert!(matches!(
-            tampered.denuo_board_object::<serde_json::Value>(&tampered_id),
+            tampered.shakescape_board_object::<serde_json::Value>(&tampered_id),
             Err(StoreError::Encryption)
         ));
     }

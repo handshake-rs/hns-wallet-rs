@@ -1,4 +1,4 @@
-use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketMessage};
+use hns_marketplace_protocol::{NameMarketMessage, ShakescapeRegistryVersion};
 use hns_swap::{
     FixedPriceListing, ListingCancellation, MAX_FIXED_PRICE_LISTING_SIZE,
     MAX_LISTING_CANCELLATION_SIZE, NetworkBinding, ShakedexLockDescriptor, SwapProof,
@@ -241,7 +241,7 @@ impl VerifiedListingCancellation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DenuoNameMarketRequest {
+pub enum ShakescapeNameMarketRequest {
     Inventory,
     Offers(Vec<ObjectHash>),
     Offer(ObjectHash),
@@ -419,26 +419,26 @@ fn verified_cancellation_from_canonical(
     verify_authenticated_listing_cancellation(authenticated, listing, expected_network, now_unix)
 }
 
-pub fn encode_denuo_offer(
-    registry: DenuoRegistryVersion,
+pub fn encode_shakescape_offer(
+    registry: ShakescapeRegistryVersion,
     request_id: u64,
     listing: &AuthenticatedFixedPriceListing,
 ) -> Result<Vec<u8>, ShakedexError> {
     NameMarketMessage::Offer(listing.canonical().clone())
         .encode_envelope(registry, request_id)
-        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)
+        .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)
 }
 
-pub fn decode_denuo_offer(
+pub fn decode_shakescape_offer(
     encoded: &[u8],
-    expected_registry: DenuoRegistryVersion,
+    expected_registry: ShakescapeRegistryVersion,
     expected_hash: ObjectHash,
     expected_network: NetworkBinding,
     now_unix: u64,
     locking_coin: &Coin,
 ) -> Result<(u64, VerifiedFixedPriceListing), ShakedexError> {
     let (request_id, authenticated) =
-        decode_denuo_authenticated_offer(encoded, expected_registry, expected_hash)?;
+        decode_shakescape_authenticated_offer(encoded, expected_registry, expected_hash)?;
     let listing = verify_authenticated_fixed_price_listing(
         authenticated,
         expected_network,
@@ -448,22 +448,22 @@ pub fn decode_denuo_offer(
     Ok((request_id, listing))
 }
 
-/// Decode one canonical Denuo offer and authenticate its signed listing plus
+/// Decode one canonical Shakescape offer and authenticate its signed listing plus
 /// exact content hash without accepting caller-supplied chain facts. This is
 /// the safe first phase for runtimes that must query the listing's current
 /// locking coin before completing time/network verification.
-pub fn decode_denuo_authenticated_offer(
+pub fn decode_shakescape_authenticated_offer(
     encoded: &[u8],
-    expected_registry: DenuoRegistryVersion,
+    expected_registry: ShakescapeRegistryVersion,
     expected_hash: ObjectHash,
 ) -> Result<(u64, AuthenticatedFixedPriceListing), ShakedexError> {
     let (registry, request_id, message) = NameMarketMessage::decode_envelope(encoded)
-        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+        .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?;
     if registry != expected_registry {
-        return Err(ShakedexError::DenuoRegistryMismatch);
+        return Err(ShakedexError::ShakescapeRegistryMismatch);
     }
     let NameMarketMessage::Offer(listing) = message else {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     };
     Ok((
         request_id,
@@ -471,30 +471,30 @@ pub fn decode_denuo_authenticated_offer(
     ))
 }
 
-pub fn encode_denuo_cancellation(
-    registry: DenuoRegistryVersion,
+pub fn encode_shakescape_cancellation(
+    registry: ShakescapeRegistryVersion,
     request_id: u64,
     cancellation: &VerifiedListingCancellation,
 ) -> Result<Vec<u8>, ShakedexError> {
     NameMarketMessage::Cancel(cancellation.canonical().clone())
         .encode_envelope(registry, request_id)
-        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)
+        .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)
 }
 
-pub fn decode_denuo_cancellation(
+pub fn decode_shakescape_cancellation(
     encoded: &[u8],
-    expected_registry: DenuoRegistryVersion,
+    expected_registry: ShakescapeRegistryVersion,
     listing: &AuthenticatedFixedPriceListing,
     expected_network: NetworkBinding,
     now_unix: u64,
 ) -> Result<(u64, VerifiedListingCancellation), ShakedexError> {
     let (registry, request_id, message) = NameMarketMessage::decode_envelope(encoded)
-        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+        .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?;
     if registry != expected_registry {
-        return Err(ShakedexError::DenuoRegistryMismatch);
+        return Err(ShakedexError::ShakescapeRegistryMismatch);
     }
     let NameMarketMessage::Cancel(cancellation) = message else {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     };
     let cancellation_hash = ObjectHash::new(
         cancellation
@@ -515,22 +515,22 @@ pub fn decode_denuo_cancellation(
     Ok((request_id, cancellation))
 }
 
-/// Decode one canonical Denuo cancellation and authenticate its signature,
+/// Decode one canonical Shakescape cancellation and authenticate its signature,
 /// exact listing target, and exact cancellation content hash. The returned
 /// object is intentionally not listing-, network-, or time-verified.
-pub fn decode_denuo_authenticated_cancellation(
+pub fn decode_shakescape_authenticated_cancellation(
     encoded: &[u8],
-    expected_registry: DenuoRegistryVersion,
+    expected_registry: ShakescapeRegistryVersion,
     expected_listing_hash: ObjectHash,
     expected_cancellation_hash: ObjectHash,
 ) -> Result<(u64, AuthenticatedListingCancellation), ShakedexError> {
     let (registry, request_id, message) = NameMarketMessage::decode_envelope(encoded)
-        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+        .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?;
     if registry != expected_registry {
-        return Err(ShakedexError::DenuoRegistryMismatch);
+        return Err(ShakedexError::ShakescapeRegistryMismatch);
     }
     let NameMarketMessage::Cancel(cancellation) = message else {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     };
     let cancellation = authenticated_cancellation_from_canonical(
         cancellation,
@@ -540,27 +540,27 @@ pub fn decode_denuo_authenticated_cancellation(
     Ok((request_id, cancellation))
 }
 
-pub fn encode_denuo_inventory(
-    registry: DenuoRegistryVersion,
+pub fn encode_shakescape_inventory(
+    registry: ShakescapeRegistryVersion,
     request_id: u64,
     hashes: &[ObjectHash],
 ) -> Result<Vec<u8>, ShakedexError> {
     NameMarketMessage::OfferInventory(hashes.iter().copied().map(ObjectHash::into_bytes).collect())
         .encode_envelope(registry, request_id)
-        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)
+        .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)
 }
 
-pub fn decode_denuo_inventory(
+pub fn decode_shakescape_inventory(
     encoded: &[u8],
-    expected_registry: DenuoRegistryVersion,
+    expected_registry: ShakescapeRegistryVersion,
 ) -> Result<(u64, Vec<ObjectHash>), ShakedexError> {
     let (registry, request_id, message) = NameMarketMessage::decode_envelope(encoded)
-        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+        .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?;
     if registry != expected_registry {
-        return Err(ShakedexError::DenuoRegistryMismatch);
+        return Err(ShakedexError::ShakescapeRegistryMismatch);
     }
     let NameMarketMessage::OfferInventory(hashes) = message else {
-        return Err(ShakedexError::InvalidDenuoEnvelope);
+        return Err(ShakedexError::InvalidShakescapeEnvelope);
     };
     Ok((
         request_id,
@@ -568,39 +568,41 @@ pub fn decode_denuo_inventory(
     ))
 }
 
-pub fn encode_denuo_request(
-    registry: DenuoRegistryVersion,
+pub fn encode_shakescape_request(
+    registry: ShakescapeRegistryVersion,
     request_id: u64,
-    request: &DenuoNameMarketRequest,
+    request: &ShakescapeNameMarketRequest,
 ) -> Result<Vec<u8>, ShakedexError> {
     let message = match request {
-        DenuoNameMarketRequest::Inventory => NameMarketMessage::GetOfferInventory,
-        DenuoNameMarketRequest::Offers(hashes) => NameMarketMessage::GetOffers(
+        ShakescapeNameMarketRequest::Inventory => NameMarketMessage::GetOfferInventory,
+        ShakescapeNameMarketRequest::Offers(hashes) => NameMarketMessage::GetOffers(
             hashes.iter().copied().map(ObjectHash::into_bytes).collect(),
         ),
-        DenuoNameMarketRequest::Offer(hash) => NameMarketMessage::GetOffer(hash.into_bytes()),
+        ShakescapeNameMarketRequest::Offer(hash) => NameMarketMessage::GetOffer(hash.into_bytes()),
     };
     message
         .encode_envelope(registry, request_id)
-        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)
+        .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)
 }
 
-pub fn decode_denuo_request(
+pub fn decode_shakescape_request(
     encoded: &[u8],
-    expected_registry: DenuoRegistryVersion,
-) -> Result<(u64, DenuoNameMarketRequest), ShakedexError> {
+    expected_registry: ShakescapeRegistryVersion,
+) -> Result<(u64, ShakescapeNameMarketRequest), ShakedexError> {
     let (registry, request_id, message) = NameMarketMessage::decode_envelope(encoded)
-        .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+        .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?;
     if registry != expected_registry {
-        return Err(ShakedexError::DenuoRegistryMismatch);
+        return Err(ShakedexError::ShakescapeRegistryMismatch);
     }
     let request = match message {
-        NameMarketMessage::GetOfferInventory => DenuoNameMarketRequest::Inventory,
+        NameMarketMessage::GetOfferInventory => ShakescapeNameMarketRequest::Inventory,
         NameMarketMessage::GetOffers(hashes) => {
-            DenuoNameMarketRequest::Offers(hashes.into_iter().map(ObjectHash::new).collect())
+            ShakescapeNameMarketRequest::Offers(hashes.into_iter().map(ObjectHash::new).collect())
         }
-        NameMarketMessage::GetOffer(hash) => DenuoNameMarketRequest::Offer(ObjectHash::new(hash)),
-        _ => return Err(ShakedexError::InvalidDenuoEnvelope),
+        NameMarketMessage::GetOffer(hash) => {
+            ShakescapeNameMarketRequest::Offer(ObjectHash::new(hash))
+        }
+        _ => return Err(ShakedexError::InvalidShakescapeEnvelope),
     };
     Ok((request_id, request))
 }
@@ -615,7 +617,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use hns_covenants::FinalizeCovenant;
-    use hns_marketplace_protocol::DenuoRegistryVersion;
+    use hns_marketplace_protocol::ShakescapeRegistryVersion;
     use hns_primitives::{BlockHash, Dollarydoos, Height, TransactionHash};
     use hns_swap::{
         FixedPriceListing, ListingCancellation, NetworkBinding, SwapProof, lock_script_hash,
@@ -749,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_shakedex_fixed_price_denuo_board_restart_and_tombstone() {
+    fn canonical_shakedex_fixed_price_shakescape_board_restart_and_tombstone() {
         let (listing, coin, signing_key) = listing_fixture(42);
         let network = listing.network();
         let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
@@ -795,28 +797,30 @@ mod tests {
         ));
 
         let offer_envelope =
-            encode_denuo_offer(DenuoRegistryVersion::V2, 77, verified.authenticated())
+            encode_shakescape_offer(ShakescapeRegistryVersion::V1, 77, verified.authenticated())
                 .expect("offer envelope");
-        let (request_id, discovered) = decode_denuo_offer(
+        let (request_id, discovered) = decode_shakescape_offer(
             &offer_envelope,
-            DenuoRegistryVersion::V2,
+            ShakescapeRegistryVersion::V1,
             listing_hash,
             network,
             ACTIVE_TIME,
             &coin,
         )
-        .expect("verified Denuo offer");
+        .expect("verified Shakescape offer");
         assert_eq!(request_id, 77);
+        let mut wrong_registry_envelope = offer_envelope.clone();
+        wrong_registry_envelope[4] = 2;
         assert!(matches!(
-            decode_denuo_offer(
-                &offer_envelope,
-                DenuoRegistryVersion::V1,
+            decode_shakescape_offer(
+                &wrong_registry_envelope,
+                ShakescapeRegistryVersion::V1,
                 listing_hash,
                 network,
                 ACTIVE_TIME,
                 &coin,
             ),
-            Err(ShakedexError::DenuoRegistryMismatch)
+            Err(ShakedexError::InvalidShakescapeEnvelope)
         ));
 
         let mut board = NameMarketBoard::default();
@@ -824,26 +828,27 @@ mod tests {
         assert!(!board.apply_offer(&discovered).expect("idempotent offer"));
         assert_eq!(board.active_inventory(ACTIVE_TIME).unwrap(), [listing_hash]);
 
-        let inventory_envelope = encode_denuo_inventory(
-            DenuoRegistryVersion::V2,
+        let inventory_envelope = encode_shakescape_inventory(
+            ShakescapeRegistryVersion::V1,
             78,
             &board.active_inventory(ACTIVE_TIME).unwrap(),
         )
         .expect("inventory envelope");
         assert_eq!(
-            decode_denuo_inventory(&inventory_envelope, DenuoRegistryVersion::V2)
+            decode_shakescape_inventory(&inventory_envelope, ShakescapeRegistryVersion::V1)
                 .expect("inventory"),
             (78, vec![listing_hash])
         );
         for request in [
-            DenuoNameMarketRequest::Inventory,
-            DenuoNameMarketRequest::Offers(vec![listing_hash]),
-            DenuoNameMarketRequest::Offer(listing_hash),
+            ShakescapeNameMarketRequest::Inventory,
+            ShakescapeNameMarketRequest::Offers(vec![listing_hash]),
+            ShakescapeNameMarketRequest::Offer(listing_hash),
         ] {
-            let encoded = encode_denuo_request(DenuoRegistryVersion::V2, 79, &request)
+            let encoded = encode_shakescape_request(ShakescapeRegistryVersion::V1, 79, &request)
                 .expect("request envelope");
             assert_eq!(
-                decode_denuo_request(&encoded, DenuoRegistryVersion::V2).expect("request envelope"),
+                decode_shakescape_request(&encoded, ShakescapeRegistryVersion::V1)
+                    .expect("request envelope"),
                 (79, request)
             );
         }
@@ -866,14 +871,17 @@ mod tests {
             ACTIVE_TIME + 2,
         )
         .expect("verified cancellation");
-        let cancellation_envelope =
-            encode_denuo_cancellation(DenuoRegistryVersion::V2, 80, &verified_cancellation)
-                .expect("cancellation envelope");
+        let cancellation_envelope = encode_shakescape_cancellation(
+            ShakescapeRegistryVersion::V1,
+            80,
+            &verified_cancellation,
+        )
+        .expect("cancellation envelope");
         let cancellation_hash = verified_cancellation.cancellation_hash();
         let (authenticated_request_id, authenticated_cancellation) =
-            decode_denuo_authenticated_cancellation(
+            decode_shakescape_authenticated_cancellation(
                 &cancellation_envelope,
-                DenuoRegistryVersion::V2,
+                ShakescapeRegistryVersion::V1,
                 listing_hash,
                 cancellation_hash,
             )
@@ -887,18 +895,18 @@ mod tests {
         assert_eq!(authenticated_cancellation.network(), network);
         assert_eq!(authenticated_cancellation.sequence(), 43);
         assert!(matches!(
-            decode_denuo_authenticated_cancellation(
+            decode_shakescape_authenticated_cancellation(
                 &cancellation_envelope,
-                DenuoRegistryVersion::V2,
+                ShakescapeRegistryVersion::V1,
                 ObjectHash::new([0x91; 32]),
                 cancellation_hash,
             ),
             Err(ShakedexError::InvalidCancellation)
         ));
         assert!(matches!(
-            decode_denuo_authenticated_cancellation(
+            decode_shakescape_authenticated_cancellation(
                 &cancellation_envelope,
-                DenuoRegistryVersion::V2,
+                ShakescapeRegistryVersion::V1,
                 listing_hash,
                 ObjectHash::new([0x92; 32]),
             ),
@@ -920,14 +928,14 @@ mod tests {
             persisted_offer.listing_hash,
         )
         .expect("restart listing authentication");
-        let (request_id, decoded_cancellation) = decode_denuo_cancellation(
+        let (request_id, decoded_cancellation) = decode_shakescape_cancellation(
             &cancellation_envelope,
-            DenuoRegistryVersion::V2,
+            ShakescapeRegistryVersion::V1,
             &persisted_listing,
             network,
             ACTIVE_TIME + 2,
         )
-        .expect("Denuo cancellation after restart");
+        .expect("Shakescape cancellation after restart");
         assert_eq!(request_id, 80);
         assert!(
             restarted

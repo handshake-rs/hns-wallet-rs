@@ -11,29 +11,30 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::direct_board::decode_canonical_envelope;
-use crate::{DenuoDirectOfferBoardPolicy, MarketError, load_denuo_direct_offer};
+use crate::{MarketError, ShakescapeDirectOfferBoardPolicy, load_shakescape_direct_offer};
 
-const DENUO_DIRECT_SWAP_SCHEMA_VERSION: u16 = 1;
-const DENUO_DIRECT_SWAP_POLICY_DOMAIN: &[u8] = b"hns-wallet-denuo-direct-swap-policy-v1\0";
-const DENUO_DIRECT_SWAP_RECORD_PREFIX: &[u8] = b"denuo-v2-direct-swap\0";
+const SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION: u16 = 1;
+const SHAKESCAPE_DIRECT_SWAP_POLICY_DOMAIN: &[u8] =
+    b"hns-wallet-shakescape-direct-swap-policy-v1\0";
+const SHAKESCAPE_DIRECT_SWAP_RECORD_PREFIX: &[u8] = b"shakescape-v2-direct-swap\0";
 
-pub const MAX_DENUO_DIRECT_SWAPS: usize = crate::MAX_CONCURRENT_SWAP_SESSIONS;
+pub const MAX_SHAKESCAPE_DIRECT_SWAPS: usize = crate::MAX_CONCURRENT_SWAP_SESSIONS;
 
 /// The direct-session policy has precisely one authority: the locally
 /// reconstructed HNS/BTC network binding. It contains no price inputs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DenuoDirectSwapPolicy {
-    board_policy: DenuoDirectOfferBoardPolicy,
+pub struct ShakescapeDirectSwapPolicy {
+    board_policy: ShakescapeDirectOfferBoardPolicy,
     fingerprint: ObjectHash,
 }
 
-impl DenuoDirectSwapPolicy {
-    pub fn new(board_policy: DenuoDirectOfferBoardPolicy) -> Result<Self, MarketError> {
+impl ShakescapeDirectSwapPolicy {
+    pub fn new(board_policy: ShakescapeDirectOfferBoardPolicy) -> Result<Self, MarketError> {
         if board_policy.pair() != MarketPair::HNS_BTC {
-            return Err(MarketError::InvalidDenuoDirectSwapPolicy);
+            return Err(MarketError::InvalidShakescapeDirectSwapPolicy);
         }
         let mut hasher = Sha256::new();
-        hasher.update(DENUO_DIRECT_SWAP_POLICY_DOMAIN);
+        hasher.update(SHAKESCAPE_DIRECT_SWAP_POLICY_DOMAIN);
         hasher.update(board_policy.fingerprint().as_bytes());
         Ok(Self {
             board_policy,
@@ -45,7 +46,7 @@ impl DenuoDirectSwapPolicy {
         self.board_policy.network()
     }
 
-    pub const fn board_policy(self) -> DenuoDirectOfferBoardPolicy {
+    pub const fn board_policy(self) -> ShakescapeDirectOfferBoardPolicy {
         self.board_policy
     }
 
@@ -55,14 +56,14 @@ impl DenuoDirectSwapPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DenuoDirectSwapStage {
+pub enum ShakescapeDirectSwapStage {
     TakeReceived,
     MakerProposed,
     Accepted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DenuoDirectSwapRecord {
+pub struct ShakescapeDirectSwapRecord {
     pub store_revision: u64,
     pub take_request_id: u64,
     pub proposal_request_id: Option<u64>,
@@ -77,23 +78,23 @@ pub struct DenuoDirectSwapRecord {
     pub first_chain_watch_ready: Option<SwapWatchReady>,
 }
 
-impl DenuoDirectSwapRecord {
-    pub fn stage(&self) -> DenuoDirectSwapStage {
+impl ShakescapeDirectSwapRecord {
+    pub fn stage(&self) -> ShakescapeDirectSwapStage {
         if self.hello.is_some() {
-            DenuoDirectSwapStage::Accepted
+            ShakescapeDirectSwapStage::Accepted
         } else if self.proposal.is_some() {
-            DenuoDirectSwapStage::MakerProposed
+            ShakescapeDirectSwapStage::MakerProposed
         } else {
-            DenuoDirectSwapStage::TakeReceived
+            ShakescapeDirectSwapStage::TakeReceived
         }
     }
 
-    pub fn snapshot(&self) -> DenuoDirectSwapSnapshot {
+    pub fn snapshot(&self) -> ShakescapeDirectSwapSnapshot {
         let terms = self
             .hello
             .as_ref()
             .or_else(|| self.proposal.as_ref().map(SwapSessionProposal::terms));
-        DenuoDirectSwapSnapshot {
+        ShakescapeDirectSwapSnapshot {
             store_revision: self.store_revision,
             stage: self.stage(),
             session_id: SessionId::new(self.take.swap_session_id),
@@ -117,9 +118,9 @@ impl DenuoDirectSwapRecord {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DenuoDirectSwapSnapshot {
+pub struct ShakescapeDirectSwapSnapshot {
     pub store_revision: u64,
-    pub stage: DenuoDirectSwapStage,
+    pub stage: ShakescapeDirectSwapStage,
     pub session_id: SessionId,
     pub offer_id: ObjectHash,
     pub take_request_id: u64,
@@ -135,14 +136,14 @@ pub struct DenuoDirectSwapSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DenuoDirectSwapAdmission {
-    Created(DenuoDirectSwapSnapshot),
-    Advanced(DenuoDirectSwapSnapshot),
-    Existing(DenuoDirectSwapSnapshot),
+pub enum ShakescapeDirectSwapAdmission {
+    Created(ShakescapeDirectSwapSnapshot),
+    Advanced(ShakescapeDirectSwapSnapshot),
+    Existing(ShakescapeDirectSwapSnapshot),
 }
 
-impl DenuoDirectSwapAdmission {
-    pub const fn snapshot(self) -> DenuoDirectSwapSnapshot {
+impl ShakescapeDirectSwapAdmission {
+    pub const fn snapshot(self) -> ShakescapeDirectSwapSnapshot {
         match self {
             Self::Created(snapshot) | Self::Advanced(snapshot) | Self::Existing(snapshot) => {
                 snapshot
@@ -154,14 +155,14 @@ impl DenuoDirectSwapAdmission {
 /// Signed peer status is coordination metadata only. Local HNS and Kyoto
 /// verification remains the authority for execution-state transitions.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DenuoDirectSwapPeerStatus {
+pub enum ShakescapeDirectSwapPeerStatus {
     Funding(SwapFundingStatus),
     Redeem(SwapRedeemStatus),
     Refund(SwapRefundStatus),
     WatchReady(SwapWatchReady),
 }
 
-impl DenuoDirectSwapPeerStatus {
+impl ShakescapeDirectSwapPeerStatus {
     pub const fn session_id(&self) -> SessionId {
         match self {
             Self::Funding(status) => SessionId::new(status.swap_session_id),
@@ -174,7 +175,7 @@ impl DenuoDirectSwapPeerStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PersistedDenuoDirectSwap {
+struct PersistedShakescapeDirectSwap {
     schema_version: u16,
     policy_fingerprint: ObjectHash,
     session_id: SessionId,
@@ -193,13 +194,13 @@ struct PersistedDenuoDirectSwap {
     first_chain_watch_ready_hex: Option<String>,
 }
 
-pub fn load_denuo_direct_swap(
+pub fn load_shakescape_direct_swap(
     store: &WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     session_id: SessionId,
-) -> Result<Option<DenuoDirectSwapRecord>, MarketError> {
+) -> Result<Option<ShakescapeDirectSwapRecord>, MarketError> {
     store
-        .load_entity::<PersistedDenuoDirectSwap>(
+        .load_entity::<PersistedShakescapeDirectSwap>(
             EntityKind::SwapSession,
             &record_id(policy, session_id),
         )?
@@ -207,17 +208,17 @@ pub fn load_denuo_direct_swap(
         .transpose()
 }
 
-pub fn load_denuo_direct_swaps(
+pub fn load_shakescape_direct_swaps(
     store: &WalletStore,
-    policy: &DenuoDirectSwapPolicy,
-) -> Result<Vec<DenuoDirectSwapRecord>, MarketError> {
-    let stored = store.list_entities_by_id_prefix::<PersistedDenuoDirectSwap>(
+    policy: &ShakescapeDirectSwapPolicy,
+) -> Result<Vec<ShakescapeDirectSwapRecord>, MarketError> {
+    let stored = store.list_entities_by_id_prefix::<PersistedShakescapeDirectSwap>(
         EntityKind::SwapSession,
         &record_prefix(policy),
-        MAX_DENUO_DIRECT_SWAPS + 1,
+        MAX_SHAKESCAPE_DIRECT_SWAPS + 1,
     )?;
-    if stored.len() > MAX_DENUO_DIRECT_SWAPS {
-        return Err(MarketError::DenuoDirectSwapCapacity);
+    if stored.len() > MAX_SHAKESCAPE_DIRECT_SWAPS {
+        return Err(MarketError::ShakescapeDirectSwapCapacity);
     }
     stored
         .into_iter()
@@ -228,38 +229,38 @@ pub fn load_denuo_direct_swaps(
 /// Freeze a locally retained direct offer and a taker's signed exact request.
 /// It performs no reservation, funding, or broadcast; the maker must still
 /// create the separately signed proposal with HTLC commitments.
-pub fn admit_denuo_direct_offer_take(
+pub fn admit_shakescape_direct_offer_take(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     envelope_bytes: &[u8],
     accepted_at_unix: u64,
-) -> Result<DenuoDirectSwapAdmission, MarketError> {
+) -> Result<ShakescapeDirectSwapAdmission, MarketError> {
     let (request_id, message) = decode_canonical_envelope(envelope_bytes)?;
     let CrossChainMessage::TakeDirectOffer(take) = message else {
-        return Err(MarketError::InvalidDenuoDirectSwap);
+        return Err(MarketError::InvalidShakescapeDirectSwap);
     };
-    let offer = load_denuo_direct_offer(store, &policy.board_policy(), take.offer_id)?
-        .ok_or(MarketError::UnknownDenuoDirectOffer)?;
+    let offer = load_shakescape_direct_offer(store, &policy.board_policy(), take.offer_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectOffer)?;
     if !offer.is_active_at(accepted_at_unix) {
-        return Err(MarketError::InvalidDenuoDirectSwap);
+        return Err(MarketError::InvalidShakescapeDirectSwap);
     }
     take.verify_for_offer(&offer.offer, policy.network(), accepted_at_unix)
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let session_id = SessionId::new(take.swap_session_id);
-    if let Some(existing) = load_denuo_direct_swap(store, policy, session_id)? {
+    if let Some(existing) = load_shakescape_direct_swap(store, policy, session_id)? {
         if existing.take_request_id == request_id
             && existing.offer == offer.offer
             && existing.take == take
         {
-            return Ok(DenuoDirectSwapAdmission::Existing(existing.snapshot()));
+            return Ok(ShakescapeDirectSwapAdmission::Existing(existing.snapshot()));
         }
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
-    if load_denuo_direct_swaps(store, policy)?.len() >= MAX_DENUO_DIRECT_SWAPS {
-        return Err(MarketError::DenuoDirectSwapCapacity);
+    if load_shakescape_direct_swaps(store, policy)?.len() >= MAX_SHAKESCAPE_DIRECT_SWAPS {
+        return Err(MarketError::ShakescapeDirectSwapCapacity);
     }
-    let persisted = PersistedDenuoDirectSwap {
-        schema_version: DENUO_DIRECT_SWAP_SCHEMA_VERSION,
+    let persisted = PersistedShakescapeDirectSwap {
+        schema_version: SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION,
         policy_fingerprint: policy.fingerprint(),
         session_id,
         take_request_id: request_id,
@@ -281,7 +282,7 @@ pub fn admit_denuo_direct_offer_take(
         &persisted,
         accepted_at_unix,
     )?;
-    let record = DenuoDirectSwapRecord {
+    let record = ShakescapeDirectSwapRecord {
         store_revision: revision,
         take_request_id: request_id,
         proposal_request_id: None,
@@ -295,27 +296,27 @@ pub fn admit_denuo_direct_offer_take(
         watch_ready_accepted_at_unix: None,
         first_chain_watch_ready: None,
     };
-    Ok(DenuoDirectSwapAdmission::Created(record.snapshot()))
+    Ok(ShakescapeDirectSwapAdmission::Created(record.snapshot()))
 }
 
-pub fn admit_denuo_direct_swap_proposal(
+pub fn admit_shakescape_direct_swap_proposal(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     envelope_bytes: &[u8],
     accepted_at_unix: u64,
-) -> Result<DenuoDirectSwapAdmission, MarketError> {
+) -> Result<ShakescapeDirectSwapAdmission, MarketError> {
     let (request_id, message) = decode_canonical_envelope(envelope_bytes)?;
     let CrossChainMessage::SwapSessionProposal(proposal) = message else {
-        return Err(MarketError::InvalidDenuoDirectSwap);
+        return Err(MarketError::InvalidShakescapeDirectSwap);
     };
     let session_id = SessionId::new(proposal.terms().swap_session_id);
-    let mut record = load_denuo_direct_swap(store, policy, session_id)?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+    let mut record = load_shakescape_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     if let Some(existing) = &record.proposal {
         if record.proposal_request_id == Some(request_id) && existing == &proposal {
-            return Ok(DenuoDirectSwapAdmission::Existing(record.snapshot()));
+            return Ok(ShakescapeDirectSwapAdmission::Existing(record.snapshot()));
         }
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     proposal
         .verify_for_direct_offer(
@@ -324,7 +325,7 @@ pub fn admit_denuo_direct_swap_proposal(
             policy.network(),
             accepted_at_unix,
         )
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let mut persisted = encode_persisted(policy, &record)?;
     persisted.proposal_request_id = Some(request_id);
     persisted.proposal_accepted_at_unix = Some(accepted_at_unix);
@@ -340,30 +341,30 @@ pub fn admit_denuo_direct_swap_proposal(
     record.proposal_request_id = Some(request_id);
     record.proposal_accepted_at_unix = Some(accepted_at_unix);
     record.proposal = Some(proposal);
-    Ok(DenuoDirectSwapAdmission::Advanced(record.snapshot()))
+    Ok(ShakescapeDirectSwapAdmission::Advanced(record.snapshot()))
 }
 
-pub fn admit_denuo_direct_swap_hello(
+pub fn admit_shakescape_direct_swap_hello(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     envelope_bytes: &[u8],
     accepted_at_unix: u64,
-) -> Result<DenuoDirectSwapAdmission, MarketError> {
+) -> Result<ShakescapeDirectSwapAdmission, MarketError> {
     let (request_id, message) = decode_canonical_envelope(envelope_bytes)?;
     let CrossChainMessage::SwapSessionHello(hello) = message else {
-        return Err(MarketError::InvalidDenuoDirectSwap);
+        return Err(MarketError::InvalidShakescapeDirectSwap);
     };
     let session_id = SessionId::new(hello.swap_session_id);
-    let mut record = load_denuo_direct_swap(store, policy, session_id)?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+    let mut record = load_shakescape_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     if record.proposal_request_id != Some(request_id) {
-        return Err(MarketError::InvalidDenuoDirectSwap);
+        return Err(MarketError::InvalidShakescapeDirectSwap);
     }
     if let Some(existing) = &record.hello {
         if existing == &hello {
-            return Ok(DenuoDirectSwapAdmission::Existing(record.snapshot()));
+            return Ok(ShakescapeDirectSwapAdmission::Existing(record.snapshot()));
         }
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     hello
         .verify_for_direct_offer(
@@ -372,15 +373,15 @@ pub fn admit_denuo_direct_swap_hello(
             policy.network(),
             accepted_at_unix,
         )
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)?;
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let proposal = record
         .proposal
         .as_ref()
-        .ok_or(MarketError::InvalidDenuoDirectSwap)?;
+        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
     let mut maker_terms = hello.clone();
     maker_terms.taker_signature = [0; 64];
     if proposal.terms() != &maker_terms {
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     let mut persisted = encode_persisted(policy, &record)?;
     persisted.hello_accepted_at_unix = Some(accepted_at_unix);
@@ -395,40 +396,40 @@ pub fn admit_denuo_direct_swap_hello(
     record.store_revision = next_revision;
     record.hello_accepted_at_unix = Some(accepted_at_unix);
     record.hello = Some(hello);
-    Ok(DenuoDirectSwapAdmission::Advanced(record.snapshot()))
+    Ok(ShakescapeDirectSwapAdmission::Advanced(record.snapshot()))
 }
 
 /// Authenticate and durably retain the receiver's acknowledgement that the
 /// exact first-chain HTLC watch is installed. Replays of the identical
 /// canonical message are idempotent; conflicting acknowledgements fail.
-pub fn admit_denuo_direct_swap_watch_ready(
+pub fn admit_shakescape_direct_swap_watch_ready(
     store: &mut WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     envelope_bytes: &[u8],
     accepted_at_unix: u64,
-) -> Result<DenuoDirectSwapAdmission, MarketError> {
+) -> Result<ShakescapeDirectSwapAdmission, MarketError> {
     let (_, message) = decode_canonical_envelope(envelope_bytes)?;
     let CrossChainMessage::SwapWatchReady(ready) = message else {
-        return Err(MarketError::InvalidDenuoPeerMessage);
+        return Err(MarketError::InvalidShakescapePeerMessage);
     };
     let session_id = SessionId::new(ready.swap_session_id);
-    let mut record = load_denuo_direct_swap(store, policy, session_id)?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+    let mut record = load_shakescape_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     let hello = record
         .hello
         .as_ref()
-        .ok_or(MarketError::InvalidDenuoDirectSwap)?;
+        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
     if ready.chain != hello.first_funding_chain {
-        return Err(MarketError::InvalidDenuoPeerMessage);
+        return Err(MarketError::InvalidShakescapePeerMessage);
     }
     ready
         .verify_for_session(hello, policy.network(), accepted_at_unix)
-        .map_err(|_| MarketError::InvalidDenuoPeerMessage)?;
+        .map_err(|_| MarketError::InvalidShakescapePeerMessage)?;
     if let Some(existing) = &record.first_chain_watch_ready {
         if existing == &ready {
-            return Ok(DenuoDirectSwapAdmission::Existing(record.snapshot()));
+            return Ok(ShakescapeDirectSwapAdmission::Existing(record.snapshot()));
         }
-        return Err(MarketError::DenuoDirectSwapConflict);
+        return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     let mut persisted = encode_persisted(policy, &record)?;
     persisted.watch_ready_accepted_at_unix = Some(accepted_at_unix);
@@ -443,53 +444,61 @@ pub fn admit_denuo_direct_swap_watch_ready(
     record.store_revision = next_revision;
     record.watch_ready_accepted_at_unix = Some(accepted_at_unix);
     record.first_chain_watch_ready = Some(ready);
-    Ok(DenuoDirectSwapAdmission::Advanced(record.snapshot()))
+    Ok(ShakescapeDirectSwapAdmission::Advanced(record.snapshot()))
 }
 
-pub fn validate_denuo_direct_swap_peer_status(
+pub fn validate_shakescape_direct_swap_peer_status(
     store: &WalletStore,
-    policy: &DenuoDirectSwapPolicy,
+    policy: &ShakescapeDirectSwapPolicy,
     envelope_bytes: &[u8],
     now_unix: u64,
-) -> Result<DenuoDirectSwapPeerStatus, MarketError> {
+) -> Result<ShakescapeDirectSwapPeerStatus, MarketError> {
     let (_, message) = decode_canonical_envelope(envelope_bytes)?;
     let status = match message {
-        CrossChainMessage::SwapFundingStatus(status) => DenuoDirectSwapPeerStatus::Funding(status),
-        CrossChainMessage::SwapRedeemStatus(status) => DenuoDirectSwapPeerStatus::Redeem(status),
-        CrossChainMessage::SwapRefundStatus(status) => DenuoDirectSwapPeerStatus::Refund(status),
-        CrossChainMessage::SwapWatchReady(status) => DenuoDirectSwapPeerStatus::WatchReady(status),
-        _ => return Err(MarketError::InvalidDenuoPeerMessage),
+        CrossChainMessage::SwapFundingStatus(status) => {
+            ShakescapeDirectSwapPeerStatus::Funding(status)
+        }
+        CrossChainMessage::SwapRedeemStatus(status) => {
+            ShakescapeDirectSwapPeerStatus::Redeem(status)
+        }
+        CrossChainMessage::SwapRefundStatus(status) => {
+            ShakescapeDirectSwapPeerStatus::Refund(status)
+        }
+        CrossChainMessage::SwapWatchReady(status) => {
+            ShakescapeDirectSwapPeerStatus::WatchReady(status)
+        }
+        _ => return Err(MarketError::InvalidShakescapePeerMessage),
     };
-    let record = load_denuo_direct_swap(store, policy, status.session_id())?
-        .ok_or(MarketError::UnknownDenuoDirectSwap)?;
+    let record = load_shakescape_direct_swap(store, policy, status.session_id())?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     let hello = record
         .hello
         .as_ref()
-        .ok_or(MarketError::InvalidDenuoDirectSwap)?;
+        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
     match &status {
-        DenuoDirectSwapPeerStatus::Funding(status) => {
+        ShakescapeDirectSwapPeerStatus::Funding(status) => {
             status.verify_for_session(hello, policy.network(), now_unix)
         }
-        DenuoDirectSwapPeerStatus::Redeem(status) => {
+        ShakescapeDirectSwapPeerStatus::Redeem(status) => {
             status.verify_for_session(hello, policy.network(), now_unix)
         }
-        DenuoDirectSwapPeerStatus::Refund(status) => {
+        ShakescapeDirectSwapPeerStatus::Refund(status) => {
             status.verify_for_session(hello, policy.network(), now_unix)
         }
-        DenuoDirectSwapPeerStatus::WatchReady(status) => {
+        ShakescapeDirectSwapPeerStatus::WatchReady(status) => {
             status.verify_for_session(hello, policy.network(), now_unix)
         }
     }
-    .map_err(|_| MarketError::InvalidDenuoPeerMessage)?;
+    .map_err(|_| MarketError::InvalidShakescapePeerMessage)?;
     Ok(status)
 }
 
 fn decode_stored_swap(
-    policy: &DenuoDirectSwapPolicy,
-    stored: StoredEntity<PersistedDenuoDirectSwap>,
-) -> Result<DenuoDirectSwapRecord, MarketError> {
+    policy: &ShakescapeDirectSwapPolicy,
+    stored: StoredEntity<PersistedShakescapeDirectSwap>,
+) -> Result<ShakescapeDirectSwapRecord, MarketError> {
     let value = stored.value;
-    if value.schema_version != DENUO_DIRECT_SWAP_SCHEMA_VERSION
+    if value.schema_version != SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION
         || value.policy_fingerprint != policy.fingerprint()
         || value.take_request_id == 0
         || value.proposal_request_id == Some(0)
@@ -502,7 +511,7 @@ fn decode_stored_swap(
             != value.first_chain_watch_ready_hex.is_some()
         || value.first_chain_watch_ready_hex.is_some() && value.hello_hex.is_none()
     {
-        return Err(MarketError::CorruptDenuoDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwap);
     }
     let offer = decode_hex::<DirectOffer>(&value.offer_hex)?;
     let take = decode_hex::<DirectOfferTake>(&value.take_hex)?;
@@ -511,7 +520,7 @@ fn decode_stored_swap(
             .verify_for_offer(&offer, policy.network(), value.take_accepted_at_unix)
             .is_err()
     {
-        return Err(MarketError::CorruptDenuoDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwap);
     }
     let proposal = value.proposal_hex.as_deref().map(decode_hex).transpose()?;
     let hello = value.hello_hex.as_deref().map(decode_hex).transpose()?;
@@ -520,7 +529,7 @@ fn decode_stored_swap(
         .as_deref()
         .map(decode_hex)
         .transpose()?;
-    let record = DenuoDirectSwapRecord {
+    let record = ShakescapeDirectSwapRecord {
         store_revision: stored.revision,
         take_request_id: value.take_request_id,
         proposal_request_id: value.proposal_request_id,
@@ -537,20 +546,20 @@ fn decode_stored_swap(
     if let (Some(proposal), Some(at)) = (&record.proposal, record.proposal_accepted_at_unix) {
         proposal
             .verify_for_direct_offer(&record.offer, &record.take, policy.network(), at)
-            .map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
+            .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
     }
     if let (Some(hello), Some(at)) = (&record.hello, record.hello_accepted_at_unix) {
         hello
             .verify_for_direct_offer(&record.offer, &record.take, policy.network(), at)
-            .map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
+            .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
         let proposal = record
             .proposal
             .as_ref()
-            .ok_or(MarketError::CorruptDenuoDirectSwap)?;
+            .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
         let mut maker_terms = hello.clone();
         maker_terms.taker_signature = [0; 64];
         if proposal.terms() != &maker_terms {
-            return Err(MarketError::CorruptDenuoDirectSwap);
+            return Err(MarketError::CorruptShakescapeDirectSwap);
         }
     }
     if let (Some(ready), Some(at), Some(hello)) = (
@@ -562,22 +571,22 @@ fn decode_stored_swap(
             .verify_for_session(hello, policy.network(), at)
             .is_err())
     {
-        return Err(MarketError::CorruptDenuoDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwap);
     }
     if stored.updated_at_unix != record.snapshot().last_accepted_at_unix
         || !timestamps_monotonic(&record)
     {
-        return Err(MarketError::CorruptDenuoDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwap);
     }
     Ok(record)
 }
 
 fn encode_persisted(
-    policy: &DenuoDirectSwapPolicy,
-    record: &DenuoDirectSwapRecord,
-) -> Result<PersistedDenuoDirectSwap, MarketError> {
-    Ok(PersistedDenuoDirectSwap {
-        schema_version: DENUO_DIRECT_SWAP_SCHEMA_VERSION,
+    policy: &ShakescapeDirectSwapPolicy,
+    record: &ShakescapeDirectSwapRecord,
+) -> Result<PersistedShakescapeDirectSwap, MarketError> {
+    Ok(PersistedShakescapeDirectSwap {
+        schema_version: SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION,
         policy_fingerprint: policy.fingerprint(),
         session_id: SessionId::new(record.take.swap_session_id),
         take_request_id: record.take_request_id,
@@ -598,7 +607,7 @@ fn encode_persisted(
     })
 }
 
-fn timestamps_monotonic(record: &DenuoDirectSwapRecord) -> bool {
+fn timestamps_monotonic(record: &ShakescapeDirectSwapRecord) -> bool {
     [
         Some(record.take_accepted_at_unix),
         record.proposal_accepted_at_unix,
@@ -645,29 +654,30 @@ fn encode_hex<T: CanonicalDirectObject>(value: &T) -> Result<String, MarketError
     value
         .encode_canonical()
         .map(hex::encode)
-        .map_err(|_| MarketError::InvalidDenuoDirectSwap)
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)
 }
 
 fn decode_hex<T: CanonicalDirectObject>(encoded: &str) -> Result<T, MarketError> {
-    let bytes = hex::decode(encoded).map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
+    let bytes = hex::decode(encoded).map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
     if hex::encode(&bytes) != encoded {
-        return Err(MarketError::CorruptDenuoDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwap);
     }
-    let value = T::decode_canonical(&bytes).map_err(|_| MarketError::CorruptDenuoDirectSwap)?;
+    let value =
+        T::decode_canonical(&bytes).map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
     if value.encode_canonical().ok().as_deref() != Some(bytes.as_slice()) {
-        return Err(MarketError::CorruptDenuoDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwap);
     }
     Ok(value)
 }
 
-fn record_prefix(policy: &DenuoDirectSwapPolicy) -> Vec<u8> {
-    let mut id = Vec::with_capacity(DENUO_DIRECT_SWAP_RECORD_PREFIX.len() + 32);
-    id.extend_from_slice(DENUO_DIRECT_SWAP_RECORD_PREFIX);
+fn record_prefix(policy: &ShakescapeDirectSwapPolicy) -> Vec<u8> {
+    let mut id = Vec::with_capacity(SHAKESCAPE_DIRECT_SWAP_RECORD_PREFIX.len() + 32);
+    id.extend_from_slice(SHAKESCAPE_DIRECT_SWAP_RECORD_PREFIX);
     id.extend_from_slice(policy.fingerprint().as_bytes());
     id
 }
 
-fn record_id(policy: &DenuoDirectSwapPolicy, session_id: SessionId) -> Vec<u8> {
+fn record_id(policy: &ShakescapeDirectSwapPolicy, session_id: SessionId) -> Vec<u8> {
     let mut id = record_prefix(policy);
     id.extend_from_slice(session_id.as_bytes());
     id

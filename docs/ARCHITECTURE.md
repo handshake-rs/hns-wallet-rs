@@ -17,8 +17,8 @@ hostile website
 ```
 
 Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
-proofs, signed fixed-price listings/cancellations, Denuo name-market envelopes,
-and Denuo V2 direct HNS/BTC offer/session envelopes remain in `hns-rs`. This
+proofs, signed fixed-price listings/cancellations, Shakescape name-market envelopes,
+and Shakescape V1 direct HNS/BTC offer/session envelopes remain in `hns-rs`. This
 workspace consumes the required protocol crates as exact published registry
 `hns-rs` `0.3.1`, whose reviewed release source is
 `0e99addca59778b7b7c6fc56291333a97c4c8815`. The full 19-crate archive cohort is
@@ -29,7 +29,7 @@ dependencies similarly use published registry `hns-dane-engine` `0.2.2` source
 verification, encrypted replay/tombstone board state, direct-offer cancellation
 state, and a direct-session journal.
 Node indexes
-and Denuo relay stores remain in `hns-node-rs`. Provider-injection authority
+and Shakescape relay stores remain in `hns-node-rs`. Provider-injection authority
 remains in `hns-dane-engine`. Browser JavaScript and platform UI remain in the
 browser repositories. This workspace owns keys, encrypted local state, wallet
 semantics, approvals, typed canonical transaction planning, and recoverable
@@ -46,9 +46,9 @@ relay, live-chain, quote, value, or release-gate authority.
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
 | `hns-wallet-hns` | exact-existing-account selector, synchronized non-value account-read runtime, purpose-minimized board account/network/time context with a complete `WalletAccount` prefix lease captured before external work, refreshed in the related board snapshot, and consumable as an atomic write guard, read-only non-atomic unchanged-account diagnostics, HNS key roles, protected Shakedex seller-key allocation and purpose-bound signing, store-global lock-source plus account funding reservations, runtime-owned Shakedex time/chain observations, shared three-branch restoration/reconciliation, snapshot MTP, address/coin/name evidence and workflows | canonical encodings or market terms |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
-| `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact two-phase listing/cancellation protocol verification, runtime-bound negative cancellation admission, canonical fulfillment/recovery/script-FINALIZE planning, encrypted parent-plan CAS, durable buyer-fulfillment/seller-recovery/seller-script-FINALIZE value aggregate, canonical Denuo adapter, encrypted `HeadV2Indexed` with compact identity/revision/time/value-commitment/listing-hash selectors, digest-addressed identity rows and encrypted listing-hash indexes, full-load commitments and index/row bijection, board-namespace plus account-guard mutation leases, strict legacy-v1 and pre-index `HeadV2` migration, O(N) metadata for every targeted read, O(K) value authentication only for all-hit queries, and O(N) semantic fallback for any miss, bounded encrypted offline publication outbox with persist-before-return single-flight handoff recovery | proof/listing/Denuo codecs, raw HNS keys, product coin selection, network/relay transport, remote acceptance, caller-asserted clock/chain truth, or release qualification |
+| `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact two-phase listing/cancellation protocol verification, runtime-bound negative cancellation admission, canonical fulfillment/recovery/script-FINALIZE planning, encrypted parent-plan CAS, durable buyer-fulfillment/seller-recovery/seller-script-FINALIZE value aggregate, canonical Shakescape adapter, encrypted `HeadV2Indexed` with compact identity/revision/time/value-commitment/listing-hash selectors, digest-addressed identity rows and encrypted listing-hash indexes, full-load commitments and index/row bijection, board-namespace plus account-guard mutation leases, strict legacy-v1 and pre-index `HeadV2` migration, O(N) metadata for every targeted read, O(K) value authentication only for all-hit queries, and O(N) semantic fallback for any miss, bounded encrypted offline publication outbox with persist-before-return single-flight handoff recovery | proof/listing/Shakescape codecs, raw HNS keys, product coin selection, network/relay transport, remote acceptance, caller-asserted clock/chain truth, or release qualification |
 | `hns-wallet-market` | durable exact HNS/BTC direct offers, cancellations, live-level aggregation, and evidence-driven cross-chain sessions | chain networking, reporter governance, relay transport, rate/oracle policy, live chain evidence, quote/value authority, or release qualification |
-| `hns-wallet-mobile` | platform-neutral lifecycle, synchronized-read, and trusted-native value controllers over one exact shared store; atomic single-HNS-account bootstrap, private ABI-v2 lifecycle controls, minimized read/name projections, closed process-local HNS value approvals, wallet-peer Shakedex board operations, and a direct-peer façade that binds its chain/Denuo connection, header, scan, mempool, restore, and listener-admission times to the value runtime | raw platform keys, a concrete device backend, generated JNI/C/Kotlin/Swift bindings, WebView/provider entry points, generic provider JSON, or product transport orchestration |
+| `hns-wallet-mobile` | platform-neutral lifecycle, synchronized-read, and trusted-native value controllers over one exact shared store; atomic single-HNS-account bootstrap, private ABI-v2 lifecycle controls, minimized read/name projections, closed process-local HNS value approvals, wallet-peer Shakedex board operations, and a direct-peer façade that binds its chain/Shakescape connection, header, scan, mempool, restore, and listener-admission times to the value runtime | raw platform keys, a concrete device backend, generated JNI/C/Kotlin/Swift bindings, WebView/provider entry points, generic provider JSON, or product transport orchestration |
 | `hns-wallet-bitcoin-kyoto` | BDK descriptor wallet, domain-separated swap keys, bounded Kyoto P2P supervisor/recovery journal, Bitcoin HTLC | alternate backends or claims of unavailable Kyoto persistence |
 | `hns-wallet-ethereum` | offline native-ETH account derivation and release-gated Helios/HTLC policy | general Ethereum provider or caller-asserted proof authority |
 | `hns-wallet-ffi` | strict ABI v2 framing, canonical service IDs, typed approvals/events, and the closed exact HNS read-operations-v1 marker | raw keys/native commands or engine authority objects |
@@ -73,7 +73,7 @@ integration.
 
 ## Evidence authority
 
-Peer statements, Denuo gossip, RPC status fields, and browser page messages are
+Peer statements, Shakescape gossip, RPC status fields, and browser page messages are
 hints. A safety-critical transition requires evidence from the corresponding
 validated chain adapter. State machines accept explicit verified-evidence
 variants and persist a compare-and-swap revision before the enclosing runtime
@@ -132,7 +132,7 @@ never become capability. The public core wrapper exposes only exact account
 selection and the synchronized projection. At the service boundary a distinct
 profile-backed recovery runtime admits the same six wallet reads and advertises
 no wallet-authority-context marker, provider dispatch, persistent permissions,
-value, browser, Shakedex-lock, Denuo, signing, workflow, import/export, or
+value, browser, Shakedex-lock, Shakescape, signing, workflow, import/export, or
 lifecycle authority. It cannot
 provision missing state; exact account/profile/revision fences and the ordinary
 chain/mempool checks still apply. Ordinary and full constructors continue to
@@ -291,7 +291,7 @@ confirmation rolls back to `RequiresRebroadcast`, and an `Authorized` row can
 recover if its exact bytes were observed outside the recorded submit path.
 Persisted quote bindings are historical evidence only, and no caller-authored
 clock or chain status restores authority after restart. Product coin selection,
-live Denuo/provider/trusted-UI integration, and full
+live Shakescape/provider/trusted-UI integration, and full
 restart/reorg/regtest qualification remain pending. All Shakedex and dependent
 HNS Shakedex-funding/value/fee source gates are enabled. Preparation,
 authorization, and submission still require their complete fresh-evidence,

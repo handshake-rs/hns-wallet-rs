@@ -1,48 +1,49 @@
 use std::collections::BTreeSet;
 
-use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketMessage};
+use hns_marketplace_protocol::{NameMarketMessage, ShakescapeRegistryVersion};
 use hns_wallet_hns::{
-    DenuoPublicationHandoff, DenuoTransportEvent, DenuoTransportMessageKind,
-    DenuoTransportSnapshotRecord, HnsBackend, HnsClock, HnsWalletRuntime,
-    MAX_DENUO_NAME_MARKET_TRANSPORT_PAGE,
+    HnsBackend, HnsClock, HnsWalletRuntime, MAX_SHAKESCAPE_NAME_MARKET_TRANSPORT_PAGE,
+    ShakescapePublicationHandoff, ShakescapeTransportEvent, ShakescapeTransportMessageKind,
+    ShakescapeTransportSnapshotRecord,
 };
 use hns_wallet_store::{SharedWalletStore, WalletStore};
 use hns_wallet_types::ObjectHash;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::outbox::{DenuoAcceptedReplay, accepted_denuo_replays};
+use crate::outbox::{ShakescapeAcceptedReplay, accepted_shakescape_replays};
 use crate::{
-    DenuoBoardRuntime, DenuoHandoffPreparation, DenuoOutboxMessageKind,
-    DenuoPublicationAcceptancePolicy, ShakedexError, load_denuo_publication_outbox,
-    prepare_next_denuo_handoff, record_denuo_handoff_acceptance, record_denuo_handoff_failure,
+    ShakedexError, ShakescapeBoardRuntime, ShakescapeHandoffPreparation,
+    ShakescapeOutboxMessageKind, ShakescapePublicationAcceptancePolicy,
+    load_shakescape_publication_outbox, prepare_next_shakescape_handoff,
+    record_shakescape_handoff_acceptance, record_shakescape_handoff_failure,
 };
 
-const DENUO_TRANSPORT_CURSOR_SCHEMA_VERSION: u16 = 1;
-const DENUO_TRANSPORT_CURSOR_RECORD_ID: &[u8] = b"canonical-name-market-transport-cursor-v1";
-const DENUO_PUBLICATION_RETRY_SECONDS: u64 = 5;
-const MAX_DENUO_PUBLICATIONS_PER_SYNC: usize = 64;
-const MAX_DENUO_EVENT_PAGES_PER_SYNC: usize = 32;
-const MAX_DENUO_SNAPSHOT_RECORDS: usize = crate::MAX_NAME_MARKET_BOARD_OFFERS;
-const DENUO_OUTBOX_ENVELOPE_ID_DOMAIN: &[u8] = b"hns-wallet-denuo-outbox-envelope-v1\0";
+const SHAKESCAPE_TRANSPORT_CURSOR_SCHEMA_VERSION: u16 = 1;
+const SHAKESCAPE_TRANSPORT_CURSOR_RECORD_ID: &[u8] = b"canonical-name-market-transport-cursor-v1";
+const SHAKESCAPE_PUBLICATION_RETRY_SECONDS: u64 = 5;
+const MAX_SHAKESCAPE_PUBLICATIONS_PER_SYNC: usize = 64;
+const MAX_SHAKESCAPE_EVENT_PAGES_PER_SYNC: usize = 32;
+const MAX_SHAKESCAPE_SNAPSHOT_RECORDS: usize = crate::MAX_NAME_MARKET_BOARD_OFFERS;
+const SHAKESCAPE_OUTBOX_ENVELOPE_ID_DOMAIN: &[u8] = b"hns-wallet-shakescape-outbox-envelope-v1\0";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PersistedDenuoTransportCursor {
+struct PersistedShakescapeTransportCursor {
     schema_version: u16,
     instance_nonce: [u8; 32],
     relay_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DenuoTransportCursorSnapshot {
+pub struct ShakescapeTransportCursorSnapshot {
     pub store_revision: u64,
     pub instance_nonce: [u8; 32],
     pub relay_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DenuoTransportSyncReport {
+pub struct ShakescapeTransportSyncReport {
     pub publications_accepted: usize,
     pub publication_failures: usize,
     pub accepted_publications_replayed: usize,
@@ -51,40 +52,40 @@ pub struct DenuoTransportSyncReport {
     pub marketplace_records_rejected: usize,
     pub event_pages_consumed: usize,
     pub snapshot_rebuilt: bool,
-    pub cursor: Option<DenuoTransportCursorSnapshot>,
+    pub cursor: Option<ShakescapeTransportCursorSnapshot>,
 }
 
 /// Same-store controller joining the durable publication outbox, authenticated
 /// local node transport, process-bound event cursor, and canonical board.
-pub struct DenuoTransportRuntime<'a, B, C> {
+pub struct ShakescapeTransportRuntime<'a, B, C> {
     hns: &'a HnsWalletRuntime<B, C>,
-    board: DenuoBoardRuntime<'a, B, C>,
+    board: ShakescapeBoardRuntime<'a, B, C>,
     store: SharedWalletStore,
-    acceptance_policy: DenuoPublicationAcceptancePolicy,
+    acceptance_policy: ShakescapePublicationAcceptancePolicy,
 }
 
-impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
+impl<'a, B: HnsBackend, C: HnsClock> ShakescapeTransportRuntime<'a, B, C> {
     pub fn new(
         hns: &'a HnsWalletRuntime<B, C>,
         store: SharedWalletStore,
-        acceptance_policy: DenuoPublicationAcceptancePolicy,
+        acceptance_policy: ShakescapePublicationAcceptancePolicy,
     ) -> Result<Self, ShakedexError> {
         if !hns.shares_store_authority(&store) {
             return Err(ShakedexError::StoreAuthorityMismatch);
         }
         if acceptance_policy.network() != hns.shakedex_network()? {
-            return Err(ShakedexError::InvalidDenuoPublicationAcceptancePolicy);
+            return Err(ShakedexError::InvalidShakescapePublicationAcceptancePolicy);
         }
         Ok(Self {
             hns,
-            board: DenuoBoardRuntime::new_value(hns, store.clone())?,
+            board: ShakescapeBoardRuntime::new_value(hns, store.clone())?,
             store,
             acceptance_policy,
         })
     }
 
-    pub fn sync(&self) -> Result<DenuoTransportSyncReport, ShakedexError> {
-        let mut report = DenuoTransportSyncReport::default();
+    pub fn sync(&self) -> Result<ShakescapeTransportSyncReport, ShakedexError> {
+        let mut report = ShakescapeTransportSyncReport::default();
         self.pump_publications(&mut report)?;
         self.consume_marketplace(&mut report)?;
         report.cursor = self.store.try_with_store(load_transport_cursor)?;
@@ -93,31 +94,31 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
 
     fn pump_publications(
         &self,
-        report: &mut DenuoTransportSyncReport,
+        report: &mut ShakescapeTransportSyncReport,
     ) -> Result<(), ShakedexError> {
-        for _ in 0..MAX_DENUO_PUBLICATIONS_PER_SYNC {
+        for _ in 0..MAX_SHAKESCAPE_PUBLICATIONS_PER_SYNC {
             let now = self.hns.trusted_now_unix()?;
             let revision = self
                 .store
-                .try_with_store(load_denuo_publication_outbox)?
+                .try_with_store(load_shakescape_publication_outbox)?
                 .revision;
-            let preparation = self
-                .store
-                .try_with_store_mut(|store| prepare_next_denuo_handoff(store, revision, now))?;
+            let preparation = self.store.try_with_store_mut(|store| {
+                prepare_next_shakescape_handoff(store, revision, now)
+            })?;
             let handoff = match preparation {
-                DenuoHandoffPreparation::NoDue { .. } => return Ok(()),
-                DenuoHandoffPreparation::Prepared(handoff)
-                | DenuoHandoffPreparation::Existing(handoff) => handoff,
+                ShakescapeHandoffPreparation::NoDue { .. } => return Ok(()),
+                ShakescapeHandoffPreparation::Prepared(handoff)
+                | ShakescapeHandoffPreparation::Existing(handoff) => handoff,
             };
             let request = handoff_request(&handoff)?;
             match self
                 .hns
                 .backend()
-                .publish_denuo_name_market(handoff.envelope_bytes(), request)
+                .publish_shakescape_name_market(handoff.envelope_bytes(), request)
             {
                 Ok(acceptance) => {
                     self.store.try_with_store_mut(|store| {
-                        record_denuo_handoff_acceptance(
+                        record_shakescape_handoff_acceptance(
                             store,
                             &handoff,
                             &self.acceptance_policy,
@@ -130,10 +131,10 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
                 Err(_) => {
                     let failed_at = self.hns.trusted_now_unix()?.max(handoff.prepared_at_unix());
                     let next_attempt = failed_at
-                        .checked_add(DENUO_PUBLICATION_RETRY_SECONDS)
+                        .checked_add(SHAKESCAPE_PUBLICATION_RETRY_SECONDS)
                         .ok_or(ShakedexError::Invariant)?;
                     self.store.try_with_store_mut(|store| {
-                        record_denuo_handoff_failure(store, handoff, failed_at, next_attempt)
+                        record_shakescape_handoff_failure(store, handoff, failed_at, next_attempt)
                     })?;
                     report.publication_failures += 1;
                     return Ok(());
@@ -145,15 +146,15 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
 
     fn consume_marketplace(
         &self,
-        report: &mut DenuoTransportSyncReport,
+        report: &mut ShakescapeTransportSyncReport,
     ) -> Result<(), ShakedexError> {
-        for _ in 0..MAX_DENUO_EVENT_PAGES_PER_SYNC {
+        for _ in 0..MAX_SHAKESCAPE_EVENT_PAGES_PER_SYNC {
             let cursor = self.store.try_with_store(load_transport_cursor)?;
             let after_revision = cursor.map_or(0, |cursor| cursor.relay_revision);
-            let page = self.hns.backend().get_denuo_name_market_events(
+            let page = self.hns.backend().get_shakescape_name_market_events(
                 cursor.map(|cursor| cursor.instance_nonce),
                 after_revision,
-                MAX_DENUO_NAME_MARKET_TRANSPORT_PAGE,
+                MAX_SHAKESCAPE_NAME_MARKET_TRANSPORT_PAGE,
             )?;
             let instance_changed = page.cursor_reset
                 || cursor.is_some_and(|cursor| cursor.instance_nonce != page.instance_nonce);
@@ -189,9 +190,9 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
 
     fn replay_accepted_publications(
         &self,
-        report: &mut DenuoTransportSyncReport,
+        report: &mut ShakescapeTransportSyncReport,
     ) -> Result<(), ShakedexError> {
-        let replays = self.store.try_with_store(accepted_denuo_replays)?;
+        let replays = self.store.try_with_store(accepted_shakescape_replays)?;
         let now = self.hns.trusted_now_unix()?;
         for replay in replays {
             if !replay_is_live(&replay, now)? {
@@ -199,7 +200,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
             }
             self.hns
                 .backend()
-                .publish_denuo_name_market(&replay.envelope_bytes, replay_handoff(&replay))?;
+                .publish_shakescape_name_market(&replay.envelope_bytes, replay_handoff(&replay))?;
             report.accepted_publications_replayed += 1;
         }
         Ok(())
@@ -208,23 +209,23 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
     fn rebuild_from_snapshot(
         &self,
         expected_instance_nonce: [u8; 32],
-        report: &mut DenuoTransportSyncReport,
+        report: &mut ShakescapeTransportSyncReport,
     ) -> Result<(), ShakedexError> {
         let mut expected_revision = None;
         let mut offset = 0usize;
         let mut records = Vec::new();
         loop {
-            let page = self.hns.backend().get_denuo_name_market_snapshot(
+            let page = self.hns.backend().get_shakescape_name_market_snapshot(
                 expected_revision,
                 offset,
-                MAX_DENUO_NAME_MARKET_TRANSPORT_PAGE,
+                MAX_SHAKESCAPE_NAME_MARKET_TRANSPORT_PAGE,
             )?;
             if page.instance_nonce != expected_instance_nonce
                 || expected_revision.is_some_and(|revision| revision != page.snapshot_revision)
                 || records
                     .len()
                     .checked_add(page.records.len())
-                    .is_none_or(|count| count > MAX_DENUO_SNAPSHOT_RECORDS)
+                    .is_none_or(|count| count > MAX_SHAKESCAPE_SNAPSHOT_RECORDS)
             {
                 return Err(ShakedexError::InvalidEvidence);
             }
@@ -265,10 +266,10 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
 
     fn apply_event(
         &self,
-        event: &DenuoTransportEvent,
-        report: &mut DenuoTransportSyncReport,
+        event: &ShakescapeTransportEvent,
+        report: &mut ShakescapeTransportSyncReport,
     ) -> Result<(), ShakedexError> {
-        let record = DenuoTransportSnapshotRecord {
+        let record = ShakescapeTransportSnapshotRecord {
             kind: event.kind,
             content_id: event.content_id,
             envelope_bytes: event.envelope_bytes.clone(),
@@ -278,33 +279,36 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
 
     fn apply_snapshot_record(
         &self,
-        record: &DenuoTransportSnapshotRecord,
-        report: &mut DenuoTransportSyncReport,
+        record: &ShakescapeTransportSnapshotRecord,
+        report: &mut ShakescapeTransportSyncReport,
     ) -> Result<AppliedRecord, ShakedexError> {
         let (_, _, message) = NameMarketMessage::decode_envelope(&record.envelope_bytes)
-            .map_err(|_| ShakedexError::InvalidDenuoEnvelope)?;
+            .map_err(|_| ShakedexError::InvalidShakescapeEnvelope)?;
         let result = match (record.kind, message) {
-            (DenuoTransportMessageKind::Offer, NameMarketMessage::Offer(listing)) => {
+            (ShakescapeTransportMessageKind::Offer, NameMarketMessage::Offer(listing)) => {
                 let listing_hash = ObjectHash::new(
                     listing
                         .listing_hash()
                         .map_err(|_| ShakedexError::InvalidListing)?,
                 );
                 if listing_hash.into_bytes() != record.content_id {
-                    return Err(ShakedexError::InvalidDenuoEnvelope);
+                    return Err(ShakedexError::InvalidShakescapeEnvelope);
                 }
                 self.board
                     .admit_offer(&record.envelope_bytes, listing_hash)
                     .map(|_| AppliedRecord::Offer)
             }
-            (DenuoTransportMessageKind::Cancellation, NameMarketMessage::Cancel(cancellation)) => {
+            (
+                ShakescapeTransportMessageKind::Cancellation,
+                NameMarketMessage::Cancel(cancellation),
+            ) => {
                 let cancellation_hash = ObjectHash::new(
                     cancellation
                         .cancellation_hash()
                         .map_err(|_| ShakedexError::InvalidCancellation)?,
                 );
                 if cancellation_hash.into_bytes() != record.content_id {
-                    return Err(ShakedexError::InvalidDenuoEnvelope);
+                    return Err(ShakedexError::InvalidShakescapeEnvelope);
                 }
                 self.board
                     .admit_cancellation(
@@ -314,7 +318,7 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
                     )
                     .map(|_| AppliedRecord::Cancellation)
             }
-            _ => return Err(ShakedexError::InvalidDenuoEnvelope),
+            _ => return Err(ShakedexError::InvalidShakescapeEnvelope),
         };
         match result {
             Ok(AppliedRecord::Offer) => {
@@ -330,8 +334,8 @@ impl<'a, B: HnsBackend, C: HnsClock> DenuoTransportRuntime<'a, B, C> {
                 ShakedexError::InvalidListing
                 | ShakedexError::InvalidCancellation
                 | ShakedexError::InvalidEvidence
-                | ShakedexError::InvalidDenuoEnvelope
-                | ShakedexError::DenuoRegistryMismatch
+                | ShakedexError::InvalidShakescapeEnvelope
+                | ShakedexError::ShakescapeRegistryMismatch
                 | ShakedexError::NameMarketReplay,
             ) => {
                 report.marketplace_records_rejected += 1;
@@ -350,23 +354,23 @@ enum AppliedRecord {
 }
 
 fn handoff_request(
-    handoff: &crate::DenuoPreparedHandoff,
-) -> Result<DenuoPublicationHandoff, ShakedexError> {
+    handoff: &crate::ShakescapePreparedHandoff,
+) -> Result<ShakescapePublicationHandoff, ShakedexError> {
     let (registry, request_id, message) =
         NameMarketMessage::decode_envelope(handoff.envelope_bytes())
-            .map_err(|_| ShakedexError::InvalidDenuoOutboxEnvelope)?;
-    if registry != DenuoRegistryVersion::V2 || request_id != handoff.request_id() {
-        return Err(ShakedexError::InvalidDenuoOutboxEnvelope);
+            .map_err(|_| ShakedexError::InvalidShakescapeOutboxEnvelope)?;
+    if registry != ShakescapeRegistryVersion::V1 || request_id != handoff.request_id() {
+        return Err(ShakedexError::InvalidShakescapeOutboxEnvelope);
     }
     let network = match message {
         NameMarketMessage::Offer(listing) => listing.network(),
         NameMarketMessage::Cancel(cancellation) => cancellation.network,
-        _ => return Err(ShakedexError::InvalidDenuoOutboxEnvelope),
+        _ => return Err(ShakedexError::InvalidShakescapeOutboxEnvelope),
     };
     let mut envelope_id = Sha256::new();
-    envelope_id.update(DENUO_OUTBOX_ENVELOPE_ID_DOMAIN);
+    envelope_id.update(SHAKESCAPE_OUTBOX_ENVELOPE_ID_DOMAIN);
     envelope_id.update(handoff.envelope_bytes());
-    Ok(DenuoPublicationHandoff {
+    Ok(ShakescapePublicationHandoff {
         network_magic: network.magic,
         network_genesis: *network.genesis.as_bytes(),
         attempt_id: handoff.attempt_id().into_bytes(),
@@ -380,8 +384,8 @@ fn handoff_request(
     })
 }
 
-fn replay_handoff(replay: &DenuoAcceptedReplay) -> DenuoPublicationHandoff {
-    DenuoPublicationHandoff {
+fn replay_handoff(replay: &ShakescapeAcceptedReplay) -> ShakescapePublicationHandoff {
+    ShakescapePublicationHandoff {
         network_magic: replay.network_magic,
         network_genesis: replay.network_genesis,
         attempt_id: replay.attempt_id,
@@ -395,39 +399,40 @@ fn replay_handoff(replay: &DenuoAcceptedReplay) -> DenuoPublicationHandoff {
     }
 }
 
-fn transport_kind(kind: DenuoOutboxMessageKind) -> DenuoTransportMessageKind {
+fn transport_kind(kind: ShakescapeOutboxMessageKind) -> ShakescapeTransportMessageKind {
     match kind {
-        DenuoOutboxMessageKind::Offer => DenuoTransportMessageKind::Offer,
-        DenuoOutboxMessageKind::Cancellation => DenuoTransportMessageKind::Cancellation,
+        ShakescapeOutboxMessageKind::Offer => ShakescapeTransportMessageKind::Offer,
+        ShakescapeOutboxMessageKind::Cancellation => ShakescapeTransportMessageKind::Cancellation,
     }
 }
 
-fn replay_is_live(replay: &DenuoAcceptedReplay, now: u64) -> Result<bool, ShakedexError> {
+fn replay_is_live(replay: &ShakescapeAcceptedReplay, now: u64) -> Result<bool, ShakedexError> {
     let (_, _, message) = NameMarketMessage::decode_envelope(&replay.envelope_bytes)
-        .map_err(|_| ShakedexError::CorruptDenuoOutbox)?;
+        .map_err(|_| ShakedexError::CorruptShakescapeOutbox)?;
     Ok(match message {
         NameMarketMessage::Offer(listing) => listing.created_at <= now && listing.expires_at > now,
         NameMarketMessage::Cancel(cancellation) => {
             cancellation.created_at <= now && cancellation.expires_at > now
         }
-        _ => return Err(ShakedexError::CorruptDenuoOutbox),
+        _ => return Err(ShakedexError::CorruptShakescapeOutbox),
     })
 }
 
 fn load_transport_cursor(
     store: &WalletStore,
-) -> Result<Option<DenuoTransportCursorSnapshot>, ShakedexError> {
-    let Some(stored) = store
-        .denuo_board_object::<PersistedDenuoTransportCursor>(DENUO_TRANSPORT_CURSOR_RECORD_ID)?
+) -> Result<Option<ShakescapeTransportCursorSnapshot>, ShakedexError> {
+    let Some(stored) = store.shakescape_board_object::<PersistedShakescapeTransportCursor>(
+        SHAKESCAPE_TRANSPORT_CURSOR_RECORD_ID,
+    )?
     else {
         return Ok(None);
     };
-    if stored.value.schema_version != DENUO_TRANSPORT_CURSOR_SCHEMA_VERSION
+    if stored.value.schema_version != SHAKESCAPE_TRANSPORT_CURSOR_SCHEMA_VERSION
         || stored.value.instance_nonce == [0; 32]
     {
         return Err(ShakedexError::InvalidEvidence);
     }
-    Ok(Some(DenuoTransportCursorSnapshot {
+    Ok(Some(ShakescapeTransportCursorSnapshot {
         store_revision: stored.revision,
         instance_nonce: stored.value.instance_nonce,
         relay_revision: stored.value.relay_revision,
@@ -436,11 +441,11 @@ fn load_transport_cursor(
 
 fn save_transport_cursor(
     store: &mut WalletStore,
-    current: Option<DenuoTransportCursorSnapshot>,
+    current: Option<ShakescapeTransportCursorSnapshot>,
     instance_nonce: [u8; 32],
     relay_revision: u64,
     updated_at_unix: u64,
-) -> Result<DenuoTransportCursorSnapshot, ShakedexError> {
+) -> Result<ShakescapeTransportCursorSnapshot, ShakedexError> {
     if instance_nonce == [0; 32] {
         return Err(ShakedexError::InvalidEvidence);
     }
@@ -455,17 +460,17 @@ fn save_transport_cursor(
         }
     }
     let expected_revision = current.map_or(0, |current| current.store_revision);
-    let store_revision = store.save_denuo_board_object(
-        DENUO_TRANSPORT_CURSOR_RECORD_ID,
+    let store_revision = store.save_shakescape_board_object(
+        SHAKESCAPE_TRANSPORT_CURSOR_RECORD_ID,
         expected_revision,
-        &PersistedDenuoTransportCursor {
-            schema_version: DENUO_TRANSPORT_CURSOR_SCHEMA_VERSION,
+        &PersistedShakescapeTransportCursor {
+            schema_version: SHAKESCAPE_TRANSPORT_CURSOR_SCHEMA_VERSION,
             instance_nonce,
             relay_revision,
         },
         updated_at_unix,
     )?;
-    Ok(DenuoTransportCursorSnapshot {
+    Ok(ShakescapeTransportCursorSnapshot {
         store_revision,
         instance_nonce,
         relay_revision,

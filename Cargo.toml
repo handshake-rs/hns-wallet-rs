@@ -18,7 +18,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -27,19 +27,19 @@ keywords = ["handshake", "wallet", "bitcoin", "ethereum"]
 categories = ["cryptography::cryptocurrencies"]
 
 [workspace.dependencies]
-hns-wallet-types = { version = "0.1.1", path = "crates/hns-wallet-types" }
-hns-wallet-store = { version = "0.1.1", path = "crates/hns-wallet-store" }
-hns-wallet-chain-api = { version = "0.1.1", path = "crates/hns-wallet-chain-api" }
-hns-wallet-hns = { version = "0.1.1", path = "crates/hns-wallet-hns" }
-hns-wallet-provider = { version = "0.1.1", path = "crates/hns-wallet-provider" }
-hns-wallet-shakedex = { version = "0.1.1", path = "crates/hns-wallet-shakedex" }
-hns-wallet-market = { version = "0.1.1", path = "crates/hns-wallet-market" }
-hns-wallet-mobile = { version = "0.1.1", path = "crates/hns-wallet-mobile" }
-hns-wallet-bitcoin-kyoto = { version = "0.1.1", path = "crates/hns-wallet-bitcoin-kyoto" }
-hns-wallet-ethereum = { version = "0.1.1", path = "crates/hns-wallet-ethereum" }
-hns-wallet-ffi = { version = "0.1.1", path = "crates/hns-wallet-ffi" }
-hns-wallet-service = { version = "0.1.1", path = "crates/hns-wallet-service" }
-hns-wallet-host = { version = "0.1.1", path = "crates/hns-wallet-host" }
+hns-wallet-types = { version = "0.2.0", path = "crates/hns-wallet-types" }
+hns-wallet-store = { version = "0.2.0", path = "crates/hns-wallet-store" }
+hns-wallet-chain-api = { version = "0.2.0", path = "crates/hns-wallet-chain-api" }
+hns-wallet-hns = { version = "0.2.0", path = "crates/hns-wallet-hns" }
+hns-wallet-provider = { version = "0.2.0", path = "crates/hns-wallet-provider" }
+hns-wallet-shakedex = { version = "0.2.0", path = "crates/hns-wallet-shakedex" }
+hns-wallet-market = { version = "0.2.0", path = "crates/hns-wallet-market" }
+hns-wallet-mobile = { version = "0.2.0", path = "crates/hns-wallet-mobile" }
+hns-wallet-bitcoin-kyoto = { version = "0.2.0", path = "crates/hns-wallet-bitcoin-kyoto" }
+hns-wallet-ethereum = { version = "0.2.0", path = "crates/hns-wallet-ethereum" }
+hns-wallet-ffi = { version = "0.2.0", path = "crates/hns-wallet-ffi" }
+hns-wallet-service = { version = "0.2.0", path = "crates/hns-wallet-service" }
+hns-wallet-host = { version = "0.2.0", path = "crates/hns-wallet-host" }
 
 argon2 = "0.5.3"
 bech32 = "0.11.0"
@@ -72,7 +72,7 @@ zeroize = { version = "1.8.1", features = ["derive"] }
 hns-covenants = { version = "=0.3.1" }
 hns-header-consensus = { version = "=0.3.1" }
 hns-marketplace-protocol = { version = "=0.4.0" }
-hns-p2p-experimental = { version = "=0.3.1" }
+hns-p2p-experimental = { version = "=0.4.0" }
 hns-light-chain = { version = "=0.2.2" }
 hns-light-p2p = { version = "=0.2.2" }
 hns-light-sync = { version = "=0.2.2" }
@@ -97,9 +97,3 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
-
-[patch.crates-io]
-# Local protocol v2 binds each signed offer to its maker-selected swap
-# session. Keep this adjacent checkout authoritative until the protocol crate
-# is published and the exact release pin above can be advanced.
-hns-marketplace-protocol = { path = "../hns-rs/crates/hns-marketplace-protocol" }

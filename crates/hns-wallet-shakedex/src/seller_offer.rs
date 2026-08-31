@@ -1,5 +1,5 @@
 use hns_covenants::{hash_name, validate_name};
-use hns_marketplace_protocol::DenuoRegistryVersion;
+use hns_marketplace_protocol::ShakescapeRegistryVersion;
 use hns_primitives::Dollarydoos;
 use hns_swap::{FixedPriceListing, ListingCancellation, SwapProof};
 use hns_transaction::Address;
@@ -12,13 +12,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::outbox::{
-    enqueue_denuo_cancellation_and_save_workflow, enqueue_denuo_offer_and_save_workflow,
+    enqueue_shakescape_cancellation_and_save_workflow, enqueue_shakescape_offer_and_save_workflow,
 };
 use crate::{
-    DenuoOutboxState, ShakedexError, authenticate_fixed_price_listing,
-    authenticate_listing_cancellation, decode_denuo_authenticated_cancellation,
-    decode_denuo_authenticated_offer, denuo_outbox_envelope_id, encode_denuo_cancellation,
-    encode_denuo_offer, load_denuo_publication_outbox, verify_fixed_price_listing,
+    ShakedexError, ShakescapeOutboxState, authenticate_fixed_price_listing,
+    authenticate_listing_cancellation, decode_shakescape_authenticated_cancellation,
+    decode_shakescape_authenticated_offer, encode_shakescape_cancellation, encode_shakescape_offer,
+    load_shakescape_publication_outbox, shakescape_outbox_envelope_id, verify_fixed_price_listing,
     verify_listing_cancellation,
 };
 
@@ -155,12 +155,13 @@ impl SellerOfferWorkflow {
                     queued_listing.listing_hash,
                     queued_cancellation.cancellation_hash,
                 )?;
-                let (request_id, envelope_cancellation) = decode_denuo_authenticated_cancellation(
-                    &queued_cancellation.envelope_bytes,
-                    DenuoRegistryVersion::V2,
-                    queued_listing.listing_hash,
-                    queued_cancellation.cancellation_hash,
-                )?;
+                let (request_id, envelope_cancellation) =
+                    decode_shakescape_authenticated_cancellation(
+                        &queued_cancellation.envelope_bytes,
+                        ShakescapeRegistryVersion::V1,
+                        queued_listing.listing_hash,
+                        queued_cancellation.cancellation_hash,
+                    )?;
                 if request_id != queued_cancellation.request_id
                     || envelope_cancellation.encoded() != cancellation.encoded()
                     || cancellation.seller_public_key() != listing.seller_public_key()
@@ -168,7 +169,7 @@ impl SellerOfferWorkflow {
                     || cancellation.created_at_unix() < listing.created_at_unix()
                     || cancellation.expires_at_unix() < listing.expires_at_unix()
                     || queued_cancellation.queued_at_unix != cancellation.created_at_unix()
-                    || denuo_outbox_envelope_id(&queued_cancellation.envelope_bytes)?
+                    || shakescape_outbox_envelope_id(&queued_cancellation.envelope_bytes)?
                         != queued_cancellation.envelope_id
                 {
                     return Err(ShakedexError::InvalidEvidence);
@@ -185,9 +186,9 @@ fn validate_queued_listing(
     queued: &QueuedSellerListing,
 ) -> Result<crate::AuthenticatedFixedPriceListing, ShakedexError> {
     let listing = authenticate_fixed_price_listing(&queued.listing_bytes, queued.listing_hash)?;
-    let (request_id, envelope_listing) = decode_denuo_authenticated_offer(
+    let (request_id, envelope_listing) = decode_shakescape_authenticated_offer(
         &queued.envelope_bytes,
-        DenuoRegistryVersion::V2,
+        ShakescapeRegistryVersion::V1,
         queued.listing_hash,
     )?;
     if request_id != queued.request_id
@@ -207,7 +208,7 @@ fn validate_queued_listing(
                 .ok_or(ShakedexError::Invariant)?
         || listing.sequence() != 1
         || queued.queued_at_unix != listing.created_at_unix()
-        || denuo_outbox_envelope_id(&queued.envelope_bytes)? != queued.envelope_id
+        || shakescape_outbox_envelope_id(&queued.envelope_bytes)? != queued.envelope_id
     {
         return Err(ShakedexError::InvalidEvidence);
     }
@@ -227,7 +228,7 @@ pub struct SellerOfferPreview {
     pub listing_lifetime_seconds: u64,
     pub listing_hash: Option<ObjectHash>,
     pub cancellation_hash: Option<ObjectHash>,
-    pub publication_state: Option<DenuoOutboxState>,
+    pub publication_state: Option<ShakescapeOutboxState>,
 }
 
 pub(crate) struct SellerOfferRuntime<'a, B, C> {
@@ -395,12 +396,12 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
             current_lock.locking_coin(),
         )?;
         let request_id = seller_offer_request_id(workflow_id, listing_hash);
-        let envelope_bytes = encode_denuo_offer(
-            DenuoRegistryVersion::V2,
+        let envelope_bytes = encode_shakescape_offer(
+            ShakescapeRegistryVersion::V1,
             request_id,
             verified.authenticated(),
         )?;
-        let envelope_id = denuo_outbox_envelope_id(&envelope_bytes)?;
+        let envelope_id = shakescape_outbox_envelope_id(&envelope_bytes)?;
         let mut next = stored.state.clone();
         next.stage = SellerOfferStage::PublicationQueued;
         next.queued_listing = Some(QueuedSellerListing {
@@ -418,7 +419,7 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
             if current.revision != stored.revision || current.state != stored.state {
                 return Err(ShakedexError::StaleRevision);
             }
-            enqueue_denuo_offer_and_save_workflow(
+            enqueue_shakescape_offer_and_save_workflow(
                 store,
                 workflow_id,
                 stored.revision,
@@ -496,8 +497,8 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
         let cancellation_hash = verified.cancellation_hash();
         let request_id = seller_cancellation_request_id(workflow_id, cancellation_hash);
         let envelope_bytes =
-            encode_denuo_cancellation(DenuoRegistryVersion::V2, request_id, &verified)?;
-        let envelope_id = denuo_outbox_envelope_id(&envelope_bytes)?;
+            encode_shakescape_cancellation(ShakescapeRegistryVersion::V1, request_id, &verified)?;
+        let envelope_id = shakescape_outbox_envelope_id(&envelope_bytes)?;
         let mut next = stored.state.clone();
         next.stage = SellerOfferStage::CancellationQueued;
         next.queued_cancellation = Some(QueuedSellerCancellation {
@@ -515,7 +516,7 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
             if current.revision != stored.revision || current.state != stored.state {
                 return Err(ShakedexError::StaleRevision);
             }
-            enqueue_denuo_cancellation_and_save_workflow(
+            enqueue_shakescape_cancellation_and_save_workflow(
                 store,
                 workflow_id,
                 stored.revision,
@@ -575,7 +576,9 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
 
     fn preview(&self, stored: StoredSellerOffer) -> Result<SellerOfferPreview, ShakedexError> {
         stored.state.validate()?;
-        let outbox = self.store.try_with_store(load_denuo_publication_outbox)?;
+        let outbox = self
+            .store
+            .try_with_store(load_shakescape_publication_outbox)?;
         let listing_hash = stored
             .state
             .queued_listing

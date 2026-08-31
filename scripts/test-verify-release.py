@@ -10,6 +10,7 @@ from typing import Callable
 
 
 REPO = Path(__file__).resolve().parent.parent
+CURRENT_RELEASE_VERSION = "0.2.0"
 VALIDATOR = runpy.run_path(str(REPO / "scripts/verify-release.py"))
 verify_state = VALIDATOR["verify_changelog_release_state"]
 require_execution_state = VALIDATOR["require_execution_release_state"]
@@ -57,7 +58,7 @@ def expect_publish_script_mutation(
             expect_failure(
                 failure,
                 lambda: verify_release_document(
-                    repo, release_order(REPO), "0.1.1"
+                    repo, release_order(REPO), CURRENT_RELEASE_VERSION
                 ),
             )
         else:
@@ -152,17 +153,15 @@ expect_failure(
 
 root_release = root_candidate.replace(
     "<!-- hns-wallet-release-state: 0.1.0 candidate -->\n"
-    "Unpublished initial release candidate for the independent Handshake wallet\n"
-    "boundary:",
+    f"{root_wording['candidate']}",
     "<!-- hns-wallet-release-state: 0.1.0 release -->\n"
-    "Initial release source for the independent Handshake wallet boundary:",
+    f"{root_wording['release']}",
 )
 crate_release = crate_candidate.replace(
     "<!-- hns-wallet-release-state: 0.1.0 candidate -->\n"
-    "This heading describes the current unpublished release candidate, not an\n"
-    "existing crates.io package, Git tag, or GitHub release.",
+    f"{crate_wording['candidate']}",
     "<!-- hns-wallet-release-state: 0.1.0 release -->\n"
-    "This crate changelog describes the prepared `hns-wallet-rs` release source.",
+    f"{crate_wording['release']}",
 )
 release_state = verify_state(root_release, crate_release, "0.1.0")
 assert release_state == "release"
@@ -176,7 +175,7 @@ expect_failure(
 # The executable release path must preserve the registry-backed reconstruction,
 # exact crate-name classification endpoint, both independent cooldown buckets,
 # and a catch-all error for an indeterminate registry response.
-verify_release_document(REPO, release_order(REPO), "0.1.1")
+verify_release_document(REPO, release_order(REPO), CURRENT_RELEASE_VERSION)
 verify_publish_script_safety(REPO)
 
 expect_publish_script_mutation(

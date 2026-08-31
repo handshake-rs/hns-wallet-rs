@@ -437,7 +437,7 @@ impl VerifiedCurrentShakedexLock {
     /// Consume the account authority into an atomic account-prefix guard.
     /// Both the read runtime and the exact same-store full runtime may carry
     /// this capability; ordinary value callers never receive the guard unless
-    /// they explicitly compose through the Denuo board boundary.
+    /// they explicitly compose through the Shakescape board boundary.
     pub fn into_account_prefix_lease(mut self) -> Result<EntityPrefixSetLease, HnsWalletError> {
         self.board_context
             .take()

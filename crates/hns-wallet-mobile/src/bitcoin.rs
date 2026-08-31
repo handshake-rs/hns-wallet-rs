@@ -21,13 +21,13 @@ use hns_wallet_bitcoin_kyoto::{
     KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor, KyotoSyncProgressHandle,
     KyotoSyncReceipt, KyotoTipDiscovery, KyotoWalletState, PreparedBitcoinHtlcFunding,
     StoredKyotoWalletState, VerifiedBitcoinLock, authorize_native_send,
-    bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit, build_denuo_bitcoin_htlc,
-    create_persisted_descriptor_wallet_from_seed, initialize_pristine_wallet_at_creation_tip,
-    initialize_pristine_wallet_at_recovery_checkpoint, load_bitcoin_htlc_watch,
-    load_persisted_descriptor_wallet_from_seed, monitor_kyoto_sync_progress,
-    persist_prepared_bitcoin_broadcast, persist_prepared_bitcoin_htlc_spend_broadcast,
-    prepare_bitcoin_htlc_funding_excluding, prepare_native_send_excluding,
-    sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
+    bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit,
+    build_shakescape_bitcoin_htlc, create_persisted_descriptor_wallet_from_seed,
+    initialize_pristine_wallet_at_creation_tip, initialize_pristine_wallet_at_recovery_checkpoint,
+    load_bitcoin_htlc_watch, load_persisted_descriptor_wallet_from_seed,
+    monitor_kyoto_sync_progress, persist_prepared_bitcoin_broadcast,
+    persist_prepared_bitcoin_htlc_spend_broadcast, prepare_bitcoin_htlc_funding_excluding,
+    prepare_native_send_excluding, sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
     unobserved_approved_broadcast_inputs, verify_htlc_funding, verify_signed_bitcoin_htlc_spend,
 };
 use hns_wallet_hns::{HnsNetwork, HnsRuntimeConfig};
@@ -38,8 +38,8 @@ use tokio::runtime::Runtime;
 use zeroize::Zeroizing;
 
 use crate::{
-    MobileDenuoBitcoinFundingPermit, MobileDenuoBitcoinSettlementPermit,
-    MobileDenuoBitcoinWatchPermit, MobileDenuoSettlementAction, MobileWalletError,
+    MobileShakescapeBitcoinFundingPermit, MobileShakescapeBitcoinSettlementPermit,
+    MobileShakescapeBitcoinWatchPermit, MobileShakescapeSettlementAction, MobileWalletError,
 };
 
 const BITCOIN_RECOVERY_SCRIPT_INDEX: u32 = 1;
@@ -141,7 +141,7 @@ impl MobileBitcoinDirectConfig {
     /// The exact Bitcoin network binding paired with an HNS network by the
     /// installed direct wallet. The identifier and genesis come from the
     /// wallet's own Bitcoin library, not a peer, relay, or price source.
-    pub fn direct_denuo_counterchain(network: HnsNetwork) -> (u64, [u8; 32]) {
+    pub fn direct_shakescape_counterchain(network: HnsNetwork) -> (u64, [u8; 32]) {
         let network = Self::bitcoin_network_for_hns(network);
         let network_id = match network {
             BitcoinNetwork::Bitcoin => 1,
@@ -260,7 +260,7 @@ struct PendingMobileBitcoinHtlcFunding {
 struct PendingMobileBitcoinHtlcSettlement {
     action_token: [u8; MOBILE_ACTION_TOKEN_BYTES],
     session_id: SessionId,
-    action: MobileDenuoSettlementAction,
+    action: MobileShakescapeSettlementAction,
     branch: HtlcSpendBranch,
     raw_transaction: Vec<u8>,
     lock: VerifiedBitcoinLock,
@@ -295,7 +295,7 @@ pub struct MobileBitcoinHtlcFundingReceipt {
 pub struct MobileBitcoinHtlcSettlementApproval {
     pub action_token: String,
     pub session_id: String,
-    pub action: MobileDenuoSettlementAction,
+    pub action: MobileShakescapeSettlementAction,
     pub txid: String,
     pub input_amount_sats: u64,
     pub output_amount_sats: u64,
@@ -308,7 +308,7 @@ pub struct MobileBitcoinHtlcSettlementApproval {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MobileBitcoinHtlcSettlementReceipt {
     pub session_id: String,
-    pub action: MobileDenuoSettlementAction,
+    pub action: MobileShakescapeSettlementAction,
     pub txid: String,
     pub attempt_count: u16,
     pub submitted_at_unix: Option<u64>,
@@ -845,11 +845,11 @@ impl MobileBitcoinValueController {
     }
 
     /// Prepare the exact first-chain Bitcoin HTLC transaction committed by a
-    /// countersigned Denuo session. The Rust-only permit proves that refund
+    /// countersigned Shakescape session. The Rust-only permit proves that refund
     /// branches were validated and the durable execution is funding-ready.
-    pub fn prepare_denuo_htlc_funding(
+    pub fn prepare_shakescape_htlc_funding(
         &mut self,
-        permit: MobileDenuoBitcoinFundingPermit,
+        permit: MobileShakescapeBitcoinFundingPermit,
         maximum_fee_sats: u64,
     ) -> Result<MobileBitcoinHtlcFundingApproval, MobileWalletError> {
         if self.pending_send.is_some()
@@ -874,7 +874,7 @@ impl MobileBitcoinValueController {
             return Err(MobileWalletError::BitcoinActionExpired);
         }
         let binding =
-            build_denuo_bitcoin_htlc(hello, hns_marketplace_protocol::SwapAssetSide::Offered)?;
+            build_shakescape_bitcoin_htlc(hello, hns_marketplace_protocol::SwapAssetSide::Offered)?;
         if binding.commitment.into_bytes() != hello.offered_lock_commitment {
             return Err(MobileWalletError::InvalidBitcoinAction);
         }
@@ -938,14 +938,14 @@ impl MobileBitcoinValueController {
 
     /// Register the HNS-offering taker's durable compact-filter watch before
     /// the counterparty broadcasts Bitcoin. This signs and spends nothing.
-    pub fn register_counterparty_denuo_htlc_watch(
+    pub fn register_counterparty_shakescape_htlc_watch(
         &mut self,
-        permit: &MobileDenuoBitcoinWatchPermit,
+        permit: &MobileShakescapeBitcoinWatchPermit,
     ) -> Result<(), MobileWalletError> {
         let now_unix = now_unix()?;
         let hello = permit.hello();
         let binding =
-            build_denuo_bitcoin_htlc(hello, hns_marketplace_protocol::SwapAssetSide::Offered)?;
+            build_shakescape_bitcoin_htlc(hello, hns_marketplace_protocol::SwapAssetSide::Offered)?;
         if binding.commitment.into_bytes() != hello.offered_lock_commitment {
             return Err(MobileWalletError::InvalidBitcoinAction);
         }
@@ -970,7 +970,7 @@ impl MobileBitcoinValueController {
     /// Persist the exact signed HTLC funding bytes before handing their txid
     /// to Kyoto. Chain-confirmed swap state is advanced separately by the
     /// local compact-filter verifier, never by this submission receipt.
-    pub fn approve_denuo_htlc_funding(
+    pub fn approve_shakescape_htlc_funding(
         &mut self,
         action_token: &str,
     ) -> Result<MobileBitcoinHtlcFundingReceipt, MobileWalletError> {
@@ -1050,7 +1050,7 @@ impl MobileBitcoinValueController {
         })
     }
 
-    pub fn reject_denuo_htlc_funding(
+    pub fn reject_shakescape_htlc_funding(
         &mut self,
         action_token: &str,
     ) -> Result<(), MobileWalletError> {
@@ -1062,9 +1062,9 @@ impl MobileBitcoinValueController {
     /// Prepare one receiver or timeout spend of the exact verified Bitcoin
     /// HTLC. The destination is a newly persisted internal wallet address;
     /// only a non-sensitive summary and a process-local token leave Rust.
-    pub fn prepare_denuo_htlc_settlement(
+    pub fn prepare_shakescape_htlc_settlement(
         &mut self,
-        mut permit: MobileDenuoBitcoinSettlementPermit,
+        mut permit: MobileShakescapeBitcoinSettlementPermit,
         maximum_fee_sats: u64,
     ) -> Result<MobileBitcoinHtlcSettlementApproval, MobileWalletError> {
         if self.pending_send.is_some()
@@ -1081,14 +1081,16 @@ impl MobileBitcoinValueController {
             .checked_add(BITCOIN_SEND_APPROVAL_LIFETIME_SECONDS)
             .ok_or(MobileWalletError::InvalidBitcoinAction)?;
         let hello = permit.hello().clone();
-        let binding =
-            build_denuo_bitcoin_htlc(&hello, hns_marketplace_protocol::SwapAssetSide::Offered)?;
+        let binding = build_shakescape_bitcoin_htlc(
+            &hello,
+            hns_marketplace_protocol::SwapAssetSide::Offered,
+        )?;
         if binding.commitment.into_bytes() != hello.offered_lock_commitment {
             return Err(MobileWalletError::InvalidBitcoinAction);
         }
         let branch = match permit.action() {
-            MobileDenuoSettlementAction::Redeem => HtlcSpendBranch::Redeem,
-            MobileDenuoSettlementAction::Refund => HtlcSpendBranch::Refund,
+            MobileShakescapeSettlementAction::Redeem => HtlcSpendBranch::Redeem,
+            MobileShakescapeSettlementAction::Refund => HtlcSpendBranch::Refund,
         };
         let expected_key = match branch {
             HtlcSpendBranch::Redeem => &binding.htlc.receiver_public_key,
@@ -1099,7 +1101,7 @@ impl MobileBitcoinValueController {
         }
         let session_id = SessionId::new(hello.swap_session_id);
         let lock = self
-            .verified_denuo_htlc_funding(session_id)?
+            .verified_shakescape_htlc_funding(session_id)?
             .ok_or(MobileWalletError::InvalidBitcoinAction)?;
         if lock.htlc != binding.htlc || lock.value_sats != binding.value_sats {
             return Err(MobileWalletError::InvalidBitcoinAction);
@@ -1167,7 +1169,7 @@ impl MobileBitcoinValueController {
         Ok(approval)
     }
 
-    pub fn approve_denuo_htlc_settlement(
+    pub fn approve_shakescape_htlc_settlement(
         &mut self,
         action_token: &str,
     ) -> Result<MobileBitcoinHtlcSettlementReceipt, MobileWalletError> {
@@ -1238,7 +1240,7 @@ impl MobileBitcoinValueController {
         })
     }
 
-    pub fn reject_denuo_htlc_settlement(
+    pub fn reject_shakescape_htlc_settlement(
         &mut self,
         action_token: &str,
     ) -> Result<(), MobileWalletError> {
@@ -1286,7 +1288,7 @@ impl MobileBitcoinValueController {
     /// Return funding evidence only when the durable HTLC watch is reconciled
     /// to this controller's exact current Kyoto checkpoint and has reached the
     /// confirmation threshold signed into the swap session.
-    pub fn verified_denuo_htlc_funding(
+    pub fn verified_shakescape_htlc_funding(
         &self,
         session_id: SessionId,
     ) -> Result<Option<VerifiedBitcoinLock>, MobileWalletError> {
@@ -1307,7 +1309,7 @@ impl MobileBitcoinValueController {
             .map_err(MobileWalletError::from)
     }
 
-    pub fn verified_denuo_htlc_spend(
+    pub fn verified_shakescape_htlc_spend(
         &self,
         session_id: SessionId,
     ) -> Result<

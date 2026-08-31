@@ -111,8 +111,8 @@ restored on-chain Shakedex index, and reserves the configured trailing scan
 gap, so concurrent writers to one wallet store cannot allocate through an
 incomplete mnemonic scan and reuse a discovered lock key.
 
-The fixed-price Denuo board now uses normalized encrypted persistence rather
-than one aggregate `DenuoBoardObject`. Its indexed schema-v2 namespace contains
+The fixed-price Shakescape board now uses normalized encrypted persistence rather
+than one aggregate `ShakescapeBoardObject`. Its indexed schema-v2 namespace contains
 one `HeadV2Indexed`, one domain-separated digest-addressed row per seller/name
 identity, and one encrypted domain-separated listing-hash index per row. Each
 strict row retains the canonical latest listing or cancellation together with
@@ -189,7 +189,7 @@ admission policy remain required for a live relay. The cache does not persist
 an action capability; current locking-coin/network/time authority must be
 reacquired before a listing can drive value behavior.
 
-The direct HNS/BTC board uses encrypted `DenuoBoardObject` records for exact
+The direct HNS/BTC board uses encrypted `ShakescapeBoardObject` records for exact
 signed offers, signed cancellations, and separately journaled accepted swap
 sessions. The direct-offer record ID, signer, network binding, expiry, offer
 amounts, and settlement keys are revalidated before the row is used. An active
@@ -204,7 +204,7 @@ exact native amounts. After restart, funding/redeem/refund behavior remains
 blocked until the wallet reacquires independent local chain evidence.
 
 The offline name-market publication outbox uses a second fixed record ID in
-the encrypted `DenuoBoardObject` namespace and its own store CAS revision. It
+the encrypted `ShakescapeBoardObject` namespace and its own store CAS revision. It
 retains at most 1,024 exact canonical V2 offer/cancellation envelopes (16 KiB
 each, 512 KiB serialized aggregate), their nonzero request IDs, canonical
 listing/cancellation content hashes, local domain-separated envelope digests,
@@ -351,7 +351,7 @@ replacement/binding-advance/reorg/finality regressions are included in the
 exact CI evidence recorded in `QUALIFICATION.md`. All
 Shakedex value authorization and submission entrypoints remain unreachable
 while the fixed Shakedex and HNS Shakedex-funding/value/fee release gates are
-`false`; live Denuo/provider/UI
+`false`; live Shakescape/provider/UI
 integration and restart/reorg/regtest qualification are also pending.
 
 HNS authorization can authenticate and return a pending approval without

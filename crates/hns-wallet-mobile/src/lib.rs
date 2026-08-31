@@ -19,11 +19,13 @@ pub use hns_wallet_bitcoin_kyoto::{
     BitcoinBroadcastRecoverySummary, VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock,
 };
 pub use market::{
-    MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDenuoBitcoinFundingPermit,
-    MobileDenuoBitcoinSettlementPermit, MobileDenuoBitcoinWatchPermit, MobileDenuoDirectAdmission,
-    MobileDenuoDirectTransportReport, MobileDenuoExecutionSummary, MobileDenuoHnsFundingPermit,
-    MobileDenuoHnsSettlementPermit, MobileDenuoHnsVerificationPermit, MobileDenuoSessionController,
-    MobileDenuoSettlementAction,
+    MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary,
+    MobileShakescapeBitcoinFundingPermit, MobileShakescapeBitcoinSettlementPermit,
+    MobileShakescapeBitcoinWatchPermit, MobileShakescapeDirectAdmission,
+    MobileShakescapeDirectTransportReport, MobileShakescapeExecutionSummary,
+    MobileShakescapeHnsFundingPermit, MobileShakescapeHnsSettlementPermit,
+    MobileShakescapeHnsVerificationPermit, MobileShakescapeSessionController,
+    MobileShakescapeSettlementAction,
 };
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
@@ -41,9 +43,9 @@ use hns_wallet_ffi::{
 /// compose its [`EmbeddedHnsBackend`] without endpoint credentials.
 pub use hns_wallet_hns::{
     ConnectedHnsPeer, EmbeddedHnsBackend, HnsBackend, HnsBlockScanProgress, HnsBootstrapPolicy,
-    HnsClock, HnsDirectDenuoListener, HnsDirectDenuoMessage, HnsDirectDenuoPeer,
-    HnsDirectPeerConfig, HnsDirectPeerCoordinator, HnsDirectPeerError, HnsHeaderRoundProgress,
-    HnsLightFloor, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
+    HnsClock, HnsDirectPeerConfig, HnsDirectPeerCoordinator, HnsDirectPeerError,
+    HnsDirectShakescapeListener, HnsDirectShakescapeMessage, HnsDirectShakescapePeer,
+    HnsHeaderRoundProgress, HnsLightFloor, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
     SystemClock as HnsReadSystemClock,
 };
 use hns_wallet_hns::{
@@ -55,21 +57,22 @@ use hns_wallet_hns::{
 use hns_wallet_host::{
     Clock, ClockError, HostError, HostOutput, SystemClock, SystemEntropy, WalletHost,
 };
-use hns_wallet_market::{DenuoDirectOfferBoardPolicy, DenuoDirectSwapPolicy};
+use hns_wallet_market::{ShakescapeDirectOfferBoardPolicy, ShakescapeDirectSwapPolicy};
 use hns_wallet_provider::{
     APPROVAL_LIFETIME_SECONDS, ApprovedCall, Origin, ProviderMethod, SelectedNamespace,
 };
 use hns_wallet_service::{
     MAX_JAVASCRIPT_SAFE_INTEGER, NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE,
     NativeHnsNameOwnershipStatus, NativeHnsNameResourceStatus, NativeHnsNameSummary,
-    NativeHnsValueSnapshot, PersistentDenuoTransport, PersistentHnsAccountConfig,
-    PersistentHnsAccountRuntime, PersistentHnsReadConfig, PersistentHnsReadRuntime,
-    PersistentHnsValueConfig, PersistentHnsValueRuntime, PersistentShakedexConfig, ServiceError,
-    ServiceRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN, TrustedNativeHnsValueAction, WalletService,
+    NativeHnsValueSnapshot, PersistentHnsAccountConfig, PersistentHnsAccountRuntime,
+    PersistentHnsReadConfig, PersistentHnsReadRuntime, PersistentHnsValueConfig,
+    PersistentHnsValueRuntime, PersistentShakedexConfig, PersistentShakescapeTransport,
+    ServiceError, ServiceRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN, TrustedNativeHnsValueAction,
+    WalletService,
 };
 use hns_wallet_shakedex::{
-    DenuoHnsaEndpointBinding, DenuoHrmRootBinding, DenuoPublicationAcceptancePolicy,
-    DirectDenuoBoardSyncReport, ShakedexSellerPolicy,
+    DirectShakescapeBoardSyncReport, ShakedexSellerPolicy, ShakescapeHnsaEndpointBinding,
+    ShakescapeHrmRootBinding, ShakescapePublicationAcceptancePolicy,
 };
 use hns_wallet_store::{SharedWalletStore, StoreError, WalletStore};
 use hns_wallet_types::{
@@ -259,8 +262,8 @@ pub struct MobileHnsValueController<B: HnsBackend, C: HnsClock = HnsReadSystemCl
     session: MobileControllerSession<PersistentHnsValueRuntime<B, C>>,
     account_config: HnsRuntimeConfig,
     pending: Option<PendingMobileHnsValueAction>,
-    pending_denuo_hns_funding: Option<PendingMobileDenuoHnsFunding>,
-    pending_denuo_hns_settlement: Option<PendingMobileDenuoHnsSettlement>,
+    pending_shakescape_hns_funding: Option<PendingMobileShakescapeHnsFunding>,
+    pending_shakescape_hns_settlement: Option<PendingMobileShakescapeHnsSettlement>,
     known_names: Vec<MobileHnsNameSummary>,
 }
 
@@ -277,17 +280,17 @@ pub struct MobileDirectHnsValueController<C: HnsClock = HnsReadSystemClock> {
     coordinator: HnsDirectPeerCoordinator,
 }
 
-/// A direct Denuo listener created by one [`MobileDirectHnsValueController`].
+/// A direct Shakescape listener created by one [`MobileDirectHnsValueController`].
 ///
 /// The underlying listener stays private so accepting a peer has to cross the
 /// same controller that owns the value runtime's trusted clock.  It is still
 /// an ordinary socket resource: the embedding application must drop it when
 /// its native I/O worker stops, including when the wallet is locked.
-pub struct MobileDirectDenuoListener {
-    listener: HnsDirectDenuoListener,
+pub struct MobileDirectShakescapeListener {
+    listener: HnsDirectShakescapeListener,
 }
 
-impl MobileDirectDenuoListener {
+impl MobileDirectShakescapeListener {
     /// Return the concrete local socket locator, including a kernel-selected
     /// port when the listener was bound with port zero.
     pub fn local_addr(&self) -> Result<SocketAddr, MobileWalletError> {
@@ -378,24 +381,24 @@ pub struct MobileHnsValueApproval {
     pub summary: ApprovalSummary,
 }
 
-struct PendingMobileDenuoHnsFunding {
+struct PendingMobileShakescapeHnsFunding {
     action_token: [u8; 32],
     session_id: hns_wallet_types::SessionId,
     prepared: PreparedSettlementLock,
     maximum_fee: BaseUnits,
 }
 
-struct PendingMobileDenuoHnsSettlement {
+struct PendingMobileShakescapeHnsSettlement {
     action_token: [u8; 32],
     session_id: hns_wallet_types::SessionId,
-    action: MobileDenuoSettlementAction,
+    action: MobileShakescapeSettlementAction,
     prepared: PreparedArtifact,
     maximum_fee: BaseUnits,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct MobileDenuoHnsFundingApproval {
+pub struct MobileShakescapeHnsFundingApproval {
     pub action_token: String,
     pub session_id: String,
     pub transaction_id: String,
@@ -408,7 +411,7 @@ pub struct MobileDenuoHnsFundingApproval {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct MobileDenuoHnsFundingReceipt {
+pub struct MobileShakescapeHnsFundingReceipt {
     pub session_id: String,
     pub transaction_id: String,
     pub accepted_at_unix: u64,
@@ -416,10 +419,10 @@ pub struct MobileDenuoHnsFundingReceipt {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct MobileDenuoHnsSettlementApproval {
+pub struct MobileShakescapeHnsSettlementApproval {
     pub action_token: String,
     pub session_id: String,
-    pub action: MobileDenuoSettlementAction,
+    pub action: MobileShakescapeSettlementAction,
     pub transaction_id: String,
     pub input_amount_dollarydoos: u64,
     pub output_amount_dollarydoos: u64,
@@ -430,26 +433,26 @@ pub struct MobileDenuoHnsSettlementApproval {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct MobileDenuoHnsSettlementReceipt {
+pub struct MobileShakescapeHnsSettlementReceipt {
     pub session_id: String,
-    pub action: MobileDenuoSettlementAction,
+    pub action: MobileShakescapeSettlementAction,
     pub transaction_id: String,
     pub accepted_at_unix: u64,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MobileDenuoAcceptancePolicyFile {
+struct MobileShakescapeAcceptancePolicyFile {
     network_magic: u32,
     network_genesis: String,
-    hrm: MobileDenuoHrmPolicyFile,
-    hnsa: MobileDenuoHnsaPolicyFile,
+    hrm: MobileShakescapeHrmPolicyFile,
+    hnsa: MobileShakescapeHnsaPolicyFile,
     maximum_receipt_lifetime_seconds: u32,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MobileDenuoHrmPolicyFile {
+struct MobileShakescapeHrmPolicyFile {
     subject: String,
     sequence: u64,
     envelope_hash: String,
@@ -460,7 +463,7 @@ struct MobileDenuoHrmPolicyFile {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct MobileDenuoHnsaPolicyFile {
+struct MobileShakescapeHnsaPolicyFile {
     canonical_service_name: String,
     application_profile_id: u16,
     service_resource_id: String,
@@ -539,7 +542,7 @@ impl<R: ServiceRuntime> MobileControllerSession<R> {
                     && (!require_shakedex
                         || session
                             .capabilities
-                            .contains(&ServiceCapability::DenuoShakedexV1))
+                            .contains(&ServiceCapability::ShakescapeShakedexV1))
                     && !session
                         .capabilities
                         .contains(&ServiceCapability::BrowserIntegration) =>
@@ -1047,8 +1050,8 @@ impl MobileWalletController {
             ),
             account_config,
             pending: None,
-            pending_denuo_hns_funding: None,
-            pending_denuo_hns_settlement: None,
+            pending_shakescape_hns_funding: None,
+            pending_shakescape_hns_settlement: None,
             known_names: Vec::new(),
         };
         controller.session.negotiate_value(require_shakedex)?;
@@ -1453,17 +1456,17 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         )
     }
 
-    /// Construct the adjacent direct HNS/BTC Denuo controller from this
+    /// Construct the adjacent direct HNS/BTC Shakescape controller from this
     /// exact value runtime's encrypted store and selected HNS network. No
     /// peer, relay, indexer, price reporter, or caller-supplied policy enters
     /// this construction.
-    pub fn direct_denuo_session_controller(
+    pub fn direct_shakescape_session_controller(
         &self,
-    ) -> Result<MobileDenuoSessionController, MobileWalletError> {
+    ) -> Result<MobileShakescapeSessionController, MobileWalletError> {
         let hns_network =
-            hns_wallet_hns::direct_denuo_network_binding(self.account_config.network)?;
+            hns_wallet_hns::direct_shakescape_network_binding(self.account_config.network)?;
         let (counterchain_network, counterchain_genesis) =
-            MobileBitcoinDirectConfig::direct_denuo_counterchain(self.account_config.network);
+            MobileBitcoinDirectConfig::direct_shakescape_counterchain(self.account_config.network);
         let network = hns_marketplace_protocol::NetworkBinding {
             hns_magic: hns_network.magic,
             hns_genesis: hns_network.genesis,
@@ -1471,9 +1474,9 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             counterchain_network,
             counterchain_genesis,
         };
-        let board_policy = DenuoDirectOfferBoardPolicy::new(network)?;
-        let swap_policy = DenuoDirectSwapPolicy::new(board_policy)?;
-        Ok(MobileDenuoSessionController::new(
+        let board_policy = ShakescapeDirectOfferBoardPolicy::new(network)?;
+        let swap_policy = ShakescapeDirectSwapPolicy::new(board_policy)?;
+        Ok(MobileShakescapeSessionController::new(
             self.session.store.clone(),
             swap_policy,
             self.account_config.wallet_id,
@@ -1503,15 +1506,15 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
     pub fn lock(&mut self) -> Result<(), MobileWalletError> {
         self.known_names.clear();
         let discard = self.discard_pending_action();
-        let discard_denuo = self.discard_pending_denuo_hns_funding();
-        let discard_settlement = self.discard_pending_denuo_hns_settlement();
+        let discard_shakescape = self.discard_pending_shakescape_hns_funding();
+        let discard_settlement = self.discard_pending_shakescape_hns_settlement();
         let lock = match self.session.wallet_request(WalletRequest::Lock) {
             Ok(WalletResponse::Locked) => Ok(()),
             Ok(_) => Err(MobileWalletError::UnexpectedResponse),
             Err(error) => Err(error),
         };
         discard?;
-        discard_denuo?;
+        discard_shakescape?;
         discard_settlement?;
         lock
     }
@@ -1554,7 +1557,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
     }
 
     /// Return the ordinary HNS payment receive target deterministically
-    /// derived from the unlocked local wallet. No HNS, Bitcoin, Denuo, or
+    /// derived from the unlocked local wallet. No HNS, Bitcoin, Shakescape, or
     /// clock operation occurs here; fund state and value operations still
     /// require a separately completed reconciliation.
     pub fn local_receive_target(&mut self) -> Result<ReceiveTarget, MobileWalletError> {
@@ -1596,7 +1599,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
 
     /// Return the exact clock authority used by the native HNS runtime after
     /// confirming that the same persisted account remains unlocked. Direct
-    /// Denuo handshakes carry a timestamp, but an embedding application must
+    /// Shakescape handshakes carry a timestamp, but an embedding application must
     /// never get to substitute its own clock for the value runtime's clock.
     fn trusted_wallet_peer_now_unix(&mut self) -> Result<u64, MobileWalletError> {
         if self.session.failed {
@@ -1608,7 +1611,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             }
             // This exact-account lookup also detects a separately changed
             // persisted account configuration before a peer sees a direct
-            // Denuo handshake for the value controller.
+            // Shakescape handshake for the value controller.
             self.session
                 .service
                 .local_trusted_native_hns_value_receive_target()
@@ -1624,7 +1627,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         result
     }
 
-    /// Query the synchronized Denuo/Shakedex board or one local trade session
+    /// Query the synchronized Shakescape/Shakedex board or one local trade session
     /// without exposing generic provider JSON as an input surface.
     pub fn query_shakedex(
         &mut self,
@@ -1662,8 +1665,8 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
     /// negotiated direct peer and controls the socket lifetime.
     pub fn begin_wallet_owned_direct_shakedex(
         &mut self,
-        peer: &mut HnsDirectDenuoPeer,
-    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+        peer: &mut HnsDirectShakescapePeer,
+    ) -> Result<DirectShakescapeBoardSyncReport, MobileWalletError> {
         // A direct peer is untrusted transport. A malformed packet, a closed
         // socket, or a timeout must discard that peer at the caller boundary,
         // never lock the wallet that independently owns chain and board state.
@@ -1677,9 +1680,9 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
     /// direct board peer. The caller must schedule subsequent calls itself.
     pub fn synchronize_wallet_owned_direct_shakedex(
         &mut self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         message_limit: usize,
-    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+    ) -> Result<DirectShakescapeBoardSyncReport, MobileWalletError> {
         self.session
             .service
             .synchronize_wallet_owned_direct_shakedex(peer, message_limit)
@@ -1691,10 +1694,10 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
     /// durable direct-session controller.
     pub fn service_wallet_owned_direct_shakedex_message(
         &mut self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         request_id: u64,
         message: hns_marketplace_protocol::NameMarketMessage,
-    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+    ) -> Result<DirectShakescapeBoardSyncReport, MobileWalletError> {
         self.session
             .service
             .service_wallet_owned_direct_shakedex_message(peer, request_id, message)
@@ -1705,7 +1708,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
     /// record the resulting local transport observation.
     pub fn announce_wallet_owned_direct_shakedex(
         &mut self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
     ) -> Result<Option<ObjectHash>, MobileWalletError> {
         self.session
             .service
@@ -1859,14 +1862,14 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         result
     }
 
-    pub fn prepare_denuo_hns_funding(
+    pub fn prepare_shakescape_hns_funding(
         &mut self,
-        permit: MobileDenuoHnsFundingPermit,
+        permit: MobileShakescapeHnsFundingPermit,
         maximum_fee_dollarydoos: u64,
-    ) -> Result<MobileDenuoHnsFundingApproval, MobileWalletError> {
+    ) -> Result<MobileShakescapeHnsFundingApproval, MobileWalletError> {
         if self.pending.is_some()
-            || self.pending_denuo_hns_funding.is_some()
-            || self.pending_denuo_hns_settlement.is_some()
+            || self.pending_shakescape_hns_funding.is_some()
+            || self.pending_shakescape_hns_settlement.is_some()
         {
             return Err(MobileWalletError::ValueActionPending);
         }
@@ -1905,7 +1908,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         let fee_dollarydoos = u64::try_from(prepared.0.fee.get())
             .map_err(|_| MobileWalletError::InvalidValueAction)?;
         let action_token = random_nonzero_bytes()?;
-        let approval = MobileDenuoHnsFundingApproval {
+        let approval = MobileShakescapeHnsFundingApproval {
             action_token: lowercase_hex(&action_token),
             session_id: lowercase_hex(session_id.as_bytes()),
             transaction_id: lowercase_hex(transaction_id.as_bytes()),
@@ -1915,7 +1918,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             refund_at_unix: hello.received_refund_deadline.value,
             expires_at_unix: prepared.0.expires_at_unix,
         };
-        self.pending_denuo_hns_funding = Some(PendingMobileDenuoHnsFunding {
+        self.pending_shakescape_hns_funding = Some(PendingMobileShakescapeHnsFunding {
             action_token,
             session_id,
             prepared,
@@ -1924,16 +1927,16 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         Ok(approval)
     }
 
-    pub fn approve_denuo_hns_funding(
+    pub fn approve_shakescape_hns_funding(
         &mut self,
         action_token: &str,
-    ) -> Result<MobileDenuoHnsFundingReceipt, MobileWalletError> {
+    ) -> Result<MobileShakescapeHnsFundingReceipt, MobileWalletError> {
         let pending = self
-            .pending_denuo_hns_funding
+            .pending_shakescape_hns_funding
             .take()
             .ok_or(MobileWalletError::NoPendingValueAction)?;
         if !mobile_action_token_matches(&pending.action_token, action_token) {
-            self.pending_denuo_hns_funding = Some(pending);
+            self.pending_shakescape_hns_funding = Some(pending);
             return Err(MobileWalletError::InvalidActionToken);
         }
         if pending.prepared.0.fee > pending.maximum_fee {
@@ -1944,23 +1947,23 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .service
             .broadcast_trusted_native_hns_settlement(&pending.prepared.0)
             .map_err(mobile_service_failure)?;
-        Ok(MobileDenuoHnsFundingReceipt {
+        Ok(MobileShakescapeHnsFundingReceipt {
             session_id: lowercase_hex(pending.session_id.as_bytes()),
             transaction_id: lowercase_hex(receipt.txid.as_bytes()),
             accepted_at_unix: receipt.accepted_at_unix,
         })
     }
 
-    pub fn reject_denuo_hns_funding(
+    pub fn reject_shakescape_hns_funding(
         &mut self,
         action_token: &str,
     ) -> Result<(), MobileWalletError> {
         let pending = self
-            .pending_denuo_hns_funding
+            .pending_shakescape_hns_funding
             .take()
             .ok_or(MobileWalletError::NoPendingValueAction)?;
         if !mobile_action_token_matches(&pending.action_token, action_token) {
-            self.pending_denuo_hns_funding = Some(pending);
+            self.pending_shakescape_hns_funding = Some(pending);
             return Err(MobileWalletError::InvalidActionToken);
         }
         self.session
@@ -1969,14 +1972,14 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .map_err(mobile_service_failure)
     }
 
-    pub fn prepare_denuo_hns_settlement(
+    pub fn prepare_shakescape_hns_settlement(
         &mut self,
-        mut permit: MobileDenuoHnsSettlementPermit,
+        mut permit: MobileShakescapeHnsSettlementPermit,
         maximum_fee_dollarydoos: u64,
-    ) -> Result<MobileDenuoHnsSettlementApproval, MobileWalletError> {
+    ) -> Result<MobileShakescapeHnsSettlementApproval, MobileWalletError> {
         if self.pending.is_some()
-            || self.pending_denuo_hns_funding.is_some()
-            || self.pending_denuo_hns_settlement.is_some()
+            || self.pending_shakescape_hns_funding.is_some()
+            || self.pending_shakescape_hns_settlement.is_some()
         {
             return Err(MobileWalletError::ValueActionPending);
         }
@@ -1995,8 +1998,8 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             return Err(MobileWalletError::InvalidValueAction);
         }
         let expected_key = match permit.action() {
-            MobileDenuoSettlementAction::Redeem => binding.descriptor.receiver_public_key,
-            MobileDenuoSettlementAction::Refund => binding.descriptor.refund_public_key,
+            MobileShakescapeSettlementAction::Redeem => binding.descriptor.receiver_public_key,
+            MobileShakescapeSettlementAction::Refund => binding.descriptor.refund_public_key,
         };
         if expected_key != permit.settlement_key().public_key() {
             return Err(MobileWalletError::InvalidValueAction);
@@ -2015,7 +2018,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         let maximum_fee = BaseUnits::new(u128::from(maximum_fee_dollarydoos));
         let action = permit.action();
         let prepared = match action {
-            MobileDenuoSettlementAction::Redeem => self
+            MobileShakescapeSettlementAction::Redeem => self
                 .session
                 .service
                 .prepare_trusted_native_hns_htlc_redeem(
@@ -2029,7 +2032,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
                     permit.settlement_key(),
                 )
                 .map(|prepared| prepared.0),
-            MobileDenuoSettlementAction::Refund => self
+            MobileShakescapeSettlementAction::Refund => self
                 .session
                 .service
                 .prepare_trusted_native_hns_htlc_refund(
@@ -2055,7 +2058,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .checked_sub(fee_dollarydoos)
             .ok_or(MobileWalletError::InvalidValueAction)?;
         let action_token = random_nonzero_bytes()?;
-        let approval = MobileDenuoHnsSettlementApproval {
+        let approval = MobileShakescapeHnsSettlementApproval {
             action_token: lowercase_hex(&action_token),
             session_id: lowercase_hex(session_id.as_bytes()),
             action,
@@ -2066,7 +2069,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             maximum_fee_dollarydoos,
             expires_at_unix: prepared.expires_at_unix,
         };
-        self.pending_denuo_hns_settlement = Some(PendingMobileDenuoHnsSettlement {
+        self.pending_shakescape_hns_settlement = Some(PendingMobileShakescapeHnsSettlement {
             action_token,
             session_id,
             action,
@@ -2076,16 +2079,16 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         Ok(approval)
     }
 
-    pub fn approve_denuo_hns_settlement(
+    pub fn approve_shakescape_hns_settlement(
         &mut self,
         action_token: &str,
-    ) -> Result<MobileDenuoHnsSettlementReceipt, MobileWalletError> {
+    ) -> Result<MobileShakescapeHnsSettlementReceipt, MobileWalletError> {
         let pending = self
-            .pending_denuo_hns_settlement
+            .pending_shakescape_hns_settlement
             .take()
             .ok_or(MobileWalletError::NoPendingValueAction)?;
         if !mobile_action_token_matches(&pending.action_token, action_token) {
-            self.pending_denuo_hns_settlement = Some(pending);
+            self.pending_shakescape_hns_settlement = Some(pending);
             return Err(MobileWalletError::InvalidActionToken);
         }
         if pending.prepared.fee > pending.maximum_fee {
@@ -2096,7 +2099,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .service
             .broadcast_trusted_native_hns_settlement(&pending.prepared)
             .map_err(mobile_service_failure)?;
-        Ok(MobileDenuoHnsSettlementReceipt {
+        Ok(MobileShakescapeHnsSettlementReceipt {
             session_id: lowercase_hex(pending.session_id.as_bytes()),
             action: pending.action,
             transaction_id: lowercase_hex(receipt.txid.as_bytes()),
@@ -2104,16 +2107,16 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         })
     }
 
-    pub fn reject_denuo_hns_settlement(
+    pub fn reject_shakescape_hns_settlement(
         &mut self,
         action_token: &str,
     ) -> Result<(), MobileWalletError> {
         let pending = self
-            .pending_denuo_hns_settlement
+            .pending_shakescape_hns_settlement
             .take()
             .ok_or(MobileWalletError::NoPendingValueAction)?;
         if !mobile_action_token_matches(&pending.action_token, action_token) {
-            self.pending_denuo_hns_settlement = Some(pending);
+            self.pending_shakescape_hns_settlement = Some(pending);
             return Err(MobileWalletError::InvalidActionToken);
         }
         self.session
@@ -2122,16 +2125,16 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .map_err(mobile_service_failure)
     }
 
-    pub fn resume_approved_denuo_hns_settlements(&self) -> Result<usize, MobileWalletError> {
+    pub fn resume_approved_shakescape_hns_settlements(&self) -> Result<usize, MobileWalletError> {
         self.session
             .service
             .rebroadcast_trusted_native_hns_settlements()
             .map_err(mobile_service_failure)
     }
 
-    pub fn verified_denuo_hns_funding(
+    pub fn verified_shakescape_hns_funding(
         &self,
-        permit: MobileDenuoHnsVerificationPermit,
+        permit: MobileShakescapeHnsVerificationPermit,
     ) -> Result<Option<hns_wallet_chain_api::VerifiedLock>, MobileWalletError> {
         let hello = permit.hello();
         let binding = hello
@@ -2154,9 +2157,9 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .map_err(mobile_service_failure)
     }
 
-    pub fn verified_denuo_hns_spend(
+    pub fn verified_shakescape_hns_spend(
         &self,
-        permit: MobileDenuoHnsVerificationPermit,
+        permit: MobileShakescapeHnsVerificationPermit,
     ) -> Result<Option<hns_wallet_hns::VerifiedNativeHtlcSpend>, MobileWalletError> {
         let hello = permit.hello();
         let binding = hello
@@ -2209,8 +2212,8 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .map_err(mobile_service_failure)
     }
 
-    fn discard_pending_denuo_hns_funding(&mut self) -> Result<(), MobileWalletError> {
-        let Some(pending) = self.pending_denuo_hns_funding.take() else {
+    fn discard_pending_shakescape_hns_funding(&mut self) -> Result<(), MobileWalletError> {
+        let Some(pending) = self.pending_shakescape_hns_funding.take() else {
             return Ok(());
         };
         self.session
@@ -2219,8 +2222,8 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .map_err(mobile_service_failure)
     }
 
-    fn discard_pending_denuo_hns_settlement(&mut self) -> Result<(), MobileWalletError> {
-        let Some(pending) = self.pending_denuo_hns_settlement.take() else {
+    fn discard_pending_shakescape_hns_settlement(&mut self) -> Result<(), MobileWalletError> {
+        let Some(pending) = self.pending_shakescape_hns_settlement.take() else {
             return Ok(());
         };
         self.session
@@ -2300,46 +2303,46 @@ impl<C: HnsClock> MobileDirectHnsValueController<C> {
             .map_err(Into::into)
     }
 
-    /// Bind one wallet-owned direct Denuo listener with the same network,
+    /// Bind one wallet-owned direct Shakescape listener with the same network,
     /// address policy, socket deadlines, and explicit peer configuration as
     /// the embedded HNS backend.  Binding the socket does not unlock the
     /// wallet or service a board exchange.
-    pub fn bind_wallet_owned_direct_denuo_listener(
+    pub fn bind_wallet_owned_direct_shakescape_listener(
         &self,
         address: SocketAddr,
-    ) -> Result<MobileDirectDenuoListener, MobileWalletError> {
+    ) -> Result<MobileDirectShakescapeListener, MobileWalletError> {
         self.coordinator
-            .bind_denuo_listener(address)
-            .map(|listener| MobileDirectDenuoListener { listener })
+            .bind_shakescape_listener(address)
+            .map(|listener| MobileDirectShakescapeListener { listener })
             .map_err(Into::into)
     }
 
-    /// Establish a direct Denuo peer using the exact policy retained by this
+    /// Establish a direct Shakescape peer using the exact policy retained by this
     /// controller and the trusted clock of its unlocked value runtime.
     ///
     /// `local_height` is only the standard peer-handshake height hint. It is
     /// not chain evidence and cannot authorize a wallet action; all value
     /// operations continue to require a later synchronized runtime view.
-    pub fn connect_wallet_owned_direct_denuo_peer(
+    pub fn connect_wallet_owned_direct_shakescape_peer(
         &mut self,
         address: SocketAddr,
         local_height: u32,
-    ) -> Result<HnsDirectDenuoPeer, MobileWalletError> {
+    ) -> Result<HnsDirectShakescapePeer, MobileWalletError> {
         let now_unix = self.value.trusted_wallet_peer_now_unix()?;
         self.coordinator
-            .connect_denuo_peer(address, local_height, now_unix)
+            .connect_shakescape_peer(address, local_height, now_unix)
             .map_err(Into::into)
     }
 
-    /// Accept at most one Denuo peer from a listener created by this direct
+    /// Accept at most one Shakescape peer from a listener created by this direct
     /// controller.  A return value of `Ok(None)` means no TCP connection is
     /// pending.  Handshake time comes from the value runtime rather than a
     /// caller-provided wall clock.
-    pub fn accept_wallet_owned_direct_denuo_peer(
+    pub fn accept_wallet_owned_direct_shakescape_peer(
         &mut self,
-        listener: &MobileDirectDenuoListener,
+        listener: &MobileDirectShakescapeListener,
         local_height: u32,
-    ) -> Result<Option<HnsDirectDenuoPeer>, MobileWalletError> {
+    ) -> Result<Option<HnsDirectShakescapePeer>, MobileWalletError> {
         let now_unix = self.value.trusted_wallet_peer_now_unix()?;
         listener
             .listener
@@ -2353,17 +2356,17 @@ impl<C: HnsClock> MobileDirectHnsValueController<C> {
     /// no relay or provider transport is involved.
     pub fn begin_wallet_owned_direct_shakedex(
         &mut self,
-        peer: &mut HnsDirectDenuoPeer,
-    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+        peer: &mut HnsDirectShakescapePeer,
+    ) -> Result<DirectShakescapeBoardSyncReport, MobileWalletError> {
         self.value.begin_wallet_owned_direct_shakedex(peer)
     }
 
     /// Process one bounded batch from an already negotiated wallet peer.
     pub fn synchronize_wallet_owned_direct_shakedex(
         &mut self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         message_limit: usize,
-    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+    ) -> Result<DirectShakescapeBoardSyncReport, MobileWalletError> {
         self.value
             .synchronize_wallet_owned_direct_shakedex(peer, message_limit)
     }
@@ -2373,10 +2376,10 @@ impl<C: HnsClock> MobileDirectHnsValueController<C> {
     /// adjacent direct HNS/BTC session controller.
     pub fn service_wallet_owned_direct_shakedex_message(
         &mut self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
         request_id: u64,
         message: hns_marketplace_protocol::NameMarketMessage,
-    ) -> Result<DirectDenuoBoardSyncReport, MobileWalletError> {
+    ) -> Result<DirectShakescapeBoardSyncReport, MobileWalletError> {
         self.value
             .service_wallet_owned_direct_shakedex_message(peer, request_id, message)
     }
@@ -2385,7 +2388,7 @@ impl<C: HnsClock> MobileDirectHnsValueController<C> {
     /// peer and persist its local transport observation.
     pub fn announce_wallet_owned_direct_shakedex(
         &mut self,
-        peer: &mut HnsDirectDenuoPeer,
+        peer: &mut HnsDirectShakescapePeer,
     ) -> Result<Option<ObjectHash>, MobileWalletError> {
         self.value.announce_wallet_owned_direct_shakedex(peer)
     }
@@ -2806,14 +2809,14 @@ fn mobile_shakedex_config(json: &[u8]) -> Result<PersistentShakedexConfig, Mobil
     {
         return Err(MobileWalletError::InvalidShakedexConfiguration);
     }
-    let wire: MobileDenuoAcceptancePolicyFile = serde_json::from_slice(json)
+    let wire: MobileShakescapeAcceptancePolicyFile = serde_json::from_slice(json)
         .map_err(|_| MobileWalletError::InvalidShakedexConfiguration)?;
-    let acceptance_policy = DenuoPublicationAcceptancePolicy::new(
+    let acceptance_policy = ShakescapePublicationAcceptancePolicy::new(
         NetworkBinding {
             magic: wire.network_magic,
             genesis: ProtocolBlockHash::new(mobile_policy_hex(&wire.network_genesis)?),
         },
-        DenuoHrmRootBinding {
+        ShakescapeHrmRootBinding {
             subject: ObjectHash::new(mobile_policy_hex(&wire.hrm.subject)?),
             sequence: wire.hrm.sequence,
             envelope_hash: ObjectHash::new(mobile_policy_hex(&wire.hrm.envelope_hash)?),
@@ -2821,7 +2824,7 @@ fn mobile_shakedex_config(json: &[u8]) -> Result<PersistentShakedexConfig, Mobil
             chain_work_be: mobile_policy_hex(&wire.hrm.chain_work_be)?,
             chain_anchor: ObjectHash::new(mobile_policy_hex(&wire.hrm.chain_anchor)?),
         },
-        DenuoHnsaEndpointBinding {
+        ShakescapeHnsaEndpointBinding {
             canonical_service_name: wire.hnsa.canonical_service_name.into_bytes(),
             application_profile_id: wire.hnsa.application_profile_id,
             service_resource_id: ObjectHash::new(mobile_policy_hex(
@@ -2844,14 +2847,14 @@ fn mobile_shakedex_config(json: &[u8]) -> Result<PersistentShakedexConfig, Mobil
     .map_err(|_| MobileWalletError::InvalidShakedexConfiguration)?;
     Ok(PersistentShakedexConfig {
         seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
-        transport: PersistentDenuoTransport::RelayAcceptance(acceptance_policy),
+        transport: PersistentShakescapeTransport::RelayAcceptance(acceptance_policy),
     })
 }
 
 fn wallet_owned_direct_shakedex_config() -> PersistentShakedexConfig {
     PersistentShakedexConfig {
         seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
-        transport: PersistentDenuoTransport::WalletPeers,
+        transport: PersistentShakescapeTransport::WalletPeers,
     }
 }
 
@@ -2930,8 +2933,8 @@ pub enum MobileWalletError {
     BitcoinActionExpired,
     #[error("the direct Bitcoin send request is invalid")]
     InvalidBitcoinAction,
-    #[error("the direct Denuo HNS/Bitcoin session message is invalid")]
-    InvalidDenuoSessionMessage,
+    #[error("the direct Shakescape HNS/Bitcoin session message is invalid")]
+    InvalidShakescapeSessionMessage,
     #[error("a direct BTC-for-HNS offer approval is already pending")]
     DirectOfferActionPending,
     #[error("there is no pending direct BTC-for-HNS offer approval")]
@@ -3027,7 +3030,7 @@ mod tests {
         }
     }
 
-    fn denuo_acceptance_policy_json() -> Vec<u8> {
+    fn shakescape_acceptance_policy_json() -> Vec<u8> {
         serde_json::to_vec(&json!({
             "network_magic": 1_535_399_072_u32,
             "network_genesis": "11".repeat(32),
@@ -3054,19 +3057,20 @@ mod tests {
             },
             "maximum_receipt_lifetime_seconds": 120
         }))
-        .expect("serialize Denuo acceptance policy")
+        .expect("serialize Shakescape acceptance policy")
     }
 
     #[test]
-    fn installed_denuo_policy_is_exact_and_disables_marketplace_fees() {
-        let encoded = denuo_acceptance_policy_json();
-        let config = mobile_shakedex_config(&encoded).expect("valid Denuo policy");
+    fn installed_shakescape_policy_is_exact_and_disables_marketplace_fees() {
+        let encoded = shakescape_acceptance_policy_json();
+        let config = mobile_shakedex_config(&encoded).expect("valid Shakescape policy");
 
         assert_eq!(
             config.seller_policy,
             ShakedexSellerPolicy::no_marketplace_fee()
         );
-        let PersistentDenuoTransport::RelayAcceptance(acceptance_policy) = &config.transport else {
+        let PersistentShakescapeTransport::RelayAcceptance(acceptance_policy) = &config.transport
+        else {
             panic!("explicit legacy relay policy must select relay transport");
         };
         assert_eq!(acceptance_policy.network().magic, 1_535_399_072);
@@ -3579,17 +3583,17 @@ mod tests {
                 .settlement_enabled
         );
         let listener = direct
-            .bind_wallet_owned_direct_denuo_listener((std::net::Ipv4Addr::LOCALHOST, 0).into())
-            .expect("bind Denuo listener from the direct value controller");
+            .bind_wallet_owned_direct_shakescape_listener((std::net::Ipv4Addr::LOCALHOST, 0).into())
+            .expect("bind Shakescape listener from the direct value controller");
         assert!(
             listener
                 .local_addr()
-                .expect("direct Denuo listener address")
+                .expect("direct Shakescape listener address")
                 .port()
                 != 0
         );
         assert!(matches!(
-            direct.connect_wallet_owned_direct_denuo_peer(
+            direct.connect_wallet_owned_direct_shakescape_peer(
                 (std::net::Ipv4Addr::LOCALHOST, 1).into(),
                 0,
             ),
@@ -3601,8 +3605,8 @@ mod tests {
             .expect("unlock direct value and Shakedex controller");
         assert!(
             direct
-                .accept_wallet_owned_direct_denuo_peer(&listener, 0)
-                .expect("poll direct Denuo listener with the value runtime clock")
+                .accept_wallet_owned_direct_shakescape_peer(&listener, 0)
+                .expect("poll direct Shakescape listener with the value runtime clock")
                 .is_none()
         );
         direct
@@ -3632,7 +3636,7 @@ mod tests {
                 MockReadClock,
                 Some(PersistentShakedexConfig {
                     seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
-                    transport: PersistentDenuoTransport::WalletPeers,
+                    transport: PersistentShakescapeTransport::WalletPeers,
                 }),
             )
             .expect("compose direct value wallet");

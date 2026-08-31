@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use blake2::Blake2bVar;
 use blake2::digest::{Update, VariableOutput};
 use hns_covenants::{FinalizeCovenant, NameState, hash_name};
-use hns_marketplace_protocol::{DenuoRegistryVersion, NameMarketHello, NameMarketMessage};
+use hns_marketplace_protocol::{NameMarketHello, NameMarketMessage, ShakescapeRegistryVersion};
 use hns_primitives::{
     BlockHash, Dollarydoos, Height, Outpoint as CanonicalOutpoint,
     TransactionHash as CanonicalTransactionHash,
@@ -30,12 +30,12 @@ use hns_wallet_hns::{
     TransactionEvidence, WalletAddressKey,
 };
 use hns_wallet_shakedex::{
-    DenuoBoardCancellationAdmission, DenuoBoardOfferAdmission, DenuoBoardOfferResponsePlan,
-    DenuoBoardOffersResponsePlan, DenuoBoardRuntime, DenuoNameMarketRequest,
-    SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED, SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED,
-    SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, ShakedexError, encode_denuo_request,
-    load_name_market_board, prepare_denuo_board_inventory_response,
-    prepare_denuo_board_offer_response, prepare_denuo_board_offers_response,
+    SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED, SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED,
+    SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, ShakedexError, ShakescapeBoardCancellationAdmission,
+    ShakescapeBoardOfferAdmission, ShakescapeBoardOfferResponsePlan,
+    ShakescapeBoardOffersResponsePlan, ShakescapeBoardRuntime, ShakescapeNameMarketRequest,
+    encode_shakescape_request, load_name_market_board, prepare_shakescape_board_inventory_response,
+    prepare_shakescape_board_offer_response, prepare_shakescape_board_offers_response,
     save_name_market_board, verify_fixed_price_listing,
 };
 use hns_wallet_store::{SharedWalletStore, WalletStore};
@@ -286,7 +286,7 @@ impl MarketFixture {
         let listing = self.listing(sequence, price);
         let hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
         let envelope = NameMarketMessage::Offer(listing)
-            .encode_envelope(DenuoRegistryVersion::V2, request_id)
+            .encode_envelope(ShakescapeRegistryVersion::V1, request_id)
             .expect("offer envelope");
         (envelope, hash)
     }
@@ -308,13 +308,13 @@ impl MarketFixture {
             .sign(&self.signing_key)
             .expect("signed cancellation");
         let (envelope, cancellation_hash) =
-            Self::cancellation_envelope(&cancellation, DenuoRegistryVersion::V2, request_id);
+            Self::cancellation_envelope(&cancellation, ShakescapeRegistryVersion::V1, request_id);
         (cancellation, envelope, cancellation_hash)
     }
 
     fn cancellation_envelope(
         cancellation: &ListingCancellation,
-        registry: DenuoRegistryVersion,
+        registry: ShakescapeRegistryVersion,
         request_id: u64,
     ) -> (Vec<u8>, ObjectHash) {
         let cancellation_hash =
@@ -1141,7 +1141,7 @@ fn blake2b_256(parts: &[&[u8]]) -> [u8; 32] {
 }
 
 fn cancellation_envelope_with_invalid_signature(encoded: &[u8]) -> Vec<u8> {
-    const DENUO_ENVELOPE_OVERHEAD: usize = 26;
+    const SHAKESCAPE_ENVELOPE_OVERHEAD: usize = 26;
     const CANCELLATION_SIGNATURE_OFFSET: usize = 128;
     const CANCELLATION_HASH_SIZE: usize = 32;
     const CANCELLATION_HASH_DOMAIN: &[u8] = b"hns-rs/hns-swap/listing-cancellation/v1/hash";
@@ -1151,12 +1151,12 @@ fn cancellation_envelope_with_invalid_signature(encoded: &[u8]) -> Vec<u8> {
         .len()
         .checked_sub(CANCELLATION_HASH_SIZE)
         .expect("cancellation envelope hash");
-    let signature_index = DENUO_ENVELOPE_OVERHEAD + CANCELLATION_SIGNATURE_OFFSET;
+    let signature_index = SHAKESCAPE_ENVELOPE_OVERHEAD + CANCELLATION_SIGNATURE_OFFSET;
     assert!(signature_index < hash_start);
     tampered[signature_index] ^= 1;
     let hash = blake2b_256(&[
         CANCELLATION_HASH_DOMAIN,
-        &tampered[DENUO_ENVELOPE_OVERHEAD..hash_start],
+        &tampered[SHAKESCAPE_ENVELOPE_OVERHEAD..hash_start],
     ]);
     tampered[hash_start..].copy_from_slice(&hash);
     tampered
@@ -1325,7 +1325,7 @@ impl TestDirectory {
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
         let path = parent.join(format!(
-            "hns-wallet-denuo-board-runtime-{}-{unique}",
+            "hns-wallet-shakescape-board-runtime-{}-{unique}",
             std::process::id()
         ));
         std::fs::create_dir(&path).expect("test directory");
@@ -1665,33 +1665,35 @@ fn batch_offers_response_rejects_over_64_pre_io_and_represents_all_absent_withou
         BatchBackendFault::Healthy,
         clock_calls.clone(),
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
+    let board =
+        ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
     let oversized_hashes = (1_u8..=65)
         .map(|byte| ObjectHash::new([byte; 32]))
         .collect();
-    let oversized = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let oversized = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         180,
-        &DenuoNameMarketRequest::Offers(oversized_hashes),
+        &ShakescapeNameMarketRequest::Offers(oversized_hashes),
     )
     .expect("protocol-valid 65-hash GetOffers request");
     let one_hash = ObjectHash::new([0xef; 32]);
-    let valid = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let valid = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         186,
-        &DenuoNameMarketRequest::Offers(vec![one_hash]),
+        &ShakescapeNameMarketRequest::Offers(vec![one_hash]),
     )
     .expect("canonical one-hash GetOffers request");
-    let v1 = encode_denuo_request(
-        DenuoRegistryVersion::V1,
+    let mut wrong_registry = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         187,
-        &DenuoNameMarketRequest::Offers(vec![one_hash]),
+        &ShakescapeNameMarketRequest::Offers(vec![one_hash]),
     )
-    .expect("V1 GetOffers request");
-    let inventory = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    .expect("canonical GetOffers request before registry corruption");
+    wrong_registry[4] = 2;
+    let inventory = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         188,
-        &DenuoNameMarketRequest::Inventory,
+        &ShakescapeNameMarketRequest::Inventory,
     )
     .expect("wrong inventory request family");
     let response = NameMarketMessage::Offers(vec![fixture.markets[0].listing(
@@ -1699,7 +1701,7 @@ fn batch_offers_response_rejects_over_64_pre_io_and_represents_all_absent_withou
         188,
         18_800,
     )])
-    .encode_envelope(DenuoRegistryVersion::V2, 188)
+    .encode_envelope(ShakescapeRegistryVersion::V1, 188)
     .expect("wrong Offers response family");
     let mut zero_id = valid.clone();
     const REQUEST_ID_OFFSET: usize = 4 + (5 * core::mem::size_of::<u16>());
@@ -1710,8 +1712,8 @@ fn batch_offers_response_rejects_over_64_pre_io_and_represents_all_absent_withou
 
     store.lock().expect("lock store before pre-I/O rejection");
     assert!(matches!(
-        prepare_denuo_board_offers_response(&oversized, &board),
-        Err(ShakedexError::InvalidDenuoEnvelope)
+        prepare_shakescape_board_offers_response(&oversized, &board),
+        Err(ShakedexError::InvalidShakescapeEnvelope)
     ));
     for rejected in [
         inventory.as_slice(),
@@ -1721,13 +1723,13 @@ fn batch_offers_response_rejects_over_64_pre_io_and_represents_all_absent_withou
         &[0x01, 0x02, 0x03],
     ] {
         assert!(matches!(
-            prepare_denuo_board_offers_response(rejected, &board),
-            Err(ShakedexError::InvalidDenuoEnvelope)
+            prepare_shakescape_board_offers_response(rejected, &board),
+            Err(ShakedexError::InvalidShakescapeEnvelope)
         ));
     }
     assert!(matches!(
-        prepare_denuo_board_offers_response(&v1, &board),
-        Err(ShakedexError::DenuoRegistryMismatch)
+        prepare_shakescape_board_offers_response(&wrong_registry, &board),
+        Err(ShakedexError::InvalidShakescapeEnvelope)
     ));
     store
         .unlock(PASSPHRASE)
@@ -1738,17 +1740,17 @@ fn batch_offers_response_rejects_over_64_pre_io_and_represents_all_absent_withou
     assert_eq!(clock_calls.load(Ordering::SeqCst), 0);
 
     let missing_hash = ObjectHash::new([0xf0; 32]);
-    let missing = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let missing = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         181,
-        &DenuoNameMarketRequest::Offers(vec![missing_hash]),
+        &ShakescapeNameMarketRequest::Offers(vec![missing_hash]),
     )
     .expect("missing GetOffers request");
-    let absent = prepare_denuo_board_offers_response(&missing, &board)
+    let absent = prepare_shakescape_board_offers_response(&missing, &board)
         .expect("typed all-absent response plan");
     assert!(matches!(
         absent,
-        DenuoBoardOffersResponsePlan::Absent {
+        ShakescapeBoardOffersResponsePlan::Absent {
             request_id: 181,
             requested_count: 1,
             board_revision: 0,
@@ -1801,10 +1803,10 @@ fn batch_offers_response_preserves_sorted_request_subset_and_tombstones_without_
     let mut requested_hashes = listing_hashes.clone();
     requested_hashes.push(missing_hash);
     requested_hashes.sort_unstable();
-    let request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         182,
-        &DenuoNameMarketRequest::Offers(requested_hashes.clone()),
+        &ShakescapeNameMarketRequest::Offers(requested_hashes.clone()),
     )
     .expect("sorted GetOffers request");
     let expected_name_order: Vec<_> = requested_hashes
@@ -1827,14 +1829,15 @@ fn batch_offers_response_preserves_sorted_request_subset_and_tombstones_without_
         BatchBackendFault::Healthy,
         clock_calls.clone(),
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
-    let plan = prepare_denuo_board_offers_response(&request, &board)
+    let board =
+        ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
+    let plan = prepare_shakescape_board_offers_response(&request, &board)
         .expect("coherent current offers response plan");
     assert_eq!(plan.request_id(), 182);
     assert_eq!(plan.requested_count(), 4);
     assert_eq!(plan.returned_count(), 3);
     assert_eq!(plan.board_revision(), 1);
-    let DenuoBoardOffersResponsePlan::Current(prepared) = &plan else {
+    let ShakescapeBoardOffersResponsePlan::Current(prepared) = &plan else {
         panic!("expected current batch response plan");
     };
     assert_eq!(prepared.request_id(), 182);
@@ -1875,7 +1878,7 @@ fn batch_offers_response_preserves_sorted_request_subset_and_tombstones_without_
             .expect("batch cancellation hash"),
     );
     let cancellation_envelope = NameMarketMessage::Cancel(cancellation)
-        .encode_envelope(DenuoRegistryVersion::V2, 183)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 183)
         .expect("batch cancellation envelope");
     board
         .admit_cancellation(&cancellation_envelope, listing_hashes[0], cancellation_hash)
@@ -1894,9 +1897,9 @@ fn batch_offers_response_preserves_sorted_request_subset_and_tombstones_without_
         BatchBackendFault::Healthy,
         tombstone_clock_calls.clone(),
     );
-    let tombstone_board = DenuoBoardRuntime::new(&tombstone_hns, store.clone())
+    let tombstone_board = ShakescapeBoardRuntime::new(&tombstone_hns, store.clone())
         .expect("tombstone shared batch store authority");
-    let tombstoned = prepare_denuo_board_offers_response(&request, &tombstone_board)
+    let tombstoned = prepare_shakescape_board_offers_response(&request, &tombstone_board)
         .expect("coherent subset after tombstone");
     assert_eq!(tombstoned.requested_count(), 4);
     assert_eq!(tombstoned.returned_count(), 2);
@@ -1919,7 +1922,7 @@ fn batch_offers_response_preserves_sorted_request_subset_and_tombstones_without_
     assert!(HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
     assert!(HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
     assert!(SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
-    assert!(SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED);
     assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
 }
 
@@ -1945,10 +1948,10 @@ fn batch_offers_response_rejects_duplicate_active_names_before_backend_or_clock(
     let (store, config) = create_store(":memory:");
     let (revision, mut hashes) = persist_batch_listings(&store, fixture.network, &listings);
     hashes.sort_unstable();
-    let request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         184,
-        &DenuoNameMarketRequest::Offers(hashes),
+        &ShakescapeNameMarketRequest::Offers(hashes),
     )
     .expect("same-name distinct-seller GetOffers request");
     let observations = Arc::new(BatchBackendObservations::default());
@@ -1961,10 +1964,11 @@ fn batch_offers_response_rejects_duplicate_active_names_before_backend_or_clock(
         BatchBackendFault::Healthy,
         clock_calls.clone(),
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
+    let board =
+        ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
 
     assert!(matches!(
-        prepare_denuo_board_offers_response(&request, &board),
+        prepare_shakescape_board_offers_response(&request, &board),
         Err(ShakedexError::InvalidEvidence)
     ));
     assert_eq!(observations.chain_calls.load(Ordering::SeqCst), 0);
@@ -2001,10 +2005,10 @@ fn batch_offers_response_fences_board_revision_and_listing_expiry() {
     let (store, config) = create_store(":memory:");
     let (revision, mut listing_hashes) = persist_batch_listings(&store, fixture.network, &listings);
     listing_hashes.sort_unstable();
-    let request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         185,
-        &DenuoNameMarketRequest::Offers(listing_hashes),
+        &ShakescapeNameMarketRequest::Offers(listing_hashes),
     )
     .expect("board-fenced GetOffers request");
     let observations = Arc::new(BatchBackendObservations::default());
@@ -2017,7 +2021,8 @@ fn batch_offers_response_fences_board_revision_and_listing_expiry() {
         BatchBackendFault::Healthy,
         clock_calls,
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
+    let board =
+        ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared batch store authority");
     let hook_store = store.clone();
     observations.install_query_hook(move || {
         hook_store
@@ -2028,7 +2033,7 @@ fn batch_offers_response_fences_board_revision_and_listing_expiry() {
             .expect("advance unrelated board revision during batch query");
     });
     assert!(matches!(
-        prepare_denuo_board_offers_response(&request, &board),
+        prepare_shakescape_board_offers_response(&request, &board),
         Err(ShakedexError::StaleRevision)
     ));
     assert_eq!(
@@ -2056,9 +2061,9 @@ fn batch_offers_response_fences_board_revision_and_listing_expiry() {
     )
     .expect("late current-lock batch runtime");
     let late_board =
-        DenuoBoardRuntime::new(&late_hns, store).expect("late shared batch store authority");
+        ShakescapeBoardRuntime::new(&late_hns, store).expect("late shared batch store authority");
     assert!(matches!(
-        prepare_denuo_board_offers_response(&request, &late_board),
+        prepare_shakescape_board_offers_response(&request, &late_board),
         Err(ShakedexError::InvalidListing)
     ));
     assert_eq!(late_observations.chain_calls.load(Ordering::SeqCst), 2);
@@ -2080,15 +2085,15 @@ fn authority_bound_board_exact_retry_survives_restart_without_revision_bump() {
         market.clone(),
         control.clone(),
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    let board = ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
 
     assert!(matches!(
         board.admit_offer(&envelope, listing_hash),
-        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Inserted { revision: 1, .. })
     ));
     assert!(matches!(
         board.admit_offer(&envelope, listing_hash),
-        Ok(DenuoBoardOfferAdmission::Existing { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Existing { revision: 1, .. })
     ));
     let current = board
         .current_offer(listing_hash)
@@ -2120,11 +2125,11 @@ fn authority_bound_board_exact_retry_survives_restart_without_revision_bump() {
         market,
         BackendControl::new(),
     );
-    let restarted = DenuoBoardRuntime::new(&restarted_hns, restarted_store)
+    let restarted = ShakescapeBoardRuntime::new(&restarted_hns, restarted_store)
         .expect("restarted shared authority");
     assert!(matches!(
         restarted.admit_offer(&envelope, listing_hash),
-        Ok(DenuoBoardOfferAdmission::Existing { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Existing { revision: 1, .. })
     ));
     assert_eq!(
         restarted
@@ -2146,14 +2151,14 @@ fn board_conflicts_spends_stale_mempool_and_unrelated_stores_fail_closed() {
         WalletStore::create(":memory:", "unrelated board store").expect("unrelated store"),
     );
     assert!(matches!(
-        DenuoBoardRuntime::new(&hns, unrelated),
+        ShakescapeBoardRuntime::new(&hns, unrelated),
         Err(ShakedexError::StoreAuthorityMismatch)
     ));
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    let board = ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
     let (first, first_hash) = market.offer(5, 51, 12_345_678);
     assert!(matches!(
         board.admit_offer(&first, first_hash),
-        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Inserted { revision: 1, .. })
     ));
 
     let (equivocation, equivocation_hash) = market.offer(5, 52, 12_345_679);
@@ -2193,7 +2198,7 @@ fn board_conflicts_spends_stale_mempool_and_unrelated_stores_fail_closed() {
         .store(false, Ordering::SeqCst);
     assert!(matches!(
         board.admit_offer(&update, update_hash),
-        Ok(DenuoBoardOfferAdmission::Updated { revision: 2, .. })
+        Ok(ShakescapeBoardOfferAdmission::Updated { revision: 2, .. })
     ));
     assert_eq!(
         store
@@ -2228,12 +2233,12 @@ fn inventory_response_plan_is_read_only_restart_safe_and_hides_cancelled_rows_wi
     let listing = market.listing(28, 12_345_678);
     let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
     let offer = NameMarketMessage::Offer(listing.clone())
-        .encode_envelope(DenuoRegistryVersion::V2, 130)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 130)
         .expect("offer envelope");
-    let request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         131,
-        &DenuoNameMarketRequest::Inventory,
+        &ShakescapeNameMarketRequest::Inventory,
     )
     .expect("GetOfferInventory request");
     let (_, cancellation, cancellation_hash) = market.cancellation(&listing, 29, 132);
@@ -2245,13 +2250,13 @@ fn inventory_response_plan_is_read_only_restart_safe_and_hides_cancelled_rows_wi
         market.clone(),
         control.clone(),
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    let board = ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
     assert!(matches!(
         board.admit_offer(&offer, listing_hash),
-        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Inserted { revision: 1, .. })
     ));
     let queries_after_admission = control.query_count.load(Ordering::SeqCst);
-    let plan = prepare_denuo_board_inventory_response(&request, &board)
+    let plan = prepare_shakescape_board_inventory_response(&request, &board)
         .expect("closed current inventory plan");
     assert_eq!(plan.request_id(), 131);
     assert_eq!(plan.board_revision(), 1);
@@ -2267,7 +2272,7 @@ fn inventory_response_plan_is_read_only_restart_safe_and_hides_cancelled_rows_wi
             .revision,
         1
     );
-    let repeated = prepare_denuo_board_inventory_response(&request, &board)
+    let repeated = prepare_shakescape_board_inventory_response(&request, &board)
         .expect("exact repeated inventory plan");
     assert_eq!(repeated.listing_count(), 1);
     assert_eq!(repeated.board_revision(), 1);
@@ -2294,9 +2299,9 @@ fn inventory_response_plan_is_read_only_restart_safe_and_hides_cancelled_rows_wi
         market,
         restarted_control.clone(),
     );
-    let restarted = DenuoBoardRuntime::new(&restarted_hns, restarted_store.clone())
+    let restarted = ShakescapeBoardRuntime::new(&restarted_hns, restarted_store.clone())
         .expect("restarted shared authority");
-    let restarted_plan = prepare_denuo_board_inventory_response(&request, &restarted)
+    let restarted_plan = prepare_shakescape_board_inventory_response(&request, &restarted)
         .expect("fresh restart inventory plan");
     assert_eq!(restarted_plan.board_revision(), 1);
     assert_eq!(restarted_plan.listing_count(), 1);
@@ -2305,7 +2310,7 @@ fn inventory_response_plan_is_read_only_restart_safe_and_hides_cancelled_rows_wi
     restarted
         .admit_cancellation(&cancellation, listing_hash, cancellation_hash)
         .expect("cancel target");
-    let cancelled = prepare_denuo_board_inventory_response(&request, &restarted)
+    let cancelled = prepare_shakescape_board_inventory_response(&request, &restarted)
         .expect("cancelled inventory plan");
     assert_eq!(cancelled.board_revision(), 2);
     assert_eq!(cancelled.listing_count(), 0);
@@ -2314,7 +2319,7 @@ fn inventory_response_plan_is_read_only_restart_safe_and_hides_cancelled_rows_wi
     assert!(HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
     assert!(HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
     assert!(SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
-    assert!(SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED);
     assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
 }
 
@@ -2324,10 +2329,10 @@ fn inventory_response_plan_accepts_empty_and_filters_expired_or_wrong_network_ro
     let control = BackendControl::new();
     control.reject_queries.store(true, Ordering::SeqCst);
     let (store, mut config) = create_store(":memory:");
-    let request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         133,
-        &DenuoNameMarketRequest::Inventory,
+        &ShakescapeNameMarketRequest::Inventory,
     )
     .expect("GetOfferInventory request");
     let empty_hns = runtime(
@@ -2337,8 +2342,8 @@ fn inventory_response_plan_accepts_empty_and_filters_expired_or_wrong_network_ro
         control.clone(),
     );
     let empty_board =
-        DenuoBoardRuntime::new(&empty_hns, store.clone()).expect("shared store authority");
-    let empty = prepare_denuo_board_inventory_response(&request, &empty_board)
+        ShakescapeBoardRuntime::new(&empty_hns, store.clone()).expect("shared store authority");
+    let empty = prepare_shakescape_board_inventory_response(&request, &empty_board)
         .expect("canonical empty inventory");
     assert_eq!(empty.board_revision(), 0);
     assert_eq!(empty.listing_count(), 0);
@@ -2355,7 +2360,7 @@ fn inventory_response_plan_accepts_empty_and_filters_expired_or_wrong_network_ro
         control.clone(),
     );
     let admitting_board =
-        DenuoBoardRuntime::new(&admitting_hns, store.clone()).expect("shared store authority");
+        ShakescapeBoardRuntime::new(&admitting_hns, store.clone()).expect("shared store authority");
     let (offer, listing_hash) = market.offer(30, 134, 12_345_678);
     admitting_board
         .admit_offer(&offer, listing_hash)
@@ -2372,8 +2377,8 @@ fn inventory_response_plan_accepts_empty_and_filters_expired_or_wrong_network_ro
         control.clone(),
     );
     let early_board =
-        DenuoBoardRuntime::new(&early_hns, store.clone()).expect("early shared authority");
-    let future = prepare_denuo_board_inventory_response(&request, &early_board)
+        ShakescapeBoardRuntime::new(&early_hns, store.clone()).expect("early shared authority");
+    let future = prepare_shakescape_board_inventory_response(&request, &early_board)
         .expect("not-yet-active row omitted");
     assert_eq!(future.board_revision(), 1);
     assert_eq!(future.listing_count(), 0);
@@ -2392,9 +2397,9 @@ fn inventory_response_plan_accepts_empty_and_filters_expired_or_wrong_network_ro
         control.clone(),
     );
     let late_board =
-        DenuoBoardRuntime::new(&late_hns, store.clone()).expect("late shared authority");
-    let expired =
-        prepare_denuo_board_inventory_response(&request, &late_board).expect("expired row omitted");
+        ShakescapeBoardRuntime::new(&late_hns, store.clone()).expect("late shared authority");
+    let expired = prepare_shakescape_board_inventory_response(&request, &late_board)
+        .expect("expired row omitted");
     assert_eq!(expired.board_revision(), 1);
     assert_eq!(expired.listing_count(), 0);
     assert_eq!(
@@ -2419,9 +2424,9 @@ fn inventory_response_plan_accepts_empty_and_filters_expired_or_wrong_network_ro
         })
         .expect("move selected account to another network");
     let other_network_hns = runtime(store.clone(), config, market, control.clone());
-    let other_network_board =
-        DenuoBoardRuntime::new(&other_network_hns, store).expect("other-network shared authority");
-    let other_network = prepare_denuo_board_inventory_response(&request, &other_network_board)
+    let other_network_board = ShakescapeBoardRuntime::new(&other_network_hns, store)
+        .expect("other-network shared authority");
+    let other_network = prepare_shakescape_board_inventory_response(&request, &other_network_board)
         .expect("wrong-network row omitted");
     assert_eq!(other_network.board_revision(), 1);
     assert_eq!(other_network.listing_count(), 0);
@@ -2442,7 +2447,7 @@ fn inventory_response_plan_rejects_every_other_family_before_context_or_backend_
         maximum_payload: 1_024,
         feature_flags: 0,
     })
-    .encode_envelope(DenuoRegistryVersion::V2, 0)
+    .encode_envelope(ShakescapeRegistryVersion::V1, 0)
     .expect("zero-ID hello family");
     let (_, cancellation, _) = market.cancellation(&listing, 33, 0);
     let control = BackendControl::new();
@@ -2463,49 +2468,50 @@ fn inventory_response_plan_rejects_every_other_family_before_context_or_backend_
         selector,
     )
     .expect("counted account read runtime");
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
-    let offer = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let board = ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    let offer = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         135,
-        &DenuoNameMarketRequest::Offer(listing_hash),
+        &ShakescapeNameMarketRequest::Offer(listing_hash),
     )
     .expect("GetOffer request");
-    let offers = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let offers = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         136,
-        &DenuoNameMarketRequest::Offers(vec![listing_hash]),
+        &ShakescapeNameMarketRequest::Offers(vec![listing_hash]),
     )
     .expect("GetOffers request");
-    let v1 = encode_denuo_request(
-        DenuoRegistryVersion::V1,
+    let mut wrong_registry = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         137,
-        &DenuoNameMarketRequest::Inventory,
+        &ShakescapeNameMarketRequest::Inventory,
     )
-    .expect("V1 GetOfferInventory request");
-    let mut zero_id = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    .expect("canonical GetOfferInventory request before registry corruption");
+    wrong_registry[4] = 2;
+    let mut zero_id = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         138,
-        &DenuoNameMarketRequest::Inventory,
+        &ShakescapeNameMarketRequest::Inventory,
     )
     .expect("canonical nonzero GetOfferInventory request");
     const REQUEST_ID_OFFSET: usize = 4 + (5 * core::mem::size_of::<u16>());
     zero_id[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + core::mem::size_of::<u64>()]
         .copy_from_slice(&0_u64.to_le_bytes());
-    let mut trailing = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let mut trailing = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         139,
-        &DenuoNameMarketRequest::Inventory,
+        &ShakescapeNameMarketRequest::Inventory,
     )
     .expect("canonical GetOfferInventory before trailing byte");
     trailing.push(0);
     let batch_response = NameMarketMessage::Offers(vec![listing.clone()])
-        .encode_envelope(DenuoRegistryVersion::V2, 140)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 140)
         .expect("batch response family");
     let offer_response = NameMarketMessage::Offer(listing)
-        .encode_envelope(DenuoRegistryVersion::V2, 141)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 141)
         .expect("offer response family");
     let inventory_response = NameMarketMessage::OfferInventory(vec![listing_hash.into_bytes()])
-        .encode_envelope(DenuoRegistryVersion::V2, 142)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 142)
         .expect("inventory response family");
 
     for rejected in [
@@ -2521,13 +2527,13 @@ fn inventory_response_plan_rejects_every_other_family_before_context_or_backend_
         &[0x01, 0x02, 0x03],
     ] {
         assert!(matches!(
-            prepare_denuo_board_inventory_response(rejected, &board),
-            Err(ShakedexError::InvalidDenuoEnvelope)
+            prepare_shakescape_board_inventory_response(rejected, &board),
+            Err(ShakedexError::InvalidShakescapeEnvelope)
         ));
     }
     assert!(matches!(
-        prepare_denuo_board_inventory_response(&v1, &board),
-        Err(ShakedexError::DenuoRegistryMismatch)
+        prepare_shakescape_board_inventory_response(&wrong_registry, &board),
+        Err(ShakedexError::InvalidShakescapeEnvelope)
     ));
     assert_eq!(clock_calls.load(Ordering::SeqCst), 0);
     assert_eq!(control.query_count.load(Ordering::SeqCst), 0);
@@ -2565,15 +2571,15 @@ fn inventory_response_plan_fences_account_mutation_during_clock_without_backend_
         selector,
     )
     .expect("account-mutating read runtime");
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
-    let request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let board = ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    let request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         143,
-        &DenuoNameMarketRequest::Inventory,
+        &ShakescapeNameMarketRequest::Inventory,
     )
     .expect("GetOfferInventory request");
     assert!(matches!(
-        prepare_denuo_board_inventory_response(&request, &board),
+        prepare_shakescape_board_inventory_response(&request, &board),
         Err(ShakedexError::HnsIntegration)
     ));
     assert_eq!(control.query_count.load(Ordering::SeqCst), 0);
@@ -2598,12 +2604,12 @@ fn single_offer_response_plan_reacquires_after_restart_and_hides_cancelled_rows_
     let listing = market.listing(30, 12_345_678);
     let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
     let offer = NameMarketMessage::Offer(listing.clone())
-        .encode_envelope(DenuoRegistryVersion::V2, 140)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 140)
         .expect("offer envelope");
-    let request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         139,
-        &DenuoNameMarketRequest::Offer(listing_hash),
+        &ShakescapeNameMarketRequest::Offer(listing_hash),
     )
     .expect("GetOffer request");
     let (_, cancellation, cancellation_hash) = market.cancellation(&listing, 31, 141);
@@ -2615,20 +2621,20 @@ fn single_offer_response_plan_reacquires_after_restart_and_hides_cancelled_rows_
         market.clone(),
         control.clone(),
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    let board = ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
     assert!(matches!(
         board.admit_offer(&offer, listing_hash),
-        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Inserted { revision: 1, .. })
     ));
     let queries_after_admission = control.query_count.load(Ordering::SeqCst);
-    let plan =
-        prepare_denuo_board_offer_response(&request, &board).expect("closed current response plan");
+    let plan = prepare_shakescape_board_offer_response(&request, &board)
+        .expect("closed current response plan");
     let queries_after_plan = control.query_count.load(Ordering::SeqCst);
     assert!(queries_after_plan > queries_after_admission);
     assert_eq!(plan.request_id(), 139);
     assert_eq!(plan.listing_hash(), listing_hash);
     assert_eq!(plan.board_revision(), Some(1));
-    let DenuoBoardOfferResponsePlan::Current(prepared) = &plan else {
+    let ShakescapeBoardOfferResponsePlan::Current(prepared) = &plan else {
         panic!("expected current response plan");
     };
     assert_eq!(prepared.request_id(), 139);
@@ -2641,9 +2647,12 @@ fn single_offer_response_plan_reacquires_after_restart_and_hides_cancelled_rows_
             .revision,
         1
     );
-    let repeated =
-        prepare_denuo_board_offer_response(&request, &board).expect("exact repeated response plan");
-    assert!(matches!(repeated, DenuoBoardOfferResponsePlan::Current(_)));
+    let repeated = prepare_shakescape_board_offer_response(&request, &board)
+        .expect("exact repeated response plan");
+    assert!(matches!(
+        repeated,
+        ShakescapeBoardOfferResponsePlan::Current(_)
+    ));
     assert!(control.query_count.load(Ordering::SeqCst) > queries_after_plan);
     assert_eq!(
         store
@@ -2668,30 +2677,30 @@ fn single_offer_response_plan_reacquires_after_restart_and_hides_cancelled_rows_
         market,
         restarted_control.clone(),
     );
-    let restarted = DenuoBoardRuntime::new(&restarted_hns, restarted_store.clone())
+    let restarted = ShakescapeBoardRuntime::new(&restarted_hns, restarted_store.clone())
         .expect("restarted shared authority");
     assert_eq!(restarted_control.query_count.load(Ordering::SeqCst), 0);
-    let restarted_plan = prepare_denuo_board_offer_response(&request, &restarted)
+    let restarted_plan = prepare_shakescape_board_offer_response(&request, &restarted)
         .expect("fresh restart response plan");
     assert!(matches!(
         restarted_plan,
-        DenuoBoardOfferResponsePlan::Current(_)
+        ShakescapeBoardOfferResponsePlan::Current(_)
     ));
     let queries_after_restart_plan = restarted_control.query_count.load(Ordering::SeqCst);
     assert!(queries_after_restart_plan > 0);
 
     let missing_hash = ObjectHash::new([0x77; 32]);
-    let missing_request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let missing_request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         142,
-        &DenuoNameMarketRequest::Offer(missing_hash),
+        &ShakescapeNameMarketRequest::Offer(missing_hash),
     )
     .expect("missing GetOffer request");
-    let missing = prepare_denuo_board_offer_response(&missing_request, &restarted)
+    let missing = prepare_shakescape_board_offer_response(&missing_request, &restarted)
         .expect("missing response plan");
     assert!(matches!(
         missing,
-        DenuoBoardOfferResponsePlan::Absent {
+        ShakescapeBoardOfferResponsePlan::Absent {
             request_id: 142,
             listing_hash: hash,
         } if hash == missing_hash
@@ -2705,11 +2714,11 @@ fn single_offer_response_plan_reacquires_after_restart_and_hides_cancelled_rows_
         .admit_cancellation(&cancellation, listing_hash, cancellation_hash)
         .expect("cancel target");
     let queries_after_cancellation = restarted_control.query_count.load(Ordering::SeqCst);
-    let cancelled =
-        prepare_denuo_board_offer_response(&request, &restarted).expect("cancelled response plan");
+    let cancelled = prepare_shakescape_board_offer_response(&request, &restarted)
+        .expect("cancelled response plan");
     assert!(matches!(
         cancelled,
-        DenuoBoardOfferResponsePlan::Absent {
+        ShakescapeBoardOfferResponsePlan::Absent {
             request_id: 139,
             listing_hash: hash,
         } if hash == listing_hash
@@ -2722,7 +2731,7 @@ fn single_offer_response_plan_reacquires_after_restart_and_hides_cancelled_rows_
     assert!(HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
     assert!(HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
     assert!(SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
-    assert!(SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED);
     assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
 }
 
@@ -2737,56 +2746,57 @@ fn single_offer_response_plan_rejects_every_other_request_family_before_node_que
         maximum_payload: 1_024,
         feature_flags: 0,
     })
-    .encode_envelope(DenuoRegistryVersion::V2, 0)
+    .encode_envelope(ShakescapeRegistryVersion::V1, 0)
     .expect("zero-ID hello family");
     let (_, cancellation, _) = market.cancellation(&listing, 41, 0);
     let control = BackendControl::new();
     control.reject_queries.store(true, Ordering::SeqCst);
     let (store, config) = create_store(":memory:");
     let hns = runtime(store.clone(), config, market, control.clone());
-    let board = DenuoBoardRuntime::new(&hns, store).expect("shared store authority");
-    let inventory = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let board = ShakescapeBoardRuntime::new(&hns, store).expect("shared store authority");
+    let inventory = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         150,
-        &DenuoNameMarketRequest::Inventory,
+        &ShakescapeNameMarketRequest::Inventory,
     )
     .expect("inventory request");
-    let offers = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let offers = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         151,
-        &DenuoNameMarketRequest::Offers(vec![listing_hash]),
+        &ShakescapeNameMarketRequest::Offers(vec![listing_hash]),
     )
     .expect("multi-offer request family");
-    let v1 = encode_denuo_request(
-        DenuoRegistryVersion::V1,
+    let mut wrong_registry = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         152,
-        &DenuoNameMarketRequest::Offer(listing_hash),
+        &ShakescapeNameMarketRequest::Offer(listing_hash),
     )
-    .expect("V1 GetOffer request");
-    let mut zero_id = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    .expect("canonical GetOffer request before registry corruption");
+    wrong_registry[4] = 2;
+    let mut zero_id = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         155,
-        &DenuoNameMarketRequest::Offer(listing_hash),
+        &ShakescapeNameMarketRequest::Offer(listing_hash),
     )
     .expect("canonical nonzero GetOffer request");
     const REQUEST_ID_OFFSET: usize = 4 + (5 * core::mem::size_of::<u16>());
     zero_id[REQUEST_ID_OFFSET..REQUEST_ID_OFFSET + core::mem::size_of::<u64>()]
         .copy_from_slice(&0_u64.to_le_bytes());
-    let mut trailing = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let mut trailing = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         156,
-        &DenuoNameMarketRequest::Offer(listing_hash),
+        &ShakescapeNameMarketRequest::Offer(listing_hash),
     )
     .expect("canonical GetOffer before trailing byte");
     trailing.push(0);
     let batch_response = NameMarketMessage::Offers(vec![listing.clone()])
-        .encode_envelope(DenuoRegistryVersion::V2, 157)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 157)
         .expect("batch response family");
     let offer_response = NameMarketMessage::Offer(listing)
-        .encode_envelope(DenuoRegistryVersion::V2, 153)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 153)
         .expect("offer response family");
     let inventory_response = NameMarketMessage::OfferInventory(vec![listing_hash.into_bytes()])
-        .encode_envelope(DenuoRegistryVersion::V2, 154)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 154)
         .expect("inventory response family");
 
     for rejected in [
@@ -2802,13 +2812,13 @@ fn single_offer_response_plan_rejects_every_other_request_family_before_node_que
         &[0x01, 0x02, 0x03],
     ] {
         assert!(matches!(
-            prepare_denuo_board_offer_response(rejected, &board),
-            Err(ShakedexError::InvalidDenuoEnvelope)
+            prepare_shakescape_board_offer_response(rejected, &board),
+            Err(ShakedexError::InvalidShakescapeEnvelope)
         ));
     }
     assert!(matches!(
-        prepare_denuo_board_offer_response(&v1, &board),
-        Err(ShakedexError::DenuoRegistryMismatch)
+        prepare_shakescape_board_offer_response(&wrong_registry, &board),
+        Err(ShakedexError::InvalidShakescapeEnvelope)
     ));
     assert_eq!(control.query_count.load(Ordering::SeqCst), 0);
 }
@@ -2819,12 +2829,12 @@ fn single_offer_response_plan_fails_on_spend_stale_mempool_board_replacement_and
     let listing = market.listing(50, 12_345_678);
     let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
     let offer = NameMarketMessage::Offer(listing)
-        .encode_envelope(DenuoRegistryVersion::V2, 160)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 160)
         .expect("offer envelope");
-    let request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         161,
-        &DenuoNameMarketRequest::Offer(listing_hash),
+        &ShakescapeNameMarketRequest::Offer(listing_hash),
     )
     .expect("GetOffer request");
     let control = BackendControl::new();
@@ -2835,15 +2845,15 @@ fn single_offer_response_plan_fails_on_spend_stale_mempool_board_replacement_and
         market.clone(),
         control.clone(),
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    let board = ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
     assert!(matches!(
         board.admit_offer(&offer, listing_hash),
-        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Inserted { revision: 1, .. })
     ));
 
     control.restart_chain_on_fence.store(true, Ordering::SeqCst);
     assert!(matches!(
-        prepare_denuo_board_offer_response(&request, &board),
+        prepare_shakescape_board_offer_response(&request, &board),
         Err(ShakedexError::InvalidEvidence)
     ));
     control
@@ -2852,7 +2862,7 @@ fn single_offer_response_plan_fails_on_spend_stale_mempool_board_replacement_and
 
     control.spent.store(true, Ordering::SeqCst);
     assert!(matches!(
-        prepare_denuo_board_offer_response(&request, &board),
+        prepare_shakescape_board_offer_response(&request, &board),
         Err(ShakedexError::InvalidEvidence)
     ));
     control.spent.store(false, Ordering::SeqCst);
@@ -2860,7 +2870,7 @@ fn single_offer_response_plan_fails_on_spend_stale_mempool_board_replacement_and
         .restart_mempool_on_fence
         .store(true, Ordering::SeqCst);
     assert!(matches!(
-        prepare_denuo_board_offer_response(&request, &board),
+        prepare_shakescape_board_offer_response(&request, &board),
         Err(ShakedexError::InvalidEvidence)
     ));
     control
@@ -2894,7 +2904,7 @@ fn single_offer_response_plan_fails_on_spend_stale_mempool_board_replacement_and
             .expect("replace board during current-lock reacquisition");
     });
     assert!(matches!(
-        prepare_denuo_board_offer_response(&request, &board),
+        prepare_shakescape_board_offer_response(&request, &board),
         Err(ShakedexError::StaleRevision)
     ));
     assert_eq!(
@@ -2910,15 +2920,15 @@ fn single_offer_response_plan_fails_on_spend_stale_mempool_board_replacement_and
     let late_control = BackendControl::new();
     let late_hns = late_runtime(store.clone(), config.clone(), market.clone(), late_control);
     let late_board =
-        DenuoBoardRuntime::new(&late_hns, store.clone()).expect("late shared authority");
-    let replacement_request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+        ShakescapeBoardRuntime::new(&late_hns, store.clone()).expect("late shared authority");
+    let replacement_request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         162,
-        &DenuoNameMarketRequest::Offer(replacement_hash),
+        &ShakescapeNameMarketRequest::Offer(replacement_hash),
     )
     .expect("expired replacement request");
     assert!(matches!(
-        prepare_denuo_board_offer_response(&replacement_request, &late_board),
+        prepare_shakescape_board_offer_response(&replacement_request, &late_board),
         Err(ShakedexError::InvalidListing)
     ));
     drop(late_board);
@@ -2945,10 +2955,10 @@ fn single_offer_response_plan_fails_on_spend_stale_mempool_board_replacement_and
         market,
         other_network_control.clone(),
     );
-    let other_network_board =
-        DenuoBoardRuntime::new(&other_network_hns, store).expect("other-network shared authority");
+    let other_network_board = ShakescapeBoardRuntime::new(&other_network_hns, store)
+        .expect("other-network shared authority");
     assert!(matches!(
-        prepare_denuo_board_offer_response(&replacement_request, &other_network_board),
+        prepare_shakescape_board_offer_response(&replacement_request, &other_network_board),
         Err(ShakedexError::InvalidEvidence)
     ));
     assert!(other_network_control.query_count.load(Ordering::SeqCst) > 0);
@@ -2960,12 +2970,12 @@ fn single_offer_response_plan_fences_account_mutation_during_clock_observation()
     let listing = market.listing(60, 12_345_678);
     let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
     let offer = NameMarketMessage::Offer(listing)
-        .encode_envelope(DenuoRegistryVersion::V2, 170)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 170)
         .expect("offer envelope");
-    let request = encode_denuo_request(
-        DenuoRegistryVersion::V2,
+    let request = encode_shakescape_request(
+        ShakescapeRegistryVersion::V1,
         171,
-        &DenuoNameMarketRequest::Offer(listing_hash),
+        &ShakescapeNameMarketRequest::Offer(listing_hash),
     )
     .expect("GetOffer request");
     let control = BackendControl::new();
@@ -2977,10 +2987,10 @@ fn single_offer_response_plan_fences_account_mutation_during_clock_observation()
         control.clone(),
     );
     let admitting_board =
-        DenuoBoardRuntime::new(&admitting_hns, store.clone()).expect("shared store authority");
+        ShakescapeBoardRuntime::new(&admitting_hns, store.clone()).expect("shared store authority");
     assert!(matches!(
         admitting_board.admit_offer(&offer, listing_hash),
-        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Inserted { revision: 1, .. })
     ));
     drop(admitting_board);
     drop(admitting_hns);
@@ -3006,10 +3016,10 @@ fn single_offer_response_plan_fences_account_mutation_during_clock_observation()
     )
     .expect("account-mutating read runtime");
     let mutating_board =
-        DenuoBoardRuntime::new(&mutating_hns, store.clone()).expect("shared store authority");
+        ShakescapeBoardRuntime::new(&mutating_hns, store.clone()).expect("shared store authority");
 
     assert!(matches!(
-        prepare_denuo_board_offer_response(&request, &mutating_board),
+        prepare_shakescape_board_offer_response(&request, &mutating_board),
         Err(ShakedexError::HnsIntegration)
     ));
     assert!(control.query_count.load(Ordering::SeqCst) > 0);
@@ -3034,12 +3044,12 @@ fn signed_cancellation_tombstone_survives_spend_restart_and_expiry_without_node_
     let listing = market.listing(7, 12_345_678);
     let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
     let offer = NameMarketMessage::Offer(listing.clone())
-        .encode_envelope(DenuoRegistryVersion::V2, 70)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 70)
         .expect("offer envelope");
     let (cancellation, cancellation_envelope, cancellation_hash) =
         market.cancellation(&listing, 8, 71);
     let retry_envelope = NameMarketMessage::Cancel(cancellation)
-        .encode_envelope(DenuoRegistryVersion::V2, 72)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 72)
         .expect("retry cancellation envelope");
     let control = BackendControl::new();
     let (store, config) = create_store(&database);
@@ -3049,11 +3059,11 @@ fn signed_cancellation_tombstone_survives_spend_restart_and_expiry_without_node_
         market.clone(),
         control.clone(),
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    let board = ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
 
     assert!(matches!(
         board.admit_offer(&offer, listing_hash),
-        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Inserted { revision: 1, .. })
     ));
     let node_queries_after_offer = control.query_count.load(Ordering::SeqCst);
     assert!(node_queries_after_offer > 0);
@@ -3065,7 +3075,7 @@ fn signed_cancellation_tombstone_survives_spend_restart_and_expiry_without_node_
         .expect("negative tombstone after lock spend");
     assert!(matches!(
         applied,
-        DenuoBoardCancellationAdmission::Applied { revision: 2, .. }
+        ShakescapeBoardCancellationAdmission::Applied { revision: 2, .. }
     ));
     assert_eq!(applied.request_id(), 71);
     assert_eq!(applied.listing_hash(), listing_hash);
@@ -3097,7 +3107,7 @@ fn signed_cancellation_tombstone_survives_spend_restart_and_expiry_without_node_
         .expect("exact cancellation retry");
     assert!(matches!(
         existing,
-        DenuoBoardCancellationAdmission::Existing { revision: 2, .. }
+        ShakescapeBoardCancellationAdmission::Existing { revision: 2, .. }
     ));
     assert_eq!(existing.request_id(), 72);
     assert_eq!(
@@ -3121,11 +3131,11 @@ fn signed_cancellation_tombstone_survives_spend_restart_and_expiry_without_node_
         market.clone(),
         restarted_control.clone(),
     );
-    let restarted = DenuoBoardRuntime::new(&restarted_hns, restarted_store.clone())
+    let restarted = ShakescapeBoardRuntime::new(&restarted_hns, restarted_store.clone())
         .expect("restarted shared authority");
     assert!(matches!(
         restarted.admit_cancellation(&retry_envelope, listing_hash, cancellation_hash),
-        Ok(DenuoBoardCancellationAdmission::Existing { revision: 2, .. })
+        Ok(ShakescapeBoardCancellationAdmission::Existing { revision: 2, .. })
     ));
     assert!(
         restarted
@@ -3161,8 +3171,9 @@ fn signed_cancellation_tombstone_survives_spend_restart_and_expiry_without_node_
         market,
         other_network_control.clone(),
     );
-    let other_network_board = DenuoBoardRuntime::new(&other_network_hns, restarted_store.clone())
-        .expect("other-network board");
+    let other_network_board =
+        ShakescapeBoardRuntime::new(&other_network_hns, restarted_store.clone())
+            .expect("other-network board");
     assert!(matches!(
         other_network_board.admit_cancellation(&retry_envelope, listing_hash, cancellation_hash,),
         Err(ShakedexError::InvalidCancellation)
@@ -3179,7 +3190,7 @@ fn signed_cancellation_tombstone_survives_spend_restart_and_expiry_without_node_
     assert!(HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED);
     assert!(HNS_VALUE_RUNTIME_RELEASE_QUALIFIED);
     assert!(SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED);
-    assert!(SHAKEDEX_DENUO_V2_RELEASE_QUALIFIED);
+    assert!(SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED);
     assert!(SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED);
 }
 
@@ -3189,7 +3200,7 @@ fn cancellation_admission_rejects_wrong_identity_absence_and_expired_initial_mut
     let listing = market.listing(10, 12_345_678);
     let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
     let offer = NameMarketMessage::Offer(listing.clone())
-        .encode_envelope(DenuoRegistryVersion::V2, 80)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 80)
         .expect("offer envelope");
     let (base_cancellation, cancellation_envelope, cancellation_hash) =
         market.cancellation(&listing, 11, 81);
@@ -3201,10 +3212,10 @@ fn cancellation_admission_rejects_wrong_identity_absence_and_expired_initial_mut
         market.clone(),
         control.clone(),
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    let board = ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
     assert!(matches!(
         board.admit_offer(&offer, listing_hash),
-        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Inserted { revision: 1, .. })
     ));
     let node_queries_after_offer = control.query_count.load(Ordering::SeqCst);
     control.reject_queries.store(true, Ordering::SeqCst);
@@ -3225,20 +3236,21 @@ fn cancellation_admission_rejects_wrong_identity_absence_and_expired_initial_mut
         ),
         Err(ShakedexError::InvalidCancellation)
     ));
-    let (wrong_registry, _) =
-        MarketFixture::cancellation_envelope(&base_cancellation, DenuoRegistryVersion::V1, 81);
+    let (mut wrong_registry, _) =
+        MarketFixture::cancellation_envelope(&base_cancellation, ShakescapeRegistryVersion::V1, 81);
+    wrong_registry[4] = 2;
     assert!(matches!(
         board.admit_cancellation(&wrong_registry, listing_hash, cancellation_hash),
-        Err(ShakedexError::DenuoRegistryMismatch)
+        Err(ShakedexError::InvalidShakescapeEnvelope)
     ));
     assert!(matches!(
         board.admit_cancellation(&offer, listing_hash, cancellation_hash),
-        Err(ShakedexError::InvalidDenuoEnvelope)
+        Err(ShakedexError::InvalidShakescapeEnvelope)
     ));
     let invalid_signature = cancellation_envelope_with_invalid_signature(&cancellation_envelope);
     assert!(matches!(
         board.admit_cancellation(&invalid_signature, listing_hash, cancellation_hash),
-        Err(ShakedexError::InvalidDenuoEnvelope)
+        Err(ShakedexError::InvalidShakescapeEnvelope)
     ));
 
     let mut wrong_network = base_cancellation.clone();
@@ -3248,7 +3260,7 @@ fn cancellation_admission_rejects_wrong_identity_absence_and_expired_initial_mut
         .sign(&market.signing_key)
         .expect("wrong-network signature");
     let (wrong_network_envelope, wrong_network_hash) =
-        MarketFixture::cancellation_envelope(&wrong_network, DenuoRegistryVersion::V2, 83);
+        MarketFixture::cancellation_envelope(&wrong_network, ShakescapeRegistryVersion::V1, 83);
     assert!(matches!(
         board.admit_cancellation(&wrong_network_envelope, listing_hash, wrong_network_hash,),
         Err(ShakedexError::InvalidCancellation)
@@ -3268,7 +3280,7 @@ fn cancellation_admission_rejects_wrong_identity_absence_and_expired_initial_mut
         .sign(&wrong_seller_key)
         .expect("wrong-seller signature");
     let (wrong_seller_envelope, wrong_seller_hash) =
-        MarketFixture::cancellation_envelope(&wrong_seller, DenuoRegistryVersion::V2, 84);
+        MarketFixture::cancellation_envelope(&wrong_seller, ShakescapeRegistryVersion::V1, 84);
     assert!(matches!(
         board.admit_cancellation(&wrong_seller_envelope, listing_hash, wrong_seller_hash),
         Err(ShakedexError::InvalidCancellation)
@@ -3281,7 +3293,7 @@ fn cancellation_admission_rejects_wrong_identity_absence_and_expired_initial_mut
         .sign(&market.signing_key)
         .expect("future cancellation signature");
     let (not_yet_active_envelope, not_yet_active_hash) =
-        MarketFixture::cancellation_envelope(&not_yet_active, DenuoRegistryVersion::V2, 85);
+        MarketFixture::cancellation_envelope(&not_yet_active, ShakescapeRegistryVersion::V1, 85);
     assert!(matches!(
         board.admit_cancellation(&not_yet_active_envelope, listing_hash, not_yet_active_hash,),
         Err(ShakedexError::InvalidCancellation)
@@ -3312,7 +3324,7 @@ fn cancellation_admission_rejects_wrong_identity_absence_and_expired_initial_mut
     late_control.reject_queries.store(true, Ordering::SeqCst);
     let late_hns = late_runtime(store.clone(), config, market, late_control.clone());
     let late_board =
-        DenuoBoardRuntime::new(&late_hns, store.clone()).expect("late shared authority");
+        ShakescapeBoardRuntime::new(&late_hns, store.clone()).expect("late shared authority");
     assert!(matches!(
         late_board.admit_cancellation(&cancellation_envelope, listing_hash, cancellation_hash),
         Err(ShakedexError::InvalidCancellation)
@@ -3335,7 +3347,7 @@ fn cancellation_sequence_conflicts_and_tombstone_watermark_survive_restart() {
     let listing = market.listing(20, 12_345_678);
     let listing_hash = ObjectHash::new(listing.listing_hash().expect("listing hash"));
     let offer = NameMarketMessage::Offer(listing.clone())
-        .encode_envelope(DenuoRegistryVersion::V2, 90)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 90)
         .expect("offer envelope");
     let (base_cancellation, zero_id_cancellation, cancellation_hash) =
         market.cancellation(&listing, 23, 0);
@@ -3347,10 +3359,10 @@ fn cancellation_sequence_conflicts_and_tombstone_watermark_survive_restart() {
         market.clone(),
         control.clone(),
     );
-    let board = DenuoBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
+    let board = ShakescapeBoardRuntime::new(&hns, store.clone()).expect("shared store authority");
     assert!(matches!(
         board.admit_offer(&offer, listing_hash),
-        Ok(DenuoBoardOfferAdmission::Inserted { revision: 1, .. })
+        Ok(ShakescapeBoardOfferAdmission::Inserted { revision: 1, .. })
     ));
     let node_queries_after_offer = control.query_count.load(Ordering::SeqCst);
     control.reject_queries.store(true, Ordering::SeqCst);
@@ -3359,7 +3371,7 @@ fn cancellation_sequence_conflicts_and_tombstone_watermark_survive_restart() {
         .expect("zero-ID offline cancellation");
     assert!(matches!(
         zero_id,
-        DenuoBoardCancellationAdmission::Applied { revision: 2, .. }
+        ShakescapeBoardCancellationAdmission::Applied { revision: 2, .. }
     ));
     assert_eq!(zero_id.request_id(), 0);
 
@@ -3371,7 +3383,7 @@ fn cancellation_sequence_conflicts_and_tombstone_watermark_survive_restart() {
         .sign(&market.signing_key)
         .expect("same-sequence conflict signature");
     let (same_sequence_envelope, same_sequence_hash) =
-        MarketFixture::cancellation_envelope(&same_sequence, DenuoRegistryVersion::V2, 91);
+        MarketFixture::cancellation_envelope(&same_sequence, ShakescapeRegistryVersion::V1, 91);
     assert!(matches!(
         board.admit_cancellation(&same_sequence_envelope, listing_hash, same_sequence_hash,),
         Err(ShakedexError::NameMarketReplay)
@@ -3397,7 +3409,7 @@ fn cancellation_sequence_conflicts_and_tombstone_watermark_survive_restart() {
             listing_hash,
             higher_sequence_hash,
         ),
-        Ok(DenuoBoardCancellationAdmission::Applied { revision: 3, .. })
+        Ok(ShakescapeBoardCancellationAdmission::Applied { revision: 3, .. })
     ));
     assert_eq!(
         control.query_count.load(Ordering::SeqCst),
@@ -3417,7 +3429,7 @@ fn cancellation_sequence_conflicts_and_tombstone_watermark_survive_restart() {
         market.clone(),
         restarted_control,
     );
-    let restarted = DenuoBoardRuntime::new(&restarted_hns, restarted_store.clone())
+    let restarted = ShakescapeBoardRuntime::new(&restarted_hns, restarted_store.clone())
         .expect("restarted shared authority");
     let replayed_listing = market.listing(24, 12_345_679);
     let replayed_hash = ObjectHash::new(
@@ -3426,7 +3438,7 @@ fn cancellation_sequence_conflicts_and_tombstone_watermark_survive_restart() {
             .expect("replayed listing hash"),
     );
     let replayed_offer = NameMarketMessage::Offer(replayed_listing)
-        .encode_envelope(DenuoRegistryVersion::V2, 94)
+        .encode_envelope(ShakescapeRegistryVersion::V1, 94)
         .expect("replayed offer envelope");
     assert!(matches!(
         restarted.admit_offer(&replayed_offer, replayed_hash),

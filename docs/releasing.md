@@ -40,15 +40,15 @@ Normalized archive inspection materializes complete tar listings and selected
 files before comparison so a successful match cannot hide an upstream tar read
 failure or emit a benign broken-pipe warning.
 
-## 0.1.1 release source
+## 0.2.0 release source
 
-Version `0.1.1` is the current `hns-wallet-rs` release line. The
+Version `0.2.0` is the current `hns-wallet-rs` release line. The
 canonical feature inventory is in `CHANGELOG.md`; source packaging, publication,
 or test success does not enable provider, value, settlement, or marketplace
 product gates. Registry and tag state are external facts and must be checked at
 release time rather than embedded as a claim in the source snapshot.
 
-The selected `0.1.1` heading and package-local changelogs use one
+The selected `0.2.0` heading and package-local changelogs use one
 version-scoped canonical `release` declaration. It describes prepared source,
 not an existing crates.io package or tag; execution requires this exact dated
 state and rejects a stale, missing, malformed, mismatched, or candidate
@@ -57,21 +57,24 @@ declaration.
 Root `CHANGELOG.md` release form:
 
 ```markdown
-<!-- hns-wallet-release-state: 0.1.1 release -->
+<!-- hns-wallet-release-state: 0.2.0 release -->
 Initial release source for the independent Handshake wallet boundary:
 ```
 
 `release/CRATE-CHANGELOG.md` release form:
 
 ```markdown
-<!-- hns-wallet-release-state: 0.1.1 release -->
+<!-- hns-wallet-release-state: 0.2.0 release -->
 This crate changelog describes the prepared `hns-wallet-rs` release source.
 ```
 
-Wallet source consumes the published registry `hns-rs` `0.3.1` cohort from
-immutable release source `0e99addca59778b7b7c6fc56291333a97c4c8815`. All 19
-required `hns-rs` `0.3.1` archives were published to crates.io and are recorded
-in `release/hns-rs-0.3.1-crates.sha256`. It also consumes the published registry
+Wallet source consumes seventeen unchanged published `hns-rs` `0.3.1` core
+crates from immutable release source
+`0e99addca59778b7b7c6fc56291333a97c4c8815`, recorded in
+`release/hns-rs-core-0.3.1-crates.sha256`. The breaking Shakescape boundary is
+the published `hns-p2p-experimental` and `hns-marketplace-protocol` `0.4.0`
+pair from source `c8feb6f90f3e03efbb982a5e33192dda6fd2f37a`, recorded in
+`release/hns-rs-shakescape-0.4.0-crates.sha256`. It also consumes the published registry
 `hns-dane-engine` `0.2.2` cohort from immutable release source
 `b7fdf8826c81b77650a0f740d1f05314b74969f9`. All 20 required
 `hns-dane-engine` `0.2.2` archives were published to crates.io and are recorded
@@ -172,10 +175,11 @@ document and verify boundaries; they grant no runtime or deployment authority.
    confirmation must equal the workspace version:
 
    ```bash
-   ./scripts/publish.sh --execute --confirm-publish 0.1.1
+   ./scripts/publish.sh --execute --confirm-publish 0.2.0
    ```
 
-Execution mode first downloads all 19 required `hns-rs` and all 20 required
+Execution mode first downloads all seventeen core `hns-rs` `0.3.1` crates,
+both Shakescape `0.4.0` crates, and all 20 required
 `hns-dane-engine` archives and rejects any package whose API record, checksum,
 or `.cargo_vcs_info.json` does not identify the exact pinned release source.
 For a new wallet version, it creates and runs the custom
@@ -205,7 +209,7 @@ limit:
 ```bash
 PUBLISH_NEW_INTERVAL_SECONDS=605 \
 PUBLISH_UPDATE_INTERVAL_SECONDS=65 \
-  ./scripts/publish.sh --execute --confirm-publish 0.1.1
+  ./scripts/publish.sh --execute --confirm-publish 0.2.0
 ```
 
 After each applicable cooldown, the script downloads the new archive and
