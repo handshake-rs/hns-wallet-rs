@@ -132,6 +132,40 @@ impl EmbeddedHnsBackend {
         Ok(changed)
     }
 
+    /// Add exact name hashes to the current direct-wallet watch set without
+    /// invalidating already verified script activity.
+    ///
+    /// This narrower extension is for an explicit, authenticated name-proof
+    /// request. Unlike replacing the complete recovery watch set, adding a
+    /// name hash does not hand out a previously undiscovered wallet script;
+    /// the exact proof remains required before a name can be imported. The
+    /// existing verified transaction projection is therefore retained while
+    /// the requested proof can be admitted and bound to it.
+    pub(crate) fn extend_name_watch_set_without_rewind(
+        &self,
+        name_hashes: &[[u8; 32]],
+        now_unix: u64,
+    ) -> Result<bool, HnsWalletError> {
+        if name_hashes.is_empty() {
+            return Ok(false);
+        }
+        let mut state = self.lock()?;
+        let installed = state.index.watch_set();
+        let mut names = installed.name_hashes.clone();
+        names.extend_from_slice(name_hashes);
+        let extended =
+            HnsLightWatchSet::new(installed.scripts.clone(), names).map_err(map_index_error)?;
+        let changed = state
+            .index
+            .extend_watch_set_without_rewind(extended, now_unix)
+            .map_err(map_index_error)?;
+        if changed {
+            state.mempool.transactions.clear();
+            advance_mempool_generation(&mut state.mempool)?;
+        }
+        Ok(changed)
+    }
+
     /// Append a locally allocated future change-gap script without rewinding
     /// the verified block index. The light index independently validates the
     /// exact persisted account transition and otherwise returns `false`.

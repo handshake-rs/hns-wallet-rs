@@ -514,7 +514,7 @@ impl EncryptedHnsLightIndex {
         self.extend_watch_set_without_rewind(extended, now_unix)
     }
 
-    fn extend_watch_set_without_rewind(
+    pub(crate) fn extend_watch_set_without_rewind(
         &mut self,
         watch_set: HnsLightWatchSet,
         now_unix: u64,

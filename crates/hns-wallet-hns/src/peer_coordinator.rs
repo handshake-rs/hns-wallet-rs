@@ -1602,7 +1602,57 @@ impl HnsDirectPeerCoordinator {
         let name_hash = hash_name(name)
             .map_err(|_| HnsWalletError::InvalidName)?
             .into_bytes();
+        self.extend_wallet_name_proof_watch_set(name_hash, now_unix)?;
         self.synchronize_name_proof(name_hash, now_unix)
+    }
+
+    /// Add one explicit canonical name to a wallet-owned direct index before
+    /// asking peers for its exact proof.
+    ///
+    /// Fresh imports are not present in the persisted known-name list yet, so
+    /// they cannot be part of the initial direct watch set.  The proof request
+    /// must nevertheless be admitted by that set.  Extend only the name-hash
+    /// member while retaining the existing authenticated script scan; the
+    /// proof and normal import validation still decide whether the name is
+    /// persisted or classified as wallet-controlled.
+    fn extend_wallet_name_proof_watch_set(
+        &self,
+        name_hash: [u8; 32],
+        now_unix: u64,
+    ) -> Result<(), HnsDirectPeerError> {
+        let installed = self
+            .backend
+            .light_watch_set()
+            .map_err(HnsDirectPeerError::Wallet)?;
+        if installed.name_hashes.binary_search(&name_hash).is_ok() {
+            return Ok(());
+        }
+        let source = self
+            .wallet_watch_set_source
+            .as_ref()
+            .ok_or(HnsDirectPeerError::InvalidConfiguration)?;
+        // The source is intentionally re-read from the unlocked encrypted
+        // store. This proves the coordinator still belongs to the selected
+        // wallet before it retains any new proof material.
+        let account = source.current_account_config()?;
+        let persisted = source
+            .store
+            .try_with_store(|wallet| derive_hns_light_watch_set(wallet, &account))
+            .map_err(HnsDirectPeerError::Wallet)?;
+        if persisted.name_hashes.binary_search(&name_hash).is_ok() {
+            // A persisted name missing from the installed set indicates an
+            // incomplete historical index, not a new import. Restore the
+            // complete deterministic set and require the normal one-time
+            // historical catch-up before using its proof.
+            self.backend
+                .install_watch_set(persisted, now_unix)
+                .map_err(HnsDirectPeerError::Wallet)?;
+            return Ok(());
+        }
+        self.backend
+            .extend_name_watch_set_without_rewind(&[name_hash], now_unix)
+            .map_err(HnsDirectPeerError::Wallet)?;
+        Ok(())
     }
 
     /// Scan a bounded sequential header range using the same Bloom filter on
@@ -3287,6 +3337,71 @@ mod tests {
         assert_eq!(scan.watched_scripts, 4);
         assert_eq!(scan.watched_names, 0);
         assert_eq!(scan.birthday_height, 0);
+    }
+
+    #[test]
+    fn exact_name_proof_watch_expansion_retains_existing_direct_scan_coverage() {
+        let config = direct_wallet_config();
+        let mut wallet = WalletStore::create(":memory:", "direct name proof passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[74; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let coordinator = open_wallet_direct_hns_peer_coordinator(
+            hns_wallet_store::SharedWalletStore::new(wallet),
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now,
+        )
+        .unwrap();
+        let before = coordinator.backend().light_scan_status().unwrap();
+        let name_hash = hash_name(b"24hour").unwrap().into_bytes();
+        // No peer is configured for this deterministic fixture, so the proof
+        // fetch itself cannot finish. The public exact-text path must still
+        // install the fresh name before reaching that transport boundary.
+        assert!(
+            coordinator
+                .synchronize_name_proof_exact_text("24hour", now + 1)
+                .is_err()
+        );
+
+        let after = coordinator.backend().light_scan_status().unwrap();
+        assert_eq!(after.birthday_height, before.birthday_height);
+        assert_eq!(after.scanned_height, before.scanned_height);
+        assert_eq!(after.scanned_hash, before.scanned_hash);
+        assert_eq!(after.watched_scripts, before.watched_scripts);
+        assert_eq!(after.watched_names, before.watched_names + 1);
+        assert!(
+            coordinator
+                .backend()
+                .light_watch_set()
+                .unwrap()
+                .name_hashes
+                .contains(&name_hash)
+        );
+
+        assert!(
+            coordinator
+                .synchronize_name_proof_exact_text("24hour", now + 2)
+                .is_err()
+        );
+        assert_eq!(
+            coordinator
+                .backend()
+                .light_scan_status()
+                .unwrap()
+                .watch_digest,
+            after.watch_digest
+        );
     }
 
     #[test]
