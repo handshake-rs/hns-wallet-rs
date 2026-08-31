@@ -5,7 +5,7 @@
 //! proofs cross the wallet's local verification boundaries before they mutate
 //! durable state.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{
     Arc, Mutex, MutexGuard,
@@ -1606,6 +1606,52 @@ impl HnsDirectPeerCoordinator {
         self.synchronize_name_proof(name_hash, now_unix)
     }
 
+    /// Refresh every exact name proof needed by the next wallet snapshot.
+    ///
+    /// The set is assembled only from already-persisted known names and from
+    /// unspent FINALIZE outputs that the wallet's locally verified filtered
+    /// index already associated with an installed wallet script.  All hashes
+    /// are installed in one forward-only name-set change, which preserves the
+    /// completed historical script scan.  Only proofs absent for the current
+    /// header-tree root are requested from peers.
+    ///
+    /// This is intentionally called after a direct block scan but before the
+    /// native snapshot: a newly finalized wallet name is not knowable before
+    /// the scan, yet adding its exact proof target never requires a second
+    /// historical script scan.
+    pub fn synchronize_wallet_name_proofs(
+        &self,
+        now_unix: u64,
+    ) -> Result<usize, HnsDirectPeerError> {
+        let source = self
+            .wallet_watch_set_source
+            .as_ref()
+            .ok_or(HnsDirectPeerError::InvalidConfiguration)?;
+        let account = source.current_account_config()?;
+        let persisted = source
+            .store
+            .try_with_store(|wallet| derive_hns_light_watch_set(wallet, &account))
+            .map_err(HnsDirectPeerError::Wallet)?;
+        let mut names = persisted.name_hashes.into_iter().collect::<BTreeSet<_>>();
+        names.extend(
+            self.backend
+                .watched_finalize_name_hashes()
+                .map_err(HnsDirectPeerError::Wallet)?,
+        );
+        let names = names.into_iter().collect::<Vec<_>>();
+        self.backend
+            .extend_name_watch_set_without_rewind(&names, now_unix)
+            .map_err(HnsDirectPeerError::Wallet)?;
+        let missing = self
+            .backend
+            .name_hashes_missing_current_proofs(&names)
+            .map_err(HnsDirectPeerError::Wallet)?;
+        for name_hash in &missing {
+            self.synchronize_name_proof(*name_hash, now_unix)?;
+        }
+        Ok(missing.len())
+    }
+
     /// Add one explicit canonical name to a wallet-owned direct index before
     /// asking peers for its exact proof.
     ///
@@ -1640,12 +1686,13 @@ impl HnsDirectPeerCoordinator {
             .try_with_store(|wallet| derive_hns_light_watch_set(wallet, &account))
             .map_err(HnsDirectPeerError::Wallet)?;
         if persisted.name_hashes.binary_search(&name_hash).is_ok() {
-            // A persisted name missing from the installed set indicates an
-            // incomplete historical index, not a new import. Restore the
-            // complete deterministic set and require the normal one-time
-            // historical catch-up before using its proof.
+            // A persisted name missing from the installed set needs its exact
+            // proof target restored, but not another historical script scan.
+            // Name hashes neither derive a wallet script nor affect filtered
+            // transaction coverage; strict current-root proof validation is
+            // still required before the name may be used.
             self.backend
-                .install_watch_set(persisted, now_unix)
+                .extend_name_watch_set_without_rewind(&[name_hash], now_unix)
                 .map_err(HnsDirectPeerError::Wallet)?;
             return Ok(());
         }
@@ -2353,20 +2400,18 @@ fn reusable_wallet_watch_set(
 
 /// Accept prior coverage only when it contains the complete current base and
 /// every retained script is still a wallet-derived member of the bounded
-/// restoration ceiling. Known-name membership remains exact: adding or
-/// removing an imported name changes compact-filter relevance and requires a
-/// deliberate rewind.
+/// restoration ceiling. Name hashes are proof targets, not derivation
+/// scripts: a persisted-name delta is added by the post-scan proof-refresh
+/// stage and never invalidates already authenticated transaction coverage.
 fn deterministic_watch_set_covers(
     installed: &crate::HnsLightWatchSet,
     required: &crate::HnsLightWatchSet,
     ceiling: &crate::HnsLightWatchSet,
 ) -> bool {
-    installed.name_hashes == required.name_hashes
-        && ceiling.name_hashes == required.name_hashes
-        && required
-            .scripts
-            .iter()
-            .all(|script| installed.scripts.binary_search(script).is_ok())
+    required
+        .scripts
+        .iter()
+        .all(|script| installed.scripts.binary_search(script).is_ok())
         && installed
             .scripts
             .iter()
@@ -3340,6 +3385,59 @@ mod tests {
     }
 
     #[test]
+    fn reusable_direct_watch_set_defers_a_persisted_name_delta_without_rewinding_scripts() {
+        let config = direct_wallet_config();
+        let mut wallet =
+            WalletStore::create(":memory:", "reusable direct name proof passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[76; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let store = hns_wallet_store::SharedWalletStore::new(wallet);
+        let installed = store
+            .try_with_store(|wallet| derive_hns_light_watch_set(wallet, &config))
+            .unwrap();
+        let name_hash = hash_name(b"24hour").unwrap().into_bytes();
+        let known = crate::KnownName {
+            name: b"24hour".to_vec(),
+            name_hash,
+            proof_height: 0,
+            unbound_proof_owner_outpoint: None,
+            unbound_current_owner_outpoint: None,
+            proof_state: None,
+            current_state: None,
+            canonical_proof_state: None,
+            canonical_current_state: None,
+            current_raw_resource: None,
+            resource_status: crate::NameResourceStatus::NoCurrentState,
+            ownership_status: crate::NameOwnershipStatus::NoCurrentOwner,
+        };
+        store
+            .with_store_mut(|wallet| {
+                wallet
+                    .save_known_name(&crate::namespaced_name_id(&config, name_hash), 0, &known, 2)
+                    .map(|_| ())
+            })
+            .unwrap();
+        let base = store
+            .try_with_store(|wallet| derive_hns_light_watch_set(wallet, &config))
+            .unwrap();
+        assert_eq!(base.name_hashes, vec![name_hash]);
+
+        let reusable = reusable_wallet_watch_set(&store, &config, &installed, base).unwrap();
+        assert_eq!(reusable.scripts, installed.scripts);
+        assert_eq!(reusable.name_hashes, installed.name_hashes);
+    }
+
+    #[test]
     fn exact_name_proof_watch_expansion_retains_existing_direct_scan_coverage() {
         let config = direct_wallet_config();
         let mut wallet = WalletStore::create(":memory:", "direct name proof passphrase").unwrap();
@@ -3401,6 +3499,87 @@ mod tests {
                 .unwrap()
                 .watch_digest,
             after.watch_digest
+        );
+    }
+
+    #[test]
+    fn persisted_name_watch_extension_heals_the_exact_watch_set_without_a_rewind() {
+        let config = direct_wallet_config();
+        let mut wallet =
+            WalletStore::create(":memory:", "persisted direct name proof passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[75; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let store = hns_wallet_store::SharedWalletStore::new(wallet);
+        let coordinator = open_wallet_direct_hns_peer_coordinator(
+            store.clone(),
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now,
+        )
+        .unwrap();
+        let before = coordinator.backend().light_scan_status().unwrap();
+        let name_hash = hash_name(b"24hour").unwrap().into_bytes();
+        let known = crate::KnownName {
+            name: b"24hour".to_vec(),
+            name_hash,
+            proof_height: 0,
+            unbound_proof_owner_outpoint: None,
+            unbound_current_owner_outpoint: None,
+            proof_state: None,
+            current_state: None,
+            canonical_proof_state: None,
+            canonical_current_state: None,
+            current_raw_resource: None,
+            resource_status: crate::NameResourceStatus::NoCurrentState,
+            ownership_status: crate::NameOwnershipStatus::NoCurrentOwner,
+        };
+        // Model an interrupted older import: its durable name row exists, but
+        // the previous direct session ended before it added the proof target
+        // to its live local index.
+        store
+            .with_store_mut(|wallet| {
+                wallet
+                    .save_known_name(
+                        &crate::namespaced_name_id(&config, name_hash),
+                        0,
+                        &known,
+                        now,
+                    )
+                    .map(|_| ())
+            })
+            .unwrap();
+
+        // This fixture intentionally has no peers. Repairing the persisted
+        // proof target must nevertheless preserve the existing direct scan;
+        // the later proof transport request is a separate operation.
+        coordinator
+            .extend_wallet_name_proof_watch_set(name_hash, now + 1)
+            .expect("restore the exact persisted name proof target");
+
+        let after = coordinator.backend().light_scan_status().unwrap();
+        assert_eq!(after.birthday_height, before.birthday_height);
+        assert_eq!(after.scanned_height, before.scanned_height);
+        assert_eq!(after.scanned_hash, before.scanned_hash);
+        assert_eq!(after.watched_scripts, before.watched_scripts);
+        assert_eq!(after.watched_names, before.watched_names + 1);
+        assert!(
+            coordinator
+                .backend()
+                .light_watch_set()
+                .unwrap()
+                .name_hashes
+                .contains(&name_hash)
         );
     }
 

@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use hns_covenants::{CovenantKind, MAX_RESOURCE_SIZE, NameState, TransferCovenant};
+use hns_covenants::{
+    Covenant, CovenantKind, FinalizeCovenant, MAX_RESOURCE_SIZE, NameState, TransferCovenant,
+};
 use hns_header_consensus::Header;
 use hns_light_sync::{HeaderRoundRequest, PeerId, SyncError, SyncState};
 use hns_light_wallet::{VerifiedWalletBlock, WalletHeaderAnchor};
@@ -164,6 +166,68 @@ impl EmbeddedHnsBackend {
             advance_mempool_generation(&mut state.mempool)?;
         }
         Ok(changed)
+    }
+
+    /// Return the exact names whose current-root proof is absent from this
+    /// wallet-owned index. The caller supplies only name hashes already
+    /// derived from the encrypted wallet store or from a locally verified
+    /// FINALIZE output; no peer or host input can enlarge this query.
+    pub(crate) fn name_hashes_missing_current_proofs(
+        &self,
+        name_hashes: &[[u8; 32]],
+    ) -> Result<Vec<[u8; 32]>, HnsWalletError> {
+        let state = self.lock()?;
+        let binding = current_binding(&state)?;
+        let mut missing = Vec::with_capacity(name_hashes.len());
+        for name_hash in name_hashes {
+            if state
+                .index
+                .name_proof(*name_hash, binding.tip.tree_root)
+                .map_err(map_index_error)?
+                .is_none()
+            {
+                missing.push(*name_hash);
+            }
+        }
+        Ok(missing)
+    }
+
+    /// Derive the exact names that must be projected because a locally
+    /// authenticated, still-unspent FINALIZE output pays one of this wallet's
+    /// installed scripts. This does not infer ownership from a peer name
+    /// response: it merely identifies the name hashes for which the ordinary
+    /// strict proof refresh is required before snapshot reconciliation.
+    pub(crate) fn watched_finalize_name_hashes(&self) -> Result<Vec<[u8; 32]>, HnsWalletError> {
+        let state = self.lock()?;
+        let binding = current_binding(&state)?;
+        let observations = state.index.transactions().map_err(map_index_error)?;
+        let rows = confirmed_rows(
+            &observations,
+            &state.index.watch_set().scripts,
+            binding.tip.height,
+        )?;
+        let mut names = BTreeSet::new();
+        for row in rows {
+            let ConfirmedRow::Coin(coin) = row else {
+                continue;
+            };
+            let covenant = Covenant::decode(&coin.coin.covenant)
+                .map_err(|_| HnsWalletError::InvalidEvidence)?;
+            if covenant
+                .encode()
+                .map_err(|_| HnsWalletError::InvalidEvidence)?
+                != coin.coin.covenant
+            {
+                return Err(HnsWalletError::InvalidEvidence);
+            }
+            if covenant.kind != CovenantKind::Finalize {
+                continue;
+            }
+            let finalize = FinalizeCovenant::try_from(&covenant)
+                .map_err(|_| HnsWalletError::InvalidEvidence)?;
+            names.insert(finalize.name_hash.into_bytes());
+        }
+        Ok(names.into_iter().collect())
     }
 
     /// Append a locally allocated future change-gap script without rewinding
