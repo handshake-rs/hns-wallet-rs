@@ -461,7 +461,8 @@ impl EncryptedHnsLightAuthority {
     }
 
     /// Replace a pristine genesis checkpoint with a locally verified header
-    /// acceleration stream.
+    /// acceleration stream, or reopen the exact already-installed pinned
+    /// checkpoint.
     ///
     /// This is intentionally only a new-wallet path. Every supplied header is
     /// appended from canonical genesis using the normal proof-of-work,
@@ -472,6 +473,10 @@ impl EncryptedHnsLightAuthority {
     /// still provide fresh agreement before the wallet treats the chain as
     /// current or authorizes value operations.
     ///
+    /// Repeating the same pinned bootstrap after a process or controller
+    /// restart is intentionally idempotent. Only an authenticated checkpoint
+    /// already at the exact expected height and hash is accepted without
+    /// replaying the stream; any other non-pristine state still fails closed.
     /// A recovery wallet must retain its genuine birthday and scan from there.
     /// It must not use this narrow shortcut to discard historical discovery.
     pub fn bootstrap_from_genesis_headers<I>(
@@ -490,9 +495,16 @@ impl EncryptedHnsLightAuthority {
         if self.birthday_height != expected_height {
             return Err(HnsLightError::BootstrapBirthdayMismatch);
         }
+        let tip = self.sync.chain().tip();
+        if tip.height() == Height::new(expected_height)
+            && tip.hash().into_bytes() == expected_hash
+            && self.archived_tip == Some((expected_height, expected_hash))
+        {
+            return Ok(self.status());
+        }
         if self.checkpoint_revision != 1
             || self.archived_tip.is_some()
-            || self.sync.chain().tip().height() != Height::new(0)
+            || tip.height() != Height::new(0)
         {
             return Err(HnsLightError::BootstrapUnavailable);
         }
@@ -852,6 +864,37 @@ mod tests {
             reopened.archived_header(3).unwrap().unwrap().block_hash(),
             headers[2].block_hash()
         );
+    }
+
+    #[test]
+    fn genesis_verified_bootstrap_is_idempotent_after_reopen() {
+        let store = store();
+        let account = AccountId::new([72; 16]);
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let mut authority = open(store.clone(), account, 3, HnsLightFloor::default(), now).unwrap();
+        let mut fixture_chain = authority.validated_chain().clone();
+        let mut headers = Vec::new();
+        for marker in 1..=3 {
+            let header = mine(fixture_chain.tip(), marker);
+            fixture_chain.append(&header, BlockTime::new(now)).unwrap();
+            headers.push(header);
+        }
+        let expected_hash = fixture_chain.tip().hash().into_bytes();
+        authority
+            .bootstrap_from_genesis_headers(headers.clone(), 3, expected_hash, now)
+            .unwrap();
+        let floor = authority.rollback_floor();
+        drop(authority);
+
+        let mut reopened = open(store, account, 3, floor, now).unwrap();
+        let before_epoch = reopened.chain_epoch();
+        let status = reopened
+            .bootstrap_from_genesis_headers(headers, 3, expected_hash, now + 1)
+            .unwrap();
+
+        assert_eq!(status.tip.height(), Height::new(3));
+        assert_eq!(status.tip.hash().into_bytes(), expected_hash);
+        assert_eq!(reopened.chain_epoch(), before_epoch);
     }
 
     #[test]
