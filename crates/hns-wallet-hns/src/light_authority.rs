@@ -475,7 +475,8 @@ impl EncryptedHnsLightAuthority {
     ///
     /// Repeating the same pinned bootstrap after a process or controller
     /// restart is intentionally idempotent. Only an authenticated checkpoint
-    /// already at the exact expected height and hash is accepted without
+    /// at the exact expected height and hash, or a verified descendant whose
+    /// retained birthday anchor has that exact hash, is accepted without
     /// replaying the stream; any other non-pristine state still fails closed.
     /// A recovery wallet must retain its genuine birthday and scan from there.
     /// It must not use this narrow shortcut to discard historical discovery.
@@ -496,11 +497,14 @@ impl EncryptedHnsLightAuthority {
             return Err(HnsLightError::BootstrapBirthdayMismatch);
         }
         let tip = self.sync.chain().tip();
-        if tip.height() == Height::new(expected_height)
-            && tip.hash().into_bytes() == expected_hash
-            && self.archived_tip == Some((expected_height, expected_hash))
-        {
-            return Ok(self.status());
+        if tip.height() >= Height::new(expected_height) {
+            let pinned_anchor_matches = self
+                .archived_header(expected_height)?
+                .is_some_and(|header| header.block_hash().into_bytes() == expected_hash);
+            if pinned_anchor_matches {
+                return Ok(self.status());
+            }
+            return Err(HnsLightError::BootstrapUnavailable);
         }
         if self.checkpoint_revision != 1
             || self.archived_tip.is_some()
@@ -894,6 +898,45 @@ mod tests {
 
         assert_eq!(status.tip.height(), Height::new(3));
         assert_eq!(status.tip.hash().into_bytes(), expected_hash);
+        assert_eq!(reopened.chain_epoch(), before_epoch);
+    }
+
+    #[test]
+    fn genesis_verified_bootstrap_is_idempotent_after_descendant_sync() {
+        let store = store();
+        let account = AccountId::new([73; 16]);
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let mut authority = open(store.clone(), account, 3, HnsLightFloor::default(), now).unwrap();
+        let mut fixture_chain = authority.validated_chain().clone();
+        let mut headers = Vec::new();
+        for marker in 1..=3 {
+            let header = mine(fixture_chain.tip(), marker);
+            fixture_chain.append(&header, BlockTime::new(now)).unwrap();
+            headers.push(header);
+        }
+        let expected_hash = fixture_chain.tip().hash().into_bytes();
+        authority
+            .bootstrap_from_genesis_headers(headers.clone(), 3, expected_hash, now)
+            .unwrap();
+
+        let extension = mine(authority.status().tip, 4);
+        let peer = peer(73);
+        authority.add_peer(peer, 4).unwrap();
+        let request = authority.begin_header_round(&[peer], now + 1).unwrap();
+        authority
+            .submit_header_response(request.generation, peer, vec![extension], now + 1)
+            .unwrap();
+        authority.finish_header_round_and_persist(now + 1).unwrap();
+        let floor = authority.rollback_floor();
+        drop(authority);
+
+        let mut reopened = open(store, account, 3, floor, now + 2).unwrap();
+        let before_epoch = reopened.chain_epoch();
+        let status = reopened
+            .bootstrap_from_genesis_headers(headers, 3, expected_hash, now + 2)
+            .unwrap();
+
+        assert_eq!(status.tip.height(), Height::new(4));
         assert_eq!(reopened.chain_epoch(), before_epoch);
     }
 

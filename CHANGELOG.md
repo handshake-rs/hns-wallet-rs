@@ -5,10 +5,10 @@ file. The public crates use a shared version and follow Semantic Versioning.
 
 ## Unreleased
 
-- Allow a mobile controller reacquisition to reuse the exact authenticated HNS
+- Allow a mobile controller reacquisition to reuse an authenticated HNS
   genesis-bootstrap checkpoint already installed at the product-pinned height
-  and hash. Other non-pristine or mismatched bootstrap state still fails
-  closed.
+  and hash, including a verified descendant retaining that exact birthday
+  anchor. Other non-pristine or mismatched bootstrap state still fails closed.
 - Accept the Android 9 app-sandbox ancestor layout where a root-owned sticky
   `/` is followed by the Android system-owned `/data` boundary. The wallet
   directory and database must still be owned by the application with exact
