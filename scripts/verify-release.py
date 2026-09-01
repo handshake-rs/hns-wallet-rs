@@ -15,19 +15,10 @@ from pathlib import Path
 
 REPOSITORY = "https://github.com/handshake-rs/hns-wallet-rs"
 PROTOCOL_REPOSITORY = "https://github.com/handshake-rs/hns-rs.git"
-PROTOCOL_REVISION = "0e99addca59778b7b7c6fc56291333a97c4c8815"
-PROTOCOL_VERSION = "=0.3.1"
+PROTOCOL_REVISION = "73611a0d83778e157b35f28ca2197d068e83fc61"
+PROTOCOL_VERSION = "=0.4.1"
 REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-PROTOCOL_CHECKSUM_MANIFEST = "release/hns-rs-core-0.3.1-crates.sha256"
-SHAKESCAPE_PROTOCOL_REVISION = "c8feb6f90f3e03efbb982a5e33192dda6fd2f37a"
-SHAKESCAPE_PROTOCOL_VERSION = "=0.4.0"
-SHAKESCAPE_PROTOCOL_CHECKSUM_MANIFEST = (
-    "release/hns-rs-shakescape-0.4.0-crates.sha256"
-)
-SHAKESCAPE_PROTOCOL_PACKAGES = (
-    "hns-p2p-experimental",
-    "hns-marketplace-protocol",
-)
+PROTOCOL_CHECKSUM_MANIFEST = "release/hns-rs-0.4.1-crates.sha256"
 PROTOCOL_PUBLIC_PACKAGES = (
     "hns-encoding",
     "hns-rollback-journal",
@@ -38,6 +29,7 @@ PROTOCOL_PUBLIC_PACKAGES = (
     "hns-header-consensus",
     "hns-service-authority",
     "hns-odoh-protocol",
+    "hns-p2p-experimental",
     "hns-urkel-proof",
     "hns-transaction",
     "hns-chat-protocol",
@@ -45,6 +37,7 @@ PROTOCOL_PUBLIC_PACKAGES = (
     "hns-script",
     "hns-mining",
     "hns-swap",
+    "hns-marketplace-protocol",
     "hns-p2p-wire",
 )
 PROTOCOL_PACKAGES = {
@@ -63,6 +56,17 @@ ENGINE_REPOSITORY = "https://github.com/handshake-rs/hns-dane-engine.git"
 ENGINE_REVISION = "b7fdf8826c81b77650a0f740d1f05314b74969f9"
 ENGINE_VERSION = "=0.2.2"
 ENGINE_CHECKSUM_MANIFEST = "release/hns-dane-engine-0.2.2-crates.sha256"
+ENGINE_PATCH_REVISION = "87d2346c13ade4987801e0f1367bd604fd77c9f0"
+ENGINE_PATCH_VERSION = "=0.2.3"
+ENGINE_PATCH_CHECKSUM_MANIFEST = (
+    "release/hns-dane-engine-light-client-0.2.3-crates.sha256"
+)
+ENGINE_PATCH_PACKAGES = (
+    "hns-light-chain",
+    "hns-light-wallet",
+    "hns-light-p2p",
+    "hns-light-sync",
+)
 ENGINE_PUBLIC_PACKAGES = (
     "hns-dns-wire",
     "hns-browser-runtime",
@@ -268,19 +272,18 @@ def verify_release_document(repo: Path, order: list[str], version: str) -> None:
         "./scripts/publish.sh --archive-only",
         ".github/workflows/release-preflight.yml",
         PROTOCOL_REVISION,
-        SHAKESCAPE_PROTOCOL_REVISION,
         ENGINE_REVISION,
+        ENGINE_PATCH_REVISION,
+        ENGINE_PATCH_REVISION,
         PROTOCOL_CHECKSUM_MANIFEST,
-        SHAKESCAPE_PROTOCOL_CHECKSUM_MANIFEST,
         ENGINE_CHECKSUM_MANIFEST,
+        ENGINE_PATCH_CHECKSUM_MANIFEST,
     )
     for required in required_release_text:
         if required not in document:
             fail(f"docs/releasing.md omits {required!r}")
-    if "seventeen unchanged published `hns-rs` `0.3.1` core" not in document:
-        fail("docs/releasing.md omits the current published core protocol prerequisite record")
-    if "published `hns-p2p-experimental` and `hns-marketplace-protocol` `0.4.0`" not in document:
-        fail("docs/releasing.md omits the current published Shakescape prerequisite record")
+    if "coherent nineteen-crate `hns-rs` `0.4.1` cohort" not in document:
+        fail("docs/releasing.md omits the current published protocol prerequisite record")
     if re.search(
         r"all 20\s+required\s+`hns-dane-engine` `0\.2\.2` archives were published",
         document,
@@ -341,9 +344,9 @@ def verify_publish_script_safety(repo: Path) -> None:
         "verify_protocol_packages_published()",
         "verify_engine_packages_published()",
         "verify_published_cohort()",
-        "protocol_checksum_manifest=release/hns-rs-core-0.3.1-crates.sha256",
-        "shakescape_protocol_checksum_manifest=release/hns-rs-shakescape-0.4.0-crates.sha256",
+        "protocol_checksum_manifest=release/hns-rs-0.4.1-crates.sha256",
         "engine_checksum_manifest=release/hns-dane-engine-0.2.2-crates.sha256",
+        "engine_patch_checksum_manifest=release/hns-dane-engine-light-client-0.2.3-crates.sha256",
         "require_clean_archive_vcs=yes",
         '*\\"dirty\\":true*',
         'cohort_vcs_info="$release_tmp/$package-$version.cargo_vcs_info.json"',
@@ -473,12 +476,14 @@ def verify_protocol_source(repo: Path) -> None:
     if "patch" in manifest:
         fail("Cargo.toml must not override registry dependencies through [patch]")
     for package, version in (
-        *((
-            package,
-            PROTOCOL_VERSION,
-        ) for package in sorted(PROTOCOL_PACKAGES - set(SHAKESCAPE_PROTOCOL_PACKAGES))),
-        *((package, SHAKESCAPE_PROTOCOL_VERSION) for package in SHAKESCAPE_PROTOCOL_PACKAGES),
-        *((package, ENGINE_VERSION) for package in sorted(ENGINE_PACKAGES)),
+        *((package, PROTOCOL_VERSION) for package in sorted(PROTOCOL_PACKAGES)),
+        *(
+            (
+                package,
+                ENGINE_PATCH_VERSION if package in ENGINE_PATCH_PACKAGES else ENGINE_VERSION,
+            )
+            for package in sorted(ENGINE_PACKAGES)
+        ),
     ):
         dependency = dependencies.get(package)
         expected = {"version": version}
@@ -488,14 +493,14 @@ def verify_protocol_source(repo: Path) -> None:
     protocol_checksums = checksum_manifest(
         repo, PROTOCOL_CHECKSUM_MANIFEST, PROTOCOL_PUBLIC_PACKAGES, PROTOCOL_VERSION
     )
-    shakescape_protocol_checksums = checksum_manifest(
-        repo,
-        SHAKESCAPE_PROTOCOL_CHECKSUM_MANIFEST,
-        SHAKESCAPE_PROTOCOL_PACKAGES,
-        SHAKESCAPE_PROTOCOL_VERSION,
-    )
     engine_checksums = checksum_manifest(
         repo, ENGINE_CHECKSUM_MANIFEST, ENGINE_PUBLIC_PACKAGES, ENGINE_VERSION
+    )
+    engine_patch_checksums = checksum_manifest(
+        repo,
+        ENGINE_PATCH_CHECKSUM_MANIFEST,
+        ENGINE_PATCH_PACKAGES,
+        ENGINE_PATCH_VERSION,
     )
 
     publish_script = (repo / "scripts/publish.sh").read_text(encoding="utf-8")
@@ -505,15 +510,15 @@ def verify_protocol_source(repo: Path) -> None:
         f"protocol_version={PROTOCOL_VERSION.removeprefix('=')}",
         f"protocol_crates='{' '.join(PROTOCOL_PUBLIC_PACKAGES)}'",
         f"protocol_checksum_manifest={PROTOCOL_CHECKSUM_MANIFEST}",
-        f"shakescape_protocol_revision={SHAKESCAPE_PROTOCOL_REVISION}",
-        f"shakescape_protocol_version={SHAKESCAPE_PROTOCOL_VERSION.removeprefix('=')}",
-        f"shakescape_protocol_crates='{' '.join(SHAKESCAPE_PROTOCOL_PACKAGES)}'",
-        f"shakescape_protocol_checksum_manifest={SHAKESCAPE_PROTOCOL_CHECKSUM_MANIFEST}",
         f"engine_repository={ENGINE_REPOSITORY}",
         f"engine_revision={ENGINE_REVISION}",
         f"engine_version={ENGINE_VERSION.removeprefix('=')}",
         f"engine_crates='{' '.join(ENGINE_PUBLIC_PACKAGES)}'",
         f"engine_checksum_manifest={ENGINE_CHECKSUM_MANIFEST}",
+        f"engine_patch_revision={ENGINE_PATCH_REVISION}",
+        f"engine_patch_version={ENGINE_PATCH_VERSION.removeprefix('=')}",
+        f"engine_patch_crates='{' '.join(ENGINE_PATCH_PACKAGES)}'",
+        f"engine_patch_checksum_manifest={ENGINE_PATCH_CHECKSUM_MANIFEST}",
     }
     script_lines = set(publish_script.splitlines())
     missing_lines = required_script_lines - script_lines
@@ -530,11 +535,11 @@ def verify_protocol_source(repo: Path) -> None:
         PROTOCOL_REVISION,
         ENGINE_REVISION,
         PROTOCOL_CHECKSUM_MANIFEST,
-        SHAKESCAPE_PROTOCOL_CHECKSUM_MANIFEST,
         ENGINE_CHECKSUM_MANIFEST,
+        ENGINE_PATCH_CHECKSUM_MANIFEST,
         f"`hns-rs` `{PROTOCOL_VERSION.removeprefix('=')}`",
-        f"`{SHAKESCAPE_PROTOCOL_VERSION.removeprefix('=')}`",
         f"`hns-dane-engine` `{ENGINE_VERSION.removeprefix('=')}`",
+        f"light-client `{ENGINE_PATCH_VERSION.removeprefix('=')}` cohort",
     )
     for required in required_document_text:
         if required not in release_document:
@@ -550,13 +555,13 @@ def verify_protocol_source(repo: Path) -> None:
             expected_version = PROTOCOL_VERSION.removeprefix("=")
             expected_checksum = protocol_checksums[f"{name}-{expected_version}.crate"]
             cohort = "protocol"
-        elif name in SHAKESCAPE_PROTOCOL_PACKAGES:
-            observed_protocol_packages.add(name)
-            expected_version = SHAKESCAPE_PROTOCOL_VERSION.removeprefix("=")
-            expected_checksum = shakescape_protocol_checksums[
+        elif name in ENGINE_PATCH_PACKAGES:
+            observed_engine_packages.add(name)
+            expected_version = ENGINE_PATCH_VERSION.removeprefix("=")
+            expected_checksum = engine_patch_checksums[
                 f"{name}-{expected_version}.crate"
             ]
-            cohort = "Shakescape protocol"
+            cohort = "engine patch"
         elif name in ENGINE_PUBLIC_PACKAGES:
             observed_engine_packages.add(name)
             expected_version = ENGINE_VERSION.removeprefix("=")
@@ -761,11 +766,7 @@ def verify_workspace(
                     fail(f"{dependency_name} must precede dependent package {name}")
             elif dependency_name in PROTOCOL_PACKAGES:
                 observed_protocol_dependencies.add(dependency_name)
-                expected_protocol_version = (
-                    SHAKESCAPE_PROTOCOL_VERSION
-                    if dependency_name in SHAKESCAPE_PROTOCOL_PACKAGES
-                    else PROTOCOL_VERSION
-                )
+                expected_protocol_version = PROTOCOL_VERSION
                 if dependency["req"] != expected_protocol_version:
                     fail(
                         f"{name} requires protocol {dependency_name} at "
@@ -775,10 +776,15 @@ def verify_workspace(
                     fail(f"{name} has a non-registry source for {dependency_name}")
             elif dependency_name in ENGINE_PACKAGES:
                 observed_engine_dependencies.add(dependency_name)
-                if dependency["req"] != ENGINE_VERSION:
+                expected_engine_version = (
+                    ENGINE_PATCH_VERSION
+                    if dependency_name in ENGINE_PATCH_PACKAGES
+                    else ENGINE_VERSION
+                )
+                if dependency["req"] != expected_engine_version:
                     fail(
                         f"{name} requires engine {dependency_name} at "
-                        f"{dependency['req']}, expected {ENGINE_VERSION}"
+                        f"{dependency['req']}, expected {expected_engine_version}"
                     )
                 if dependency.get("source") != REGISTRY_SOURCE:
                     fail(f"{name} has a non-registry source for {dependency_name}")

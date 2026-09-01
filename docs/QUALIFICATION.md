@@ -39,27 +39,35 @@ commits must receive
 their own exact workflow records before upload. No source workflow result
 supplies product, network, value, or release-gate authority.
 
-Published `hns-rs` `0.3.1` release source
-`0e99addca59778b7b7c6fc56291333a97c4c8815` passed its complete
-[`CI run`](https://github.com/handshake-rs/hns-rs/actions/runs/32637180489),
-[`CodeQL run`](https://github.com/handshake-rs/hns-rs/actions/runs/32637186016),
-and [`19-package release preflight`](https://github.com/handshake-rs/hns-rs/actions/runs/32637182502).
-All 19 archive checksums are recorded in `release/hns-rs-0.3.1-crates.sha256`.
+Published `hns-rs` `0.4.1` release source
+`73611a0d83778e157b35f28ca2197d068e83fc61` passed its complete
+[`CI run`](https://github.com/handshake-rs/hns-rs/actions/runs/33492052293),
+[`CodeQL run`](https://github.com/handshake-rs/hns-rs/actions/runs/33492052309),
+and [`19-package release preflight`](https://github.com/handshake-rs/hns-rs/actions/runs/33492499333).
+All 19 archive checksums are recorded in `release/hns-rs-0.4.1-crates.sha256`.
 Published `hns-dane-engine` `0.2.2` release source
 `b7fdf8826c81b77650a0f740d1f05314b74969f9` passed its complete
 [`CI run`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/32643678964),
 [`CodeQL run`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/32643677191),
 and [`20-package release preflight`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/32643680641).
 All 20 archive checksums are recorded in
-`release/hns-dane-engine-0.2.2-crates.sha256`. This upstream source evidence
-anchors the wallet dependency graph; exact wallet-source qualification is
-recorded only after its own locked CI, CodeQL, and normalized preflight pass.
+`release/hns-dane-engine-0.2.2-crates.sha256`. The compatible engine
+light-client `0.2.3` patch source
+`87d2346c13ade4987801e0f1367bd604fd77c9f0` passed its complete
+[`CI run`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/33498122962),
+[`CodeQL run`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/33498122737),
+and
+[`four-package release preflight`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/33499010562).
+Its four archive checksums are recorded in
+`release/hns-dane-engine-light-client-0.2.3-crates.sha256`. This upstream source
+evidence anchors the wallet dependency graph; exact wallet-source qualification
+is recorded only after its own locked CI, CodeQL, and normalized preflight pass.
 
 | Area | Exact source evidence | Persistence/restart and reorg | Product/network evidence | Release status |
 | --- | --- | --- | --- | --- |
 | Types and chain traits | complete locked workspace CI passed at `2229be8` | n/a | no product dependency | exact source recorded; API review remains |
 | Encrypted store/schema v3 | exact `2229be8` CI passed, including atomic bootstrap, rollback, migrations, encrypted CRUD/CAS, and Unix filesystem regressions | source reopen/restart tests; no installed Android/iOS secure-store runtime evidence in this package boundary | downstream mobile candidate source contains Keystore/Keychain wrapping, but device filesystem/runtime qualification remains external | platform qualification pending |
-| HNS wallet and names | exact historical `bc5901f` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, dedicated name targets, trusted exact-text import, name workflows, and fail-closed value-evidence checks | source restart/reorg paths; no multi-process regtest | script-free wallet RPC remains compatible with node `2b267ffe`; pruning-safe wallet-owned name actions pair with selected node main `4275b4e`; the release graph uses published registry `hns-rs` `0.3.1` source `0e99addca59778b7b7c6fc56291333a97c4c8815` and `hns-dane-engine` `0.2.2` source `b7fdf8826c81b77650a0f740d1f05314b74969f9`, with archive manifests in `release/` | HNS funding, value, and fee source gates enabled; exact wallet hosted qualification and live product qualification remain pending |
+| HNS wallet and names | exact historical `bc5901f` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, dedicated name targets, trusted exact-text import, name workflows, and fail-closed value-evidence checks | source restart/reorg paths; no multi-process regtest | script-free wallet RPC remains compatible with node `2b267ffe`; pruning-safe wallet-owned name actions pair with selected node main `4275b4e`; the release graph uses published registry `hns-rs` `0.4.1` source `73611a0d83778e157b35f28ca2197d068e83fc61`, the historical `hns-dane-engine` `0.2.2` source `b7fdf8826c81b77650a0f740d1f05314b74969f9`, and its compatible light-client `0.2.3` source `87d2346c13ade4987801e0f1367bd604fd77c9f0`, with archive manifests in `release/` | HNS funding, value, and fee source gates enabled; exact wallet hosted qualification and live product qualification remain pending |
 | Provider core | exact `2229be8` CI passed, including account binding, scoped reads, exact Names consent, and unavailable-method ordering | grants persist; pending approval/UI authority remains process-local | no installed-browser wallet consent or backend E2E | browser and value exposure unavailable |
 | Fixed-price Shakedex | exact `2229be8` CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Shakescape, provider, trusted UI, or product coin selection | Shakedex and dependent HNS value source gates enabled; live product integration pending |
 | Market sessions | exact `2229be8` workspace CI passed | CAS journal source; recovery evidence incomplete | no pair E2E, rendezvous, or relay transport | unavailable |
@@ -264,12 +272,16 @@ crates.io and provenance-verified on 2026-08-14 at exact source commit
 satisfy the current release prerequisite.
 
 Before any wallet upload, execute mode rechecks all 19 published `hns-rs`
-`0.3.1` archives against `release/hns-rs-0.3.1-crates.sha256` and source
-`0e99addca59778b7b7c6fc56291333a97c4c8815`, and all 20 published
+`0.4.1` archives against `release/hns-rs-0.4.1-crates.sha256` and source
+`73611a0d83778e157b35f28ca2197d068e83fc61`, and all 20 published
 `hns-dane-engine` `0.2.2` archives against
 `release/hns-dane-engine-0.2.2-crates.sha256` and source
-`b7fdf8826c81b77650a0f740d1f05314b74969f9`. It verifies crates.io API
-checksums/non-yanked status, archive SHA-256, and clean `crates/<package>` VCS
-identity before it constructs or uploads a wallet archive. Any missing or
-different upstream provenance aborts execution. Actual publication remains a
-separate, explicitly authorized human action. No runtime gate changes.
+`b7fdf8826c81b77650a0f740d1f05314b74969f9`.
+The compatible light-client `0.2.3` cohort is additionally bound to engine
+source `87d2346c13ade4987801e0f1367bd604fd77c9f0` by
+`release/hns-dane-engine-light-client-0.2.3-crates.sha256`. Execute mode verifies
+crates.io API checksums/non-yanked status, archive SHA-256, and clean
+`crates/<package>` VCS identity for all four patch packages before it constructs
+or uploads a wallet archive. Any missing or different upstream provenance
+aborts execution. Actual publication remains a separate, explicitly authorized
+human action. No runtime gate changes.

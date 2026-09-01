@@ -40,15 +40,15 @@ Normalized archive inspection materializes complete tar listings and selected
 files before comparison so a successful match cannot hide an upstream tar read
 failure or emit a benign broken-pipe warning.
 
-## 0.2.0 release source
+## 0.2.1 release source
 
-Version `0.2.0` is the current `hns-wallet-rs` release line. The
+Version `0.2.1` is the current `hns-wallet-rs` release line. The
 canonical feature inventory is in `CHANGELOG.md`; source packaging, publication,
 or test success does not enable provider, value, settlement, or marketplace
 product gates. Registry and tag state are external facts and must be checked at
 release time rather than embedded as a claim in the source snapshot.
 
-The selected `0.2.0` heading and package-local changelogs use one
+The selected `0.2.1` heading and package-local changelogs use one
 version-scoped canonical `release` declaration. It describes prepared source,
 not an existing crates.io package or tag; execution requires this exact dated
 state and rejects a stale, missing, malformed, mismatched, or candidate
@@ -57,28 +57,30 @@ declaration.
 Root `CHANGELOG.md` release form:
 
 ```markdown
-<!-- hns-wallet-release-state: 0.2.0 release -->
-Initial release source for the independent Handshake wallet boundary:
+<!-- hns-wallet-release-state: 0.2.1 release -->
+Breaking clean-break migration of the wallet and atomic-swap boundary:
 ```
 
 `release/CRATE-CHANGELOG.md` release form:
 
 ```markdown
-<!-- hns-wallet-release-state: 0.2.0 release -->
+<!-- hns-wallet-release-state: 0.2.1 release -->
 This crate changelog describes the prepared `hns-wallet-rs` release source.
 ```
 
-Wallet source consumes seventeen unchanged published `hns-rs` `0.3.1` core
-crates from immutable release source
-`0e99addca59778b7b7c6fc56291333a97c4c8815`, recorded in
-`release/hns-rs-core-0.3.1-crates.sha256`. The breaking Shakescape boundary is
-the published `hns-p2p-experimental` and `hns-marketplace-protocol` `0.4.0`
-pair from source `c8feb6f90f3e03efbb982a5e33192dda6fd2f37a`, recorded in
-`release/hns-rs-shakescape-0.4.0-crates.sha256`. It also consumes the published registry
+Wallet source consumes the coherent nineteen-crate `hns-rs` `0.4.1` cohort
+from immutable release source
+`73611a0d83778e157b35f28ca2197d068e83fc61`, recorded in
+`release/hns-rs-0.4.1-crates.sha256`. It also consumes the published registry
 `hns-dane-engine` `0.2.2` cohort from immutable release source
 `b7fdf8826c81b77650a0f740d1f05314b74969f9`. All 20 required
 `hns-dane-engine` `0.2.2` archives were published to crates.io and are recorded
-in `release/hns-dane-engine-0.2.2-crates.sha256`.
+in `release/hns-dane-engine-0.2.2-crates.sha256`. The wallet uses the compatible
+light-client `0.2.3` cohort (`hns-light-chain`, `hns-light-wallet`,
+`hns-light-p2p`, and `hns-light-sync`) from immutable engine source
+`87d2346c13ade4987801e0f1367bd604fd77c9f0`, recorded in
+`release/hns-dane-engine-light-client-0.2.3-crates.sha256`; the release gate
+verifies both the historical engine cohort and all four exact patch archives.
 
 Execution downloads and revalidates each prerequisite immediately before any
 wallet upload. It checks the API checksum and non-yanked status, downloaded
@@ -175,12 +177,12 @@ document and verify boundaries; they grant no runtime or deployment authority.
    confirmation must equal the workspace version:
 
    ```bash
-   ./scripts/publish.sh --execute --confirm-publish 0.2.0
+   ./scripts/publish.sh --execute --confirm-publish 0.2.1
    ```
 
-Execution mode first downloads all seventeen core `hns-rs` `0.3.1` crates,
-both Shakescape `0.4.0` crates, and all 20 required
-`hns-dane-engine` archives and rejects any package whose API record, checksum,
+Execution mode first downloads all nineteen `hns-rs` `0.4.1` crates, all 20
+historical `hns-dane-engine 0.2.2` archives, and the four-crate light-client
+`0.2.3` cohort. It rejects any package whose API record, checksum,
 or `.cargo_vcs_info.json` does not identify the exact pinned release source.
 For a new wallet version, it creates and runs the custom
 inventory verifier over the normalized source package before any possible
@@ -209,7 +211,7 @@ limit:
 ```bash
 PUBLISH_NEW_INTERVAL_SECONDS=605 \
 PUBLISH_UPDATE_INTERVAL_SECONDS=65 \
-  ./scripts/publish.sh --execute --confirm-publish 0.2.0
+  ./scripts/publish.sh --execute --confirm-publish 0.2.1
 ```
 
 After each applicable cooldown, the script downloads the new archive and

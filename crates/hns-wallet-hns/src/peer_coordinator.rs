@@ -20,7 +20,7 @@ use hns_light_p2p::{
     PeerConfig, PeerConnection, PeerError, PeerEvent, PeerMetadata, WalletPeerEvent,
     light_wallet_version,
 };
-use hns_light_sync::{PeerId, SyncConfig};
+use hns_light_sync::{HeaderRoundRequest, PeerId, SyncConfig};
 use hns_light_wallet::{
     BloomUpdate, HsdBloomFilter, VerifiedWalletBlock, WalletBlockEvidence, WalletHeaderAnchor,
 };
@@ -1096,6 +1096,11 @@ pub struct HnsDirectPeerCoordinator {
     config: HnsDirectPeerConfig,
     wallet_watch_set_source: Option<WalletWatchSetSource>,
     pending_header: Arc<Mutex<Option<PendingHeaderRound>>>,
+    // Serialize the complete begin/request/finish lifecycle across coordinator
+    // clones. Without this gate, two foreground/background callers can both
+    // observe no pending metadata and race to begin (or finish) one authority
+    // round.
+    header_round_operation: Arc<Mutex<()>>,
     // The persistent peer pool is deliberately wider than a single header
     // agreement round. `hns_light_sync` requires every selected response to
     // complete a round, so selecting the entire pool would turn optional
@@ -1173,6 +1178,7 @@ impl HnsDirectPeerCoordinator {
             config,
             wallet_watch_set_source: None,
             pending_header: Arc::new(Mutex::new(None)),
+            header_round_operation: Arc::new(Mutex::new(())),
             next_header_peer_offset: Arc::new(AtomicUsize::new(0)),
             next_block_peer_offset: Arc::new(AtomicUsize::new(0)),
             block_scan_selection_count: Arc::new(AtomicUsize::new(0)),
@@ -1439,6 +1445,10 @@ impl HnsDirectPeerCoordinator {
         &self,
         now_unix: u64,
     ) -> Result<HnsHeaderRoundProgress, HnsDirectPeerError> {
+        let _operation = self
+            .header_round_operation
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
         let pending = {
             let pending = self.lock_pending_header()?;
             *pending
@@ -1451,7 +1461,7 @@ impl HnsDirectPeerCoordinator {
             return Err(HnsDirectPeerError::NoReadyPeers);
         }
         let ids = handles.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-        let request = self.backend.begin_header_round(&ids, now_unix)?;
+        let (request, mut pending) = self.begin_tracked_header_round(&ids, now_unix)?;
         // Some HSD peers do not emit an explicit empty `headers` packet when
         // the first locator hash is already their tip.  Ask from the prior
         // locator instead: a peer at our existing tip must then return the
@@ -1459,13 +1469,6 @@ impl HnsDirectPeerCoordinator {
         // response is normalized below, so the agreement engine still sees
         // only headers extending its own authenticated base.
         let locator = header_freshness_locator(&request.packet.locator);
-        let mut pending = PendingHeaderRound {
-            generation: request.generation,
-            deadline: request.deadline,
-            requested: ids.len(),
-            submitted: 0,
-        };
-        *self.lock_pending_header()? = Some(pending);
         let responses = std::thread::scope(|scope| {
             let tasks = handles
                 .into_iter()
@@ -1529,6 +1532,30 @@ impl HnsDirectPeerCoordinator {
         let finished_at =
             header_round_finished_at(pending, submitted, worker_panicked, now_unix_or(now_unix))?;
         self.finish_or_report_header_round(pending, finished_at)
+    }
+
+    fn begin_tracked_header_round(
+        &self,
+        ids: &[PeerId],
+        now_unix: u64,
+    ) -> Result<(HeaderRoundRequest, PendingHeaderRound), HnsDirectPeerError> {
+        // An active authority round with no matching coordinator metadata is
+        // orphaned. The operation gate proves that no other coordinator clone
+        // can currently own the missing metadata. Its partial peer responses
+        // are untrusted and uncommitted, so release only that round before
+        // starting a fresh agreement from the durable authenticated tip.
+        if self.backend.header_sync_status()?.round_active {
+            self.backend.abandon_uncommitted_header_round()?;
+        }
+        let request = self.backend.begin_header_round(ids, now_unix)?;
+        let pending = PendingHeaderRound {
+            generation: request.generation,
+            deadline: request.deadline,
+            requested: ids.len(),
+            submitted: 0,
+        };
+        *self.lock_pending_header()? = Some(pending);
+        Ok((request, pending))
     }
 
     /// Fetch the same exact-root/key proof from every available peer in
@@ -3382,6 +3409,51 @@ mod tests {
         assert_eq!(scan.watched_scripts, 4);
         assert_eq!(scan.watched_names, 0);
         assert_eq!(scan.birthday_height, 0);
+    }
+
+    #[test]
+    fn tracked_header_begin_replaces_only_an_orphaned_authority_round() {
+        let config = direct_wallet_config();
+        let mut wallet =
+            WalletStore::create(":memory:", "orphaned header round test passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[76; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let coordinator = open_wallet_direct_hns_peer_coordinator(
+            hns_wallet_store::SharedWalletStore::new(wallet),
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now,
+        )
+        .unwrap();
+        let id = PeerId::new([76; 32]);
+        coordinator.backend().add_header_peer(id, 1).unwrap();
+        let original_tip = coordinator.backend().header_sync_status().unwrap().tip;
+        let orphan = coordinator
+            .backend()
+            .begin_header_round(&[id], now)
+            .unwrap();
+
+        let _operation = coordinator.header_round_operation.lock().unwrap();
+        let (replacement, pending) = coordinator
+            .begin_tracked_header_round(&[id], now + 1)
+            .unwrap();
+        assert!(replacement.generation > orphan.generation);
+        assert_eq!(pending.generation, replacement.generation);
+        assert_eq!(*coordinator.lock_pending_header().unwrap(), Some(pending));
+        let status = coordinator.backend().header_sync_status().unwrap();
+        assert!(status.round_active);
+        assert_eq!(status.tip, original_tip);
     }
 
     #[test]

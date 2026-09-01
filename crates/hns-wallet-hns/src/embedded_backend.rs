@@ -335,6 +335,13 @@ impl EmbeddedHnsBackend {
             .map_err(map_authority_error)
     }
 
+    /// Release an authority round whose connection-local coordinator metadata
+    /// no longer exists. Authenticated headers and durable checkpoints are
+    /// unchanged because an active round has not committed either.
+    pub fn abandon_uncommitted_header_round(&self) -> Result<bool, HnsWalletError> {
+        Ok(self.lock()?.authority.abandon_uncommitted_header_round())
+    }
+
     /// Submit one peer's untrusted header response.
     pub fn submit_header_response(
         &self,

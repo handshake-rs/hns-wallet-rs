@@ -144,11 +144,11 @@ refreshed quote and `RequiresRebroadcast` state, and then submits those same
 bytes. A stale snapshot or temporarily unavailable quote input permits exactly
 one complete reconciliation and one quote retry; there is no polling loop.
 
-The reviewed published registry `hns-script` `0.3.1` source
-`0e99addca59778b7b7c6fc56291333a97c4c8815` supplies transaction sigops,
+The reviewed published registry `hns-script` `0.4.1` source
+`73611a0d83778e157b35f28ca2197d068e83fc61` supplies transaction sigops,
 sigop-adjusted policy size, minimum-fee construction, and standard weight/sigop
 bounds directly to the wallet. No local formula is copied. Its archive checksum
-is bound by `release/hns-rs-0.3.1-crates.sha256`. The exact current wallet
+is bound by `release/hns-rs-0.4.1-crates.sha256`. The exact current wallet
 release source must pass its complete locked CI gate and CodeQL; multi-process
 node/wallet, restart/reorg, adversarial, product, and resource qualification
 remain open. The source-level

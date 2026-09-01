@@ -3,7 +3,10 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
-## Unreleased
+## 0.2.1 - 2026-09-01
+
+<!-- hns-wallet-release-state: 0.2.1 release -->
+Breaking clean-break migration of the wallet and atomic-swap boundary:
 
 - Allow a mobile controller reacquisition to reuse an authenticated HNS
   genesis-bootstrap checkpoint already installed at the product-pinned height
@@ -13,6 +16,14 @@ file. The public crates use a shared version and follow Semantic Versioning.
   `/` is followed by the Android system-owned `/data` boundary. The wallet
   directory and database must still be owned by the application with exact
   `0700` and `0600` modes, respectively.
+- Serialize the complete embedded HNS header-round lifecycle across cloned
+  wallet coordinators. If a retired controller left only an uncommitted round,
+  the replacement abandons that partial work, preserves authenticated chain
+  state, and begins one fresh round instead of leaving the wallet permanently
+  stuck on an already-active header round.
+- Repin the complete Handshake protocol dependency graph to the coherent
+  `hns-rs 0.4.1` registry cohort and consume `hns-light-sync 0.2.3` for bounded
+  abandoned-round recovery.
 
 ## 0.2.0 - 2026-08-30
 

@@ -364,6 +364,13 @@ impl EncryptedHnsLightAuthority {
         Ok(self.sync.begin_round(selected_peers, now)?)
     }
 
+    /// Release connection-local, uncommitted header responses after the
+    /// transport owner has lost the matching round metadata.
+    #[must_use]
+    pub fn abandon_uncommitted_header_round(&mut self) -> bool {
+        self.sync.abandon_uncommitted_round()
+    }
+
     /// Submit one peer's untrusted header response.
     pub fn submit_header_response(
         &mut self,
@@ -1022,6 +1029,25 @@ mod tests {
         let replacement = authority
             .begin_header_round(&[peer], after_deadline)
             .unwrap();
+        assert!(replacement.generation > first.generation);
+    }
+
+    #[test]
+    fn orphaned_uncommitted_header_round_can_be_replaced_without_chain_change() {
+        let store = store();
+        let account = AccountId::new([81; 16]);
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let mut authority = open(store, account, 0, HnsLightFloor::default(), now).unwrap();
+        let peer = peer(81);
+        authority.add_peer(peer, 1).unwrap();
+        let original_tip = authority.status().tip;
+
+        let first = authority.begin_header_round(&[peer], now).unwrap();
+        assert!(authority.abandon_uncommitted_header_round());
+        assert!(!authority.status().round_active);
+        assert_eq!(authority.status().tip, original_tip);
+
+        let replacement = authority.begin_header_round(&[peer], now + 1).unwrap();
         assert!(replacement.generation > first.generation);
     }
 
