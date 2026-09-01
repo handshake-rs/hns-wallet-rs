@@ -329,7 +329,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         if !self.shakedex_available() {
             return Ok(());
         }
-        let trade = self.shakedex_runtime()?;
+        let trade = self.unrecovered_shakedex_runtime()?;
         trade.recover_startup().map_err(shakedex_failure)?;
         trade
             .recover_seller_publications()
@@ -415,9 +415,20 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
             .ok_or_else(|| ServiceFailure::unsupported(ServiceCapability::ShakescapeShakedexV1))
     }
 
-    fn shakedex_runtime(&self) -> Result<ShakedexTradeRuntime<'_, B, C>, ServiceFailure> {
+    fn unrecovered_shakedex_runtime(
+        &self,
+    ) -> Result<ShakedexTradeRuntime<'_, B, C>, ServiceFailure> {
         self.require_shakedex()?;
         ShakedexTradeRuntime::new(&self.runtime, self.store.clone()).map_err(shakedex_failure)
+    }
+
+    /// Marketplace recovery is deliberately lazy. Ordinary HNS balance and
+    /// history synchronization must not wait for or fail because a separate
+    /// Shakedex workflow needs recovery. Every actual marketplace operation
+    /// still fails closed until its durable workflows have been reconciled.
+    fn recovered_shakedex_runtime(&self) -> Result<ShakedexTradeRuntime<'_, B, C>, ServiceFailure> {
+        self.recover_shakedex_after_reconcile()?;
+        self.unrecovered_shakedex_runtime()
     }
 
     fn direct_shakedex_transport(
@@ -488,7 +499,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         }
         self.reconcile()?;
         let policy = &self.require_shakedex()?.seller_policy;
-        let trade = self.shakedex_runtime()?;
+        let trade = self.recovered_shakedex_runtime()?;
         let seller = trade
             .prepare_seller_offer(
                 PrepareSellerOffer {
@@ -540,7 +551,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         let listing_hash = parse_object_hash(&params.listing_id, "listingId")?;
         self.reconcile()?;
         let preview = self
-            .shakedex_runtime()?
+            .recovered_shakedex_runtime()?
             .prepare_buyer_fulfillment(PrepareBuyerTrade {
                 listing_hash,
                 request_nonce: call.request_nonce,
@@ -563,7 +574,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         let parent_value_workflow_id = parse_workflow_id(&params.session_id, "sessionId")?;
         self.reconcile()?;
         let preview = self
-            .shakedex_runtime()?
+            .recovered_shakedex_runtime()?
             .prepare_script_finalize(PrepareScriptFinalize {
                 parent_value_workflow_id,
                 maximum_fee: params.maximum_fee,
@@ -591,7 +602,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         }
         let seller_workflow_id = parse_workflow_id(&params.seller_session_id, "sellerSessionId")?;
         self.reconcile()?;
-        let trade = self.shakedex_runtime()?;
+        let trade = self.recovered_shakedex_runtime()?;
         let seller = trade
             .load_seller_offer(seller_workflow_id)
             .map_err(shakedex_failure)?
@@ -731,7 +742,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         }
         self.reconcile()?;
         let page = self
-            .shakedex_runtime()?
+            .recovered_shakedex_runtime()?
             .list_current_offers(cursor, limit)
             .map_err(shakedex_failure)?;
         public_offer_page(page)
@@ -743,7 +754,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         })?;
         let session_id = parse_workflow_id(&params.session_id, "sessionId")?;
         self.reconcile()?;
-        let trade = self.shakedex_runtime()?;
+        let trade = self.recovered_shakedex_runtime()?;
         if trade
             .load_seller_offer(session_id)
             .map_err(shakedex_failure)?
@@ -778,7 +789,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         let workflow_id = parse_workflow_id(&params.seller_session_id, "sellerSessionId")?;
         self.reconcile()?;
         let seller = self
-            .shakedex_runtime()?
+            .recovered_shakedex_runtime()?
             .load_seller_offer(workflow_id)
             .map_err(shakedex_failure)?
             .ok_or_else(|| invalid_request("seller session is unknown"))?;
@@ -824,7 +835,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         approval_id: ApprovalId,
     ) -> Result<Value, ServiceFailure> {
         let (_, prepared) = self.prepare_buyer_trade(call)?;
-        let trade = self.shakedex_runtime()?;
+        let trade = self.recovered_shakedex_runtime()?;
         let authorized = trade
             .authorize(prepared.workflow_id, approval_id, call.origin.as_str())
             .map_err(shakedex_failure)?;
@@ -840,7 +851,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         approval_id: ApprovalId,
     ) -> Result<Value, ServiceFailure> {
         let (_, prepared) = self.prepare_script_finalize(call)?;
-        let trade = self.shakedex_runtime()?;
+        let trade = self.recovered_shakedex_runtime()?;
         let authorized = trade
             .authorize(prepared.workflow_id, approval_id, call.origin.as_str())
             .map_err(shakedex_failure)?;
@@ -854,7 +865,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         let (params, _) = self.prepare_cancel_offer(call)?;
         let workflow_id = parse_workflow_id(&params.seller_session_id, "sellerSessionId")?;
         let cancelled = self
-            .shakedex_runtime()?
+            .recovered_shakedex_runtime()?
             .cancel_seller_offer(workflow_id)
             .map_err(shakedex_failure)?;
         self.sync_shakedex_transport()?;
@@ -867,7 +878,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         approval_id: ApprovalId,
     ) -> Result<Value, ServiceFailure> {
         let (_, _, prepared) = self.prepare_seller_recovery(call)?;
-        let trade = self.shakedex_runtime()?;
+        let trade = self.recovered_shakedex_runtime()?;
         let authorized = trade
             .authorize(prepared.workflow_id, approval_id, call.origin.as_str())
             .map_err(shakedex_failure)?;
@@ -1161,7 +1172,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
             }
             (ApprovalKind::NameMarketPurchase, ProviderMethod::NameMarketAcceptOffer) => {
                 let (params, prepared) = self.prepare_buyer_trade(approval.call)?;
-                self.shakedex_runtime()?
+                self.recovered_shakedex_runtime()?
                     .register_approval(
                         prepared.workflow_id,
                         approval.id,
@@ -1191,7 +1202,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
             }
             (ApprovalKind::NameMarketPurchase, ProviderMethod::NameMarketFinalizePurchase) => {
                 let (params, prepared) = self.prepare_script_finalize(approval.call)?;
-                self.shakedex_runtime()?
+                self.recovered_shakedex_runtime()?
                     .register_approval(
                         prepared.workflow_id,
                         approval.id,
@@ -1222,7 +1233,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
             }
             (ApprovalKind::NameMarketOffer, ProviderMethod::NameMarketRecoverName) => {
                 let (params, seller, prepared) = self.prepare_seller_recovery(approval.call)?;
-                self.shakedex_runtime()?
+                self.recovered_shakedex_runtime()?
                     .register_approval(
                         prepared.workflow_id,
                         approval.id,
@@ -1649,7 +1660,11 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
                 failure.message = format!("{}: {detail}", failure.message);
                 failure
             })?;
-        self.runtime.recover_shakedex_after_reconcile()?;
+        // Shakedex is a separately authorized subsystem. Its durable startup
+        // recovery can involve workflow evidence and rebroadcasts, so it must
+        // never delay or invalidate an otherwise complete HNS read snapshot.
+        // Marketplace entry points invoke the same recovery fail-closed when
+        // the user actually accesses Shakedex.
         if self.runtime.exact_account()? != selected {
             return Err(hns_read_failure(HnsWalletError::StaleAccountRead));
         }
