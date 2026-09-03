@@ -51,12 +51,13 @@ qualify that Rust API explicitly. This crate also does not ship a production
 device backend: the existing
 `HnsNodeRpcBackend` and `HnsNodeRpcConfig` are re-exported here for downstream
 composition, but remain an authenticated loopback node adapter rather than an
-Android or iOS wallet-index integration. The downstream Android/iOS 0.5.9
-candidate source contains JNI/C projection, native recovery/read screens,
-Keystore/Keychain wrapping, and off-UI-thread call sites. Those wrappers are not
-shipped by this crate and do not supply a backend. A product must still provide
-or integrate a bounded, deadline-enforced backend and qualify the exact
-installed network/runtime before exposing synchronized results.
+Android or iOS wallet-index integration. The downstream Shakescape Android/iOS
+`1.0.4` source consumes published `hns-wallet-mobile 0.2.1` and supplies JNI/C
+projection, native recovery/read/value/name screens, Keystore/Keychain
+wrapping, off-UI-thread calls, and its wallet-owned direct-peer backend. Those
+wrappers and that backend are not shipped by this crate. Each product must
+still qualify its exact installed network/runtime before exposing synchronized
+results or authorizing value.
 
 Each read first obtains the durable chain epoch and initialized tip through the
 script-free `chain_snapshot` backend call, validates height-zero block evidence
