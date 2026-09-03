@@ -186,10 +186,11 @@ reads and writes v2 frames on inherited standard streams. The database path is
 trusted launcher configuration, never a website request; the passphrase is
 accepted only as the ABI-owned zeroizing unlock secret. A production Chromium
 launcher must supply private child pipes and a separately released signed
-artifact. The downstream Android/iOS 0.5.9 candidate source now drives the
-trusted-native controller through separately maintained JNI/C wrappers; those
-wrappers are not a mobile provider, production backend, signed release, or
-installed-device qualification. Filesystem paths, process commands, raw signing,
+artifact. The downstream Shakescape Android/iOS `1.0.4` source drives published
+wallet `0.2.1` through separately maintained JNI/C wrappers and a wallet-owned
+direct-peer backend. Those wrappers are a trusted-native product surface, not
+a website provider, and their store/installed-device evidence does not qualify
+this ABI package. Filesystem paths, process commands, raw signing,
 recovery output, private keys, database keys, preimages, and arbitrary contract
 calls are absent from the protocol.
 
