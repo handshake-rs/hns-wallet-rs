@@ -24,11 +24,13 @@ selected entries may not be symlinks, and the file identity is checked around
 SQLite's no-follow open. This repository's portable filesystem regressions run
 on Linux; downstream mobile products own their target/runtime evidence, app
 sandbox, ACL and data-protection policy, backup exclusion, and
-Keystore/Keychain wrapping. The downstream Android/iOS 0.5.9 candidate source
-now contains platform key wrapping, JNI/C projection, native recovery and read
-screens, and off-UI-thread synchronization call sites; those separately
-maintained implementations are not package or installed-device evidence for
-this repository. A platform-neutral native controller creates or restores
+Keystore/Keychain wrapping. The downstream Shakescape Android/iOS `1.0.4`
+source pins the published `hns-wallet-rs 0.2.1` cohort and contains platform
+key wrapping, JNI/C projection, native recovery/read/value/name screens,
+off-UI-thread synchronization, direct HNS peer coordination, and the guarded
+Bitcoin runtime. Those separately maintained implementations and store
+submissions are product evidence, not package evidence for this repository. A
+platform-neutral native controller creates or restores
 exactly one non-value HNS account, opens only a complete seed/account bootstrap,
 and exposes status, unlock, lock, and account identity through a private ABI-v2
 session. A separate backend-injected native read controller reuses that exact
@@ -111,23 +113,26 @@ trusted-app surface: exact-text import exists only as a direct Rust native API,
 is serialized with synchronization, and exposes no provider authority. The
 checked-in executable still has
 no account-selection or backend inputs, so it remains the control-only runtime.
-The native controllers are library-only compositions. Downstream mobile
-candidate wrappers do not supply a production wallet-index backend or make the
-browser/provider integration and value paths available here.
-The separately maintained `hns-dane-browser-mobile` consumer currently pins an
-older wallet source and therefore does not yet consume this producer shape. It
-must coordinate an HNS Wallet Read v2 (HNWR-v2) dependency, binding,
-serialization, and trusted-UI adoption before presenting `nameReceiveTarget`;
-the producer source may land first, but that does not make the pinned consumer
-compatible or available.
+The native controllers are library-only compositions. The downstream mobile
+product supplies its wallet-owned direct-peer backend and private trusted UI;
+that does not make browser/provider integration available in this repository
+or turn product qualification into library qualification.
+The separately maintained `hns-dane-browser-mobile` consumer now adopts this
+producer through the published `0.2.1` cohort, including HNWR-v2, the distinct
+name receive target, exact-text name import, direct HNS value operations, and
+the private trusted-mobile Bitcoin permit. That adoption does not expose any
+of those capabilities to website JavaScript and does not transfer the mobile
+product's store, installed-device, network, or release evidence back into this
+package boundary.
 
 Current safety status: the production-hardening source boundary is implemented.
 Native HNS send, settlement, and Shakedex paths are source-enabled but require
 the exact authenticated runtime evidence and account configuration recorded in
 [`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and
-[`docs/QUALIFICATION.md`](docs/QUALIFICATION.md). Bitcoin and Ethereum value
-operations remain disabled by their own source gates. Test success is never a
-mainnet authorization signal. HNS name-role keys are scanned and persisted separately,
+[`docs/QUALIFICATION.md`](docs/QUALIFICATION.md). Bitcoin send and atomic-swap
+settlement are enabled only through the private trusted-mobile permit;
+Ethereum synchronization, signing, send, and settlement remain disabled. Test
+success is never a mainnet authorization signal. HNS name-role keys are scanned and persisted separately,
 and the protected `HnsShakedex` allocation high-water feeds an independent
 32-byte lock-script restore scan. A durable scan fence and atomic account/key
 CAS prevent another process from allocating through an incomplete mnemonic
