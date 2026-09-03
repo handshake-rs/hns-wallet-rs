@@ -52,6 +52,7 @@ use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountRecord, HnsExistingAccountSelector, HnsRuntimeConfig,
     HnsWalletBootstrap, HnsWalletError, HnsWalletRuntime, KnownName, NameOwnershipStatus,
     NameResourceStatus, RecoveryPhrase, open_wallet_direct_hns_peer_coordinator_with_floor,
+    open_wallet_direct_hns_peer_coordinator_with_floor_and_checkpoint_bootstrap,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap,
 };
 use hns_wallet_host::{
@@ -799,6 +800,45 @@ impl MobileWalletController {
             &account_config,
             peer_config,
             rollback_floor,
+            now_unix,
+        );
+        let relocked = store.lock();
+        match (opened, relocked) {
+            (Ok(coordinator), Ok(())) => Ok(coordinator),
+            (Err(error), _) => Err(error.into()),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
+    }
+
+    /// Open the direct coordinator from the compiled Mainnet checkpoint and
+    /// the canonical header segment after block 300,000 through the wallet's
+    /// exact birthday.
+    pub fn open_direct_hns_peer_coordinator_with_floor_and_checkpoint_bootstrap<I>(
+        &mut self,
+        database_key: &MobileDatabaseKey,
+        peer_config: HnsDirectPeerConfig,
+        rollback_floor: HnsLightFloor,
+        expected_height: u32,
+        expected_hash: [u8; 32],
+        headers_after_checkpoint: I,
+    ) -> Result<HnsDirectPeerCoordinator, MobileWalletError>
+    where
+        I: IntoIterator<Item = hns_header_consensus::Header>,
+    {
+        self.lock()?;
+        let store = self.session.store.clone();
+        let account_config = self.account_config.clone();
+        let passphrase = database_key.store_passphrase();
+        store.unlock(passphrase.as_str())?;
+        let now_unix = HnsReadSystemClock.now_unix()?;
+        let opened = open_wallet_direct_hns_peer_coordinator_with_floor_and_checkpoint_bootstrap(
+            store.clone(),
+            &account_config,
+            peer_config,
+            rollback_floor,
+            expected_height,
+            expected_hash,
+            headers_after_checkpoint,
             now_unix,
         );
         let relocked = store.lock();

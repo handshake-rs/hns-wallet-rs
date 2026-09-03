@@ -924,7 +924,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-bitcoin-kyoto"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bdk_kyoto",
  "bdk_wallet",
@@ -947,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-chain-api"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "hns-wallet-types",
  "serde",
@@ -957,7 +957,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-ethereum"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bip39",
  "bitcoin",
@@ -974,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-ffi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "hns-covenants",
  "hns-wallet-types",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-hns"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bech32",
  "bip39",
@@ -1022,7 +1022,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-host"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "getrandom 0.3.4",
  "hns-wallet-ffi",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-market"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "hex",
  "hkdf",
@@ -1054,7 +1054,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-mobile"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bdk_wallet",
  "getrandom 0.3.4",
@@ -1084,7 +1084,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-provider"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "hns-wallet-store",
  "hns-wallet-types",
@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-service"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "getrandom 0.3.4",
  "hns-marketplace-protocol",
@@ -1119,7 +1119,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-shakedex"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "blake2",
  "hex",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-store"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-testkit"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "hns-wallet-bitcoin-kyoto",
  "hns-wallet-chain-api",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-types"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "hex",
  "serde",

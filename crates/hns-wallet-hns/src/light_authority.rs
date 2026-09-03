@@ -21,6 +21,21 @@ pub const HNS_LIGHT_CHAIN_FORMAT_VERSION: u16 = 1;
 /// bootstrap. Product shells pin their own reviewed checkpoint and may advance
 /// this bound in a later release alongside a new bundled checkpoint.
 pub const MAX_GENESIS_BOOTSTRAP_HEADERS: u32 = 500_000;
+/// Product-pinned Mainnet checkpoint used to bound restored-wallet header work.
+pub const MAINNET_WALLET_CHECKPOINT_HEIGHT: u32 = 300_000;
+/// Highest birthday accepted by the checkpoint-segment acceleration path.
+pub const MAX_CHECKPOINT_BOOTSTRAP_HEIGHT: u32 = 1_000_000;
+
+const MAINNET_WALLET_CHECKPOINT_HASH: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x34, 0x6b, 0x20, 0x3c, 0x4d, 0xd8, 0x66, 0xa6,
+    0x88, 0x1a, 0x82, 0x9c, 0x9d, 0xca, 0x10, 0xbe, 0x1f, 0x59, 0x7b, 0xb3, 0x8e, 0x13, 0x2b, 0xa9,
+];
+const MAINNET_WALLET_CHECKPOINT_CHAINWORK: [u8; 32] = [
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xbd, 0xbe, 0x7c, 0x97, 0x26, 0xcc, 0xed, 0x5f, 0x67, 0x77,
+];
+const MAINNET_WALLET_CHECKPOINT_SNAPSHOT_HEX: &str = include_str!("mainnet_checkpoint_300000.hex");
+const MAINNET_WALLET_CHECKPOINT_HEADER_HEX: &str = include_str!("mainnet_header_300000.hex");
 
 const CHECKPOINT_SUFFIX: &[u8] = b"/hns-light/checkpoint";
 const HEADER_SUFFIX: &[u8] = b"/hns-light/header/";
@@ -581,6 +596,163 @@ impl EncryptedHnsLightAuthority {
         Ok(self.sync.status())
     }
 
+    /// Initialize a pristine Mainnet restore from the product-pinned block
+    /// 300,000 consensus state and validate only the headers after that
+    /// checkpoint through the wallet birthday.
+    ///
+    /// The embedded checkpoint contains the complete 147-entry consensus
+    /// lookback window, including cumulative chainwork. It was independently
+    /// derived from the reviewed Mainnet header stream and is part of this
+    /// crate's immutable release bytes. The caller supplies only the canonical
+    /// extension after the checkpoint; every supplied header still passes the
+    /// ordinary proof-of-work, linkage, difficulty, and median-time rules.
+    pub fn bootstrap_from_mainnet_checkpoint_headers<I>(
+        &mut self,
+        headers_after_checkpoint: I,
+        expected_height: u32,
+        expected_hash: [u8; 32],
+        now: u64,
+    ) -> Result<SyncStatus, HnsLightError>
+    where
+        I: IntoIterator<Item = Header>,
+    {
+        if self.network != Network::Mainnet {
+            return Err(HnsLightError::CheckpointBootstrapNetworkMismatch);
+        }
+        let snapshot = hex::decode(MAINNET_WALLET_CHECKPOINT_SNAPSHOT_HEX.trim())
+            .map_err(|_| HnsLightError::CorruptCheckpointBootstrap)?;
+        let checkpoint_chain = LightChain::decode_authenticated_snapshot(
+            &snapshot,
+            Network::Mainnet,
+            ChainSnapshotFloor {
+                minimum_height: Height::new(MAINNET_WALLET_CHECKPOINT_HEIGHT),
+                minimum_chainwork: Chainwork::from_be_bytes(MAINNET_WALLET_CHECKPOINT_CHAINWORK),
+            },
+        )?;
+        let checkpoint_header = Header::decode(
+            &hex::decode(MAINNET_WALLET_CHECKPOINT_HEADER_HEX.trim())
+                .map_err(|_| HnsLightError::CorruptCheckpointBootstrap)?,
+        )?;
+        self.bootstrap_from_checkpoint_chain(
+            checkpoint_chain,
+            checkpoint_header,
+            MAINNET_WALLET_CHECKPOINT_HEIGHT,
+            MAINNET_WALLET_CHECKPOINT_HASH,
+            MAINNET_WALLET_CHECKPOINT_CHAINWORK,
+            headers_after_checkpoint,
+            expected_height,
+            expected_hash,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bootstrap_from_checkpoint_chain<I>(
+        &mut self,
+        mut chain: LightChain,
+        checkpoint_header: Header,
+        checkpoint_height: u32,
+        checkpoint_hash: [u8; 32],
+        checkpoint_chainwork: [u8; 32],
+        headers_after_checkpoint: I,
+        expected_height: u32,
+        expected_hash: [u8; 32],
+        now: u64,
+    ) -> Result<SyncStatus, HnsLightError>
+    where
+        I: IntoIterator<Item = Header>,
+    {
+        if expected_height < checkpoint_height || expected_height > MAX_CHECKPOINT_BOOTSTRAP_HEIGHT
+        {
+            return Err(HnsLightError::InvalidCheckpointBootstrapTarget);
+        }
+        if self.birthday_height != expected_height {
+            return Err(HnsLightError::BootstrapBirthdayMismatch);
+        }
+        let current_tip = self.sync.chain().tip();
+        if current_tip.height() >= Height::new(expected_height) {
+            let installed_anchor_matches = self
+                .archived_header(expected_height)?
+                .is_some_and(|header| header.block_hash().into_bytes() == expected_hash);
+            if installed_anchor_matches {
+                return Ok(self.status());
+            }
+            return Err(HnsLightError::BootstrapUnavailable);
+        }
+        if self.checkpoint_revision != 1
+            || self.archived_tip.is_some()
+            || current_tip.height() != Height::new(0)
+        {
+            return Err(HnsLightError::BootstrapUnavailable);
+        }
+        let pinned_tip = chain.tip();
+        if chain.network() != self.network
+            || pinned_tip.height().get() != checkpoint_height
+            || pinned_tip.hash().into_bytes() != checkpoint_hash
+            || pinned_tip.chainwork().to_be_bytes() != checkpoint_chainwork
+            || checkpoint_header.block_hash().into_bytes() != checkpoint_hash
+        {
+            return Err(HnsLightError::CorruptCheckpointBootstrap);
+        }
+
+        let expected_count = expected_height.saturating_sub(checkpoint_height);
+        let mut count = 0_u32;
+        let mut final_header = checkpoint_header;
+        for header in headers_after_checkpoint {
+            count = count
+                .checked_add(1)
+                .ok_or(HnsLightError::BootstrapHeaderCountMismatch)?;
+            if count > expected_count {
+                return Err(HnsLightError::BootstrapHeaderCountMismatch);
+            }
+            chain.append(&header, BlockTime::new(now))?;
+            final_header = header;
+        }
+        let final_entry = chain.tip();
+        if count != expected_count
+            || final_entry.height().get() != expected_height
+            || final_entry.hash().into_bytes() != expected_hash
+        {
+            return Err(HnsLightError::BootstrapTargetMismatch);
+        }
+
+        let next_archived_tip = Some((expected_height, expected_hash));
+        let checkpoint = checkpoint_record(
+            &chain,
+            self.network,
+            self.birthday_height,
+            next_archived_tip,
+        )?;
+        let saves = [
+            EntityBatchSave {
+                id: checkpoint_id(self.account_id),
+                expected_revision: self.checkpoint_revision,
+                value: StoredHnsLightRecord::Checkpoint(checkpoint),
+                updated_at_unix: now,
+            },
+            EntityBatchSave {
+                id: header_id(self.account_id, expected_height),
+                expected_revision: 0,
+                value: StoredHnsLightRecord::Header(StoredHnsHeader::new(
+                    self.network,
+                    expected_height,
+                    &final_header,
+                )),
+                updated_at_unix: now,
+            },
+        ];
+        self.store.with_store_mut(|wallet| {
+            wallet.apply_entity_batch(EntityKind::HnsLightChain, &saves, &[])
+        })?;
+        self.checkpoint_revision = self
+            .checkpoint_revision
+            .checked_add(1)
+            .ok_or(HnsLightError::RevisionOverflow)?;
+        self.archived_tip = next_archived_tip;
+        self.sync = HeaderSync::from_chain(chain, self.sync_config)?;
+        Ok(self.sync.status())
+    }
+
     /// Issue current-chain proof authority only after fresh no-extension peer
     /// agreement and explicit currency policy.
     pub fn require_current(&self, policy: CurrencyPolicy) -> Result<CurrentChain, HnsLightError> {
@@ -756,6 +928,12 @@ pub enum HnsLightError {
     BootstrapHeaderCountMismatch,
     #[error("HNS genesis bootstrap does not match its pinned endpoint")]
     BootstrapTargetMismatch,
+    #[error("HNS checkpoint bootstrap is available only on its pinned network")]
+    CheckpointBootstrapNetworkMismatch,
+    #[error("HNS checkpoint bootstrap target is outside its supported range")]
+    InvalidCheckpointBootstrapTarget,
+    #[error("HNS checkpoint bootstrap is inconsistent with its compiled trust anchor")]
+    CorruptCheckpointBootstrap,
     #[error("independent header validation disagreed with the selected sync candidate")]
     ConsensusStateMismatch,
     #[error("HNS light-chain persistence revision overflow")]
@@ -874,6 +1052,112 @@ mod tests {
         assert_eq!(
             reopened.archived_header(3).unwrap().unwrap().block_hash(),
             headers[2].block_hash()
+        );
+    }
+
+    #[test]
+    fn checkpoint_bootstrap_validates_only_the_segment_after_the_anchor() {
+        let store = store();
+        let account = AccountId::new([74; 16]);
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let mut authority = open(store.clone(), account, 5, HnsLightFloor::default(), now).unwrap();
+        let mut fixture_chain = authority.validated_chain().clone();
+        let mut headers = Vec::new();
+        let mut checkpoint_chain = None;
+        for marker in 1..=5 {
+            let header = mine(fixture_chain.tip(), marker);
+            fixture_chain.append(&header, BlockTime::new(now)).unwrap();
+            headers.push(header);
+            if marker == 3 {
+                checkpoint_chain = Some(fixture_chain.clone());
+            }
+        }
+        let checkpoint_chain = checkpoint_chain.unwrap();
+        let checkpoint_tip = checkpoint_chain.tip();
+        let expected_hash = fixture_chain.tip().hash().into_bytes();
+
+        let status = authority
+            .bootstrap_from_checkpoint_chain(
+                checkpoint_chain,
+                headers[2].clone(),
+                3,
+                checkpoint_tip.hash().into_bytes(),
+                checkpoint_tip.chainwork().to_be_bytes(),
+                headers[3..].to_vec(),
+                5,
+                expected_hash,
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(status.tip.height(), Height::new(5));
+        assert_eq!(status.tip.hash().into_bytes(), expected_hash);
+        assert_eq!(
+            authority.archived_header(5).unwrap(),
+            Some(headers[4].clone())
+        );
+        assert!(authority.archived_header(4).unwrap().is_none());
+    }
+
+    #[test]
+    fn compiled_mainnet_checkpoint_opens_at_300000_without_genesis_replay() {
+        let store = store();
+        let account = AccountId::new([75; 16]);
+        let now = 2_000_000_000;
+        let mut authority = EncryptedHnsLightAuthority::open_or_create(
+            store.clone(),
+            account,
+            HnsNetwork::Mainnet,
+            MAINNET_WALLET_CHECKPOINT_HEIGHT,
+            HnsLightFloor::default(),
+            BlockTime::new(now),
+            ChainLimits::default(),
+            config(),
+        )
+        .unwrap();
+
+        let status = authority
+            .bootstrap_from_mainnet_checkpoint_headers(
+                Vec::<Header>::new(),
+                MAINNET_WALLET_CHECKPOINT_HEIGHT,
+                MAINNET_WALLET_CHECKPOINT_HASH,
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            status.tip.height(),
+            Height::new(MAINNET_WALLET_CHECKPOINT_HEIGHT)
+        );
+        assert_eq!(
+            status.tip.hash().into_bytes(),
+            MAINNET_WALLET_CHECKPOINT_HASH
+        );
+        assert_eq!(
+            status.tip.chainwork().to_be_bytes(),
+            MAINNET_WALLET_CHECKPOINT_CHAINWORK
+        );
+        let floor = authority.rollback_floor();
+        drop(authority);
+
+        let reopened = EncryptedHnsLightAuthority::open_or_create(
+            store,
+            account,
+            HnsNetwork::Mainnet,
+            MAINNET_WALLET_CHECKPOINT_HEIGHT,
+            floor,
+            BlockTime::new(now + 1),
+            ChainLimits::default(),
+            config(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.status().tip.height(),
+            Height::new(MAINNET_WALLET_CHECKPOINT_HEIGHT)
+        );
+        assert_eq!(
+            reopened.status().tip.hash().into_bytes(),
+            MAINNET_WALLET_CHECKPOINT_HASH
         );
     }
 

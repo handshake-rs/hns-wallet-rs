@@ -2317,6 +2317,43 @@ where
     )
 }
 
+/// Open the direct coordinator from the compiled Mainnet block-300,000
+/// checkpoint plus only the canonical header segment through the wallet
+/// birthday. The resulting controller still requires fresh direct-peer
+/// agreement before current value authority is available.
+#[allow(clippy::too_many_arguments)]
+pub fn open_wallet_direct_hns_peer_coordinator_with_floor_and_checkpoint_bootstrap<I>(
+    store: SharedWalletStore,
+    account: &HnsRuntimeConfig,
+    peer_config: HnsDirectPeerConfig,
+    rollback_floor: HnsLightFloor,
+    expected_height: u32,
+    expected_hash: [u8; 32],
+    headers_after_checkpoint: I,
+    now_unix: u64,
+) -> Result<HnsDirectPeerCoordinator, HnsDirectPeerError>
+where
+    I: IntoIterator<Item = Header>,
+{
+    open_wallet_direct_hns_peer_coordinator_with_initializer(
+        store,
+        account,
+        peer_config,
+        rollback_floor,
+        now_unix,
+        |authority| {
+            authority
+                .bootstrap_from_mainnet_checkpoint_headers(
+                    headers_after_checkpoint,
+                    expected_height,
+                    expected_hash,
+                    now_unix,
+                )
+                .map(|_| ())
+        },
+    )
+}
+
 fn open_wallet_direct_hns_peer_coordinator_with_initializer<F>(
     store: SharedWalletStore,
     account: &HnsRuntimeConfig,

@@ -3,6 +3,23 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## 0.2.2 - 2026-09-03
+
+<!-- hns-wallet-release-state: 0.2.2 release -->
+Breaking clean-break migration of the wallet and atomic-swap boundary:
+
+- compile the authenticated Mainnet block-300,000 consensus checkpoint,
+  including its complete difficulty and median-time lookback window and
+  cumulative chainwork, into the HNS wallet authority;
+- initialize a pristine restored wallet by validating only the canonical
+  headers after block 300,000 through its exact birthday, instead of replaying
+  every header from genesis;
+- preserve ordinary proof-of-work, linkage, difficulty, median-time, encrypted
+  checkpoint persistence, rollback-floor, and fresh direct-peer agreement
+  checks for the resulting wallet authority; and
+- reopen an already initialized wallet directly from its persisted birthday
+  anchor without decoding or replaying any bootstrap segment.
+
 ## 0.2.1 - 2026-09-01
 
 <!-- hns-wallet-release-state: 0.2.1 release -->

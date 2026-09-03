@@ -17,7 +17,8 @@ mod hnsa_hnsr_publisher;
 pub use embedded_backend::{EmbeddedHnsBackend, HnsLightNetwork};
 pub use light_authority::{
     AcceptedHnsHeader, EncryptedHnsLightAuthority, HNS_LIGHT_CHAIN_FORMAT_VERSION, HnsLightError,
-    HnsLightFloor, MAX_GENESIS_BOOTSTRAP_HEADERS, PersistedHeaderRound,
+    HnsLightFloor, MAINNET_WALLET_CHECKPOINT_HEIGHT, MAX_CHECKPOINT_BOOTSTRAP_HEIGHT,
+    MAX_GENESIS_BOOTSTRAP_HEADERS, PersistedHeaderRound,
 };
 pub use light_index::{
     EncryptedHnsLightIndex, HNS_LIGHT_INDEX_FORMAT_VERSION, HnsLightIndexError, HnsLightScanStatus,
@@ -36,6 +37,7 @@ pub use peer_coordinator::{
     HnsDirectPeerCoordinator, HnsDirectPeerError, HnsDirectShakescapeListener,
     HnsDirectShakescapeMessage, HnsDirectShakescapePeer, HnsHeaderRoundProgress, NativeHnsPeerPool,
     open_wallet_direct_hns_peer_coordinator, open_wallet_direct_hns_peer_coordinator_with_floor,
+    open_wallet_direct_hns_peer_coordinator_with_floor_and_checkpoint_bootstrap,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap,
 };
 pub use shakedex_funding::{
