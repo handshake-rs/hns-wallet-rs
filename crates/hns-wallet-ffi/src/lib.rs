@@ -679,6 +679,14 @@ pub enum ApprovalSummary {
         maximum_fee: Amount,
         warnings: BTreeSet<ApprovalWarning>,
     },
+    NameUpdate {
+        name: String,
+        resource_hex: String,
+        resource_bytes: u16,
+        record_count: u16,
+        maximum_fee: Amount,
+        warnings: BTreeSet<ApprovalWarning>,
+    },
     TypedSignature {
         message_type: String,
         message_digest: String,
@@ -742,6 +750,7 @@ impl ApprovalSummary {
             Self::Send { .. } => ApprovalKind::Send,
             Self::NameTransfer { .. } => ApprovalKind::NameTransfer,
             Self::NameFinalize { .. } => ApprovalKind::NameFinalize,
+            Self::NameUpdate { .. } => ApprovalKind::NameUpdate,
             Self::TypedSignature { .. } => ApprovalKind::TypedSignature,
             Self::NameMarketOffer { .. } => ApprovalKind::NameMarketOffer,
             Self::NameMarketPurchase { .. } => ApprovalKind::NameMarketPurchase,
@@ -805,6 +814,27 @@ impl ApprovalSummary {
                     *maximum_fee,
                     warnings,
                 )?;
+            }
+            Self::NameUpdate {
+                name,
+                resource_hex,
+                resource_bytes,
+                maximum_fee,
+                warnings,
+                ..
+            } => {
+                if maximum_fee.asset != WalletAsset::Hns
+                    || usize::from(*resource_bytes) > 512
+                    || resource_hex.len() != usize::from(*resource_bytes) * 2
+                    || !resource_hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(AbiError::InvalidApproval);
+                }
+                validate_public_string(name)?;
+                validate_amount(*maximum_fee, false)?;
+                validate_warnings(warnings)?;
             }
             Self::TypedSignature {
                 message_type,
@@ -937,6 +967,7 @@ impl ApprovalSummary {
             Self::Send { .. } => matches!(method, "hns_send" | "asset_send"),
             Self::NameTransfer { .. } => method == "hns_transferName",
             Self::NameFinalize { .. } => method == "hns_finalizeName",
+            Self::NameUpdate { .. } => method == "hns_updateName",
             Self::TypedSignature { .. } => method == "hns_signTypedMessage",
             Self::NameMarketOffer { action, .. } => matches!(
                 (method, *action),

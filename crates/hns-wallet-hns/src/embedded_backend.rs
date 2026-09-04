@@ -1672,7 +1672,7 @@ fn embedded_name_action_context(
     let mut renewal_block_hash = None;
     let mut renewal_valid_at_candidate = None;
     match action {
-        HnsNameAction::Transfer => {
+        HnsNameAction::Transfer | HnsNameAction::Update => {
             if current.transfer.get() != 0 {
                 reasons.push(NameActionIneligibility::TransferAlreadyPending);
             }

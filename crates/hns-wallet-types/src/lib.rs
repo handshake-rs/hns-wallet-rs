@@ -7,7 +7,7 @@ use thiserror::Error;
 
 /// The complete canonical website-provider method vocabulary in stable enum
 /// order. Availability is negotiated separately.
-pub const PROVIDER_METHOD_WIRE_NAMES: [&str; 42] = [
+pub const PROVIDER_METHOD_WIRE_NAMES: [&str; 43] = [
     "wallet_getCapabilities",
     "wallet_getEnabledModules",
     "wallet_enableModule",
@@ -50,6 +50,7 @@ pub const PROVIDER_METHOD_WIRE_NAMES: [&str; 42] = [
     "swap_getSession",
     "swap_redeem",
     "swap_refund",
+    "hns_updateName",
 ];
 
 macro_rules! semantic_id {
@@ -575,6 +576,7 @@ pub enum PermissionCapability {
     Names,
     NameTransfer,
     NameFinalize,
+    NameUpdate,
     TypedIdentitySignature,
     NameMarket,
     CrossChainMarket,
@@ -589,6 +591,7 @@ pub enum ApprovalKind {
     Send,
     NameTransfer,
     NameFinalize,
+    NameUpdate,
     TypedSignature,
     NameMarketOffer,
     NameMarketPurchase,
@@ -605,6 +608,7 @@ pub enum WorkflowKind {
     HnsSend,
     NameTransfer,
     NameFinalize,
+    NameUpdate,
     ShakedexSeller,
     ShakedexBuyer,
     ShakedexSellerPlan,

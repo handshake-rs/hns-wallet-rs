@@ -7,6 +7,7 @@ use super::*;
 pub enum HnsNameAction {
     Transfer,
     Finalize,
+    Update,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -55,6 +56,7 @@ impl HnsNameAction {
         match self {
             Self::Transfer => WorkflowKind::NameTransfer,
             Self::Finalize => WorkflowKind::NameFinalize,
+            Self::Update => WorkflowKind::NameUpdate,
         }
     }
 }
@@ -79,6 +81,16 @@ pub struct PrepareNameFinalize {
     pub maximum_fee: BaseUnits,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PrepareNameUpdate {
+    pub account: AccountId,
+    pub request_nonce: u64,
+    pub name: Vec<u8>,
+    /// Exact canonical HSD resource bytes. Empty bytes clear all records.
+    pub resource_data: Vec<u8>,
+    pub maximum_fee: BaseUnits,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NameOperationState {
@@ -90,6 +102,7 @@ pub enum NameOperationState {
     TransferLocked,
     FinalizeEligible,
     Finalized,
+    Updated,
     TransferCancelled,
     ReapprovalRequired,
     Conflicted,
@@ -121,6 +134,7 @@ pub struct PreparedNameOperation {
     pub name: Vec<u8>,
     pub name_hash: ObjectHash,
     pub recipient: String,
+    pub resource_data: Option<Vec<u8>>,
     pub fee: BaseUnits,
     pub maximum_fee: BaseUnits,
     pub expires_at_unix: u64,
@@ -672,6 +686,8 @@ pub(super) struct HnsNamePlan {
     pub recipient: WalletAddressKey,
     pub recipient_display: String,
     pub finalize: Option<HnsFinalizeTerms>,
+    #[serde(default)]
+    pub resource_data: Option<Vec<u8>>,
     pub funding_inputs: Vec<TrackedHnsCoin>,
     pub unsigned_transaction: Vec<u8>,
     pub fee_rate: BaseUnits,
@@ -690,6 +706,7 @@ impl fmt::Debug for HnsNamePlan {
             .field("name_hash", &hex::encode(self.name_hash))
             .field("owner_outpoint", &self.source.owner_outpoint)
             .field("recipient_display", &self.recipient_display)
+            .field("resource_bytes", &self.resource_data.as_ref().map(Vec::len))
             .field("funding_inputs", &self.funding_inputs.len())
             .field("fee", &self.fee)
             .field("maximum_fee", &self.maximum_fee)
@@ -839,6 +856,7 @@ fn name_workflow_id(
     hasher.update([match action {
         HnsNameAction::Transfer => 0,
         HnsNameAction::Finalize => 1,
+        HnsNameAction::Update => 2,
     }]);
     hasher.update(request_nonce.to_be_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
@@ -944,6 +962,7 @@ fn prepared_name_operation(plan: &HnsNamePlan) -> Result<PreparedNameOperation, 
         name: plan.name.clone(),
         name_hash: ObjectHash::new(plan.name_hash),
         recipient: plan.recipient_display.clone(),
+        resource_data: plan.resource_data.clone(),
         fee: plan.fee,
         maximum_fee: plan.maximum_fee,
         expires_at_unix: plan.expires_at_unix,
@@ -961,6 +980,7 @@ fn decode_prepared_name_operation(
         || plan.name != prepared.name
         || ObjectHash::new(plan.name_hash) != prepared.name_hash
         || plan.recipient_display != prepared.recipient
+        || plan.resource_data != prepared.resource_data
         || plan.fee != prepared.fee
         || plan.maximum_fee != prepared.maximum_fee
         || plan.expires_at_unix != prepared.expires_at_unix
@@ -1118,12 +1138,121 @@ fn name_input_sequence(outpoint: HnsOutpoint) -> Input {
     }
 }
 
+fn build_name_update_output(
+    owner: &hns_transaction::Coin,
+    current_state: &NameState,
+    resource_data: &[u8],
+) -> Result<Output, HnsWalletError> {
+    if resource_data.len() > MAX_RESOURCE_SIZE
+        || (!resource_data.is_empty() && Resource::decode(resource_data).is_err())
+        || current_state.owner_outpoint() != Some(owner.outpoint)
+        || current_state.value != owner.value
+        || current_state
+            .name_hash
+            .as_bytes()
+            .iter()
+            .all(|byte| *byte == 0)
+        || !matches!(
+            owner.covenant.kind,
+            CovenantKind::Register
+                | CovenantKind::Update
+                | CovenantKind::Renew
+                | CovenantKind::Finalize
+        )
+    {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    let output = Output {
+        value: owner.value,
+        address: owner.address.clone(),
+        covenant: Covenant {
+            kind: CovenantKind::Update,
+            items: vec![
+                current_state.name_hash.into_bytes().to_vec(),
+                current_state.height.get().to_le_bytes().to_vec(),
+                resource_data.to_vec(),
+            ],
+        },
+    };
+    output
+        .encode()
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+    Ok(output)
+}
+
+fn build_name_update_transaction(
+    owner: &hns_transaction::Coin,
+    current_state: &NameState,
+    resource_data: &[u8],
+    mut additional_inputs: Vec<Input>,
+    additional_outputs: Vec<Output>,
+) -> Result<Transaction, HnsWalletError> {
+    if additional_inputs
+        .iter()
+        .any(|input| input.previous_output == owner.outpoint)
+    {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    let mut inputs = vec![Input {
+        previous_output: owner.outpoint,
+        sequence: u32::MAX,
+        witness: Witness::default(),
+    }];
+    inputs.append(&mut additional_inputs);
+    let mut outputs = vec![build_name_update_output(
+        owner,
+        current_state,
+        resource_data,
+    )?];
+    outputs.extend(additional_outputs);
+    let transaction = Transaction {
+        version: 0,
+        inputs,
+        outputs,
+        locktime: 0,
+    };
+    transaction
+        .size()
+        .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+    Ok(transaction)
+}
+
+fn verify_name_update_at_index_zero(
+    transaction: &Transaction,
+    owner: &hns_transaction::Coin,
+    current_state: &NameState,
+    resource_data: &[u8],
+) -> Result<(), HnsWalletError> {
+    if transaction.version != 0
+        || transaction.locktime != 0
+        || transaction.inputs.first().is_none_or(|input| {
+            input.previous_output != owner.outpoint || input.sequence != u32::MAX
+        })
+        || transaction.inputs[1..]
+            .iter()
+            .any(|input| input.previous_output == owner.outpoint)
+        || transaction.outputs.first()
+            != Some(&build_name_update_output(
+                owner,
+                current_state,
+                resource_data,
+            )?)
+    {
+        return Err(HnsWalletError::InvalidPreparedArtifact);
+    }
+    Ok(())
+}
+
+// The arguments keep consensus state, destination, optional action terms, and
+// fee funding explicit at the one transaction-construction boundary.
+#[allow(clippy::too_many_arguments)]
 fn build_name_transition_transaction(
     action: HnsNameAction,
     source: &hns_transaction::Coin,
     current_state: &NameState,
     recipient: &Address,
     finalize: Option<&HnsFinalizeTerms>,
+    resource_data: Option<&[u8]>,
     funding_inputs: &[TrackedHnsCoin],
     change: Option<(&Address, u64)>,
 ) -> Result<(Transaction, Vec<hns_transaction::Coin>), HnsWalletError> {
@@ -1150,7 +1279,7 @@ fn build_name_transition_transaction(
     });
     let mut transaction = match action {
         HnsNameAction::Transfer => {
-            if finalize.is_some() {
+            if finalize.is_some() || resource_data.is_some() {
                 return Err(HnsWalletError::InvalidWorkflow);
             }
             hns_transaction::build_transfer_transaction(
@@ -1162,6 +1291,9 @@ fn build_name_transition_transaction(
             .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?
         }
         HnsNameAction::Finalize => {
+            if resource_data.is_some() {
+                return Err(HnsWalletError::InvalidWorkflow);
+            }
             let terms = finalize.ok_or(HnsWalletError::InvalidWorkflow)?;
             hns_transaction::build_finalize_transaction(
                 source,
@@ -1172,6 +1304,18 @@ fn build_name_transition_transaction(
             )
             .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?
         }
+        HnsNameAction::Update => {
+            if finalize.is_some() {
+                return Err(HnsWalletError::InvalidWorkflow);
+            }
+            build_name_update_transaction(
+                source,
+                current_state,
+                resource_data.ok_or(HnsWalletError::InvalidWorkflow)?,
+                additional_inputs,
+                additional_outputs,
+            )?
+        }
     };
     for input in &mut transaction.inputs {
         input.witness = Witness {
@@ -1181,19 +1325,28 @@ fn build_name_transition_transaction(
     match action {
         HnsNameAction::Transfer => {
             hns_transaction::verify_transfer_at_index_zero(&transaction, source, recipient)
+                .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
         }
-        HnsNameAction::Finalize => hns_transaction::verify_finalize_at_index_zero(
+        HnsNameAction::Finalize => {
+            hns_transaction::verify_finalize_at_index_zero(
+                &transaction,
+                source,
+                current_state,
+                hns_primitives::BlockHash::new(
+                    finalize
+                        .ok_or(HnsWalletError::InvalidWorkflow)?
+                        .renewal_block_hash,
+                ),
+            )
+            .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+        }
+        HnsNameAction::Update => verify_name_update_at_index_zero(
             &transaction,
             source,
             current_state,
-            hns_primitives::BlockHash::new(
-                finalize
-                    .ok_or(HnsWalletError::InvalidWorkflow)?
-                    .renewal_block_hash,
-            ),
-        ),
+            resource_data.ok_or(HnsWalletError::InvalidWorkflow)?,
+        )?,
     }
-    .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
     hns_transaction::verify_covenant_links(&transaction, &resolved)
         .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
     Ok((transaction, resolved))
@@ -1208,6 +1361,7 @@ fn build_unsigned_name_operation(
     current_state: &NameState,
     recipient: &Address,
     finalize: Option<&HnsFinalizeTerms>,
+    resource_data: Option<&[u8]>,
     mut candidates: Vec<TrackedHnsCoin>,
     change: &Address,
     minimum_confirmations: u32,
@@ -1242,6 +1396,7 @@ fn build_unsigned_name_operation(
             current_state,
             recipient,
             finalize,
+            resource_data,
             &selected,
             Some((change, 1)),
         )?;
@@ -1260,6 +1415,7 @@ fn build_unsigned_name_operation(
                     current_state,
                     recipient,
                     finalize,
+                    resource_data,
                     &selected,
                     Some((change, change_value)),
                 )?;
@@ -1278,6 +1434,7 @@ fn build_unsigned_name_operation(
             current_state,
             recipient,
             finalize,
+            resource_data,
             &selected,
             None,
         )?;
@@ -1302,7 +1459,7 @@ fn name_plan_inputs(
     tracked.extend(plan.funding_inputs.iter().cloned());
     let canonical = canonical_input_coins(&tracked)?;
     if canonical.first().is_none_or(|coin| match plan.action {
-        HnsNameAction::Transfer => !matches!(
+        HnsNameAction::Transfer | HnsNameAction::Update => !matches!(
             coin.covenant.kind,
             CovenantKind::Register
                 | CovenantKind::Update
@@ -1354,12 +1511,16 @@ fn validate_name_plan_transaction(
     .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
     match plan.action {
         HnsNameAction::Transfer => {
-            if plan.finalize.is_some() {
+            if plan.finalize.is_some() || plan.resource_data.is_some() {
                 return Err(HnsWalletError::InvalidPreparedArtifact);
             }
             hns_transaction::verify_transfer_at_index_zero(&unsigned, &canonical[0], &recipient)
+                .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
         }
         HnsNameAction::Finalize => {
+            if plan.resource_data.is_some() {
+                return Err(HnsWalletError::InvalidPreparedArtifact);
+            }
             let finalize = plan
                 .finalize
                 .as_ref()
@@ -1386,9 +1547,22 @@ fn validate_name_plan_transaction(
                 &state,
                 hns_primitives::BlockHash::new(finalize.renewal_block_hash),
             )
+            .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+        }
+        HnsNameAction::Update => {
+            if plan.finalize.is_some() {
+                return Err(HnsWalletError::InvalidPreparedArtifact);
+            }
+            verify_name_update_at_index_zero(
+                &unsigned,
+                &canonical[0],
+                &state,
+                plan.resource_data
+                    .as_deref()
+                    .ok_or(HnsWalletError::InvalidPreparedArtifact)?,
+            )?;
         }
     }
-    .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
     hns_transaction::verify_covenant_links(&unsigned, &canonical)
         .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
     let actual_fee = actual_transaction_fee(&unsigned, &canonical)?;
@@ -1573,7 +1747,7 @@ fn validate_name_action_context(
 
     let mut finalize_eligible_height = None;
     match action {
-        HnsNameAction::Transfer => {
+        HnsNameAction::Transfer | HnsNameAction::Update => {
             if context.transfer_height.is_some()
                 || context.transfer_lockup.is_some()
                 || context.finalize_eligible_height.is_some()
@@ -1585,7 +1759,7 @@ fn validate_name_action_context(
                 || context.renewal_valid_at_candidate.is_some()
             {
                 return Err(name_preparation_stage(
-                    "transfer-only context fields",
+                    "non-finalize context fields",
                     HnsWalletError::InvalidEvidence,
                 ));
             }
@@ -1702,6 +1876,7 @@ fn project_name_operation(
     }
     let transfer_height = match workflow.plan.action {
         HnsNameAction::Transfer => workflow.last_verified_inclusion.map(|value| value.height),
+        HnsNameAction::Update => None,
         HnsNameAction::Finalize => workflow
             .plan
             .finalize
@@ -2093,8 +2268,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         plan: &HnsNamePlan,
         required_snapshot: Option<(SnapshotBinding, MempoolSnapshotBinding)>,
     ) -> Result<(SnapshotBinding, MempoolSnapshotBinding), HnsWalletError> {
-        if (plan.action == HnsNameAction::Transfer && plan.finalize.is_some())
+        if (matches!(plan.action, HnsNameAction::Transfer | HnsNameAction::Update)
+            && plan.finalize.is_some())
             || (plan.action == HnsNameAction::Finalize && plan.finalize.is_none())
+            || (plan.action == HnsNameAction::Update && plan.resource_data.is_none())
+            || (plan.action != HnsNameAction::Update && plan.resource_data.is_some())
         {
             return Err(HnsWalletError::InvalidPreparedArtifact);
         }
@@ -2106,7 +2284,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         }
         let authority = self.verify_wallet_name_action_v2(&plan.name, plan.action)?;
         match plan.action {
-            HnsNameAction::Transfer => {
+            HnsNameAction::Transfer | HnsNameAction::Update => {
                 if authority.recipient.is_some()
                     || plan.recipient_display
                         != encode_hns_address(
@@ -2156,7 +2334,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             && source.owner_derivation == plan.source.owner_derivation
             && source.action_context.owner_coin == plan.source.action_context.owner_coin;
         let action_terms_match = match plan.action {
-            HnsNameAction::Transfer => plan.finalize.is_none(),
+            HnsNameAction::Transfer => plan.finalize.is_none() && plan.resource_data.is_none(),
+            HnsNameAction::Update => plan.finalize.is_none() && plan.resource_data.is_some(),
             HnsNameAction::Finalize => {
                 let Some(expected) = plan.finalize.as_ref() else {
                     return Err(HnsWalletError::InvalidPreparedArtifact);
@@ -2486,7 +2665,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     ) -> Result<Vec<WorkflowId>, HnsWalletError> {
         let config = self.cache_read()?.account.config.clone();
         let mut pending = Vec::new();
-        for kind in [WorkflowKind::NameTransfer, WorkflowKind::NameFinalize] {
+        for kind in [
+            WorkflowKind::NameTransfer,
+            WorkflowKind::NameFinalize,
+            WorkflowKind::NameUpdate,
+        ] {
             let workflows =
                 store.list_workflows_complete::<HnsNameWorkflow>(kind, MAX_HISTORY_RESULTS)?;
             for stored in workflows {
@@ -2569,6 +2752,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                         match workflow.plan.action {
                             HnsNameAction::Finalize => {
                                 workflow.stage = NameOperationState::Finalized;
+                            }
+                            HnsNameAction::Update => {
+                                workflow.stage = NameOperationState::Updated;
                             }
                             HnsNameAction::Transfer => {
                                 match confirmed_transfer_spend_kind(
@@ -2721,6 +2907,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         recipient: WalletAddressKey,
         recipient_display: String,
         finalize: Option<HnsFinalizeTerms>,
+        resource_data: Option<Vec<u8>>,
         maximum_fee: BaseUnits,
         now_unix: u64,
     ) -> Result<PreparedNameOperation, HnsWalletError> {
@@ -2746,6 +2933,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     || plan.recipient != recipient
                     || plan.recipient_display != recipient_display
                     || plan.finalize != finalize
+                    || plan.resource_data != resource_data
                     || plan.maximum_fee != maximum_fee
                     || plan.expires_at_unix <= now_unix
                 {
@@ -2787,6 +2975,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             &current_state,
             &recipient_address,
             finalize.as_ref(),
+            resource_data.as_deref(),
             coins,
             &change,
             config.minimum_confirmations,
@@ -2809,6 +2998,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             recipient,
             recipient_display,
             finalize,
+            resource_data,
             funding_inputs,
             unsigned_transaction: transaction
                 .encode()
@@ -2970,6 +3160,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             recipient,
             recipient_display,
             None,
+            None,
             request.maximum_fee,
             now,
         )
@@ -3078,6 +3269,88 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             recipient,
             recipient_display,
             Some(finalize),
+            None,
+            request.maximum_fee,
+            now,
+        )
+        .map_err(|error| name_preparation_stage("transaction construction", error))
+    }
+
+    pub fn prepare_name_update(
+        &self,
+        request: PrepareNameUpdate,
+    ) -> Result<PreparedNameOperation, HnsWalletError> {
+        if request.request_nonce == 0
+            || request.maximum_fee.is_zero()
+            || !validate_name(&request.name)
+            || request.resource_data.len() > MAX_RESOURCE_SIZE
+            || (!request.resource_data.is_empty()
+                && Resource::decode(&request.resource_data).is_err())
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let now = self.clock.now_unix()?;
+        let cache = self.cache_read()?;
+        ensure_name_value_ready(&cache)?;
+        if request.account != cache.account.config.account_id {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let account = cache.account.clone();
+        let account_revision = cache.account_revision;
+        let cached_coins = cache.coins.clone();
+        drop(cache);
+        let authority = self
+            .verify_wallet_name_action_v2(&request.name, HnsNameAction::Update)
+            .map_err(|error| name_preparation_stage("ownership verification", error))?;
+        if authority.recipient.is_some() {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let state = NameState::decode(NameHash::new(authority.name_hash), &authority.current_state)
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        if state.resource_data == request.resource_data {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let recipient = WalletAddressKey {
+            version: authority.owner_coin.address.version,
+            hash: authority.owner_coin.address.hash.clone(),
+        };
+        let recipient_display = encode_hns_address(account.config.network, &recipient)?;
+        let source = tracked_name_source_from_coin(
+            authority.binding,
+            &authority.owner_coin,
+            authority.owner_inclusion,
+            authority
+                .context
+                .owner_coin_source_binding
+                .unwrap_or(ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection),
+            authority.owner_derivation,
+        )
+        .map_err(|error| name_preparation_stage("owner coin projection", error))?;
+        let source_evidence = HnsNameSourceEvidence {
+            preparation_binding: authority.binding,
+            preparation_mempool: authority.mempool,
+            current_name_state: authority.current_state,
+            owner_outpoint: authority.owner_outpoint,
+            owner_transaction: Vec::new(),
+            owner_inclusion: authority.owner_inclusion,
+            owner_derivation: authority.owner_derivation,
+            action_context: authority.context,
+        };
+        self.persist_prepared_name_operation(
+            account,
+            account_revision,
+            cached_coins,
+            request.request_nonce,
+            HnsNameAction::Update,
+            authority.name,
+            authority.name_hash,
+            source_evidence,
+            source,
+            state,
+            recipient,
+            recipient_display,
+            None,
+            Some(request.resource_data),
             request.maximum_fee,
             now,
         )
@@ -3183,7 +3456,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             ));
         }
         match action {
-            HnsNameAction::Transfer if state.transfer.get() != 0 => {
+            HnsNameAction::Transfer | HnsNameAction::Update if state.transfer.get() != 0 => {
                 return Err(name_preparation_stage(
                     "transfer-state validation",
                     HnsWalletError::NameNotOwned,
@@ -3214,7 +3487,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             ));
         }
         let recipient = match action {
-            HnsNameAction::Transfer => None,
+            HnsNameAction::Transfer | HnsNameAction::Update => None,
             HnsNameAction::Finalize => {
                 let transfer = TransferCovenant::try_from(&owner_coin.covenant)
                     .map_err(|_| HnsWalletError::InvalidEvidence)?;
@@ -3555,7 +3828,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let config = self.cache_read()?.account.config.clone();
         let store = self.store_lock()?;
         let mut operations = Vec::new();
-        for kind in [WorkflowKind::NameTransfer, WorkflowKind::NameFinalize] {
+        for kind in [
+            WorkflowKind::NameTransfer,
+            WorkflowKind::NameFinalize,
+            WorkflowKind::NameUpdate,
+        ] {
             for stored in
                 store.list_workflows_complete::<HnsNameWorkflow>(kind, MAX_HISTORY_RESULTS)?
             {
@@ -3583,7 +3860,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         };
         if !matches!(
             stored.kind,
-            WorkflowKind::NameTransfer | WorkflowKind::NameFinalize
+            WorkflowKind::NameTransfer | WorkflowKind::NameFinalize | WorkflowKind::NameUpdate
         ) || stored.state.plan.wallet_id != config.wallet_id
             || stored.state.plan.account_id != config.account_id
         {
@@ -3867,6 +4144,7 @@ mod tests {
             &state,
             &recipient,
             None,
+            None,
             vec![funding],
             &change,
             1,
@@ -3925,6 +4203,7 @@ mod tests {
             &state,
             &recipient,
             None,
+            None,
             vec![funding],
             &change,
             1,
@@ -3954,6 +4233,78 @@ mod tests {
         .expect("signed transfer");
         let signed = validate_witness_only_change(&unsigned, &signed).expect("witness-only");
         let canonical = canonical_input_coins(&inputs).expect("input evidence");
+        hns_transaction::verify_covenant_links(&signed, &canonical).expect("covenant linkage");
+        for (index, coin) in canonical.iter().enumerate() {
+            hns_script::verify_witness_program(
+                &signed,
+                index,
+                coin,
+                hns_script::ScriptFlags::STANDARD,
+                &hns_script::K256SignatureVerifier,
+            )
+            .expect("signature");
+        }
+    }
+
+    #[test]
+    fn canonical_hns_v3_name_update_preserves_owner_and_commits_exact_resource() {
+        let (store, account) = account_with_seed();
+        let (source, state, _) = owned_name_source(&store, &account);
+        let funding = tracked_input(
+            &store,
+            &account,
+            KeyRole::HnsCoin,
+            0,
+            HnsOutpoint {
+                transaction: TransactionHash::new([77; 32]),
+                output_index: 1,
+            },
+            10_000,
+            395,
+            Covenant::default(),
+        );
+        let owner = Address::new(0, source.address_program.clone()).expect("owner address");
+        let change = Address::new(0, funding.address_program.clone()).expect("change");
+        let resource = [0, 4, 192, 0, 2, 1];
+        let (unsigned, selected, fee) = build_unsigned_name_operation(
+            HnsNameAction::Update,
+            &source,
+            &state,
+            &owner,
+            None,
+            Some(&resource),
+            vec![funding],
+            &change,
+            1,
+            BaseUnits::new(1_000),
+            BaseUnits::new(10_000),
+            BaseUnits::new(DEFAULT_DUST_THRESHOLD),
+        )
+        .expect("unsigned update");
+        let update = &unsigned.outputs[0];
+        assert_eq!(update.value, state.value);
+        assert_eq!(update.address, owner);
+        assert_eq!(update.covenant.kind, CovenantKind::Update);
+        assert_eq!(update.covenant.items.len(), 3);
+        assert_eq!(update.covenant.items[0], state.name_hash.into_bytes());
+        assert_eq!(update.covenant.items[1], state.height.get().to_le_bytes());
+        assert_eq!(update.covenant.items[2], resource);
+        assert!(fee <= BaseUnits::new(10_000));
+
+        let mut inputs = vec![source];
+        inputs.extend(selected);
+        let signed = sign_ordered_p2pkh_inputs(
+            &store,
+            &account,
+            unsigned.clone(),
+            &inputs,
+            &[KeyRole::HnsName, KeyRole::HnsCoin],
+        )
+        .expect("signed update");
+        let signed = validate_witness_only_change(&unsigned, &signed).expect("witness-only");
+        let canonical = canonical_input_coins(&inputs).expect("input evidence");
+        verify_name_update_at_index_zero(&signed, &canonical[0], &state, &resource)
+            .expect("exact update covenant");
         hns_transaction::verify_covenant_links(&signed, &canonical).expect("covenant linkage");
         for (index, coin) in canonical.iter().enumerate() {
             hns_script::verify_witness_program(
@@ -4039,6 +4390,7 @@ mod tests {
             &state,
             &recipient,
             Some(&finalize),
+            None,
             vec![funding],
             &change,
             1,

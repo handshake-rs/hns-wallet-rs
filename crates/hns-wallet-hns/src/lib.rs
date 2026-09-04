@@ -27,9 +27,10 @@ pub use light_index::{
 pub use name_workflow::{
     AuthorizedNameOperation, CurrentShakedexLockQuery, HnsNameAction, HnsNameLifecycle,
     NameActionContextEvidence, NameActionIneligibility, NameOperation, NameOperationState,
-    PrepareNameFinalize, PrepareNameTransfer, PreparedNameOperation, VerifiedCurrentShakedexLock,
-    VerifiedCurrentShakedexLockBatch, VerifiedCurrentShakedexLockEntry,
-    VerifiedCurrentShakedexTransfer, VerifiedOutgoingNameTransfer,
+    PrepareNameFinalize, PrepareNameTransfer, PrepareNameUpdate, PreparedNameOperation,
+    VerifiedCurrentShakedexLock, VerifiedCurrentShakedexLockBatch,
+    VerifiedCurrentShakedexLockEntry, VerifiedCurrentShakedexTransfer,
+    VerifiedOutgoingNameTransfer,
 };
 pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
 pub use peer_coordinator::{
@@ -69,8 +70,8 @@ use blake2::Blake2bVar;
 use blake2::digest::VariableOutput;
 use hkdf::Hkdf;
 use hns_covenants::{
-    Covenant, CovenantKind, FinalizeCovenant, MAX_RESOURCE_SIZE, NameState, TransferCovenant,
-    hash_name, validate_name,
+    Covenant, CovenantKind, FinalizeCovenant, MAX_RESOURCE_SIZE, NameState, Resource,
+    TransferCovenant, hash_name, validate_name,
 };
 use hns_primitives::{
     BlockHash, Dollarydoos, Height, NameHash, TransactionHash as CanonicalTransactionHash, TreeRoot,
@@ -6824,6 +6825,7 @@ fn pending_name_transaction_status(stage: NameOperationState) -> Option<LocalTra
         | NameOperationState::TransferLocked
         | NameOperationState::FinalizeEligible
         | NameOperationState::Finalized
+        | NameOperationState::Updated
         | NameOperationState::TransferCancelled
         | NameOperationState::Expired
         | NameOperationState::Cancelled => None,

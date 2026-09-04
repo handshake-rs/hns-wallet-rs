@@ -2818,7 +2818,7 @@ fn finish_validated_name_action_response(
         expected_reasons.push(NameActionIneligibility::LifecycleNotClosed);
     }
     match expected_action {
-        HnsNameAction::Transfer => {
+        HnsNameAction::Transfer | HnsNameAction::Update => {
             if transfer_height.is_some() {
                 expected_reasons.push(NameActionIneligibility::TransferAlreadyPending);
             }
@@ -2886,7 +2886,7 @@ fn finish_validated_name_action_response(
         mempool_spender: header.mempool_spender,
     };
     Ok(match expected_action {
-        HnsNameAction::Transfer => common,
+        HnsNameAction::Transfer | HnsNameAction::Update => common,
         HnsNameAction::Finalize => NameActionContextEvidence {
             transfer_height: response.transfer.current_transfer_height.map(u64::from),
             transfer_lockup: Some(response.transfer.lockup_blocks),

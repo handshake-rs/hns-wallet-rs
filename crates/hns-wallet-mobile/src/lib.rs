@@ -352,6 +352,12 @@ pub enum MobileHnsValueIntent {
         expected_recipient: Option<String>,
         maximum_fee: BaseUnits,
     },
+    SetNameRecords {
+        name: String,
+        /// Human-readable records, or `hex:` followed by exact HSD resource bytes.
+        records: String,
+        maximum_fee: BaseUnits,
+    },
     CreateFixedPriceOffer {
         name: String,
         price: BaseUnits,
@@ -1866,7 +1872,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         let request_nonce = random_nonzero_request_nonce()?;
         let origin = Origin::parse(TRUSTED_NATIVE_HNS_VALUE_ORIGIN)
             .map_err(|_| MobileWalletError::InvalidValueAction)?;
-        let (kind, method, params) = intent.into_provider_parts(self.account_config.account_id);
+        let (kind, method, params) = intent.into_provider_parts(self.account_config.account_id)?;
         let call = ApprovedCall {
             origin,
             namespace: SelectedNamespace::Hns,
@@ -2464,10 +2470,213 @@ impl<C: HnsClock> MobileDirectHnsValueController<C> {
     }
 }
 
+const MAX_MOBILE_NAME_RESOURCE_EDITOR_BYTES: usize = 4 * 1024;
+
+fn parse_mobile_name_resource(input: &str) -> Result<Vec<u8>, MobileWalletError> {
+    if input.len() > MAX_MOBILE_NAME_RESOURCE_EDITOR_BYTES {
+        return Err(MobileWalletError::InvalidValueAction);
+    }
+    let trimmed = input.trim();
+    if let Some(exact) = trimmed.strip_prefix("hex:") {
+        let compact = exact
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        if compact.len() % 2 != 0 || compact.len() > hns_covenants::MAX_RESOURCE_SIZE * 2 {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
+        let mut raw = Vec::with_capacity(compact.len() / 2);
+        for pair in compact.chunks_exact(2) {
+            let nibble = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            let high = nibble(pair[0]).ok_or(MobileWalletError::InvalidValueAction)?;
+            let low = nibble(pair[1]).ok_or(MobileWalletError::InvalidValueAction)?;
+            raw.push((high << 4) | low);
+        }
+        if !raw.is_empty() && hns_covenants::Resource::decode(&raw).is_err() {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
+        return Ok(raw);
+    }
+
+    let lines = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut raw = vec![0_u8];
+    for line in lines {
+        let split = line.find(char::is_whitespace);
+        let (kind, arguments) =
+            split.map_or((line, ""), |index| (&line[..index], line[index..].trim()));
+        match kind.to_ascii_uppercase().as_str() {
+            "NS" => {
+                raw.push(1);
+                encode_mobile_resource_name(arguments, &mut raw)?;
+            }
+            "GLUE4" => {
+                let (name, address) = two_resource_arguments(arguments)?;
+                raw.push(2);
+                encode_mobile_resource_name(name, &mut raw)?;
+                raw.extend_from_slice(
+                    &address
+                        .parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| MobileWalletError::InvalidValueAction)?
+                        .octets(),
+                );
+            }
+            "GLUE6" => {
+                let (name, address) = two_resource_arguments(arguments)?;
+                raw.push(3);
+                encode_mobile_resource_name(name, &mut raw)?;
+                raw.extend_from_slice(
+                    &address
+                        .parse::<std::net::Ipv6Addr>()
+                        .map_err(|_| MobileWalletError::InvalidValueAction)?
+                        .octets(),
+                );
+            }
+            "SYNTH4" => {
+                raw.push(4);
+                raw.extend_from_slice(
+                    &arguments
+                        .parse::<std::net::Ipv4Addr>()
+                        .map_err(|_| MobileWalletError::InvalidValueAction)?
+                        .octets(),
+                );
+            }
+            "SYNTH6" => {
+                raw.push(5);
+                raw.extend_from_slice(
+                    &arguments
+                        .parse::<std::net::Ipv6Addr>()
+                        .map_err(|_| MobileWalletError::InvalidValueAction)?
+                        .octets(),
+                );
+            }
+            "TXT" => {
+                let text = if arguments.starts_with('"') {
+                    serde_json::from_str::<String>(arguments)
+                        .map_err(|_| MobileWalletError::InvalidValueAction)?
+                } else {
+                    arguments.to_owned()
+                };
+                let bytes = text.as_bytes();
+                if bytes.is_empty() || bytes.len() > u8::MAX as usize {
+                    return Err(MobileWalletError::InvalidValueAction);
+                }
+                raw.extend_from_slice(&[6, 1, bytes.len() as u8]);
+                raw.extend_from_slice(bytes);
+            }
+            "DS" => {
+                let fields = arguments.split_whitespace().collect::<Vec<_>>();
+                if fields.len() != 4 {
+                    return Err(MobileWalletError::InvalidValueAction);
+                }
+                let key_tag = fields[0]
+                    .parse::<u16>()
+                    .map_err(|_| MobileWalletError::InvalidValueAction)?;
+                let algorithm = fields[1]
+                    .parse::<u8>()
+                    .map_err(|_| MobileWalletError::InvalidValueAction)?;
+                let digest_type = fields[2]
+                    .parse::<u8>()
+                    .map_err(|_| MobileWalletError::InvalidValueAction)?;
+                let digest = parse_mobile_resource_digest(fields[3])?;
+                raw.push(0);
+                raw.extend_from_slice(&key_tag.to_be_bytes());
+                raw.extend_from_slice(&[algorithm, digest_type, digest.len() as u8]);
+                raw.extend_from_slice(&digest);
+            }
+            _ => return Err(MobileWalletError::InvalidValueAction),
+        }
+        if raw.len() > hns_covenants::MAX_RESOURCE_SIZE {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
+    }
+    hns_covenants::Resource::decode(&raw).map_err(|_| MobileWalletError::InvalidValueAction)?;
+    Ok(raw)
+}
+
+fn two_resource_arguments(arguments: &str) -> Result<(&str, &str), MobileWalletError> {
+    let mut fields = arguments.split_whitespace();
+    let first = fields.next().ok_or(MobileWalletError::InvalidValueAction)?;
+    let second = fields.next().ok_or(MobileWalletError::InvalidValueAction)?;
+    if fields.next().is_some() {
+        return Err(MobileWalletError::InvalidValueAction);
+    }
+    Ok((first, second))
+}
+
+fn encode_mobile_resource_name(input: &str, output: &mut Vec<u8>) -> Result<(), MobileWalletError> {
+    if input.is_empty() || input == "." {
+        if input == "." {
+            output.push(0);
+            return Ok(());
+        }
+        return Err(MobileWalletError::InvalidValueAction);
+    }
+    let without_root = input.strip_suffix('.').unwrap_or(input);
+    let labels = without_root.split('.').collect::<Vec<_>>();
+    let encoded_size = labels.iter().try_fold(1_usize, |size, label| {
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte) && byte != b'.')
+        {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
+        size.checked_add(label.len() + 1)
+            .ok_or(MobileWalletError::InvalidValueAction)
+    })?;
+    if encoded_size > 255 {
+        return Err(MobileWalletError::InvalidValueAction);
+    }
+    for label in labels {
+        output.push(label.len() as u8);
+        output.extend(label.bytes().map(|byte| byte.to_ascii_lowercase()));
+    }
+    output.push(0);
+    Ok(())
+}
+
+fn parse_mobile_resource_digest(input: &str) -> Result<Vec<u8>, MobileWalletError> {
+    if input.is_empty() || input.len() % 2 != 0 || input.len() > u8::MAX as usize * 2 {
+        return Err(MobileWalletError::InvalidValueAction);
+    }
+    input
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let nibble = |byte| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            Ok(
+                (nibble(pair[0]).ok_or(MobileWalletError::InvalidValueAction)? << 4)
+                    | nibble(pair[1]).ok_or(MobileWalletError::InvalidValueAction)?,
+            )
+        })
+        .collect()
+}
+
 impl MobileHnsValueIntent {
-    fn into_provider_parts(self, account: AccountId) -> (ApprovalKind, ProviderMethod, Value) {
+    fn into_provider_parts(
+        self,
+        account: AccountId,
+    ) -> Result<(ApprovalKind, ProviderMethod, Value), MobileWalletError> {
         let market_account = lowercase_hex(account.as_bytes());
-        match self {
+        Ok(match self {
             Self::Send {
                 recipient,
                 amount,
@@ -2510,6 +2719,23 @@ impl MobileHnsValueIntent {
                     "maximumFee": maximum_fee,
                 }),
             ),
+            Self::SetNameRecords {
+                name,
+                records,
+                maximum_fee,
+            } => {
+                let resource = parse_mobile_name_resource(&records)?;
+                (
+                    ApprovalKind::NameUpdate,
+                    ProviderMethod::HnsUpdateName,
+                    json!({
+                        "account": account,
+                        "name": name,
+                        "rawResource": lowercase_hex(&resource),
+                        "maximumFee": maximum_fee,
+                    }),
+                )
+            }
             Self::CreateFixedPriceOffer {
                 name,
                 price,
@@ -2570,7 +2796,7 @@ impl MobileHnsValueIntent {
                     "maximumFee": maximum_fee,
                 }),
             ),
-        }
+        })
     }
 }
 
@@ -3877,7 +4103,8 @@ mod tests {
             amount: BaseUnits::new(12_345),
             maximum_fee: BaseUnits::new(678),
         }
-        .into_provider_parts(account);
+        .into_provider_parts(account)
+        .expect("valid send intent");
         assert_eq!(kind, ApprovalKind::Send);
         assert_eq!(method, ProviderMethod::HnsSend);
         assert_eq!(params["account"], json!(account));
@@ -3903,6 +4130,45 @@ mod tests {
             &token,
             std::str::from_utf8(&changed).expect("ASCII token")
         ));
+    }
+
+    #[test]
+    fn mobile_name_resource_editor_encodes_supported_records() {
+        let raw = parse_mobile_name_resource(
+            r#"
+                # Delegation and service records
+                NS NS1.Example.
+                GLUE4 ns1.example. 192.0.2.1
+                GLUE6 ns1.example. 2001:db8::1
+                SYNTH4 198.51.100.2
+                SYNTH6 2001:db8::2
+                DS 12345 8 2 a1b2c3d4
+                TXT "wallet record with spaces"
+            "#,
+        )
+        .expect("supported presentation forms");
+        let decoded = hns_covenants::Resource::decode(&raw).expect("valid HSD resource");
+        assert_eq!(decoded.records().len(), 7);
+        assert_eq!(decoded.as_bytes(), raw);
+        assert!(raw.windows(b"ns1".len()).any(|window| window == b"ns1"));
+        assert!(!raw.windows(b"NS1".len()).any(|window| window == b"NS1"));
+    }
+
+    #[test]
+    fn mobile_name_resource_editor_supports_clear_and_exact_hex() {
+        assert_eq!(
+            parse_mobile_name_resource("  # clear all records\n")
+                .expect("empty editor clears the resource"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            parse_mobile_name_resource("hex: 00 04 c0 00 02 01")
+                .expect("valid exact encoded resource"),
+            vec![0, 4, 192, 0, 2, 1]
+        );
+        assert!(parse_mobile_name_resource("hex: ff").is_err());
+        assert!(parse_mobile_name_resource("TXT \"unterminated").is_err());
+        assert!(parse_mobile_name_resource("UNKNOWN value").is_err());
     }
 
     #[test]

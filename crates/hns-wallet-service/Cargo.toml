@@ -14,6 +14,7 @@ publish = ["crates-io"]
 
 [dependencies]
 getrandom.workspace = true
+hns-covenants.workspace = true
 hns-wallet-chain-api.workspace = true
 hns-wallet-ffi.workspace = true
 hns-wallet-hns.workspace = true

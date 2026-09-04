@@ -180,6 +180,9 @@ pub enum ProviderMethod {
     SwapGetSession,
     SwapRedeem,
     SwapRefund,
+    /// Set the exact Handshake resource bytes for a currently owned name.
+    /// Appended to preserve every existing stable enum/wire index.
+    HnsUpdateName,
 }
 
 impl ProviderMethod {
@@ -226,6 +229,7 @@ impl ProviderMethod {
         Self::SwapGetSession,
         Self::SwapRedeem,
         Self::SwapRefund,
+        Self::HnsUpdateName,
     ];
 
     pub const fn wire_name(self) -> &'static str {
@@ -260,6 +264,7 @@ impl ProviderMethod {
                 | Self::HnsImportKnownName
                 | Self::HnsTransferName
                 | Self::HnsFinalizeName
+                | Self::HnsUpdateName
                 | Self::HnsSignTypedMessage
                 | Self::NameMarketListOffers
                 | Self::NameMarketCreateFixedPriceOffer
@@ -296,6 +301,7 @@ impl ProviderMethod {
             }
             Self::HnsTransferName => Some(PermissionCapability::NameTransfer),
             Self::HnsFinalizeName => Some(PermissionCapability::NameFinalize),
+            Self::HnsUpdateName => Some(PermissionCapability::NameUpdate),
             Self::HnsSignTypedMessage => Some(PermissionCapability::TypedIdentitySignature),
             Self::NameMarketListOffers
             | Self::NameMarketCreateFixedPriceOffer
@@ -327,6 +333,7 @@ impl ProviderMethod {
             Self::HnsSend | Self::AssetSend => Some(ApprovalKind::Send),
             Self::HnsTransferName => Some(ApprovalKind::NameTransfer),
             Self::HnsFinalizeName => Some(ApprovalKind::NameFinalize),
+            Self::HnsUpdateName => Some(ApprovalKind::NameUpdate),
             Self::HnsSignTypedMessage => Some(ApprovalKind::TypedSignature),
             Self::NameMarketCreateFixedPriceOffer | Self::NameMarketCancelOffer => {
                 Some(ApprovalKind::NameMarketOffer)
@@ -1415,12 +1422,12 @@ mod tests {
 
     #[test]
     fn canonical_provider_method_set_has_exact_wire_round_trips() {
-        assert_eq!(ProviderMethod::ALL.len(), 42);
+        assert_eq!(ProviderMethod::ALL.len(), 43);
         let names: BTreeSet<_> = ProviderMethod::ALL
             .into_iter()
             .map(ProviderMethod::wire_name)
             .collect();
-        assert_eq!(names.len(), 42);
+        assert_eq!(names.len(), 43);
         for (index, method) in ProviderMethod::ALL.into_iter().enumerate() {
             assert_eq!(method.wire_name(), PROVIDER_METHOD_WIRE_NAMES[index]);
             assert!(matches!(
@@ -1452,7 +1459,7 @@ mod tests {
             .into_iter()
             .filter(|method| method.requires_hns_namespace())
             .collect::<Vec<_>>();
-        assert_eq!(hns_methods.len(), 19);
+        assert_eq!(hns_methods.len(), 20);
         for (index, method) in hns_methods.into_iter().enumerate() {
             let request = serde_json::to_vec(&serde_json::json!({
                 "method": method.wire_name(),

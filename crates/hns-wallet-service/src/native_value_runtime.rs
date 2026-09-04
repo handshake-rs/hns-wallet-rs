@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use hns_covenants::{MAX_RESOURCE_SIZE, Resource};
 use hns_marketplace_protocol::NameMarketMessage;
 use hns_swap::HnsHtlc;
 use hns_wallet_chain_api::{
@@ -23,7 +24,7 @@ use hns_wallet_hns::{
     HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED, HNS_VALUE_RUNTIME_RELEASE_QUALIFIED, HnsBackend,
     HnsClock, HnsDirectShakescapePeer, HnsNameAction, HnsNetwork, HnsRuntimeConfig, HnsWalletError,
     HnsWalletRuntime, KnownName, NameOperation, NameOperationState, NameOwnershipStatus,
-    PrepareNameFinalize, PrepareNameTransfer,
+    PrepareNameFinalize, PrepareNameTransfer, PrepareNameUpdate,
 };
 use hns_wallet_provider::{
     APPROVAL_LIFETIME_SECONDS, ApprovedCall, PendingApproval, ProviderMethod, SelectedNamespace,
@@ -205,6 +206,15 @@ struct HnsFinalizeNameParams {
     account: AccountId,
     name: String,
     expected_recipient: Option<String>,
+    maximum_fee: BaseUnits,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct HnsUpdateNameParams {
+    account: AccountId,
+    name: String,
+    raw_resource: String,
     maximum_fee: BaseUnits,
 }
 
@@ -698,6 +708,33 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         Ok((params, prepared))
     }
 
+    fn prepare_update(
+        &self,
+        call: &ApprovedCall,
+    ) -> Result<(HnsUpdateNameParams, hns_wallet_hns::PreparedNameOperation), ServiceFailure> {
+        let params =
+            self.parse_account_params(call, |params: &HnsUpdateNameParams| params.account)?;
+        let resource_data =
+            parse_bounded_lowercase_hex(&params.raw_resource, MAX_RESOURCE_SIZE, "rawResource")?;
+        if !resource_data.is_empty() && Resource::decode(&resource_data).is_err() {
+            return Err(invalid_request(
+                "rawResource is not a canonical Handshake resource",
+            ));
+        }
+        self.reconcile()?;
+        let prepared = self
+            .runtime
+            .prepare_name_update(PrepareNameUpdate {
+                account: params.account,
+                request_nonce: call.request_nonce,
+                name: params.name.as_bytes().to_vec(),
+                resource_data,
+                maximum_fee: params.maximum_fee,
+            })
+            .map_err(crate::hns_name_preparation_failure)?;
+        Ok((params, prepared))
+    }
+
     fn current_names(&self) -> Result<Vec<KnownName>, ServiceFailure> {
         self.reconcile()?;
         self.runtime.list_names().map_err(hns_read_failure)
@@ -926,6 +963,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
                 ("reapprovalRequired", Some("prepareAgain"), false)
             }
             NameOperationState::Finalized => ("finalized", None, true),
+            NameOperationState::Updated => ("updated", None, true),
             NameOperationState::TransferCancelled => ("transferCancelled", None, true),
             NameOperationState::Conflicted => ("conflicted", None, true),
             NameOperationState::Expired => ("expired", None, true),
@@ -1142,6 +1180,25 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
             .map_err(hns_runtime_failure)?;
         provider_broadcast_receipt(receipt, call.request_nonce, Some(workflow_id.to_string()))
     }
+
+    fn execute_approved_update(
+        &self,
+        call: &ApprovedCall,
+        approval_id: ApprovalId,
+        approved_at_unix: u64,
+    ) -> Result<Value, ServiceFailure> {
+        let (_, prepared) = self.prepare_update(call)?;
+        let workflow_id = prepared.workflow_id;
+        let authorized = self
+            .runtime
+            .authorize_name_operation(approval_id, &prepared, approved_at_unix)
+            .map_err(hns_runtime_failure)?;
+        let receipt = self
+            .runtime
+            .broadcast_name_operation(&authorized)
+            .map_err(hns_runtime_failure)?;
+        provider_broadcast_receipt(receipt, call.request_nonce, Some(workflow_id.to_string()))
+    }
 }
 
 impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B, C> {
@@ -1174,6 +1231,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                 | ProviderMethod::HnsImportKnownName
                 | ProviderMethod::HnsTransferName
                 | ProviderMethod::HnsFinalizeName
+                | ProviderMethod::HnsUpdateName
         ) || (self.shakedex_available()
             && matches!(
                 method,
@@ -1271,6 +1329,42 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                 Ok(ApprovalSummary::NameFinalize {
                     name: prepared_name_text(&prepared.name)?,
                     recipient: prepared.recipient,
+                    maximum_fee: Amount {
+                        asset: WalletAsset::Hns,
+                        base_units: prepared.maximum_fee,
+                    },
+                    warnings: BTreeSet::from([ApprovalWarning::FeeEstimateMayChange]),
+                })
+            }
+            (ApprovalKind::NameUpdate, ProviderMethod::HnsUpdateName) => {
+                let (_, prepared) = self.prepare_update(approval.call)?;
+                self.runtime
+                    .register_name_operation_approval(
+                        approval.id,
+                        approval.call.origin.as_str(),
+                        &prepared,
+                        approval.expires_at_unix,
+                    )
+                    .map_err(hns_runtime_failure)?;
+                let resource = prepared
+                    .resource_data
+                    .as_deref()
+                    .ok_or_else(|| invalid_request("prepared UPDATE has no resource"))?;
+                let record_count = if resource.is_empty() {
+                    0
+                } else {
+                    Resource::decode(resource)
+                        .map_err(|_| invalid_request("prepared UPDATE resource is invalid"))?
+                        .records()
+                        .len()
+                };
+                Ok(ApprovalSummary::NameUpdate {
+                    name: prepared_name_text(&prepared.name)?,
+                    resource_hex: lowercase_hex(resource),
+                    resource_bytes: u16::try_from(resource.len())
+                        .map_err(|_| invalid_request("prepared UPDATE resource is too large"))?,
+                    record_count: u16::try_from(record_count)
+                        .map_err(|_| invalid_request("prepared UPDATE has too many records"))?,
                     maximum_fee: Amount {
                         asset: WalletAsset::Hns,
                         base_units: prepared.maximum_fee,
@@ -1476,6 +1570,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
             ProviderMethod::HnsSend
             | ProviderMethod::HnsTransferName
             | ProviderMethod::HnsFinalizeName
+            | ProviderMethod::HnsUpdateName
             | ProviderMethod::NameMarketCreateFixedPriceOffer
             | ProviderMethod::NameMarketCancelOffer
             | ProviderMethod::NameMarketAcceptOffer
@@ -1507,6 +1602,9 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
             }
             ProviderMethod::HnsFinalizeName => {
                 self.execute_approved_finalize(&call, approval_id, approved_at_unix)
+            }
+            ProviderMethod::HnsUpdateName => {
+                self.execute_approved_update(&call, approval_id, approved_at_unix)
             }
             ProviderMethod::NameMarketCreateFixedPriceOffer => {
                 self.execute_approved_seller_creation(&call, approval_id, approved_at_unix)
@@ -2142,6 +2240,32 @@ fn parse_lowercase_hex<const N: usize>(
     }
     if output.iter().all(|byte| *byte == 0) {
         return Err(invalid_request(&format!("{field} cannot be zero")));
+    }
+    Ok(output)
+}
+
+fn parse_bounded_lowercase_hex(
+    encoded: &str,
+    maximum_bytes: usize,
+    field: &str,
+) -> Result<Vec<u8>, ServiceFailure> {
+    if encoded.len() % 2 != 0 || encoded.len() > maximum_bytes.saturating_mul(2) {
+        return Err(invalid_request(&format!(
+            "{field} must contain at most {maximum_bytes} bytes of lowercase hexadecimal"
+        )));
+    }
+    let mut output = Vec::with_capacity(encoded.len() / 2);
+    for pair in encoded.as_bytes().chunks_exact(2) {
+        let decode = |byte| match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            _ => None,
+        };
+        let high = decode(pair[0])
+            .ok_or_else(|| invalid_request(&format!("{field} is not canonical hexadecimal")))?;
+        let low = decode(pair[1])
+            .ok_or_else(|| invalid_request(&format!("{field} is not canonical hexadecimal")))?;
+        output.push((high << 4) | low);
     }
     Ok(output)
 }

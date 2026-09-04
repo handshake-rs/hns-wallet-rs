@@ -15,6 +15,7 @@ publish = ["crates-io"]
 [dependencies]
 bdk_wallet.workspace = true
 getrandom.workspace = true
+hns-covenants.workspace = true
 hns-header-consensus.workspace = true
 hns-marketplace-protocol.workspace = true
 hns-primitives.workspace = true
