@@ -190,6 +190,25 @@ pub struct MobileHnsNameSummary {
     pub ownership_status: MobileHnsNameOwnershipStatus,
     pub registered: Option<bool>,
     pub expired: Option<bool>,
+    pub canonical_state: Option<MobileHnsNameStateSummary>,
+    pub raw_resource_hex: Option<String>,
+    pub resource_record_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileHnsNameStateSummary {
+    /// Locked name value in HNS base units. A decimal string preserves u64.
+    pub value_base_units: String,
+    /// Highest auction bid in HNS base units. A decimal string preserves u64.
+    pub highest_base_units: String,
+    pub start_height: u32,
+    pub renewal_height: u32,
+    pub transfer_height: u32,
+    pub revoked_height: u32,
+    pub claimed_height: u32,
+    pub renewals: u32,
+    pub weak: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3047,6 +3066,29 @@ fn mobile_hns_name_summary(name: &KnownName) -> Result<MobileHnsNameSummary, Mob
         .map_or((None, None), |state| {
             (Some(state.registered), Some(state.expired))
         });
+    let canonical_state = name.canonical_current_state.as_ref().map(|state| {
+        MobileHnsNameStateSummary {
+            value_base_units: state.value.to_string(),
+            highest_base_units: state.highest.to_string(),
+            start_height: state.start_height,
+            renewal_height: state.renewal_height,
+            transfer_height: state.transfer_height,
+            revoked_height: state.revoked_height,
+            claimed_height: state.claimed_height,
+            renewals: state.renewals,
+            weak: state.weak,
+        }
+    });
+    let raw_resource_hex = name.current_raw_resource.as_deref().map(lowercase_hex);
+    let resource_record_count = name.current_raw_resource.as_deref().and_then(|raw| {
+        if raw.is_empty() {
+            Some(0)
+        } else {
+            hns_covenants::Resource::decode(raw)
+                .ok()
+                .and_then(|resource| u32::try_from(resource.records().len()).ok())
+        }
+    });
     Ok(MobileHnsNameSummary {
         name: display,
         name_hash,
@@ -3055,6 +3097,9 @@ fn mobile_hns_name_summary(name: &KnownName) -> Result<MobileHnsNameSummary, Mob
         ownership_status,
         registered,
         expired,
+        canonical_state,
+        raw_resource_hex,
+        resource_record_count,
     })
 }
 
@@ -3095,6 +3140,27 @@ fn mobile_native_hns_name_summary(
             MobileHnsNameOwnershipStatus::OutgoingTransfer
         }
     };
+    let canonical_state = name.canonical_state.map(|state| MobileHnsNameStateSummary {
+        value_base_units: state.value.to_string(),
+        highest_base_units: state.highest.to_string(),
+        start_height: state.start_height,
+        renewal_height: state.renewal_height,
+        transfer_height: state.transfer_height,
+        revoked_height: state.revoked_height,
+        claimed_height: state.claimed_height,
+        renewals: state.renewals,
+        weak: state.weak,
+    });
+    let raw_resource_hex = name.raw_resource.as_deref().map(lowercase_hex);
+    let resource_record_count = name.raw_resource.as_deref().and_then(|raw| {
+        if raw.is_empty() {
+            Some(0)
+        } else {
+            hns_covenants::Resource::decode(raw)
+                .ok()
+                .and_then(|resource| u32::try_from(resource.records().len()).ok())
+        }
+    });
     let summary = MobileHnsNameSummary {
         name: name.name,
         name_hash: name.name_hash,
@@ -3103,6 +3169,9 @@ fn mobile_native_hns_name_summary(
         ownership_status,
         registered: name.registered,
         expired: name.expired,
+        canonical_state,
+        raw_resource_hex,
+        resource_record_count,
     };
     if summary.proof_height > MAX_JAVASCRIPT_SAFE_INTEGER {
         return Err(MobileWalletError::Hns(HnsWalletError::InvalidEvidence));
@@ -4476,7 +4545,7 @@ mod tests {
     }
 
     #[test]
-    fn native_import_summary_projection_is_minimized_and_exact() {
+    fn native_import_summary_projection_is_bounded_and_exact() {
         let summary = mobile_native_hns_name_summary(NativeHnsNameSummary {
             name: "alpha".to_owned(),
             name_hash: "271878f8a927b4566ac951fc815b18dfad8d0302d61d11d80cbe15b7a3a056af"
@@ -4486,6 +4555,8 @@ mod tests {
             ownership_status: NativeHnsNameOwnershipStatus::IncomingTransfer,
             registered: Some(true),
             expired: Some(false),
+            canonical_state: None,
+            raw_resource: None,
         })
         .expect("mobile native name summary");
         assert_eq!(summary.name, "alpha");
@@ -4503,18 +4574,21 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "expired",
+                "canonicalState",
                 "name",
                 "nameHash",
                 "ownershipStatus",
                 "proofHeight",
+                "rawResourceHex",
                 "registered",
+                "resourceRecordCount",
                 "resourceStatus",
             ])
         );
     }
 
     #[test]
-    fn known_name_projection_is_minimized_typed_and_serializable() {
+    fn known_name_projection_is_bounded_typed_and_serializable() {
         let known_name = KnownName {
             name: b"alpha".to_vec(),
             name_hash: [
@@ -4559,12 +4633,14 @@ mod tests {
         );
         assert_eq!(summary.registered, Some(true));
         assert_eq!(summary.expired, Some(false));
+        assert_eq!(summary.raw_resource_hex.as_deref(), Some("070809"));
+        assert_eq!(summary.resource_record_count, None);
+        assert_eq!(summary.canonical_state.as_ref().map(|state| state.renewals), Some(1));
 
         let encoded = serde_json::to_string(&summary).expect("serialize name summary");
         for forbidden in [
             "proofState",
             "currentState",
-            "rawResource",
             "ownerOutpoint",
             "derivation",
         ] {
@@ -4595,6 +4671,9 @@ mod tests {
                 ownership_status: MobileHnsNameOwnershipStatus::WalletOwned,
                 registered: Some(true),
                 expired: Some(false),
+                canonical_state: None,
+                raw_resource_hex: None,
+                resource_record_count: None,
             })
             .collect::<Vec<_>>();
         let first = mobile_hns_name_page(&names, 0, 64).expect("first page");

@@ -60,9 +60,10 @@ pub const MAX_SERVICE_PENDING_APPROVALS: usize = 128;
 pub const MAX_PROVIDER_HNS_READ_ITEMS: usize = 128;
 pub const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
-/// Minimized canonical name state returned only to trusted native callers.
-/// Derivations, owner outputs, proof/state bytes, and resources stay inside
-/// the HNS runtime.
+/// Bounded canonical name state returned only to trusted native callers.
+/// Derivations, owner outputs, proof bytes, and key material stay inside the
+/// HNS runtime; public state and the protocol-bounded resource may be shown by
+/// a first-party wallet UI without another database or chain scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NativeHnsNameSummary {
     pub name: String,
@@ -72,6 +73,21 @@ pub struct NativeHnsNameSummary {
     pub ownership_status: NativeHnsNameOwnershipStatus,
     pub registered: Option<bool>,
     pub expired: Option<bool>,
+    pub canonical_state: Option<NativeHnsNameStateSummary>,
+    pub raw_resource: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeHnsNameStateSummary {
+    pub value: u64,
+    pub highest: u64,
+    pub start_height: u32,
+    pub renewal_height: u32,
+    pub transfer_height: u32,
+    pub revoked_height: u32,
+    pub claimed_height: u32,
+    pub renewals: u32,
+    pub weak: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2777,6 +2793,19 @@ fn native_hns_name_summary(name: &KnownName) -> Result<NativeHnsNameSummary, Ser
         .map_or((None, None), |state| {
             (Some(state.registered), Some(state.expired))
         });
+    let canonical_state = name.canonical_current_state.as_ref().map(|state| {
+        NativeHnsNameStateSummary {
+            value: state.value,
+            highest: state.highest,
+            start_height: state.start_height,
+            renewal_height: state.renewal_height,
+            transfer_height: state.transfer_height,
+            revoked_height: state.revoked_height,
+            claimed_height: state.claimed_height,
+            renewals: state.renewals,
+            weak: state.weak,
+        }
+    });
     Ok(NativeHnsNameSummary {
         name: disclosure.name,
         name_hash: disclosure.name_hash,
@@ -2785,6 +2814,8 @@ fn native_hns_name_summary(name: &KnownName) -> Result<NativeHnsNameSummary, Ser
         ownership_status,
         registered,
         expired,
+        canonical_state,
+        raw_resource: name.current_raw_resource.clone(),
     })
 }
 
