@@ -221,6 +221,7 @@ struct PendingHeaderRound {
 #[derive(Debug)]
 struct NativePeer {
     address: SocketAddr,
+    advertised_height: u32,
     connection: PeerConnection<TcpStream>,
     deferred_wallet: VecDeque<WalletPeerEvent>,
 }
@@ -939,6 +940,7 @@ impl NativeHnsPeerPool {
         };
         let peer = Arc::new(Mutex::new(NativePeer {
             address,
+            advertised_height: metadata.height,
             connection,
             deferred_wallet: VecDeque::new(),
         }));
@@ -1468,7 +1470,24 @@ impl HnsDirectPeerCoordinator {
         // exact known tip before it can prove that no extension follows.  The
         // response is normalized below, so the agreement engine still sees
         // only headers extending its own authenticated base.
-        let locator = header_freshness_locator(&request.packet.locator);
+        // During catch-up, start at the authenticated tip so a standard
+        // 2,000-header response contains 2,000 new headers. Only step back to
+        // the predecessor when every selected peer says it is already at our
+        // tip; that echo is needed because some HSD peers omit an explicit
+        // empty response at current height.
+        let selected_peer_heights = handles
+            .iter()
+            .map(|(_, peer)| {
+                peer.lock()
+                    .map(|peer| peer.advertised_height)
+                    .map_err(|_| HnsDirectPeerError::RuntimePoisoned)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let locator = header_round_locator(
+            &request.packet.locator,
+            request.base_height,
+            &selected_peer_heights,
+        );
         let responses = std::thread::scope(|scope| {
             let tasks = handles
                 .into_iter()
@@ -3147,6 +3166,22 @@ fn header_freshness_locator(locator: &[BlockHash]) -> Vec<BlockHash> {
     }
 }
 
+fn header_round_locator(
+    locator: &[BlockHash],
+    base_height: u32,
+    selected_peer_heights: &[u32],
+) -> Vec<BlockHash> {
+    if !selected_peer_heights.is_empty()
+        && selected_peer_heights
+            .iter()
+            .all(|height| *height > base_height)
+    {
+        locator.to_vec()
+    } else {
+        header_freshness_locator(locator)
+    }
+}
+
 /// Strip the peer's echo of the already authenticated base header.  A reply
 /// that starts with any other header remains untouched and fails normal local
 /// chain validation rather than being mistaken for a current-chain proof.
@@ -3311,6 +3346,25 @@ mod tests {
             vec![previous, older]
         );
         assert_eq!(header_freshness_locator(&[tip]), vec![tip]);
+    }
+
+    #[test]
+    fn header_round_locator_preserves_full_catchup_capacity() {
+        let tip = BlockHash::new([1; 32]);
+        let previous = BlockHash::new([2; 32]);
+        let locator = vec![tip, previous];
+        assert_eq!(
+            header_round_locator(&locator, 340_000, &[345_555, 345_555]),
+            locator
+        );
+        assert_eq!(
+            header_round_locator(&locator, 345_555, &[345_555, 345_555]),
+            vec![previous]
+        );
+        assert_eq!(
+            header_round_locator(&locator, 345_555, &[345_556, 345_555]),
+            vec![previous]
+        );
     }
 
     #[test]
@@ -4065,6 +4119,7 @@ mod tests {
         connection.complete_handshake(|| now).unwrap();
         let mut peer = NativePeer {
             address,
+            advertised_height: 42,
             connection,
             deferred_wallet: VecDeque::new(),
         };
