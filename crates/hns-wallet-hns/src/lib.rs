@@ -1536,7 +1536,10 @@ fn validate_name_owner_transaction(
                 || finalize.start_height != state.height
                 || finalize.name != state.name
                 || finalize.claimed != state.claimed
-                || finalize.renewals != state.renewals
+                || !finalize
+                    .renewals
+                    .checked_add(1)
+                    .is_some_and(|renewals| renewals == state.renewals)
                 || finalize.weak() != state.weak
             {
                 return Err(HnsWalletError::InvalidEvidence);
@@ -4849,7 +4852,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 &previous_transactions,
             ),
         )?;
-        let coins = reconcile_coins(scan.indexed_coins, &scan.addresses, scan.binding.tip.height)?;
+        let coins = annotate_persisted_value_read_unavailable(
+            "reconciling direct wallet coins",
+            reconcile_coins(scan.indexed_coins, &scan.addresses, scan.binding.tip.height),
+        )?;
         let names = annotate_persisted_value_read_unavailable(
             "reconciling wallet-owned names",
             reconcile_hns_read_names(
@@ -7715,6 +7721,9 @@ fn annotate_persisted_value_read_unavailable<T>(
         Err(HnsWalletError::RuntimeIntegrationUnavailable) => Err(HnsWalletError::Backend(
             format!("direct wallet read unavailable while {stage}"),
         )),
+        Err(HnsWalletError::InvalidEvidence) => Err(HnsWalletError::Backend(format!(
+            "direct wallet evidence failed authentication while {stage}"
+        ))),
         result => result,
     }
 }
@@ -12731,10 +12740,19 @@ mod tests {
                     .to_covenant()
                     .expect("transfer covenant")
             }
-            None => FinalizeCovenant::from_name_state(&state, BlockHash::new([9; 32]))
-                .expect("finalize")
-                .to_covenant()
-                .expect("finalize covenant"),
+            None => {
+                // FINALIZE commits the pre-finalization renewal count. Applying
+                // it advances the canonical NameState count by one.
+                let mut pre_finalize = state.clone();
+                pre_finalize.renewals = state
+                    .renewals
+                    .checked_sub(1)
+                    .expect("post-finalize renewal count");
+                FinalizeCovenant::from_name_state(&pre_finalize, BlockHash::new([9; 32]))
+                    .expect("finalize")
+                    .to_covenant()
+                    .expect("finalize covenant")
+            }
         };
         let transaction = Transaction {
             version: 0,
