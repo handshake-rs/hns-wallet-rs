@@ -789,6 +789,10 @@ fn ensure_name_value_ready(cache: &HnsRuntimeCache) -> Result<(), HnsWalletError
     Ok(())
 }
 
+fn name_preparation_stage(stage: &'static str, error: HnsWalletError) -> HnsWalletError {
+    HnsWalletError::Backend(format!("name action {stage} failed: {error}"))
+}
+
 pub(super) fn expected_chain_identity(
     network: HnsNetwork,
 ) -> Result<(u8, [u8; 32]), HnsWalletError> {
@@ -1014,15 +1018,24 @@ fn tracked_name_source_from_coin(
     binding: SnapshotBinding,
     owner_coin: &Coin,
     owner_inclusion: TransactionInclusion,
+    source_binding: ActiveNameOwnerCoinSourceBinding,
     derivation: DerivationReference,
 ) -> Result<TrackedHnsCoin, HnsWalletError> {
     let owner_outpoint = HnsOutpoint {
         transaction: TransactionHash::new(owner_coin.outpoint.transaction_hash.into_bytes()),
         output_index: owner_coin.outpoint.index,
     };
+    let valid_inclusion_shape = match source_binding {
+        ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection => {
+            owner_inclusion.transaction_index.is_none()
+        }
+        ActiveNameOwnerCoinSourceBinding::LocallyVerifiedFilteredBlock => {
+            owner_inclusion.transaction_index.is_some()
+        }
+    };
     if owner_coin.coinbase
         || u64::from(owner_coin.height.get()) != owner_inclusion.height
-        || owner_inclusion.transaction_index.is_some()
+        || !valid_inclusion_shape
     {
         return Err(HnsWalletError::InvalidEvidence);
     }
@@ -1063,6 +1076,10 @@ fn name_source_from_plan(plan: &HnsNamePlan) -> Result<TrackedHnsCoin, HnsWallet
             plan.source.preparation_binding,
             &owner_coin,
             plan.source.owner_inclusion,
+            plan.source
+                .action_context
+                .owner_coin_source_binding
+                .unwrap_or(ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection),
             plan.source.owner_derivation,
         );
     }
@@ -1440,14 +1457,17 @@ fn validate_name_action_context(
                 .owner_coin_source_binding
                 .unwrap_or(ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection),
         };
-        let validated_state =
-            validate_active_name_owner_coin_evidence(&active, name_hash, binding)?;
+        let validated_state = validate_active_name_owner_coin_evidence(&active, name_hash, binding)
+            .map_err(|error| name_preparation_stage("active owner coin validation", error))?;
         if validated_state != *state
             || owner_coin.outpoint.transaction_hash.as_bytes()
                 != context.owner_outpoint.transaction.as_bytes()
             || owner_coin.outpoint.index != context.owner_outpoint.output_index
         {
-            return Err(HnsWalletError::InvalidEvidence);
+            return Err(name_preparation_stage(
+                "active owner coin binding",
+                HnsWalletError::InvalidEvidence,
+            ));
         }
         owner_coin.covenant.kind
     } else {
@@ -1472,19 +1492,48 @@ fn validate_name_action_context(
         .kind
     };
     let reasons = &context.ineligibility_reasons;
-    if reasons.len() > 9
-        || !reasons
-            .windows(2)
-            .all(|pair| pair[0].rank() < pair[1].rank())
-        || context.action_eligible != reasons.is_empty()
-        || context.mempool_spender.is_some()
-            != reasons.contains(&NameActionIneligibility::OwnerSpentInMempool)
-        || (context.lifecycle != HnsNameLifecycle::Closed)
-            != reasons.contains(&NameActionIneligibility::LifecycleNotClosed)
-        || state.registered == reasons.contains(&NameActionIneligibility::NameNotRegistered)
-        || (state.expired && !reasons.contains(&NameActionIneligibility::NameExpiredAtCandidate))
+    if reasons.len() > 9 {
+        return Err(name_preparation_stage(
+            "eligibility reason bound",
+            HnsWalletError::InvalidEvidence,
+        ));
+    }
+    if !reasons
+        .windows(2)
+        .all(|pair| pair[0].rank() < pair[1].rank())
     {
-        return Err(HnsWalletError::InvalidEvidence);
+        return Err(name_preparation_stage(
+            "eligibility reason ordering",
+            HnsWalletError::InvalidEvidence,
+        ));
+    }
+    if context.action_eligible != reasons.is_empty() {
+        return Err(name_preparation_stage(
+            "eligibility action flag",
+            HnsWalletError::InvalidEvidence,
+        ));
+    }
+    if context.mempool_spender.is_some()
+        != reasons.contains(&NameActionIneligibility::OwnerSpentInMempool)
+    {
+        return Err(name_preparation_stage(
+            "eligibility mempool flag",
+            HnsWalletError::InvalidEvidence,
+        ));
+    }
+    if (context.lifecycle != HnsNameLifecycle::Closed)
+        != reasons.contains(&NameActionIneligibility::LifecycleNotClosed)
+    {
+        return Err(name_preparation_stage(
+            "eligibility lifecycle flag",
+            HnsWalletError::InvalidEvidence,
+        ));
+    }
+    if state.registered == reasons.contains(&NameActionIneligibility::NameNotRegistered) {
+        return Err(name_preparation_stage(
+            "eligibility registered flag",
+            HnsWalletError::InvalidEvidence,
+        ));
     }
     if context.binding != binding
         || context.mempool != mempool
@@ -1505,7 +1554,10 @@ fn validate_name_action_context(
                 || outpoint.index != owner_outpoint.output_index
         })
     {
-        return Err(HnsWalletError::InvalidEvidence);
+        return Err(name_preparation_stage(
+            "context identity binding",
+            HnsWalletError::InvalidEvidence,
+        ));
     }
 
     let mut expected_reasons = Vec::new();
@@ -1532,7 +1584,10 @@ fn validate_name_action_context(
                 || context.renewal_block_hash.is_some()
                 || context.renewal_valid_at_candidate.is_some()
             {
-                return Err(HnsWalletError::InvalidEvidence);
+                return Err(name_preparation_stage(
+                    "transfer-only context fields",
+                    HnsWalletError::InvalidEvidence,
+                ));
             }
             if state.transfer.get() != 0 {
                 expected_reasons.push(NameActionIneligibility::TransferAlreadyPending);
@@ -1609,9 +1664,15 @@ fn validate_name_action_context(
         expected_reasons.push(NameActionIneligibility::OwnerSpentInMempool);
     }
     if reasons != &expected_reasons {
-        return Err(HnsWalletError::InvalidEvidence);
+        return Err(name_preparation_stage(
+            "eligibility reason derivation",
+            HnsWalletError::InvalidEvidence,
+        ));
     }
     if require_eligible && !context.action_eligible {
+        if reasons.contains(&NameActionIneligibility::NameExpiredAtCandidate) {
+            return Err(HnsWalletError::NameExpired);
+        }
         if action == HnsNameAction::Finalize
             && reasons.as_slice() == [NameActionIneligibility::TransferNotMature]
         {
@@ -1619,7 +1680,10 @@ fn validate_name_action_context(
                 eligible_height: finalize_eligible_height.ok_or(HnsWalletError::InvalidEvidence)?,
             });
         }
-        return Err(HnsWalletError::InvalidEvidence);
+        return Err(name_preparation_stage(
+            "action eligibility",
+            HnsWalletError::InvalidEvidence,
+        ));
     }
     Ok(())
 }
@@ -2858,19 +2922,30 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         if recipient_display != request.recipient {
             return Err(HnsWalletError::InvalidAddress);
         }
-        let authority =
-            self.verify_wallet_name_action_v2(&request.name, HnsNameAction::Transfer)?;
+        let authority = self
+            .verify_wallet_name_action_v2(&request.name, HnsNameAction::Transfer)
+            .map_err(|error| name_preparation_stage("ownership verification", error))?;
         if authority.recipient.is_some() {
-            return Err(HnsWalletError::InvalidEvidence);
+            return Err(name_preparation_stage(
+                "transfer recipient state",
+                HnsWalletError::InvalidEvidence,
+            ));
         }
         let state = NameState::decode(NameHash::new(authority.name_hash), &authority.current_state)
-            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+            .map_err(|_| {
+                name_preparation_stage("current-state decoding", HnsWalletError::InvalidEvidence)
+            })?;
         let source = tracked_name_source_from_coin(
             authority.binding,
             &authority.owner_coin,
             authority.owner_inclusion,
+            authority
+                .context
+                .owner_coin_source_binding
+                .unwrap_or(ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection),
             authority.owner_derivation,
-        )?;
+        )
+        .map_err(|error| name_preparation_stage("owner coin projection", error))?;
         let source_evidence = HnsNameSourceEvidence {
             preparation_binding: authority.binding,
             preparation_mempool: authority.mempool,
@@ -2898,6 +2973,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             request.maximum_fee,
             now,
         )
+        .map_err(|error| name_preparation_stage("transaction construction", error))
     }
 
     pub fn prepare_name_finalize(
@@ -2920,8 +2996,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let account_revision = cache.account_revision;
         let cached_coins = cache.coins.clone();
         drop(cache);
-        let authority =
-            self.verify_wallet_name_action_v2(&request.name, HnsNameAction::Finalize)?;
+        let authority = self
+            .verify_wallet_name_action_v2(&request.name, HnsNameAction::Finalize)
+            .map_err(|error| name_preparation_stage("ownership verification", error))?;
         let recipient = authority
             .recipient
             .clone()
@@ -2944,8 +3021,13 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             authority.binding,
             &authority.owner_coin,
             authority.owner_inclusion,
+            authority
+                .context
+                .owner_coin_source_binding
+                .unwrap_or(ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection),
             authority.owner_derivation,
-        )?;
+        )
+        .map_err(|error| name_preparation_stage("owner coin projection", error))?;
         let finalize = HnsFinalizeTerms {
             transfer_height: authority
                 .context
@@ -2999,6 +3081,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             request.maximum_fee,
             now,
         )
+        .map_err(|error| name_preparation_stage("transaction construction", error))
     }
 
     // Each value is separately checked against node evidence and cached
@@ -3080,26 +3163,37 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         drop(cache);
         let wallet_name_addresses = {
             let store = self.store_lock()?;
-            persisted_name_addresses(&store, &config)?
+            persisted_name_addresses(&store, &config)
+                .map_err(|error| name_preparation_stage("address load", error))?
         };
-        validate_wallet_name_addresses(&wallet_name_addresses)?;
+        validate_wallet_name_addresses(&wallet_name_addresses)
+            .map_err(|error| name_preparation_stage("address validation", error))?;
         let (context, state, owner_coin) = self
-            .require_action_context_v2(&config, action, name_hash, binding, mempool, true, true)?;
+            .require_action_context_v2(&config, action, name_hash, binding, mempool, true, true)
+            .map_err(|error| name_preparation_stage("context validation", error))?;
         if state.name.as_slice() != name
             || !state.registered
-            || state.expired
             || state.revoked.get() != 0
             || owner_coin.address.version != 0
             || owner_coin.address.hash.len() != 20
         {
-            return Err(HnsWalletError::NameNotOwned);
+            return Err(name_preparation_stage(
+                "owner-state validation",
+                HnsWalletError::NameNotOwned,
+            ));
         }
         match action {
             HnsNameAction::Transfer if state.transfer.get() != 0 => {
-                return Err(HnsWalletError::NameNotOwned);
+                return Err(name_preparation_stage(
+                    "transfer-state validation",
+                    HnsWalletError::NameNotOwned,
+                ));
             }
             HnsNameAction::Finalize if state.transfer.get() == 0 => {
-                return Err(HnsWalletError::NameNotOwned);
+                return Err(name_preparation_stage(
+                    "finalize-state validation",
+                    HnsWalletError::NameNotOwned,
+                ));
             }
             _ => {}
         }
@@ -3110,9 +3204,14 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let owner_derivation = matches
             .next()
             .map(|address| address.derivation)
-            .ok_or(HnsWalletError::NameNotOwned)?;
+            .ok_or_else(|| {
+                name_preparation_stage("owner derivation", HnsWalletError::NameNotOwned)
+            })?;
         if matches.next().is_some() {
-            return Err(HnsWalletError::InvalidEvidence);
+            return Err(name_preparation_stage(
+                "owner derivation uniqueness",
+                HnsWalletError::InvalidEvidence,
+            ));
         }
         let recipient = match action {
             HnsNameAction::Transfer => None,
@@ -3130,7 +3229,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             output_index: owner_coin.outpoint.index,
         };
         if owner_outpoint != context.owner_outpoint {
-            return Err(HnsWalletError::InvalidEvidence);
+            return Err(name_preparation_stage(
+                "owner outpoint binding",
+                HnsWalletError::InvalidEvidence,
+            ));
         }
         let cache = self.cache_read()?;
         if cache.binding != Some(binding) || cache.mempool_binding != Some(mempool) {
@@ -4124,6 +4226,67 @@ mod tests {
             true,
         )
         .expect("eligible pruning-safe context");
+
+        let mut historically_expired_state = state.clone();
+        historically_expired_state.expired = true;
+        let mut historically_expired_context = pruning_safe.clone();
+        historically_expired_context.current_state = historically_expired_state
+            .encode()
+            .expect("historically expired state");
+        validate_name_action_context(
+            &account.config,
+            HnsNameAction::Finalize,
+            historically_expired_state.name_hash.into_bytes(),
+            owner_outpoint,
+            historically_expired_context.owner_inclusion,
+            binding,
+            mempool,
+            &historically_expired_state,
+            &historically_expired_context,
+            true,
+            true,
+        )
+        .expect("historical expiration resource flag does not imply current expiration");
+
+        tracked_name_source_from_coin(
+            binding,
+            &active_owner_coin,
+            pruning_safe.owner_inclusion,
+            ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection,
+            owned.derivation,
+        )
+        .expect("trusted active-UTXO projection has no transaction position");
+
+        let mut locally_verified_inclusion = pruning_safe.owner_inclusion;
+        locally_verified_inclusion.transaction_index = Some(1);
+        tracked_name_source_from_coin(
+            binding,
+            &active_owner_coin,
+            locally_verified_inclusion,
+            ActiveNameOwnerCoinSourceBinding::LocallyVerifiedFilteredBlock,
+            owned.derivation,
+        )
+        .expect("locally verified filtered-block owner retains its transaction position");
+        assert!(
+            tracked_name_source_from_coin(
+                binding,
+                &active_owner_coin,
+                locally_verified_inclusion,
+                ActiveNameOwnerCoinSourceBinding::TrustedNodeActiveUtxoProjection,
+                owned.derivation,
+            )
+            .is_err()
+        );
+        assert!(
+            tracked_name_source_from_coin(
+                binding,
+                &active_owner_coin,
+                pruning_safe.owner_inclusion,
+                ActiveNameOwnerCoinSourceBinding::LocallyVerifiedFilteredBlock,
+                owned.derivation,
+            )
+            .is_err()
+        );
 
         let mut mixed_sources = pruning_safe.clone();
         mixed_sources.owner_transaction = transfer_transaction.encode().expect("transfer");

@@ -64,12 +64,12 @@ use hns_wallet_provider::{
 };
 use hns_wallet_service::{
     MAX_JAVASCRIPT_SAFE_INTEGER, NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE,
-    NativeHnsNameOwnershipStatus, NativeHnsNameResourceStatus, NativeHnsNameSummary,
-    NativeHnsValueSnapshot, PersistentHnsAccountConfig, PersistentHnsAccountRuntime,
-    PersistentHnsReadConfig, PersistentHnsReadRuntime, PersistentHnsValueConfig,
-    PersistentHnsValueRuntime, PersistentShakedexConfig, PersistentShakescapeTransport,
-    ServiceError, ServiceRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN, TrustedNativeHnsValueAction,
-    WalletService,
+    NativeHnsFinalizeNoticePhase, NativeHnsNameOwnershipStatus, NativeHnsNameResourceStatus,
+    NativeHnsNameSummary, NativeHnsValueSnapshot, PersistentHnsAccountConfig,
+    PersistentHnsAccountRuntime, PersistentHnsReadConfig, PersistentHnsReadRuntime,
+    PersistentHnsValueConfig, PersistentHnsValueRuntime, PersistentShakedexConfig,
+    PersistentShakescapeTransport, ServiceError, ServiceRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN,
+    TrustedNativeHnsValueAction, WalletService,
 };
 use hns_wallet_shakedex::{
     DirectShakescapeBoardSyncReport, ShakedexSellerPolicy, ShakescapeHnsaEndpointBinding,
@@ -229,7 +229,29 @@ pub struct MobileHnsReadSnapshot {
     pub known_names: Vec<MobileHnsNameSummary>,
     pub known_name_count: u32,
     pub known_names_complete: bool,
+    /// Durable TRANSFER-to-FINALIZE lifecycle notices. These are present only
+    /// on the full value controller; the read-only controller returns none.
+    pub finalize_notices: Vec<MobileHnsFinalizeNotice>,
     pub module_status: SyncStatus,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileHnsFinalizeNotice {
+    pub name: String,
+    pub transaction_id: String,
+    pub phase: MobileHnsFinalizeNoticePhase,
+    pub current_height: u64,
+    pub finalize_eligible_height: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MobileHnsFinalizeNoticePhase {
+    TransferPending,
+    FinalizeWaiting,
+    FinalizeAvailable,
+    FinalizePending,
 }
 
 /// One deterministic page from the last authenticated known-name projection.
@@ -1423,6 +1445,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
             known_names,
             known_name_count,
             known_names_complete,
+            finalize_notices: Vec::new(),
             module_status: SyncStatus {
                 phase: SyncPhase::Ready,
                 validated_height: height,
@@ -2619,6 +2642,30 @@ fn mobile_hns_value_snapshot(
     let mut first_page = known_names.clone();
     first_page.truncate(MAX_MOBILE_HNS_NAME_PAGE);
     let known_names_complete = first_page.len() == known_names.len();
+    let finalize_notices = snapshot
+        .finalize_notices
+        .into_iter()
+        .map(|notice| MobileHnsFinalizeNotice {
+            name: notice.name,
+            transaction_id: notice.transaction_id,
+            phase: match notice.phase {
+                NativeHnsFinalizeNoticePhase::TransferPending => {
+                    MobileHnsFinalizeNoticePhase::TransferPending
+                }
+                NativeHnsFinalizeNoticePhase::FinalizeWaiting => {
+                    MobileHnsFinalizeNoticePhase::FinalizeWaiting
+                }
+                NativeHnsFinalizeNoticePhase::FinalizeAvailable => {
+                    MobileHnsFinalizeNoticePhase::FinalizeAvailable
+                }
+                NativeHnsFinalizeNoticePhase::FinalizePending => {
+                    MobileHnsFinalizeNoticePhase::FinalizePending
+                }
+            },
+            current_height: notice.current_height,
+            finalize_eligible_height: notice.finalize_eligible_height,
+        })
+        .collect();
     Ok((
         MobileHnsReadSnapshot {
             balance: snapshot.balance,
@@ -2628,6 +2675,7 @@ fn mobile_hns_value_snapshot(
             known_names: first_page,
             known_name_count,
             known_names_complete,
+            finalize_notices,
             module_status: snapshot.module_status,
         },
         known_names,
@@ -3950,6 +3998,7 @@ mod tests {
         );
         assert!(snapshot.transaction_history.is_empty());
         assert!(snapshot.known_names.is_empty());
+        assert!(snapshot.finalize_notices.is_empty());
         assert_eq!(snapshot.known_name_count, 0);
         assert!(snapshot.known_names_complete);
         assert_eq!(
@@ -3985,6 +4034,7 @@ mod tests {
             fields,
             BTreeSet::from([
                 "balance",
+                "finalizeNotices",
                 "knownNameCount",
                 "knownNames",
                 "knownNamesComplete",

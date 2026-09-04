@@ -6,7 +6,7 @@
 //! hostile-page permission boundary and binds its exact approval identifier to
 //! the encrypted, single-use approval consumed by the HNS runtime.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use hns_marketplace_protocol::NameMarketMessage;
 use hns_swap::HnsHtlc;
@@ -21,9 +21,9 @@ use hns_wallet_ffi::{
 };
 use hns_wallet_hns::{
     HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED, HNS_VALUE_RUNTIME_RELEASE_QUALIFIED, HnsBackend,
-    HnsClock, HnsDirectShakescapePeer, HnsNetwork, HnsRuntimeConfig, HnsWalletError,
-    HnsWalletRuntime, KnownName, NameOperation, NameOperationState, PrepareNameFinalize,
-    PrepareNameTransfer,
+    HnsClock, HnsDirectShakescapePeer, HnsNameAction, HnsNetwork, HnsRuntimeConfig, HnsWalletError,
+    HnsWalletRuntime, KnownName, NameOperation, NameOperationState, NameOwnershipStatus,
+    PrepareNameFinalize, PrepareNameTransfer,
 };
 use hns_wallet_provider::{
     APPROVAL_LIFETIME_SECONDS, ApprovedCall, PendingApproval, ProviderMethod, SelectedNamespace,
@@ -51,12 +51,12 @@ use sha2::{Digest, Sha256};
 use super::{
     MAX_HNS_NAME_BYTES, MAX_JAVASCRIPT_SAFE_INTEGER, MAX_PROVIDER_HNS_READ_ITEMS,
     MAX_PUBLIC_STRING_BYTES, ServiceError, ServiceRuntime, WalletService, bounded_provider_value,
-    hns_native_name_import_failure, hns_read_failure, hns_read_result_bound, hns_runtime_failure,
-    invalid_request, is_printable_ascii, lowercase_hex, native_hns_name_summary,
-    persistent_store_failure, public_hns_amount, public_hns_name_read, public_hns_name_summary,
-    public_hns_receive_target, public_hns_transaction_summary, validate_approval_summary,
-    validate_empty_params, validate_hns_account_summary, validate_hns_wallet_read_scope,
-    wallet_locked,
+    canonical_hns_name, hns_native_name_import_failure, hns_read_failure, hns_read_result_bound,
+    hns_runtime_failure, invalid_request, is_printable_ascii, lowercase_hex,
+    native_hns_name_summary, persistent_store_failure, public_hns_amount, public_hns_name_read,
+    public_hns_name_summary, public_hns_receive_target, public_hns_transaction_summary,
+    validate_approval_summary, validate_empty_params, validate_hns_account_summary,
+    validate_hns_wallet_read_scope, wallet_locked,
 };
 
 /// Reserved origin commitment used only by the installed native value UI.
@@ -86,7 +86,28 @@ pub struct NativeHnsValueSnapshot {
     pub name_receive_target: HnsNameReceiveTarget,
     pub transactions: Vec<TransactionSummary>,
     pub known_names: Vec<super::NativeHnsNameSummary>,
+    pub finalize_notices: Vec<NativeHnsFinalizeNotice>,
     pub module_status: SyncStatus,
+}
+
+/// Durable native notice spanning TRANSFER submission through verified
+/// FINALIZE completion. It is derived from encrypted name workflows plus the
+/// current authenticated name state; a host cannot manufacture its lifecycle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeHnsFinalizeNotice {
+    pub name: String,
+    pub transaction_id: String,
+    pub phase: NativeHnsFinalizeNoticePhase,
+    pub current_height: u64,
+    pub finalize_eligible_height: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeHnsFinalizeNoticePhase {
+    TransferPending,
+    FinalizeWaiting,
+    FinalizeAvailable,
+    FinalizePending,
 }
 
 /// Opaque, single-owner permit proving that the exact native value action was
@@ -652,7 +673,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
                 recipient: params.recipient.clone(),
                 maximum_fee: params.maximum_fee,
             })
-            .map_err(hns_runtime_failure)?;
+            .map_err(crate::hns_name_preparation_failure)?;
         Ok((params, prepared))
     }
 
@@ -673,7 +694,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
                 expected_recipient: params.expected_recipient.clone(),
                 maximum_fee: params.maximum_fee,
             })
-            .map_err(hns_runtime_failure)?;
+            .map_err(crate::hns_name_preparation_failure)?;
         Ok((params, prepared))
     }
 
@@ -916,6 +937,141 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
             next_action: next_action.map(str::to_owned),
             terminal,
         }
+    }
+
+    fn native_finalize_notices(
+        &self,
+        names: &[KnownName],
+        operations: &[NameOperation],
+        current_height: u64,
+    ) -> Result<Vec<NativeHnsFinalizeNotice>, ServiceFailure> {
+        if operations.len() > MAX_PROVIDER_HNS_READ_ITEMS {
+            return Err(hns_read_result_bound());
+        }
+        let transfer_lockup = match self.configured.network {
+            HnsNetwork::Mainnet | HnsNetwork::Testnet => 288_u64,
+            HnsNetwork::Regtest => 10,
+            HnsNetwork::Simnet => 5,
+        };
+        let mut operations_by_name: BTreeMap<&[u8], Vec<&NameOperation>> = BTreeMap::new();
+        for operation in operations {
+            operations_by_name
+                .entry(operation.name.as_slice())
+                .or_default()
+                .push(operation);
+        }
+        let active = |state| {
+            matches!(
+                state,
+                NameOperationState::Authorized
+                    | NameOperationState::Broadcast
+                    | NameOperationState::Mempool
+                    | NameOperationState::RequiresRebroadcast
+                    | NameOperationState::ReapprovalRequired
+            )
+        };
+        let mut notices = Vec::new();
+        for name in names {
+            let Some(name_operations) = operations_by_name.get(name.name.as_slice()) else {
+                continue;
+            };
+            let current = name.canonical_current_state.as_ref();
+            let outgoing = matches!(
+                name.ownership_status,
+                NameOwnershipStatus::OutgoingTransfer { .. }
+            );
+            let active_finalize = name_operations.iter().copied().find(|operation| {
+                operation.action == HnsNameAction::Finalize
+                    && active(operation.state)
+                    && operation.transaction.is_some()
+            });
+            if let Some(finalize) = active_finalize {
+                let transaction = finalize
+                    .transaction
+                    .ok_or_else(|| hns_read_failure(HnsWalletError::InvalidWorkflow))?;
+                let finalized = current.is_some_and(|state| {
+                    state.transfer_height == 0
+                        && state
+                            .owner_outpoint
+                            .is_some_and(|owner| owner.transaction == transaction)
+                });
+                if finalized {
+                    continue;
+                }
+                if outgoing {
+                    notices.push(NativeHnsFinalizeNotice {
+                        name: canonical_hns_name(name)?.to_owned(),
+                        transaction_id: lowercase_hex(transaction.as_bytes()),
+                        phase: NativeHnsFinalizeNoticePhase::FinalizePending,
+                        current_height,
+                        finalize_eligible_height: finalize.finalize_eligible_height,
+                    });
+                }
+                continue;
+            }
+
+            if outgoing {
+                let state =
+                    current.ok_or_else(|| hns_read_failure(HnsWalletError::InvalidEvidence))?;
+                let transfer_height = u64::from(state.transfer_height);
+                if transfer_height == 0 {
+                    return Err(hns_read_failure(HnsWalletError::InvalidEvidence));
+                }
+                let eligible_height = transfer_height
+                    .checked_add(transfer_lockup)
+                    .ok_or_else(|| hns_read_failure(HnsWalletError::Arithmetic))?;
+                let transfer = name_operations.iter().copied().find(|operation| {
+                    operation.action == HnsNameAction::Transfer
+                        && operation.transaction.is_some_and(|transaction| {
+                            state
+                                .owner_outpoint
+                                .is_some_and(|owner| owner.transaction == transaction)
+                        })
+                });
+                let Some(transfer) = transfer else { continue };
+                notices.push(NativeHnsFinalizeNotice {
+                    name: canonical_hns_name(name)?.to_owned(),
+                    transaction_id: lowercase_hex(
+                        transfer
+                            .transaction
+                            .ok_or_else(|| hns_read_failure(HnsWalletError::InvalidWorkflow))?
+                            .as_bytes(),
+                    ),
+                    phase: if current_height >= eligible_height {
+                        NativeHnsFinalizeNoticePhase::FinalizeAvailable
+                    } else {
+                        NativeHnsFinalizeNoticePhase::FinalizeWaiting
+                    },
+                    current_height,
+                    finalize_eligible_height: Some(eligible_height),
+                });
+                continue;
+            }
+
+            if matches!(
+                name.ownership_status,
+                NameOwnershipStatus::WalletOwned { .. }
+            ) && let Some(transfer) = name_operations.iter().copied().find(|operation| {
+                operation.action == HnsNameAction::Transfer
+                    && active(operation.state)
+                    && operation.transaction.is_some()
+            }) {
+                notices.push(NativeHnsFinalizeNotice {
+                    name: canonical_hns_name(name)?.to_owned(),
+                    transaction_id: lowercase_hex(
+                        transfer
+                            .transaction
+                            .ok_or_else(|| hns_read_failure(HnsWalletError::InvalidWorkflow))?
+                            .as_bytes(),
+                    ),
+                    phase: NativeHnsFinalizeNoticePhase::TransferPending,
+                    current_height,
+                    finalize_eligible_height: None,
+                });
+            }
+        }
+        notices.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(notices)
     }
 
     fn execute_approved_send(
@@ -1671,6 +1827,16 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         if snapshot.transactions.len() > MAX_PROVIDER_HNS_READ_ITEMS {
             return Err(hns_read_result_bound());
         }
+        let operations = self
+            .runtime
+            .runtime
+            .list_name_operations()
+            .map_err(hns_runtime_failure)?;
+        let finalize_notices = self.runtime.native_finalize_notices(
+            &snapshot.known_names,
+            &operations,
+            snapshot.binding.chain.tip.height,
+        )?;
         let known_names = snapshot
             .known_names
             .iter()
@@ -1683,6 +1849,7 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             name_receive_target: snapshot.name_receive_target,
             transactions: snapshot.transactions,
             known_names,
+            finalize_notices,
             module_status: self.runtime.runtime.sync_status(),
         })
     }

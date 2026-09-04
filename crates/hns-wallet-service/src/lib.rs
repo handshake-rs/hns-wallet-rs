@@ -49,7 +49,8 @@ pub use native_read_profile::{
     provision_native_hns_read_profile, revoke_native_hns_read_profile,
 };
 pub use native_value_runtime::{
-    NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE, NativeHnsValueSnapshot, PersistentHnsValueConfig,
+    NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE, NativeHnsFinalizeNotice,
+    NativeHnsFinalizeNoticePhase, NativeHnsValueSnapshot, PersistentHnsValueConfig,
     PersistentHnsValueRuntime, PersistentShakedexConfig, PersistentShakescapeTransport,
     TRUSTED_NATIVE_HNS_VALUE_ORIGIN, TrustedNativeHnsValueAction,
 };
@@ -3158,6 +3159,18 @@ fn hns_runtime_failure(error: HnsWalletError) -> ServiceFailure {
         message: message.to_owned(),
         unsupported_capability: None,
     }
+}
+
+// Native name preparation has several authenticated evidence boundaries after
+// account selection. Preserve the safe, public error classification, but do
+// not collapse an ownership/proof failure into the misleading account-selector
+// message. The detail contains only the closed HnsWalletError description; it
+// never includes a name, address, transaction, script, or store path.
+fn hns_name_preparation_failure(error: HnsWalletError) -> ServiceFailure {
+    let detail = error.to_string();
+    let mut failure = hns_runtime_failure(error);
+    failure.message = format!("Handshake name action preparation failed: {detail}");
+    failure
 }
 
 fn hns_read_failure(error: HnsWalletError) -> ServiceFailure {

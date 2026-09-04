@@ -2779,6 +2779,42 @@ mod tests {
     }
 
     #[test]
+    fn historical_expiration_resource_flag_does_not_override_current_lifecycle() {
+        let name = b"expired-wallet-name".to_vec();
+        let name_hash = hash_name(&name).unwrap();
+        let state = NameState {
+            name_hash,
+            name,
+            height: Height::new(100),
+            renewal: Height::new(100),
+            owner: Outpoint {
+                transaction_hash: hns_primitives::TransactionHash::new([21; 32]),
+                index: 0,
+            },
+            value: Dollarydoos::new(900_000),
+            highest: Dollarydoos::new(900_000),
+            resource_data: Vec::new(),
+            transfer: Height::new(0),
+            revoked: Height::new(0),
+            claimed: Height::new(0),
+            renewals: 0,
+            registered: true,
+            expired: true,
+            weak: false,
+        };
+        let parameters = embedded_name_parameters(Network::Regtest);
+        assert_eq!(
+            embedded_name_lifecycle(&state, 101, parameters),
+            HnsNameLifecycle::Opening
+        );
+        // HSD's `expired` bit says resource data survived an earlier expiration
+        // reset. Current expiration is derived from the authenticated lifecycle
+        // at the candidate height, so a re-registered name can retain this bit
+        // without being currently expired.
+        assert!(!embedded_name_is_expired(&state, 101, parameters));
+    }
+
+    #[test]
     fn agreed_urkel_state_and_verified_post_boundary_transfer_drive_name_actions() {
         let store = store();
         let account = AccountId::new([22; 16]);

@@ -3962,7 +3962,6 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         }
         let current = validated.current.ok_or(HnsWalletError::NameNotOwned)?;
         if !current.state.registered
-            || current.state.expired
             || current.state.revoked.get() != 0
             || current.state.transfer.get() != 0
         {
@@ -4678,7 +4677,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             mempool_binding,
             now,
         )?);
-        self.retain_or_insert_pending_send_activity(&store, &mut transactions)?;
+        self.retain_or_insert_pending_wallet_activity(&store, &mut transactions)?;
         persist_reconciled_entities(&mut store, &account.config, &coins, &transactions, now)?;
         pending_user_actions.extend(self.reconcile_settlement_workflows(
             &mut store,
@@ -4823,11 +4822,21 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 preparation.fenced_account.config.birthday_height,
             ),
         )?;
-        let previous_transactions = preparation
+        let mut previous_transactions = preparation
             .transactions
             .iter()
             .map(|stored| stored.value.clone())
             .collect::<Vec<_>>();
+        // Durable locally submitted sends and name actions may not yet be in
+        // the restored script history. Seed them before reconciliation so the
+        // exact synchronized mempool evidence can classify them immediately.
+        self.store.try_with_store(|store| {
+            retain_or_insert_pending_wallet_activity_for_config(
+                store,
+                &scan.account.config,
+                &mut previous_transactions,
+            )
+        })?;
         let mut transactions = annotate_persisted_value_read_unavailable(
             "reconciling the direct wallet history",
             reconcile_hns_read_transactions(
@@ -4855,7 +4864,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             active_input_reservation_outpoints(store, &scan.account.config, now)
         })?;
         self.store.try_with_store(|store| {
-            retain_or_insert_pending_send_activity_for_config(
+            retain_or_insert_pending_wallet_activity_for_config(
                 store,
                 &scan.account.config,
                 &mut transactions,
@@ -5865,13 +5874,13 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         Ok(pending)
     }
 
-    fn retain_or_insert_pending_send_activity(
+    fn retain_or_insert_pending_wallet_activity(
         &self,
         store: &WalletStore,
         transactions: &mut Vec<HnsTransactionRecord>,
     ) -> Result<(), HnsWalletError> {
         let config = self.cache_read()?.account.config.clone();
-        retain_or_insert_pending_send_activity_for_config(store, &config, transactions)
+        retain_or_insert_pending_wallet_activity_for_config(store, &config, transactions)
     }
 
     fn has_competing_spender(
@@ -6694,7 +6703,7 @@ fn send_is_within_propagation_grace(
         && now_unix.saturating_sub(updated_at_unix) < SEND_PROPAGATION_GRACE_SECONDS
 }
 
-fn retain_or_insert_pending_send_activity_for_config(
+fn retain_or_insert_pending_wallet_activity_for_config(
     store: &WalletStore,
     config: &HnsRuntimeConfig,
     transactions: &mut Vec<HnsTransactionRecord>,
@@ -6749,6 +6758,37 @@ fn retain_or_insert_pending_send_activity_for_config(
         };
         transactions.push(pending_send_record(&stored, status)?);
     }
+    for kind in [WorkflowKind::NameTransfer, WorkflowKind::NameFinalize] {
+        let pending = store
+            .list_workflows_complete::<HnsNameWorkflow>(kind, MAX_HISTORY_RESULTS)?
+            .into_iter()
+            .filter(|stored| {
+                stored.state.plan.wallet_id == config.wallet_id
+                    && stored.state.plan.account_id == config.account_id
+            });
+        for stored in pending {
+            let Some(status) = pending_name_transaction_status(stored.state.stage) else {
+                continue;
+            };
+            let txid = stored
+                .state
+                .transaction
+                .ok_or(HnsWalletError::InvalidWorkflow)?;
+            if let Some(transaction) = transactions
+                .iter_mut()
+                .find(|transaction| transaction.summary.txid == txid)
+            {
+                if transaction.summary.status == LocalTransactionStatus::Dropped {
+                    transaction.summary.status = status;
+                }
+                continue;
+            }
+            transactions.push(pending_name_record(&stored, status)?);
+        }
+    }
+    if transactions.len() > MAX_HISTORY_RESULTS {
+        return Err(HnsWalletError::HistoryLimit);
+    }
     transactions.sort_by(|left, right| {
         right
             .summary
@@ -6763,6 +6803,74 @@ fn retain_or_insert_pending_send_activity_for_config(
             .then_with(|| left.summary.txid.cmp(&right.summary.txid))
     });
     Ok(())
+}
+
+fn pending_name_transaction_status(stage: NameOperationState) -> Option<LocalTransactionStatus> {
+    match stage {
+        NameOperationState::Authorized => Some(LocalTransactionStatus::Authorized),
+        NameOperationState::Broadcast => Some(LocalTransactionStatus::Broadcast),
+        NameOperationState::Mempool => Some(LocalTransactionStatus::Mempool),
+        NameOperationState::RequiresRebroadcast | NameOperationState::ReapprovalRequired => {
+            Some(LocalTransactionStatus::Dropped)
+        }
+        NameOperationState::Conflicted => Some(LocalTransactionStatus::Conflicted),
+        NameOperationState::Prepared
+        | NameOperationState::TransferLocked
+        | NameOperationState::FinalizeEligible
+        | NameOperationState::Finalized
+        | NameOperationState::TransferCancelled
+        | NameOperationState::Expired
+        | NameOperationState::Cancelled => None,
+    }
+}
+
+fn pending_name_record(
+    stored: &StoredWorkflow<HnsNameWorkflow>,
+    status: LocalTransactionStatus,
+) -> Result<HnsTransactionRecord, HnsWalletError> {
+    if !matches!(
+        status,
+        LocalTransactionStatus::Authorized
+            | LocalTransactionStatus::Broadcast
+            | LocalTransactionStatus::Mempool
+            | LocalTransactionStatus::Conflicted
+            | LocalTransactionStatus::Dropped
+    ) {
+        return Err(HnsWalletError::InvalidWorkflow);
+    }
+    let txid = stored
+        .state
+        .transaction
+        .ok_or(HnsWalletError::InvalidWorkflow)?;
+    let raw = stored
+        .state
+        .signed_transaction
+        .clone()
+        .ok_or(HnsWalletError::InvalidWorkflow)?;
+    decode_transaction_for_id(&raw, txid)?;
+    Ok(HnsTransactionRecord {
+        summary: TransactionSummary {
+            module: ModuleId::Handshake,
+            txid,
+            status,
+            // The name value is preserved by TRANSFER/FINALIZE and is not an
+            // ordinary spendable balance. Only the network fee is a wallet
+            // value loss for this activity row.
+            net_amount: SignedBaseUnits {
+                negative: true,
+                magnitude: stored.state.plan.fee,
+            },
+            fee: Some(stored.state.plan.fee),
+            block_height: stored
+                .state
+                .last_verified_inclusion
+                .map(|inclusion| inclusion.height),
+            first_seen_unix: Some(stored.updated_at_unix),
+            confirmation_count: 0,
+        },
+        raw,
+        inclusion: stored.state.last_verified_inclusion,
+    })
 }
 
 fn pending_send_record(
@@ -11164,6 +11272,8 @@ pub enum HnsWalletError {
     HistoryLimit,
     #[error("current name owner output is not controlled by this account")]
     NameNotOwned,
+    #[error("Handshake name is expired and cannot be transferred or finalized")]
+    NameExpired,
     #[error("name transfer is not finalizable before candidate height {eligible_height}")]
     NameFinalizeNotMature { eligible_height: u64 },
     #[error("wallet state encoding failed")]
@@ -11289,6 +11399,34 @@ mod tests {
             pending_send_record(&mismatched, LocalTransactionStatus::Broadcast),
             Err(HnsWalletError::InvalidEvidence)
         ));
+    }
+
+    #[test]
+    fn pending_name_activity_statuses_cover_submission_and_recovery() {
+        assert_eq!(
+            pending_name_transaction_status(NameOperationState::Authorized),
+            Some(LocalTransactionStatus::Authorized)
+        );
+        assert_eq!(
+            pending_name_transaction_status(NameOperationState::Broadcast),
+            Some(LocalTransactionStatus::Broadcast)
+        );
+        assert_eq!(
+            pending_name_transaction_status(NameOperationState::Mempool),
+            Some(LocalTransactionStatus::Mempool)
+        );
+        assert_eq!(
+            pending_name_transaction_status(NameOperationState::RequiresRebroadcast),
+            Some(LocalTransactionStatus::Dropped)
+        );
+        assert_eq!(
+            pending_name_transaction_status(NameOperationState::Conflicted),
+            Some(LocalTransactionStatus::Conflicted)
+        );
+        assert_eq!(
+            pending_name_transaction_status(NameOperationState::Finalized),
+            None
+        );
     }
 
     #[test]
