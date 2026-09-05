@@ -874,9 +874,9 @@ impl HnsBackend for EmbeddedHnsBackend {
         require_binding(&state, binding)?;
         let view = embedded_name_view(&state, name_hash, binding)?;
         let (proof_owner_outpoint, proof_owner_transaction, proof_owner_inclusion) =
-            optional_name_owner_fields(view.proof_owner.as_ref());
+            optional_name_owner_fields(view.proof_state.as_ref(), view.proof_owner.as_ref());
         let (current_owner_outpoint, current_owner_transaction, current_owner_inclusion) =
-            optional_name_owner_fields(view.current_owner.as_ref());
+            optional_name_owner_fields(view.current.as_ref(), view.current_owner.as_ref());
         Ok(NameEvidence {
             binding,
             proof: NameProofResponse {
@@ -938,6 +938,7 @@ impl HnsBackend for EmbeddedHnsBackend {
 
 struct EmbeddedNameView {
     proof: VerifiedHnsNameProof,
+    proof_state: Option<NameState>,
     current_raw: Option<Vec<u8>>,
     current: Option<NameState>,
     proof_owner: Option<EmbeddedNameOwner>,
@@ -1068,6 +1069,7 @@ fn embedded_name_view(
     let current_owner = name_owner_observation(current.as_ref(), &observations)?;
     Ok(EmbeddedNameView {
         proof,
+        proof_state,
         current_raw,
         current,
         proof_owner,
@@ -1086,10 +1088,18 @@ fn name_owner_observation(
         return Ok(None);
     };
     let txid = TransactionHash::new(owner.transaction_hash.into_bytes());
-    let observation = observations
+    let Some(observation) = observations
         .iter()
         .find(|observation| observation.txid == txid)
-        .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)?;
+    else {
+        // A direct wallet deliberately indexes only transactions matching its
+        // installed scripts. The authenticated Urkel name state can therefore
+        // reference an arbitrary non-wallet owner's historical transaction
+        // that is correctly absent here. Retain the state and owner outpoint
+        // as watch-only evidence; ownership-sensitive operations still require
+        // the full locally verified owner transaction below.
+        return Ok(None);
+    };
     let output = observation
         .transaction
         .outputs
@@ -1113,19 +1123,31 @@ fn name_owner_observation(
 }
 
 fn optional_name_owner_fields(
+    state: Option<&NameState>,
     owner: Option<&EmbeddedNameOwner>,
 ) -> (
     Option<crate::HnsOutpoint>,
     Option<Vec<u8>>,
     Option<TransactionInclusion>,
 ) {
-    owner.map_or((None, None, None), |owner| {
-        (
-            Some(owner.outpoint),
-            Some(owner.transaction.clone()),
-            Some(owner.inclusion),
-        )
-    })
+    owner.map_or_else(
+        || {
+            let outpoint = state.and_then(NameState::owner_outpoint).map(|owner| {
+                crate::HnsOutpoint {
+                    transaction: TransactionHash::new(owner.transaction_hash.into_bytes()),
+                    output_index: owner.index,
+                }
+            });
+            (outpoint, None, None)
+        },
+        |owner| {
+            (
+                Some(owner.outpoint),
+                Some(owner.transaction.clone()),
+                Some(owner.inclusion),
+            )
+        },
+    )
 }
 
 fn active_name_owner_coin(

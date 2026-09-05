@@ -1031,6 +1031,11 @@ pub enum NameResourceStatus {
 pub enum NameOwnershipStatus {
     /// Legacy persisted records remain watch-only until fresh reconciliation.
     WatchOnlyCanonicalStateDecoderUnavailable,
+    /// The canonical state and owner outpoint are authenticated, but the
+    /// filtered wallet index does not contain the owner's historical
+    /// transaction. The name remains safely trackable while value actions stay
+    /// disabled until wallet ownership can be proven.
+    WatchOnlyOwnerTransactionUnavailable,
     /// Canonical name state was authenticated without an account address set,
     /// so wallet ownership was deliberately not classified.
     WalletContextUnavailable,
@@ -1313,6 +1318,7 @@ fn validate_canonical_name_state(
     }
     let validated_owner = match (canonical_owner, raw, inclusion) {
         (None, None, None) => None,
+        (Some(_), None, None) => None,
         (Some(owner), Some(raw), Some(inclusion)) => Some(validate_name_owner_transaction(
             &state, owner, raw, inclusion,
         )?),
@@ -1611,7 +1617,11 @@ fn classify_name_ownership(
         return Ok(NameOwnershipStatus::NoCurrentOwner);
     };
     let Some(owner) = current.owner.as_ref() else {
-        return Ok(NameOwnershipStatus::NoCurrentOwner);
+        return Ok(if current.summary.owner_outpoint.is_some() {
+            NameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable
+        } else {
+            NameOwnershipStatus::NoCurrentOwner
+        });
     };
     let owner_derivation = wallet_name_derivation(&owner.output.address, wallet_name_addresses);
     if current.state.transfer.get() == 0 {
@@ -6280,6 +6290,7 @@ fn imported_wallet_derivation(status: &NameOwnershipStatus) -> Option<Derivation
             owner_derivation, ..
         } => Some(*owner_derivation),
         NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable
+        | NameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable
         | NameOwnershipStatus::WalletContextUnavailable
         | NameOwnershipStatus::NoCurrentOwner
         | NameOwnershipStatus::NotWalletOwned => None,
@@ -13199,6 +13210,29 @@ mod tests {
                 Ok(())
             })
             .expect("no partial name mutation");
+    }
+
+    #[test]
+    fn native_name_import_tracks_authenticated_owner_without_historical_transaction() {
+        let (store, config, _) = native_import_store();
+        let (_, state, transaction, outpoint) =
+            canonical_name_view(vec![93; 20], vec![7, 8, 9], None);
+        let mut evidence =
+            native_import_evidence(b"alpha", Some((state, transaction, outpoint)));
+        evidence.current_owner_transaction = None;
+        evidence.current_owner_inclusion = None;
+        let runtime = native_import_runtime(store, config, evidence, false);
+
+        let imported = runtime
+            .import_name_exact_text("alpha")
+            .expect("watch-only import with authenticated owner outpoint");
+        assert_eq!(
+            imported.ownership_status,
+            NameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable
+        );
+        assert_eq!(imported.unbound_current_owner_outpoint, Some(outpoint));
+        assert_eq!(imported.current_raw_resource.as_deref(), Some(&[7, 8, 9][..]));
+        assert!(imported.canonical_current_state.is_some());
     }
 
     #[test]

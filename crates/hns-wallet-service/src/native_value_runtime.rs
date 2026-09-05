@@ -2061,8 +2061,18 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             .ok_or_else(|| invalid_request("Handshake name text is invalid"))
     }
 
-    /// Authenticate a bounded exact-name set against one reconciled value
-    /// snapshot and commit all known-name rows in one store transaction.
+    /// Authenticate a bounded exact-name set against the last synchronized
+    /// value snapshot and commit all known-name rows in one store transaction.
+    ///
+    /// The installed native caller has already fetched each exact proof into
+    /// the direct backend before entering this boundary. Do not run an
+    /// unrelated account reconciliation here: extending the direct name watch
+    /// set can temporarily make that broader read unavailable even though the
+    /// existing value snapshot and requested proof remain authenticated. Name
+    /// import is a watch-list mutation, so [`HnsWalletRuntime::import_names`]
+    /// performs the narrower chain-binding, proof, persisted-bound, and atomic
+    /// store checks that it needs. Spending and name actions continue to pass
+    /// through `reconcile` immediately before preparation.
     pub fn import_trusted_native_hns_value_names_exact_text(
         &self,
         names: &[&str],
@@ -2077,7 +2087,6 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         {
             return Err(invalid_request("Handshake name text is invalid"));
         }
-        self.runtime.reconcile()?;
         let name_bytes = names.iter().map(|name| name.as_bytes()).collect::<Vec<_>>();
         self.runtime
             .runtime

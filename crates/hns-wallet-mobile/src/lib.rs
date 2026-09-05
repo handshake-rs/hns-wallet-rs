@@ -225,6 +225,7 @@ pub enum MobileHnsNameResourceStatus {
 #[serde(rename_all = "camelCase")]
 pub enum MobileHnsNameOwnershipStatus {
     WatchOnlyCanonicalStateDecoderUnavailable,
+    WatchOnlyOwnerTransactionUnavailable,
     WalletContextUnavailable,
     NoCurrentOwner,
     NotWalletOwned,
@@ -1831,8 +1832,8 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         }
     }
 
-    /// Atomically import exact names after one reconciliation and defer the
-    /// caller's one desired post-import snapshot refresh.
+    /// Atomically import exact names against the last synchronized value
+    /// snapshot and defer the caller's one desired post-import refresh.
     pub fn import_names_exact_text(&mut self, names: &[&str]) -> Result<usize, MobileWalletError> {
         if self.session.failed {
             return Err(MobileWalletError::ControllerFailed);
@@ -3047,6 +3048,9 @@ fn mobile_hns_name_summary(name: &KnownName) -> Result<MobileHnsNameSummary, Mob
         NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable => {
             MobileHnsNameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable
         }
+        NameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable => {
+            MobileHnsNameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable
+        }
         NameOwnershipStatus::WalletContextUnavailable => {
             MobileHnsNameOwnershipStatus::WalletContextUnavailable
         }
@@ -3122,6 +3126,9 @@ fn mobile_native_hns_name_summary(
     let ownership_status = match name.ownership_status {
         NativeHnsNameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable => {
             MobileHnsNameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable
+        }
+        NativeHnsNameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable => {
+            MobileHnsNameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable
         }
         NativeHnsNameOwnershipStatus::WalletContextUnavailable => {
             MobileHnsNameOwnershipStatus::WalletContextUnavailable

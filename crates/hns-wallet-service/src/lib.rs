@@ -102,6 +102,7 @@ pub enum NativeHnsNameResourceStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeHnsNameOwnershipStatus {
     WatchOnlyCanonicalStateDecoderUnavailable,
+    WatchOnlyOwnerTransactionUnavailable,
     WalletContextUnavailable,
     NoCurrentOwner,
     NotWalletOwned,
@@ -2774,6 +2775,9 @@ fn native_hns_name_summary(name: &KnownName) -> Result<NativeHnsNameSummary, Ser
         NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable => {
             NativeHnsNameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable
         }
+        NameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable => {
+            NativeHnsNameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable
+        }
         NameOwnershipStatus::WalletContextUnavailable => {
             NativeHnsNameOwnershipStatus::WalletContextUnavailable
         }
@@ -2977,6 +2981,9 @@ fn public_hns_name_summary(name: &KnownName) -> Result<Value, ServiceFailure> {
     let ownership_status = match &name.ownership_status {
         NameOwnershipStatus::WatchOnlyCanonicalStateDecoderUnavailable => {
             "watchOnlyCanonicalStateDecoderUnavailable"
+        }
+        NameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable => {
+            "watchOnlyOwnerTransactionUnavailable"
         }
         NameOwnershipStatus::WalletContextUnavailable => "walletContextUnavailable",
         NameOwnershipStatus::NoCurrentOwner => "noCurrentOwner",
@@ -4456,12 +4463,12 @@ mod tests {
         );
         assert_eq!(summary.registered, Some(true));
         assert_eq!(summary.expired, Some(false));
+        assert_eq!(summary.raw_resource.as_deref(), Some(&[7, 8, 9][..]));
         let debug = format!("{summary:?}");
         for forbidden in [
             "proof_state",
             "current_state",
             "owner_outpoint",
-            "raw_resource",
             "derivation",
         ] {
             assert!(!debug.contains(forbidden));
