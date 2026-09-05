@@ -3,6 +3,21 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## 0.2.3 - 2026-09-05
+
+<!-- hns-wallet-release-state: 0.2.3 release -->
+Breaking clean-break migration of the wallet and atomic-swap boundary:
+
+- preserve complete direct-peer header catch-up batches so mobile synchronization
+  does not silently stop one header short;
+- retain transfer, finalize, renewal, and other name-action lifecycle state across
+  synchronized refreshes, and validate the finalized-name renewal transition;
+- add atomic multi-name imports and authenticated raw resource-record updates;
+- expose canonical Handshake name state through the minimized mobile projection;
+  and
+- allow authenticated watch-only tracked-name imports without granting ownership
+  or transaction authority.
+
 ## 0.2.2 - 2026-09-03
 
 <!-- hns-wallet-release-state: 0.2.2 release -->

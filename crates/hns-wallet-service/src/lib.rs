@@ -2797,19 +2797,20 @@ fn native_hns_name_summary(name: &KnownName) -> Result<NativeHnsNameSummary, Ser
         .map_or((None, None), |state| {
             (Some(state.registered), Some(state.expired))
         });
-    let canonical_state = name.canonical_current_state.as_ref().map(|state| {
-        NativeHnsNameStateSummary {
-            value: state.value,
-            highest: state.highest,
-            start_height: state.start_height,
-            renewal_height: state.renewal_height,
-            transfer_height: state.transfer_height,
-            revoked_height: state.revoked_height,
-            claimed_height: state.claimed_height,
-            renewals: state.renewals,
-            weak: state.weak,
-        }
-    });
+    let canonical_state =
+        name.canonical_current_state
+            .as_ref()
+            .map(|state| NativeHnsNameStateSummary {
+                value: state.value,
+                highest: state.highest,
+                start_height: state.start_height,
+                renewal_height: state.renewal_height,
+                transfer_height: state.transfer_height,
+                revoked_height: state.revoked_height,
+                claimed_height: state.claimed_height,
+                renewals: state.renewals,
+                weak: state.weak,
+            });
     Ok(NativeHnsNameSummary {
         name: disclosure.name,
         name_hash: disclosure.name_hash,

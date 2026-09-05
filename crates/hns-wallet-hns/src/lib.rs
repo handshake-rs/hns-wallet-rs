@@ -1543,10 +1543,10 @@ fn validate_name_owner_transaction(
                 || finalize.start_height != state.height
                 || finalize.name != state.name
                 || finalize.claimed != state.claimed
-                || !finalize
+                || finalize
                     .renewals
                     .checked_add(1)
-                    .is_some_and(|renewals| renewals == state.renewals)
+                    .is_none_or(|renewals| renewals != state.renewals)
                 || finalize.weak() != state.weak
             {
                 return Err(HnsWalletError::InvalidEvidence);
@@ -13217,8 +13217,7 @@ mod tests {
         let (store, config, _) = native_import_store();
         let (_, state, transaction, outpoint) =
             canonical_name_view(vec![93; 20], vec![7, 8, 9], None);
-        let mut evidence =
-            native_import_evidence(b"alpha", Some((state, transaction, outpoint)));
+        let mut evidence = native_import_evidence(b"alpha", Some((state, transaction, outpoint)));
         evidence.current_owner_transaction = None;
         evidence.current_owner_inclusion = None;
         let runtime = native_import_runtime(store, config, evidence, false);
@@ -13231,7 +13230,10 @@ mod tests {
             NameOwnershipStatus::WatchOnlyOwnerTransactionUnavailable
         );
         assert_eq!(imported.unbound_current_owner_outpoint, Some(outpoint));
-        assert_eq!(imported.current_raw_resource.as_deref(), Some(&[7, 8, 9][..]));
+        assert_eq!(
+            imported.current_raw_resource.as_deref(),
+            Some(&[7, 8, 9][..])
+        );
         assert!(imported.canonical_current_state.is_some());
     }
 

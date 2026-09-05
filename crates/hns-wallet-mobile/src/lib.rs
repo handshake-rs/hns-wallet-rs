@@ -3070,19 +3070,20 @@ fn mobile_hns_name_summary(name: &KnownName) -> Result<MobileHnsNameSummary, Mob
         .map_or((None, None), |state| {
             (Some(state.registered), Some(state.expired))
         });
-    let canonical_state = name.canonical_current_state.as_ref().map(|state| {
-        MobileHnsNameStateSummary {
-            value_base_units: state.value.to_string(),
-            highest_base_units: state.highest.to_string(),
-            start_height: state.start_height,
-            renewal_height: state.renewal_height,
-            transfer_height: state.transfer_height,
-            revoked_height: state.revoked_height,
-            claimed_height: state.claimed_height,
-            renewals: state.renewals,
-            weak: state.weak,
-        }
-    });
+    let canonical_state =
+        name.canonical_current_state
+            .as_ref()
+            .map(|state| MobileHnsNameStateSummary {
+                value_base_units: state.value.to_string(),
+                highest_base_units: state.highest.to_string(),
+                start_height: state.start_height,
+                renewal_height: state.renewal_height,
+                transfer_height: state.transfer_height,
+                revoked_height: state.revoked_height,
+                claimed_height: state.claimed_height,
+                renewals: state.renewals,
+                weak: state.weak,
+            });
     let raw_resource_hex = name.current_raw_resource.as_deref().map(lowercase_hex);
     let resource_record_count = name.current_raw_resource.as_deref().and_then(|raw| {
         if raw.is_empty() {
@@ -4642,15 +4643,13 @@ mod tests {
         assert_eq!(summary.expired, Some(false));
         assert_eq!(summary.raw_resource_hex.as_deref(), Some("070809"));
         assert_eq!(summary.resource_record_count, None);
-        assert_eq!(summary.canonical_state.as_ref().map(|state| state.renewals), Some(1));
+        assert_eq!(
+            summary.canonical_state.as_ref().map(|state| state.renewals),
+            Some(1)
+        );
 
         let encoded = serde_json::to_string(&summary).expect("serialize name summary");
-        for forbidden in [
-            "proofState",
-            "currentState",
-            "ownerOutpoint",
-            "derivation",
-        ] {
+        for forbidden in ["proofState", "currentState", "ownerOutpoint", "derivation"] {
             assert!(!encoded.contains(forbidden));
         }
         assert_eq!(

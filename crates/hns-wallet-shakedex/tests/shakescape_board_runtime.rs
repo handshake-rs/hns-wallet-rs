@@ -156,17 +156,21 @@ impl MarketFixture {
             transfer: Height::new(0),
             revoked: Height::new(0),
             claimed: Height::new(0),
-            renewals: 0,
+            // FINALIZE commits the preceding count and advances the canonical
+            // post-FINALIZE NameState renewal count by one.
+            renewals: 1,
             registered: true,
             expired: false,
             weak: false,
         };
+        let mut pre_finalize = state.clone();
+        pre_finalize.renewals = 0;
         let covenant = FinalizeCovenant::new(
             name.clone(),
-            state.height,
-            state.weak,
-            state.claimed,
-            state.renewals,
+            pre_finalize.height,
+            pre_finalize.weak,
+            pre_finalize.claimed,
+            pre_finalize.renewals,
             BlockHash::new([0x55; 32]),
         )
         .expect("finalize covenant")
@@ -667,17 +671,20 @@ impl BatchMarketFixture {
             transfer: Height::new(0),
             revoked: Height::new(0),
             claimed: Height::new(0),
-            renewals: 0,
+            // This is the canonical state after the first FINALIZE.
+            renewals: 1,
             registered: true,
             expired: false,
             weak: false,
         };
+        let mut pre_finalize = state.clone();
+        pre_finalize.renewals = 0;
         let covenant = FinalizeCovenant::new(
             name.to_vec(),
-            state.height,
-            state.weak,
-            state.claimed,
-            state.renewals,
+            pre_finalize.height,
+            pre_finalize.weak,
+            pre_finalize.claimed,
+            pre_finalize.renewals,
             BlockHash::new([tag.wrapping_add(40); 32]),
         )
         .expect("batch finalize covenant")

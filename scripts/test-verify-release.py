@@ -10,7 +10,7 @@ from typing import Callable
 
 
 REPO = Path(__file__).resolve().parent.parent
-CURRENT_RELEASE_VERSION = "0.2.2"
+CURRENT_RELEASE_VERSION = "0.2.3"
 VALIDATOR = runpy.run_path(str(REPO / "scripts/verify-release.py"))
 verify_state = VALIDATOR["verify_changelog_release_state"]
 require_execution_state = VALIDATOR["require_execution_release_state"]

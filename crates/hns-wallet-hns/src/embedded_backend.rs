@@ -1132,12 +1132,13 @@ fn optional_name_owner_fields(
 ) {
     owner.map_or_else(
         || {
-            let outpoint = state.and_then(NameState::owner_outpoint).map(|owner| {
-                crate::HnsOutpoint {
-                    transaction: TransactionHash::new(owner.transaction_hash.into_bytes()),
-                    output_index: owner.index,
-                }
-            });
+            let outpoint =
+                state
+                    .and_then(NameState::owner_outpoint)
+                    .map(|owner| crate::HnsOutpoint {
+                        transaction: TransactionHash::new(owner.transaction_hash.into_bytes()),
+                        output_index: owner.index,
+                    });
             (outpoint, None, None)
         },
         |owner| {
