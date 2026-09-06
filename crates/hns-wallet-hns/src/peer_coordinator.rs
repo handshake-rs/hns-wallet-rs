@@ -1184,6 +1184,7 @@ pub struct NativeHnsPeerPool {
     config: HnsDirectPeerConfig,
     peers: Mutex<HashMap<PeerId, PeerHandle>>,
     known_addresses: Mutex<HashSet<SocketAddr>>,
+    retired_addresses: Mutex<HashSet<SocketAddr>>,
     shakescape_candidates: Arc<Mutex<HnsShakescapeCandidateCache>>,
     last_shakescape_getaddr: Mutex<Option<u64>>,
     shakescape_advertisement: Mutex<Option<HnsShakescapeAdvertisement>>,
@@ -1201,6 +1202,7 @@ impl NativeHnsPeerPool {
             config,
             peers: Mutex::new(HashMap::new()),
             known_addresses: Mutex::new(known_addresses),
+            retired_addresses: Mutex::new(HashSet::new()),
             shakescape_candidates: Arc::new(Mutex::new(HnsShakescapeCandidateCache::default())),
             last_shakescape_getaddr: Mutex::new(None),
             shakescape_advertisement: Mutex::new(None),
@@ -1518,6 +1520,39 @@ impl NativeHnsPeerPool {
         Ok(false)
     }
 
+    /// Remove a peer whose response proves it cannot satisfy the wallet's
+    /// standard proof protocol, and suppress that address for the rest of
+    /// this in-memory session. DNS and ADDR discovery may otherwise insert it
+    /// again immediately; deterministic candidate ordering would then make a
+    /// mobile retry reconnect to the same incompatible peers forever.
+    fn retire(&self, id: PeerId) -> Result<bool, HnsDirectPeerError> {
+        let removed = self.lock_peers()?.remove(&id);
+        let Some(peer) = removed else {
+            return Ok(false);
+        };
+        let address = peer
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .address;
+        if let Ok(mut peer) = peer.lock() {
+            let _ = peer.connection.shutdown();
+        }
+        self.retire_address(address)?;
+        Ok(true)
+    }
+
+    fn retire_address(&self, address: SocketAddr) -> Result<(), HnsDirectPeerError> {
+        self.retired_addresses
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .insert(address);
+        self.known_addresses
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .remove(&address);
+        Ok(())
+    }
+
     fn ready_handles(&self) -> Result<Vec<(PeerId, PeerHandle)>, HnsDirectPeerError> {
         Ok(self
             .lock_peers()?
@@ -1550,13 +1585,20 @@ impl NativeHnsPeerPool {
         addresses: impl IntoIterator<Item = SocketAddr>,
         explicit: bool,
     ) -> Result<usize, HnsDirectPeerError> {
+        let retired = self
+            .retired_addresses
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
         let mut known = self
             .known_addresses
             .lock()
             .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
         let mut added = 0usize;
         for address in addresses {
-            if known.len() >= MAX_DISCOVERED_ADDRESSES || !self.address_allowed(address, explicit) {
+            if known.len() >= MAX_DISCOVERED_ADDRESSES
+                || retired.contains(&address)
+                || !self.address_allowed(address, explicit)
+            {
                 continue;
             }
             added = added.saturating_add(usize::from(known.insert(address)));
@@ -2305,7 +2347,12 @@ impl HnsDirectPeerCoordinator {
             }
         }
         for id in failures {
-            self.disconnect_peer(id)?;
+            self.block_scan_peer_latencies
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                .remove(&id);
+            let _ = self.pool.retire(id)?;
+            let _ = self.backend.remove_header_peer(id)?;
         }
         verified.ok_or(HnsDirectPeerError::NoValidNameProof)
     }
@@ -4873,6 +4920,20 @@ mod tests {
             Err(HnsDirectPeerError::NoReadyPeers)
         ));
         assert_eq!(*pool.last_shakescape_getaddr.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn retired_proof_peer_is_not_reintroduced_by_discovery() {
+        let pool =
+            NativeHnsPeerPool::new(HnsDirectPeerConfig::for_network(HnsNetwork::Regtest)).unwrap();
+        let address: SocketAddr = "127.0.0.1:14038".parse().unwrap();
+        assert_eq!(pool.add_known_addresses([address], true).unwrap(), 1);
+        assert_eq!(pool.candidate_addresses().unwrap(), vec![address]);
+
+        pool.retire_address(address).unwrap();
+        assert!(pool.candidate_addresses().unwrap().is_empty());
+        assert_eq!(pool.add_known_addresses([address], true).unwrap(), 0);
+        assert!(pool.candidate_addresses().unwrap().is_empty());
     }
 
     #[test]
