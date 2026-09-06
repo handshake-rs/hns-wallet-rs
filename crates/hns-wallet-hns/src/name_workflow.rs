@@ -3026,7 +3026,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             fee_rate,
             maximum_fee,
             config.dust_threshold,
-        )?;
+        )
+        .map_err(|error| name_preparation_stage("unsigned transaction assembly", error))?;
         let expires_at_unix = now_unix
             .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
             .ok_or(HnsWalletError::Arithmetic)?;
@@ -4409,6 +4410,9 @@ mod tests {
             index: 0,
         };
         state.transfer = Height::new(400);
+        // A re-registered name can retain HSD's historical resource-expiration
+        // bit while its authenticated lifecycle is currently active.
+        state.expired = true;
         let transfer_source = TrackedHnsCoin {
             coin: WalletCoin {
                 outpoint: transfer_outpoint,

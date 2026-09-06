@@ -103,3 +103,11 @@ all = "warn"
 # discarding their locators. Mobile NETWORK service depends on that reviewed
 # wire/session implementation while retaining the exact published version.
 hns-light-p2p = { path = "../hns-dane-engine/crates/hns-light-p2p" }
+# FINALIZE must preserve HSD's distinction between the historical resource
+# expiration bit and current lifecycle expiration. Keep its foundational HNS
+# types on that same source so transaction, mining, and script crates share one
+# Cargo type identity.
+hns-covenants = { path = "../hns-rs/crates/hns-covenants" }
+hns-encoding = { path = "../hns-rs/crates/hns-encoding" }
+hns-primitives = { path = "../hns-rs/crates/hns-primitives" }
+hns-transaction = { path = "../hns-rs/crates/hns-transaction" }
