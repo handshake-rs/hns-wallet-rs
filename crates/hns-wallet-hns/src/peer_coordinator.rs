@@ -2178,6 +2178,27 @@ impl HnsDirectPeerCoordinator {
         Ok(connected)
     }
 
+    /// Ensure the verification quorum needed by the latency-sensitive wallet
+    /// synchronization path is present.
+    ///
+    /// The configured peer target may deliberately be much wider than the
+    /// exact header/block quorum so the unlocked runtime has warm failover
+    /// sessions. Re-filling that entire reserve between consecutive header
+    /// batches can nevertheless put dead-address connection deadlines on the
+    /// foreground critical path even while enough independent peers remain to
+    /// verify the next batch. Preserve the existing pool in that case. If the
+    /// quorum has actually fallen below policy, use the ordinary bounded
+    /// connection/discovery path so recovery behavior is unchanged.
+    pub fn connect_sync_quorum_available(
+        &self,
+        now_unix: u64,
+    ) -> Result<Vec<ConnectedHnsPeer>, HnsDirectPeerError> {
+        if self.pool.peer_count()? >= self.config.minimum_block_views {
+            return Ok(Vec::new());
+        }
+        self.connect_available(now_unix)
+    }
+
     /// Ask connected standard peers for address gossip and retain only bounded,
     /// network-port-correct candidates. Gossip is never chain authority.
     pub fn discover_from_connected(&self, now_unix: u64) -> Result<usize, HnsDirectPeerError> {
