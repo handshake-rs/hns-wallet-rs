@@ -2338,6 +2338,9 @@ impl HnsDirectPeerCoordinator {
         });
         let mut failures = Vec::new();
         let mut verified = None;
+        let mut invalid_proofs = 0usize;
+        let mut response_failures = 0usize;
+        let mut last_failure = None;
         for response in responses {
             match response {
                 Ok((id, Ok(proof))) => {
@@ -2349,7 +2352,9 @@ impl HnsDirectPeerCoordinator {
                     // revisions and, more importantly, used to collapse a
                     // local authority/store failure into the misleading
                     // `NoValidNameProof` peer error below.
-                    if proof.verify().is_err() {
+                    if let Err(error) = proof.verify() {
+                        invalid_proofs = invalid_proofs.saturating_add(1);
+                        last_failure = Some(error.to_string());
                         failures.push(id);
                     } else if verified.is_none() {
                         verified = Some(
@@ -2358,7 +2363,11 @@ impl HnsDirectPeerCoordinator {
                         );
                     }
                 }
-                Ok((id, Err(_))) => failures.push(id),
+                Ok((id, Err(error))) => {
+                    response_failures = response_failures.saturating_add(1);
+                    last_failure = Some(error.to_string());
+                    failures.push(id);
+                }
                 Err(_) => return Err(HnsDirectPeerError::WorkerPanicked),
             }
         }
@@ -2370,7 +2379,11 @@ impl HnsDirectPeerCoordinator {
             let _ = self.pool.retire(id)?;
             let _ = self.backend.remove_header_peer(id)?;
         }
-        verified.ok_or(HnsDirectPeerError::NoValidNameProof)
+        verified.ok_or_else(|| HnsDirectPeerError::NoValidNameProof {
+            invalid_proofs,
+            response_failures,
+            last_failure: last_failure.unwrap_or_else(|| "none".to_owned()),
+        })
     }
 
     /// Fetch and locally verify one exact Handshake name proof from ordinary
@@ -4066,8 +4079,14 @@ pub enum HnsDirectPeerError {
     InvalidScanLimit,
     #[error("only {actual} independent block views are available; {required} required")]
     InsufficientBlockViews { required: usize, actual: usize },
-    #[error("no peer supplied a locally valid current-root name proof")]
-    NoValidNameProof,
+    #[error(
+        "no peer supplied a locally valid current-root name proof (invalid proofs: {invalid_proofs}, response failures: {response_failures}, last failure: {last_failure})"
+    )]
+    NoValidNameProof {
+        invalid_proofs: usize,
+        response_failures: usize,
+        last_failure: String,
+    },
     #[error("checked direct-peer arithmetic failed")]
     Arithmetic,
 }
