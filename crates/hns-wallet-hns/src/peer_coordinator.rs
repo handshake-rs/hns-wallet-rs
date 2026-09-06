@@ -9,7 +9,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{
     Arc, Mutex, MutexGuard,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,7 +36,7 @@ use hns_p2p_experimental::{
     SHAKESCAPE_V1_REGISTRY_VERSION, ShakescapeExtensionEnvelope,
 };
 use hns_p2p_wire::{
-    Inventory, InventoryKind, NetAddress, NetworkMagic, Packet, ProofPacket, SERVICE_BLOOM,
+    Frame, Inventory, InventoryKind, NetAddress, NetworkMagic, Packet, ProofPacket, SERVICE_BLOOM,
     SERVICE_NETWORK,
 };
 use hns_primitives::{BlockHash, BlockTime, NameHash, TreeRoot};
@@ -78,6 +78,16 @@ const BLOOM_FALSE_POSITIVE_RATE: f64 = 0.01;
 const BLOOM_GROWTH_RESERVE: usize = 1_024;
 const SHAKESCAPE_MAX_RESPONSE_EVENTS: usize = 256;
 const SHAKESCAPE_MAXIMUM_LIVE_REQUESTS: u16 = 64;
+const MAX_SHAKESCAPE_CANDIDATES: usize = 128;
+const MAX_SHAKESCAPE_ADDR_PEERS_PER_ROUND: usize = 2;
+const SHAKESCAPE_ADDR_FRESHNESS_SECONDS: u64 = 60 * 60;
+const SHAKESCAPE_ADDR_FUTURE_SKEW_SECONDS: u64 = 10 * 60;
+const SHAKESCAPE_GETADDR_INTERVAL_SECONDS: u64 = 15 * 60;
+const SHAKESCAPE_ADVERTISEMENT_INTERVAL_SECONDS: u64 = 30 * 60;
+const SHAKESCAPE_ADVERTISEMENT_CHANGE_INTERVAL_SECONDS: u64 = 60;
+const SHAKESCAPE_RETRY_BASE_SECONDS: u64 = 30;
+const SHAKESCAPE_RETRY_MAX_SECONDS: u64 = 30 * 60;
+const SHAKESCAPE_MAX_ATTEMPTS_PER_OBSERVATION: u8 = 8;
 /// A direct index only grows after it has authenticated a trailing-gap
 /// discovery. Eight complete extra gaps fit comfortably under the direct
 /// watch-set bound for reviewed wallet defaults while preventing unbounded
@@ -156,6 +166,164 @@ pub struct ConnectedHnsPeer {
     pub metadata: PeerMetadata,
 }
 
+/// One hostile-input-filtered ShakeScape endpoint learned from ordinary HSD
+/// `ADDR` traffic. The record is a connectivity hint only: neither its source
+/// HSD peer nor the endpoint is identity or board authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HnsShakescapeCandidate {
+    pub address: SocketAddr,
+    pub services: u64,
+    /// Always zero for the stock-HSD carrier profile. Retaining the field
+    /// makes that lossy interoperability boundary explicit to callers.
+    pub key: [u8; 33],
+    pub advertised_at: u64,
+    pub last_observed_at: u64,
+    pub attempts: u8,
+    pub next_attempt_at: u64,
+    pub last_failure_at: Option<u64>,
+}
+
+/// Coarse, non-sensitive outcome of the most recent direct discovery dial.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HnsShakescapeDirectFailure {
+    AddressRejected,
+    DirectUnreachable,
+    HandshakeRejected,
+    RegistryNegotiation,
+    Internal,
+}
+
+/// Non-sensitive process-local discovery and direct-connect telemetry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HnsShakescapeDiscoveryStatus {
+    pub hsd_peers_connected: usize,
+    pub candidates_known: usize,
+    pub self_advertisement_active: bool,
+    pub last_getaddr_at: Option<u64>,
+    pub last_advertisement_at: Option<u64>,
+    pub direct_connection_attempts: u64,
+    pub direct_tcp_connections: u64,
+    pub last_direct_failure: Option<HnsShakescapeDirectFailure>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct HnsShakescapeAdvertisement {
+    address: SocketAddr,
+    sent_at: u64,
+}
+
+#[derive(Debug, Default)]
+struct HnsShakescapeCandidateCache {
+    candidates: HashMap<SocketAddr, HnsShakescapeCandidate>,
+}
+
+impl HnsShakescapeCandidateCache {
+    fn observe(
+        &mut self,
+        addresses: &[NetAddress],
+        now_unix: u64,
+        allow_private_addresses: bool,
+    ) -> usize {
+        self.expire(now_unix);
+        let mut added = 0usize;
+        for address in addresses.iter().take(hns_p2p_wire::MAX_ADDR_ITEMS) {
+            if !shakescape_net_address_allowed(address, now_unix, allow_private_addresses) {
+                continue;
+            }
+            let socket = address.socket_addr();
+            match self.candidates.get_mut(&socket) {
+                Some(existing) => {
+                    existing.services = address.services;
+                    existing.key = address.key;
+                    existing.advertised_at = existing.advertised_at.max(address.time);
+                    existing.last_observed_at = now_unix;
+                    // A hostile HSD peer can increment an ADDR timestamp. Do
+                    // not let that reset dial backoff for the same endpoint.
+                }
+                None => {
+                    if self.candidates.len() >= MAX_SHAKESCAPE_CANDIDATES {
+                        let oldest = self
+                            .candidates
+                            .iter()
+                            .min_by_key(|(_, candidate)| candidate.last_observed_at)
+                            .map(|(address, _)| *address);
+                        if let Some(oldest) = oldest {
+                            self.candidates.remove(&oldest);
+                        }
+                    }
+                    self.candidates.insert(
+                        socket,
+                        HnsShakescapeCandidate {
+                            address: socket,
+                            services: address.services,
+                            key: address.key,
+                            advertised_at: address.time,
+                            last_observed_at: now_unix,
+                            attempts: 0,
+                            next_attempt_at: now_unix,
+                            last_failure_at: None,
+                        },
+                    );
+                    added = added.saturating_add(1);
+                }
+            }
+        }
+        added
+    }
+
+    fn expire(&mut self, now_unix: u64) {
+        self.candidates.retain(|_, candidate| {
+            candidate
+                .advertised_at
+                .checked_add(SHAKESCAPE_ADDR_FRESHNESS_SECONDS)
+                .is_some_and(|expires| expires >= now_unix)
+        });
+    }
+
+    fn snapshot(&mut self, now_unix: u64) -> Vec<HnsShakescapeCandidate> {
+        self.expire(now_unix);
+        let mut candidates = self.candidates.values().cloned().collect::<Vec<_>>();
+        candidates.sort_by_key(|candidate| (candidate.next_attempt_at, candidate.address));
+        candidates
+    }
+
+    fn begin_attempt(&mut self, now_unix: u64) -> Option<HnsShakescapeCandidate> {
+        self.expire(now_unix);
+        let address = self
+            .candidates
+            .values()
+            .filter(|candidate| {
+                candidate.attempts < SHAKESCAPE_MAX_ATTEMPTS_PER_OBSERVATION
+                    && candidate.next_attempt_at <= now_unix
+            })
+            .min_by_key(|candidate| (candidate.next_attempt_at, candidate.address))?
+            .address;
+        let candidate = self.candidates.get_mut(&address)?;
+        candidate.attempts = candidate.attempts.saturating_add(1);
+        Some(candidate.clone())
+    }
+
+    fn finish_attempt(&mut self, address: SocketAddr, now_unix: u64, succeeded: bool) {
+        if succeeded {
+            self.candidates.remove(&address);
+            return;
+        }
+        let Some(candidate) = self.candidates.get_mut(&address) else {
+            return;
+        };
+        candidate.last_failure_at = Some(now_unix);
+        let exponent = u32::from(candidate.attempts.saturating_sub(1).min(10));
+        let delay = SHAKESCAPE_RETRY_BASE_SECONDS
+            .saturating_mul(1_u64.checked_shl(exponent).unwrap_or(u64::MAX))
+            .min(SHAKESCAPE_RETRY_MAX_SECONDS);
+        candidate.next_attempt_at = now_unix.saturating_add(delay);
+    }
+
+    fn remove(&mut self, address: SocketAddr) {
+        self.candidates.remove(&address);
+    }
+}
+
 /// Result of one bounded direct header round.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HnsHeaderRoundProgress {
@@ -224,6 +392,9 @@ struct NativePeer {
     advertised_height: u32,
     connection: PeerConnection<TcpStream>,
     deferred_wallet: VecDeque<WalletPeerEvent>,
+    address_gossip_requested: bool,
+    shakescape_candidates: Arc<Mutex<HnsShakescapeCandidateCache>>,
+    allow_private_addresses: bool,
 }
 
 /// One direct Shakescape Experimental V2 session owned by the wallet.
@@ -269,6 +440,84 @@ pub enum HnsDirectShakescapeMessage {
 pub struct HnsDirectShakescapeListener {
     listener: TcpListener,
     config: HnsDirectPeerConfig,
+}
+
+/// One admitted inbound connection on the shared mobile Handshake listener.
+/// Extension-capable wallets proceed to exact ShakeScape negotiation; an
+/// ordinary stock peer remains a standard bounded NETWORK session.
+pub enum HnsInboundMobilePeer {
+    Shakescape(HnsDirectShakescapePeer),
+    Network(HnsInboundNetworkPeer),
+}
+
+/// A stock-compatible inbound Handshake peer served from the wallet's
+/// verified header authority. It intentionally exposes no wallet filters,
+/// names, keys, RPC, or arbitrary extension data.
+pub struct HnsInboundNetworkPeer {
+    address: SocketAddr,
+    connection: PeerConnection<TcpStream>,
+}
+
+impl HnsInboundNetworkPeer {
+    /// Remote transport locator for status and bounded duplicate handling.
+    #[must_use]
+    pub const fn address(&self) -> SocketAddr {
+        self.address
+    }
+
+    /// Process at most one complete standard packet without waiting for input.
+    /// Ping/pong remains automatic in `PeerConnection`; locator requests are
+    /// answered from the encrypted verified header archive, and unavailable
+    /// object requests receive a standard `notfound` response.
+    pub fn try_service(
+        &mut self,
+        backend: &EmbeddedHnsBackend,
+        now_unix: u64,
+    ) -> Result<bool, HnsDirectPeerError> {
+        self.connection
+            .transport_mut()
+            .set_nonblocking(true)
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        let event = self.connection.receive_event(now_unix);
+        let restored = self
+            .connection
+            .transport_mut()
+            .set_nonblocking(false)
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()));
+        restored?;
+        let event = match event {
+            Ok(event) => event,
+            Err(PeerError::Io(std::io::ErrorKind::WouldBlock)) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let response = match event {
+            PeerEvent::GetHeaders(request) => {
+                Packet::Headers(backend.network_headers_after_locator(&request)?)
+            }
+            // Do not announce block inventory that this deliberately small
+            // mobile node does not retain. A header-synced stock peer receives
+            // an empty, standards-compliant inventory response.
+            PeerEvent::GetBlocks(_) => Packet::Inv(Vec::new()),
+            PeerEvent::GetAddresses => Packet::Addr(Vec::new()),
+            PeerEvent::Wallet(WalletPeerEvent::DataRequest(items)) => Packet::NotFound(items),
+            PeerEvent::Ignored(_)
+            | PeerEvent::Addresses(_)
+            | PeerEvent::Wallet(_)
+            | PeerEvent::Experimental { .. }
+            | PeerEvent::Pong(_) => return Ok(true),
+            PeerEvent::Rejected(reject) => {
+                return Err(HnsDirectPeerError::PeerRejected(format!("{reject:?}")));
+            }
+            PeerEvent::Ready(_)
+            | PeerEvent::Send(_)
+            | PeerEvent::Headers(_)
+            | PeerEvent::Proof(_) => return Err(HnsDirectPeerError::UnexpectedPeerEvent),
+        };
+        let frame = Frame::from_packet(&response)
+            .map_err(|error| HnsDirectPeerError::Peer(error.to_string()))?;
+        self.connection.send_frame(&frame)?;
+        Ok(true)
+    }
 }
 
 impl HnsDirectShakescapeListener {
@@ -319,6 +568,30 @@ impl HnsDirectShakescapeListener {
             .set_write_timeout(Some(self.config.connect_timeout))
             .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
         HnsDirectShakescapePeer::accept(&self.config, stream, local_height, now_unix).map(Some)
+    }
+
+    /// Accept at most one pending connection and route it after the ordinary
+    /// Handshake version/verack exchange. This method must be polled only
+    /// while [`HnsDirectPeerCoordinator::minimal_network_service_ready`] is
+    /// true, because its local version truthfully advertises `NETWORK`.
+    pub fn accept_next_mobile(
+        &self,
+        local_height: u32,
+        now_unix: u64,
+    ) -> Result<Option<HnsInboundMobilePeer>, HnsDirectPeerError> {
+        let (stream, _) = match self.listener.accept() {
+            Ok(accepted) => accepted,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(HnsDirectPeerError::Io(error.kind())),
+        };
+        stream
+            .set_read_timeout(Some(self.config.connect_timeout))
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        stream
+            .set_write_timeout(Some(self.config.connect_timeout))
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        HnsDirectShakescapePeer::accept_mobile(&self.config, stream, local_height, now_unix)
+            .map(Some)
     }
 }
 
@@ -381,6 +654,20 @@ impl HnsDirectShakescapePeer {
         local_height: u32,
         now_unix: u64,
     ) -> Result<Self, HnsDirectPeerError> {
+        match Self::accept_mobile(config, stream, local_height, now_unix)? {
+            HnsInboundMobilePeer::Shakescape(peer) => Ok(peer),
+            HnsInboundMobilePeer::Network(_) => {
+                Err(HnsDirectPeerError::ShakescapePeerNotAdvertised)
+            }
+        }
+    }
+
+    fn accept_mobile(
+        config: &HnsDirectPeerConfig,
+        stream: TcpStream,
+        local_height: u32,
+        now_unix: u64,
+    ) -> Result<HnsInboundMobilePeer, HnsDirectPeerError> {
         config.validate()?;
         let address = stream
             .peer_addr()
@@ -402,17 +689,20 @@ impl HnsDirectShakescapePeer {
             .complete_handshake(|| now_unix_or(now_unix))
             .map_err(|error| HnsDirectPeerError::Peer(error.to_string()))?;
         if metadata.services & SHAKESCAPE_EXTENSION_SERVICE.value() == 0 {
-            return Err(HnsDirectPeerError::ShakescapePeerNotAdvertised);
+            return Ok(HnsInboundMobilePeer::Network(HnsInboundNetworkPeer {
+                address,
+                connection,
+            }));
         }
         let negotiated =
             respond_shakescape_registry_hello(&mut connection, config.network, now_unix)?;
-        Ok(Self {
+        Ok(HnsInboundMobilePeer::Shakescape(Self {
             address,
             network: config.network,
             connection,
             negotiated,
             next_request_id: request_id.checked_add(1).unwrap_or(1),
-        })
+        }))
     }
 
     /// Direct socket peer address. It is a transport locator, never an
@@ -529,12 +819,41 @@ impl HnsDirectShakescapePeer {
                 }
                 PeerEvent::Ready(_)
                 | PeerEvent::Send(_)
+                | PeerEvent::GetAddresses
+                | PeerEvent::GetBlocks(_)
+                | PeerEvent::GetHeaders(_)
                 | PeerEvent::Headers(_)
                 | PeerEvent::Proof(_)
                 | PeerEvent::Pong(_) => return Err(HnsDirectPeerError::UnexpectedPeerEvent),
             }
         }
         Err(HnsDirectPeerError::ResponseEventLimit)
+    }
+
+    /// Poll for one canonical ShakeScape message without waiting for socket
+    /// input. Partial frames remain in the canonical decoder for a later poll.
+    /// This is the mobile multi-peer scheduling surface: `Ok(None)` means the
+    /// negotiated peer is still live but has no complete message available.
+    pub fn try_receive_shakescape_message(
+        &mut self,
+        now_unix: u64,
+    ) -> Result<Option<HnsDirectShakescapeMessage>, HnsDirectPeerError> {
+        self.connection
+            .transport_mut()
+            .set_nonblocking(true)
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        let received = self.receive_shakescape_message(now_unix);
+        let restored = self
+            .connection
+            .transport_mut()
+            .set_nonblocking(false)
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()));
+        restored?;
+        match received {
+            Ok(message) => Ok(Some(message)),
+            Err(HnsDirectPeerError::Io(std::io::ErrorKind::WouldBlock)) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Send one exact canonical Shakescape HNS/BTC session envelope over the
@@ -671,6 +990,9 @@ fn receive_shakescape_hello_ack(
             }
             PeerEvent::Ready(_)
             | PeerEvent::Send(_)
+            | PeerEvent::GetAddresses
+            | PeerEvent::GetBlocks(_)
+            | PeerEvent::GetHeaders(_)
             | PeerEvent::Headers(_)
             | PeerEvent::Proof(_)
             | PeerEvent::Pong(_) => return Err(HnsDirectPeerError::UnexpectedPeerEvent),
@@ -718,6 +1040,9 @@ fn respond_shakescape_registry_hello(
             }
             PeerEvent::Ready(_)
             | PeerEvent::Send(_)
+            | PeerEvent::GetAddresses
+            | PeerEvent::GetBlocks(_)
+            | PeerEvent::GetHeaders(_)
             | PeerEvent::Headers(_)
             | PeerEvent::Proof(_)
             | PeerEvent::Pong(_) => return Err(HnsDirectPeerError::UnexpectedPeerEvent),
@@ -797,15 +1122,34 @@ const fn experimental_network(network: HnsNetwork) -> ExperimentalNetwork {
 fn direct_address_allowed(
     config: &HnsDirectPeerConfig,
     address: SocketAddr,
-    explicit: bool,
+    _explicit: bool,
 ) -> bool {
-    address.port() != 0
-        && (explicit || address.port() == default_peer_port(config.network))
-        && (config.allow_private_addresses || is_public_peer_ip(address.ip()))
+    address.port() != 0 && (config.allow_private_addresses || is_public_peer_ip(address.ip()))
 }
 
 fn inbound_shakescape_address_allowed(config: &HnsDirectPeerConfig, address: SocketAddr) -> bool {
     address.port() != 0 && (config.allow_private_addresses || is_public_peer_ip(address.ip()))
+}
+
+fn shakescape_net_address_allowed(
+    address: &NetAddress,
+    now_unix: u64,
+    allow_private_addresses: bool,
+) -> bool {
+    let required = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
+    let socket = address.socket_addr();
+    address.services & required == required
+        // Stock HSD deliberately refuses every key-bearing ADDR. Keep this
+        // discovery profile explicit instead of accepting records that could
+        // only have arrived through a modified or non-HSD carrier.
+        && address.key == [0; 33]
+        && socket.port() != 0
+        && (allow_private_addresses || is_public_peer_ip(socket.ip()))
+        && address.time <= now_unix.saturating_add(SHAKESCAPE_ADDR_FUTURE_SKEW_SECONDS)
+        && address
+            .time
+            .checked_add(SHAKESCAPE_ADDR_FRESHNESS_SECONDS)
+            .is_some_and(|expires| expires >= now_unix)
 }
 
 type PeerHandle = Arc<Mutex<NativePeer>>;
@@ -840,6 +1184,12 @@ pub struct NativeHnsPeerPool {
     config: HnsDirectPeerConfig,
     peers: Mutex<HashMap<PeerId, PeerHandle>>,
     known_addresses: Mutex<HashSet<SocketAddr>>,
+    shakescape_candidates: Arc<Mutex<HnsShakescapeCandidateCache>>,
+    last_shakescape_getaddr: Mutex<Option<u64>>,
+    shakescape_advertisement: Mutex<Option<HnsShakescapeAdvertisement>>,
+    direct_connection_attempts: AtomicU64,
+    direct_tcp_connections: AtomicU64,
+    last_direct_failure: Mutex<Option<HnsShakescapeDirectFailure>>,
 }
 
 impl NativeHnsPeerPool {
@@ -851,6 +1201,12 @@ impl NativeHnsPeerPool {
             config,
             peers: Mutex::new(HashMap::new()),
             known_addresses: Mutex::new(known_addresses),
+            shakescape_candidates: Arc::new(Mutex::new(HnsShakescapeCandidateCache::default())),
+            last_shakescape_getaddr: Mutex::new(None),
+            shakescape_advertisement: Mutex::new(None),
+            direct_connection_attempts: AtomicU64::new(0),
+            direct_tcp_connections: AtomicU64::new(0),
+            last_direct_failure: Mutex::new(None),
         })
     }
 
@@ -863,6 +1219,186 @@ impl NativeHnsPeerPool {
     /// Number of currently registered ready sessions.
     pub fn peer_count(&self) -> Result<usize, HnsDirectPeerError> {
         Ok(self.lock_peers()?.len())
+    }
+
+    fn shakescape_candidates(
+        &self,
+        now_unix: u64,
+    ) -> Result<Vec<HnsShakescapeCandidate>, HnsDirectPeerError> {
+        Ok(self
+            .shakescape_candidates
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .snapshot(now_unix))
+    }
+
+    fn refresh_shakescape_discovery(&self, now_unix: u64) -> Result<usize, HnsDirectPeerError> {
+        let mut handles = self.ready_handles()?;
+        // Stock HSD answers GETADDR only once on a connection. Preserve the
+        // persistent header sessions and query each newly established session
+        // once instead of turning later refresh ticks into request timeouts.
+        handles.retain(|(_, peer)| {
+            peer.lock()
+                .map(|peer| !peer.address_gossip_requested)
+                .unwrap_or(false)
+        });
+        handles.sort_by_key(|(_, peer)| peer.lock().ok().map(|peer| peer.address));
+        handles.truncate(MAX_SHAKESCAPE_ADDR_PEERS_PER_ROUND);
+        if handles.is_empty() {
+            return if self.peer_count()? == 0 {
+                Err(HnsDirectPeerError::NoReadyPeers)
+            } else {
+                Ok(0)
+            };
+        }
+        {
+            let mut last = self
+                .last_shakescape_getaddr
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+            if last.is_some_and(|last| {
+                now_unix < last.saturating_add(SHAKESCAPE_GETADDR_INTERVAL_SECONDS)
+            }) {
+                return Ok(0);
+            }
+            // Only consume the interval when there is at least one established
+            // HSD session that can actually receive GETADDR. This keeps mobile
+            // startup while offline from delaying its first useful query.
+            *last = Some(now_unix);
+        }
+        let before = self.shakescape_candidates(now_unix)?.len();
+        let results = std::thread::scope(|scope| {
+            handles
+                .into_iter()
+                .map(|(_, peer)| {
+                    scope.spawn(move || {
+                        peer.lock()
+                            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                            .request_addresses(now_unix)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|task| task.join())
+                .collect::<Vec<_>>()
+        });
+        if results.iter().all(|result| !matches!(result, Ok(Ok(_)))) {
+            return Err(results
+                .into_iter()
+                .find_map(|result| match result {
+                    Ok(Err(error)) => Some(error),
+                    Err(_) => Some(HnsDirectPeerError::WorkerPanicked),
+                    Ok(Ok(_)) => None,
+                })
+                .unwrap_or(HnsDirectPeerError::NoReadyPeers));
+        }
+        let after = self.shakescape_candidates(now_unix)?.len();
+        Ok(after.saturating_sub(before))
+    }
+
+    fn advertise_shakescape_endpoint(
+        &self,
+        verified_public_endpoint: SocketAddr,
+        now_unix: u64,
+    ) -> Result<usize, HnsDirectPeerError> {
+        if !inbound_shakescape_address_allowed(&self.config, verified_public_endpoint) {
+            return Err(HnsDirectPeerError::AddressNotAllowed);
+        }
+        {
+            let advertisement = self
+                .shakescape_advertisement
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+            if let Some(previous) = advertisement.as_ref() {
+                let interval = if previous.address == verified_public_endpoint {
+                    SHAKESCAPE_ADVERTISEMENT_INTERVAL_SECONDS
+                } else {
+                    SHAKESCAPE_ADVERTISEMENT_CHANGE_INTERVAL_SECONDS
+                };
+                if now_unix < previous.sent_at.saturating_add(interval) {
+                    return Ok(0);
+                }
+            }
+        }
+        let address = NetAddress::from_socket_addr(
+            verified_public_endpoint,
+            now_unix,
+            SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value(),
+        );
+        debug_assert_eq!(address.key, [0; 33]);
+        let mut handles = self.ready_handles()?;
+        handles.sort_by_key(|(_, peer)| peer.lock().ok().map(|peer| peer.address));
+        handles.truncate(MAX_SHAKESCAPE_ADDR_PEERS_PER_ROUND);
+        if handles.is_empty() {
+            return Err(HnsDirectPeerError::NoReadyPeers);
+        }
+        let mut delivered = 0usize;
+        let mut last_error = None;
+        for (_, peer) in handles {
+            match peer
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                .send_shakescape_address(&address)
+            {
+                Ok(()) => delivered = delivered.saturating_add(1),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if delivered == 0 {
+            return Err(last_error.unwrap_or(HnsDirectPeerError::NoReadyPeers));
+        }
+        *self
+            .shakescape_advertisement
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)? = Some(HnsShakescapeAdvertisement {
+            address: verified_public_endpoint,
+            sent_at: now_unix,
+        });
+        Ok(delivered)
+    }
+
+    fn retire_shakescape_advertisement(&self) -> Result<bool, HnsDirectPeerError> {
+        Ok(self
+            .shakescape_advertisement
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .take()
+            .is_some())
+    }
+
+    fn shakescape_status(
+        &self,
+        now_unix: u64,
+    ) -> Result<HnsShakescapeDiscoveryStatus, HnsDirectPeerError> {
+        let candidates_known = self.shakescape_candidates(now_unix)?.len();
+        let advertisement = self
+            .shakescape_advertisement
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .clone();
+        let last_getaddr_at = *self
+            .last_shakescape_getaddr
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        let last_direct_failure = *self
+            .last_direct_failure
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        Ok(HnsShakescapeDiscoveryStatus {
+            hsd_peers_connected: self.peer_count()?,
+            candidates_known,
+            self_advertisement_active: advertisement.as_ref().is_some_and(|advertisement| {
+                now_unix
+                    < advertisement
+                        .sent_at
+                        .saturating_add(SHAKESCAPE_ADDR_FRESHNESS_SECONDS)
+            }),
+            last_getaddr_at,
+            last_advertisement_at: advertisement.map(|advertisement| advertisement.sent_at),
+            direct_connection_attempts: self.direct_connection_attempts.load(Ordering::Relaxed),
+            direct_tcp_connections: self.direct_tcp_connections.load(Ordering::Relaxed),
+            last_direct_failure,
+        })
     }
 
     /// Resolve configured DNS seeds into untrusted address candidates.
@@ -943,6 +1479,9 @@ impl NativeHnsPeerPool {
             advertised_height: metadata.height,
             connection,
             deferred_wallet: VecDeque::new(),
+            address_gossip_requested: false,
+            shakescape_candidates: Arc::clone(&self.shakescape_candidates),
+            allow_private_addresses: self.config.allow_private_addresses,
         }));
         let mut peers = self.lock_peers()?;
         if peers.len() >= self.config.target_peers {
@@ -1208,6 +1747,68 @@ impl HnsDirectPeerCoordinator {
         HnsDirectShakescapeListener::bind(self.config.clone(), address)
     }
 
+    /// Whether the shared listener may truthfully advertise the mandatory
+    /// standard `NETWORK` bit. Reachability is evaluated separately by the
+    /// mobile platform; this gate covers only locally verified service data.
+    pub fn minimal_network_service_ready(&self, now_unix: u64) -> Result<bool, HnsDirectPeerError> {
+        self.backend
+            .minimal_network_service_ready(now_unix)
+            .map_err(HnsDirectPeerError::Wallet)
+    }
+
+    /// Ask at most two newly connected ordinary HSD sessions for address
+    /// gossip and retain fresh `NETWORK|SHAKESCAPE` zero-key TCP endpoints.
+    /// Stock HSD answers one `GETADDR` per connection; repeated calls and
+    /// sessions already queried are therefore no-ops.
+    pub fn refresh_shakescape_discovery(&self, now_unix: u64) -> Result<usize, HnsDirectPeerError> {
+        self.pool.refresh_shakescape_discovery(now_unix)
+    }
+
+    /// Snapshot the bounded untrusted ShakeScape connectivity candidates.
+    pub fn shakescape_candidates(
+        &self,
+        now_unix: u64,
+    ) -> Result<Vec<HnsShakescapeCandidate>, HnsDirectPeerError> {
+        self.pool.shakescape_candidates(now_unix)
+    }
+
+    /// Advertise one host-verified publicly reachable plaintext Handshake TCP
+    /// listener through ordinary stock-HSD `ADDR`. Stock HSD rejects nonzero
+    /// address keys, so this record is intentionally only an untrusted locator;
+    /// exact ShakeScape registry and board validation remain mandatory.
+    pub fn advertise_shakescape_endpoint(
+        &self,
+        verified_public_endpoint: SocketAddr,
+        now_unix: u64,
+    ) -> Result<usize, HnsDirectPeerError> {
+        if !self.minimal_network_service_ready(now_unix)? {
+            return Err(HnsDirectPeerError::NetworkServiceNotReady);
+        }
+        let delivered = self
+            .pool
+            .advertise_shakescape_endpoint(verified_public_endpoint, now_unix)?;
+        self.pool
+            .shakescape_candidates
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .remove(verified_public_endpoint);
+        Ok(delivered)
+    }
+
+    /// Retire process-local self-advertisement state. Stock HSD has no address
+    /// withdrawal, so already relayed records age out through their timestamp.
+    pub fn retire_shakescape_advertisement(&self) -> Result<bool, HnsDirectPeerError> {
+        self.pool.retire_shakescape_advertisement()
+    }
+
+    /// Return bounded, non-sensitive discovery/direct-connect telemetry.
+    pub fn shakescape_discovery_status(
+        &self,
+        now_unix: u64,
+    ) -> Result<HnsShakescapeDiscoveryStatus, HnsDirectPeerError> {
+        self.pool.shakescape_status(now_unix)
+    }
+
     /// Connect one direct Shakescape peer with the exact validated peer policy
     /// already used by this coordinator.
     ///
@@ -1220,7 +1821,74 @@ impl HnsDirectPeerCoordinator {
         local_height: u32,
         now_unix: u64,
     ) -> Result<HnsDirectShakescapePeer, HnsDirectPeerError> {
-        HnsDirectShakescapePeer::connect(&self.config, address, local_height, now_unix)
+        if !self.minimal_network_service_ready(now_unix)? {
+            return Err(HnsDirectPeerError::NetworkServiceNotReady);
+        }
+        self.pool
+            .direct_connection_attempts
+            .fetch_add(1, Ordering::Relaxed);
+        match HnsDirectShakescapePeer::connect(&self.config, address, local_height, now_unix) {
+            Ok(peer) => {
+                self.pool
+                    .direct_tcp_connections
+                    .fetch_add(1, Ordering::Relaxed);
+                *self
+                    .pool
+                    .last_direct_failure
+                    .lock()
+                    .map_err(|_| HnsDirectPeerError::RuntimePoisoned)? = None;
+                Ok(peer)
+            }
+            Err(error) => {
+                *self
+                    .pool
+                    .last_direct_failure
+                    .lock()
+                    .map_err(|_| HnsDirectPeerError::RuntimePoisoned)? =
+                    Some(shakescape_direct_failure(&error));
+                Err(error)
+            }
+        }
+    }
+
+    /// Attempt at most one due candidate. A successful return has already
+    /// completed the ordinary Handshake handshake and exact ShakeScape registry
+    /// negotiation; `Ok(None)` means every retained candidate is in backoff.
+    pub fn connect_next_discovered_shakescape_peer(
+        &self,
+        local_height: u32,
+        now_unix: u64,
+    ) -> Result<Option<HnsDirectShakescapePeer>, HnsDirectPeerError> {
+        if let Some(advertisement) = self
+            .pool
+            .shakescape_advertisement
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .as_ref()
+            .cloned()
+        {
+            self.pool
+                .shakescape_candidates
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                .remove(advertisement.address);
+        }
+        let candidate = self
+            .pool
+            .shakescape_candidates
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .begin_attempt(now_unix);
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let result = self.connect_shakescape_peer(candidate.address, local_height, now_unix);
+        self.pool
+            .shakescape_candidates
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .finish_attempt(candidate.address, now_unix, result.is_ok());
+        result.map(Some)
     }
 
     /// Extend the wallet-owned direct watch set to the largest bounded restore
@@ -2502,6 +3170,24 @@ fn deterministic_watch_set_covers(
 }
 
 impl NativePeer {
+    fn receive_peer_event(&mut self, now_unix: u64) -> Result<PeerEvent, HnsDirectPeerError> {
+        let event = self.connection.receive_event(now_unix)?;
+        if let PeerEvent::Addresses(addresses) = &event {
+            self.shakescape_candidates
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                .observe(addresses, now_unix, self.allow_private_addresses);
+        }
+        Ok(event)
+    }
+
+    fn send_shakescape_address(&mut self, address: &NetAddress) -> Result<(), HnsDirectPeerError> {
+        let frame = Frame::from_packet(&Packet::Addr(vec![address.clone()]))
+            .map_err(|error| HnsDirectPeerError::Peer(error.to_string()))?;
+        self.connection.send_frame(&frame)?;
+        Ok(())
+    }
+
     /// Relay a transaction using the standard Handshake inventory handshake.
     /// A full transaction is sent only after this peer requests the exact
     /// announced hash with `getdata`; HSD disconnects peers that send an
@@ -2554,7 +3240,7 @@ impl NativePeer {
                 .transport_mut()
                 .set_read_timeout(Some(remaining))
                 .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
-            match self.connection.receive_event(now_unix_or(0)) {
+            match self.receive_peer_event(now_unix_or(0)) {
                 Ok(PeerEvent::Wallet(WalletPeerEvent::DataRequest(mut requested))) => {
                     let exact_request = requested.iter().any(|item| item == &announced);
                     requested.retain(|item| item != &announced);
@@ -2570,6 +3256,9 @@ impl NativePeer {
                 Ok(PeerEvent::Wallet(event)) => self.defer_wallet(event)?,
                 Ok(
                     PeerEvent::Addresses(_)
+                    | PeerEvent::GetAddresses
+                    | PeerEvent::GetBlocks(_)
+                    | PeerEvent::GetHeaders(_)
                     | PeerEvent::Ignored(_)
                     | PeerEvent::Experimental { .. }
                     | PeerEvent::Pong(_)
@@ -2581,10 +3270,10 @@ impl NativePeer {
                 Ok(PeerEvent::Headers(_) | PeerEvent::Proof(_) | PeerEvent::Send(_)) => {
                     return Err(HnsDirectPeerError::UnexpectedPeerEvent);
                 }
-                Err(PeerError::Io(
+                Err(HnsDirectPeerError::Io(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut,
                 )) => return Ok(false),
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
         Err(HnsDirectPeerError::ResponseEventLimit)
@@ -2598,10 +3287,13 @@ impl NativePeer {
     ) -> Result<Vec<Header>, HnsDirectPeerError> {
         self.connection.request_headers(locator, stop, now_unix)?;
         for _ in 0..MAX_RESPONSE_EVENTS {
-            match self.connection.receive_event(now_unix_or(now_unix))? {
+            match self.receive_peer_event(now_unix_or(now_unix))? {
                 PeerEvent::Headers(headers) => return Ok(headers),
                 PeerEvent::Wallet(event) => self.defer_wallet(event)?,
                 PeerEvent::Addresses(_)
+                | PeerEvent::GetAddresses
+                | PeerEvent::GetBlocks(_)
+                | PeerEvent::GetHeaders(_)
                 | PeerEvent::Ignored(_)
                 | PeerEvent::Experimental { .. }
                 | PeerEvent::Pong(_)
@@ -2625,10 +3317,13 @@ impl NativePeer {
     ) -> Result<ProofPacket, HnsDirectPeerError> {
         self.connection.request_proof(root, key, now_unix)?;
         for _ in 0..MAX_RESPONSE_EVENTS {
-            match self.connection.receive_event(now_unix_or(now_unix))? {
+            match self.receive_peer_event(now_unix_or(now_unix))? {
                 PeerEvent::Proof(proof) => return Ok(proof),
                 PeerEvent::Wallet(event) => self.defer_wallet(event)?,
                 PeerEvent::Addresses(_)
+                | PeerEvent::GetAddresses
+                | PeerEvent::GetBlocks(_)
+                | PeerEvent::GetHeaders(_)
                 | PeerEvent::Ignored(_)
                 | PeerEvent::Experimental { .. }
                 | PeerEvent::Pong(_)
@@ -2645,9 +3340,13 @@ impl NativePeer {
     }
 
     fn request_addresses(&mut self, now_unix: u64) -> Result<Vec<NetAddress>, HnsDirectPeerError> {
+        if self.address_gossip_requested {
+            return Ok(Vec::new());
+        }
         self.connection.request_addresses()?;
+        self.address_gossip_requested = true;
         for _ in 0..MAX_RESPONSE_EVENTS {
-            match self.connection.receive_event(now_unix_or(now_unix))? {
+            match self.receive_peer_event(now_unix_or(now_unix))? {
                 PeerEvent::Addresses(addresses) => {
                     return Ok(addresses
                         .into_iter()
@@ -2659,6 +3358,9 @@ impl NativePeer {
                 }
                 PeerEvent::Wallet(event) => self.defer_wallet(event)?,
                 PeerEvent::Ignored(_)
+                | PeerEvent::GetAddresses
+                | PeerEvent::GetBlocks(_)
+                | PeerEvent::GetHeaders(_)
                 | PeerEvent::Experimental { .. }
                 | PeerEvent::Pong(_)
                 | PeerEvent::Ready(_) => {}
@@ -2708,7 +3410,7 @@ impl NativePeer {
         let mut collector = None;
         let mut expected_transactions = HashSet::new();
         for _ in 0..MAX_RESPONSE_EVENTS {
-            match self.connection.receive_event(now_unix_or(now_unix))? {
+            match self.receive_peer_event(now_unix_or(now_unix))? {
                 PeerEvent::Wallet(WalletPeerEvent::MerkleBlock(payload)) => {
                     if collector.is_some() {
                         return Err(HnsDirectPeerError::UnexpectedPeerEvent);
@@ -2761,6 +3463,9 @@ impl NativePeer {
                 }
                 PeerEvent::Wallet(event) => self.defer_wallet(event)?,
                 PeerEvent::Addresses(_)
+                | PeerEvent::GetAddresses
+                | PeerEvent::GetBlocks(_)
+                | PeerEvent::GetHeaders(_)
                 | PeerEvent::Ignored(_)
                 | PeerEvent::Experimental { .. }
                 | PeerEvent::Pong(_)
@@ -2830,7 +3535,7 @@ impl NativePeer {
                 .transport_mut()
                 .set_read_timeout(Some(remaining))
                 .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
-            match self.connection.receive_event(now_unix_or(now_unix)) {
+            match self.receive_peer_event(now_unix_or(now_unix)) {
                 Ok(PeerEvent::Wallet(event)) => {
                     events.push(event);
                     if events.len() >= MAX_RESPONSE_EVENTS {
@@ -2839,6 +3544,9 @@ impl NativePeer {
                 }
                 Ok(
                     PeerEvent::Addresses(_)
+                    | PeerEvent::GetAddresses
+                    | PeerEvent::GetBlocks(_)
+                    | PeerEvent::GetHeaders(_)
                     | PeerEvent::Ignored(_)
                     | PeerEvent::Experimental { .. }
                     | PeerEvent::Pong(_)
@@ -2856,10 +3564,10 @@ impl NativePeer {
                 Ok(PeerEvent::Headers(_) | PeerEvent::Proof(_) | PeerEvent::Send(_)) => {
                     return Err(HnsDirectPeerError::UnexpectedPeerEvent);
                 }
-                Err(PeerError::Io(
+                Err(HnsDirectPeerError::Io(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut,
                 )) => return Ok(events),
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
         Ok(events)
@@ -3077,12 +3785,20 @@ fn is_public_ipv4(ip: Ipv4Addr) -> bool {
 
 fn is_public_ipv6(ip: Ipv6Addr) -> bool {
     let octets = ip.octets();
-    !(ip.is_unspecified()
-        || ip.is_loopback()
-        || ip.is_multicast()
-        || (octets[0] & 0xfe) == 0xfc
-        || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
-        || (octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0d && octets[3] == 0xb8))
+    if octets[..12].iter().all(|octet| *octet == 0)
+        || (octets[..10].iter().all(|octet| *octet == 0)
+            && octets[10] == 0xff
+            && octets[11] == 0xff)
+    {
+        return is_public_ipv4(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ));
+    }
+    // Public mobile IPv6 endpoints are global-unicast allocations. Limiting
+    // hostile ADDR input to 2000::/3 also excludes link-local, ULA, multicast,
+    // documentation, translation, and other special-use ranges from dialing.
+    (octets[0] & 0xe0) == 0x20
+        && !(octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0d && octets[3] == 0xb8)
 }
 
 const fn network_magic(network: HnsNetwork) -> NetworkMagic {
@@ -3198,6 +3914,32 @@ fn normalize_header_freshness_response(
     headers
 }
 
+fn shakescape_direct_failure(error: &HnsDirectPeerError) -> HnsShakescapeDirectFailure {
+    match error {
+        HnsDirectPeerError::AddressNotAllowed => HnsShakescapeDirectFailure::AddressRejected,
+        HnsDirectPeerError::Io(
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::AddrNotAvailable
+            | std::io::ErrorKind::NetworkDown
+            | std::io::ErrorKind::NetworkUnreachable
+            | std::io::ErrorKind::HostUnreachable
+            | std::io::ErrorKind::TimedOut,
+        ) => HnsShakescapeDirectFailure::DirectUnreachable,
+        HnsDirectPeerError::Peer(_)
+        | HnsDirectPeerError::PeerRejected(_)
+        | HnsDirectPeerError::ResponseEventLimit
+        | HnsDirectPeerError::UnexpectedPeerEvent
+        | HnsDirectPeerError::ShakescapePeerNotAdvertised => {
+            HnsShakescapeDirectFailure::HandshakeRejected
+        }
+        HnsDirectPeerError::Shakescape(_) => HnsShakescapeDirectFailure::RegistryNegotiation,
+        _ => HnsShakescapeDirectFailure::Internal,
+    }
+}
+
 /// Direct-peer construction, transport, or locally verified data failure.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -3222,6 +3964,8 @@ pub enum HnsDirectPeerError {
     DuplicatePeer,
     #[error("no ready standard Handshake peers are connected")]
     NoReadyPeers,
+    #[error("the verified header authority is not ready to provide minimal NETWORK service")]
+    NetworkServiceNotReady,
     #[error("operating-system randomness is unavailable")]
     Randomness,
     #[error("direct-peer runtime lock is poisoned")]
@@ -4023,6 +4767,244 @@ mod tests {
     }
 
     #[test]
+    fn stock_hsd_shakescape_candidates_require_a_fresh_keyless_network_address() {
+        let now = 1_700_000_000;
+        let services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
+        let mut address =
+            NetAddress::from_socket_addr("1.1.1.1:32123".parse().unwrap(), now, services);
+        assert!(shakescape_net_address_allowed(&address, now, false));
+
+        address.services = SHAKESCAPE_EXTENSION_SERVICE.value();
+        assert!(!shakescape_net_address_allowed(&address, now, false));
+        address.services = SERVICE_NETWORK;
+        assert!(!shakescape_net_address_allowed(&address, now, false));
+        address.services = services;
+
+        address.key = [2; 33];
+        assert!(!shakescape_net_address_allowed(&address, now, false));
+        address.key = [0; 33];
+
+        address.time = now - SHAKESCAPE_ADDR_FRESHNESS_SECONDS - 1;
+        assert!(!shakescape_net_address_allowed(&address, now, false));
+        address.time = now + SHAKESCAPE_ADDR_FUTURE_SKEW_SECONDS + 1;
+        assert!(!shakescape_net_address_allowed(&address, now, false));
+
+        address = NetAddress::from_socket_addr("127.0.0.1:32123".parse().unwrap(), now, services);
+        assert!(!shakescape_net_address_allowed(&address, now, false));
+        assert!(shakescape_net_address_allowed(&address, now, true));
+    }
+
+    #[test]
+    fn shakescape_candidate_cache_is_deduplicated_bounded_and_backed_off() {
+        let now = 1_700_000_000;
+        let services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
+        let mut cache = HnsShakescapeCandidateCache::default();
+        let first = NetAddress::from_socket_addr("8.8.8.8:20000".parse().unwrap(), now, services);
+        assert_eq!(cache.observe(std::slice::from_ref(&first), now, false), 1);
+        assert_eq!(
+            cache.observe(std::slice::from_ref(&first), now + 1, false),
+            0
+        );
+        assert_eq!(cache.snapshot(now + 1).len(), 1);
+
+        let attempt = cache.begin_attempt(now + 1).unwrap();
+        assert_eq!(attempt.address, first.socket_addr());
+        assert_eq!(attempt.attempts, 1);
+        cache.finish_attempt(attempt.address, now + 1, false);
+        assert!(cache.begin_attempt(now + 1).is_none());
+        let refreshed = NetAddress::from_socket_addr(first.socket_addr(), now + 2, services);
+        assert_eq!(cache.observe(&[refreshed], now + 2, false), 0);
+        assert!(cache.begin_attempt(now + 2).is_none());
+        let backed_off = cache.snapshot(now + 1).pop().unwrap();
+        assert_eq!(
+            backed_off.next_attempt_at,
+            now + 1 + SHAKESCAPE_RETRY_BASE_SECONDS
+        );
+        assert_eq!(backed_off.last_failure_at, Some(now + 1));
+
+        for offset in 0..=MAX_SHAKESCAPE_CANDIDATES {
+            let socket: SocketAddr = format!("8.8.4.4:{}", 21_000 + offset).parse().unwrap();
+            let address = NetAddress::from_socket_addr(socket, now + 2, services);
+            cache.observe(&[address], now + 2 + offset as u64, false);
+        }
+        assert_eq!(cache.snapshot(now + 200).len(), MAX_SHAKESCAPE_CANDIDATES);
+        assert!(
+            cache
+                .snapshot(now + SHAKESCAPE_ADDR_FRESHNESS_SECONDS + 3)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn direct_failure_status_is_coarse_and_non_sensitive() {
+        assert_eq!(
+            shakescape_direct_failure(&HnsDirectPeerError::AddressNotAllowed),
+            HnsShakescapeDirectFailure::AddressRejected
+        );
+        assert_eq!(
+            shakescape_direct_failure(&HnsDirectPeerError::Io(
+                std::io::ErrorKind::ConnectionRefused
+            )),
+            HnsShakescapeDirectFailure::DirectUnreachable
+        );
+        assert_eq!(
+            shakescape_direct_failure(&HnsDirectPeerError::Shakescape(
+                "deliberately omitted from status".to_owned()
+            )),
+            HnsShakescapeDirectFailure::RegistryNegotiation
+        );
+    }
+
+    #[test]
+    fn offline_getaddr_does_not_consume_the_first_connected_refresh() {
+        let pool =
+            NativeHnsPeerPool::new(HnsDirectPeerConfig::for_network(HnsNetwork::Regtest)).unwrap();
+        assert!(matches!(
+            pool.refresh_shakescape_discovery(1_700_000_000),
+            Err(HnsDirectPeerError::NoReadyPeers)
+        ));
+        assert_eq!(*pool.last_shakescape_getaddr.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn stock_hsd_advertisement_is_one_keyless_network_extension_addr() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer_address = listener.local_addr().unwrap();
+        let now = 1_700_000_000;
+        let server = thread::spawn(move || {
+            let (stream, remote) = listener.accept().unwrap();
+            let mut version = light_wallet_version(remote, [22; 8], 42, now);
+            version.services = SERVICE_NETWORK | SERVICE_BLOOM;
+            let mut connection = PeerConnection::accept(
+                stream,
+                PeerConfig::for_network(NetworkMagic::Regtest),
+                &version,
+                now,
+            )
+            .unwrap();
+            connection.complete_handshake(|| now).unwrap();
+            match connection.receive_event(now).unwrap() {
+                PeerEvent::Addresses(addresses) => addresses,
+                event => panic!("expected one stock ADDR advertisement, received {event:?}"),
+            }
+        });
+
+        let mut client_version = light_wallet_version(peer_address, [21; 8], 42, now);
+        client_version.services = SERVICE_NETWORK;
+        let mut connection = PeerConnection::connect(
+            peer_address,
+            PeerConfig::for_wallet_network(NetworkMagic::Regtest),
+            &client_version,
+            now,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let metadata = connection.complete_handshake(|| now).unwrap();
+        let pool =
+            NativeHnsPeerPool::new(HnsDirectPeerConfig::for_network(HnsNetwork::Regtest)).unwrap();
+        pool.lock_peers().unwrap().insert(
+            PeerId::new([23; 32]),
+            Arc::new(Mutex::new(NativePeer {
+                address: peer_address,
+                advertised_height: metadata.height,
+                connection,
+                deferred_wallet: VecDeque::new(),
+                address_gossip_requested: false,
+                shakescape_candidates: Arc::clone(&pool.shakescape_candidates),
+                allow_private_addresses: true,
+            })),
+        );
+
+        let advertised: SocketAddr = "127.0.0.1:32123".parse().unwrap();
+        assert_eq!(
+            pool.advertise_shakescape_endpoint(advertised, now).unwrap(),
+            1
+        );
+        assert_eq!(
+            pool.advertise_shakescape_endpoint(advertised, now + 1)
+                .unwrap(),
+            0
+        );
+        let addresses = server.join().unwrap();
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(addresses[0].socket_addr(), advertised);
+        assert_eq!(addresses[0].time, now);
+        assert_eq!(
+            addresses[0].services,
+            SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value()
+        );
+        assert_eq!(addresses[0].key, [0; 33]);
+    }
+
+    #[test]
+    fn normal_getaddr_response_populates_the_shakescape_cache() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer_address = listener.local_addr().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let candidate: SocketAddr = "127.0.0.1:32124".parse().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, remote) = listener.accept().unwrap();
+            let mut version = light_wallet_version(remote, [32; 8], 42, now);
+            version.services = SERVICE_NETWORK | SERVICE_BLOOM;
+            let mut connection = PeerConnection::accept(
+                stream,
+                PeerConfig::for_network(NetworkMagic::Regtest),
+                &version,
+                now,
+            )
+            .unwrap();
+            connection.complete_handshake(|| now).unwrap();
+            assert!(matches!(
+                connection.receive_event(now).unwrap(),
+                PeerEvent::GetAddresses
+            ));
+            let address = NetAddress::from_socket_addr(
+                candidate,
+                now,
+                SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value(),
+            );
+            let frame = Frame::from_packet(&Packet::Addr(vec![address])).unwrap();
+            connection.send_frame(&frame).unwrap();
+        });
+
+        let mut client_version = light_wallet_version(peer_address, [31; 8], 42, now);
+        client_version.services = SERVICE_NETWORK;
+        let mut connection = PeerConnection::connect(
+            peer_address,
+            PeerConfig::for_wallet_network(NetworkMagic::Regtest),
+            &client_version,
+            now,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        connection.complete_handshake(|| now).unwrap();
+        let candidates = Arc::new(Mutex::new(HnsShakescapeCandidateCache::default()));
+        let mut peer = NativePeer {
+            address: peer_address,
+            advertised_height: 42,
+            connection,
+            deferred_wallet: VecDeque::new(),
+            address_gossip_requested: false,
+            shakescape_candidates: Arc::clone(&candidates),
+            allow_private_addresses: true,
+        };
+
+        // The ordinary HNS host list still excludes the non-BLOOM address,
+        // while the same normal ADDR event feeds the dedicated ShakeScape
+        // candidate cache before that existing filter is applied.
+        assert!(peer.request_addresses(now).unwrap().is_empty());
+        assert!(peer.request_addresses(now + 1).unwrap().is_empty());
+        let discovered = candidates.lock().unwrap().snapshot(now);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].address, candidate);
+        assert_eq!(discovered[0].key, [0; 33]);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn direct_shakescape_wallet_accepts_and_negotiates_an_inbound_wallet_peer() {
         let listener = HnsDirectShakescapeListener::bind(
             HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
@@ -4046,12 +5028,55 @@ mod tests {
 
         let mut client_config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
         client_config.static_peers.push(address);
-        let client = HnsDirectShakescapePeer::connect(&client_config, address, 42, now).unwrap();
-        let server = server.join().unwrap();
+        let mut client =
+            HnsDirectShakescapePeer::connect(&client_config, address, 42, now).unwrap();
+        let mut server = server.join().unwrap();
 
         assert_eq!(client.negotiated_registry(), server.negotiated_registry());
         assert_eq!(client.address(), address);
         assert!(server.address().ip().is_loopback());
+        assert_eq!(client.try_receive_shakescape_message(now).unwrap(), None);
+        assert_eq!(server.try_receive_shakescape_message(now).unwrap(), None);
+    }
+
+    #[test]
+    fn shared_mobile_listener_retains_an_ordinary_network_peer() {
+        let listener = HnsDirectShakescapeListener::bind(
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+        )
+        .unwrap();
+        let address = listener.local_addr().unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let server = thread::spawn(move || {
+            for _ in 0..100 {
+                if let Some(peer) = listener.accept_next_mobile(42, now).unwrap() {
+                    return matches!(peer, HnsInboundMobilePeer::Network(_));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            false
+        });
+
+        let mut local_version = light_wallet_version(address, [41; 8], 42, now);
+        local_version.services = SERVICE_NETWORK;
+        let mut connection = PeerConnection::connect(
+            address,
+            PeerConfig::for_network(NetworkMagic::Regtest),
+            &local_version,
+            now,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let metadata = connection.complete_handshake(|| now).unwrap();
+        assert_eq!(
+            metadata.services,
+            SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value()
+        );
+        assert!(server.join().unwrap());
     }
 
     #[test]
@@ -4122,6 +5147,9 @@ mod tests {
             advertised_height: 42,
             connection,
             deferred_wallet: VecDeque::new(),
+            address_gossip_requested: false,
+            shakescape_candidates: Arc::new(Mutex::new(HnsShakescapeCandidateCache::default())),
+            allow_private_addresses: true,
         };
         assert!(
             peer.announce_transaction(transaction, transaction_hash, Duration::from_secs(1))
@@ -4141,6 +5169,8 @@ mod tests {
             "192.0.2.1",
             "100.64.0.1",
             "::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
             "fc00::1",
             "fe80::1",
             "2001:db8::1",

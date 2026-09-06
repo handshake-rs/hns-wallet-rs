@@ -9,8 +9,8 @@ use hns_covenants::{
 use hns_header_consensus::Header;
 use hns_light_sync::{HeaderRoundRequest, PeerId, SyncError, SyncState};
 use hns_light_wallet::{VerifiedWalletBlock, WalletHeaderAnchor};
-use hns_p2p_wire::{GetProofPacket, ProofPacket};
-use hns_primitives::{Height, NameHash, Outpoint, TreeRoot};
+use hns_p2p_wire::{GetProofPacket, LocatorPacket, ProofPacket};
+use hns_primitives::{BlockHash, Height, NameHash, Outpoint, TreeRoot};
 use hns_transaction::{Coin, Output, Transaction};
 use hns_wallet_types::{BaseUnits, TransactionHash};
 use sha2::{Digest, Sha256};
@@ -247,6 +247,42 @@ impl EmbeddedHnsBackend {
     /// Current authenticated header-sync status owned by this wallet.
     pub fn header_sync_status(&self) -> Result<hns_light_sync::SyncStatus, HnsWalletError> {
         Ok(self.lock()?.authority.status())
+    }
+
+    /// Whether this backend currently has a fresh peer-agreed tip and its
+    /// authenticated canonical header, which are the minimum data authority
+    /// required before the mobile listener may advertise `SERVICE_NETWORK`.
+    pub fn minimal_network_service_ready(&self, now_unix: u64) -> Result<bool, HnsWalletError> {
+        self.lock()?
+            .authority
+            .minimal_network_service_ready(now_unix)
+            .map_err(map_authority_error)
+    }
+
+    /// Construct one standard bounded `headers` response exclusively from the
+    /// encrypted, locally validated canonical archive.
+    pub fn network_headers_after_locator(
+        &self,
+        request: &LocatorPacket,
+    ) -> Result<Vec<Header>, HnsWalletError> {
+        self.lock()?
+            .authority
+            .network_headers_after_locator(&request.locator, request.stop)
+            .map_err(map_authority_error)
+    }
+
+    /// Construct standard block inventory for the same verified header range.
+    /// The minimal mobile node does not claim body availability; subsequent
+    /// `getdata` is answered with `notfound` unless a body cache is added.
+    pub fn network_block_inventory_after_locator(
+        &self,
+        request: &LocatorPacket,
+    ) -> Result<Vec<BlockHash>, HnsWalletError> {
+        Ok(self
+            .network_headers_after_locator(request)?
+            .into_iter()
+            .map(|header| header.block_hash())
+            .collect())
     }
 
     /// Latest local header floor for platform-owned anti-rollback storage.

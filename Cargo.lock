@@ -750,8 +750,6 @@ dependencies = [
 [[package]]
 name = "hns-light-p2p"
 version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a44148533bd5809f9883089fe1ddf934cc633491f45f558db63274c105abe470"
 dependencies = [
  "hns-header-consensus",
  "hns-p2p-wire",

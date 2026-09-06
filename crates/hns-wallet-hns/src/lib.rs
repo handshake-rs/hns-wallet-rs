@@ -36,7 +36,9 @@ pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
 pub use peer_coordinator::{
     ConnectedHnsPeer, HnsBlockScanBatchTelemetry, HnsBlockScanProgress, HnsDirectPeerConfig,
     HnsDirectPeerCoordinator, HnsDirectPeerError, HnsDirectShakescapeListener,
-    HnsDirectShakescapeMessage, HnsDirectShakescapePeer, HnsHeaderRoundProgress, NativeHnsPeerPool,
+    HnsDirectShakescapeMessage, HnsDirectShakescapePeer, HnsHeaderRoundProgress,
+    HnsInboundMobilePeer, HnsInboundNetworkPeer, HnsShakescapeCandidate,
+    HnsShakescapeDirectFailure, HnsShakescapeDiscoveryStatus, NativeHnsPeerPool,
     open_wallet_direct_hns_peer_coordinator, open_wallet_direct_hns_peer_coordinator_with_floor,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_checkpoint_bootstrap,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap,

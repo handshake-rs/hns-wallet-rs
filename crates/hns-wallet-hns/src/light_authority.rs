@@ -1,12 +1,16 @@
 //! Wallet-owned Handshake header authority persisted in the encrypted store.
 
+use std::collections::HashSet;
+
 use hns_header_consensus::{HEADER_SIZE, Header, HeaderError, Network};
 use hns_light_chain::{
     ChainLimits, ChainSnapshotFloor, CurrencyPolicy, CurrentChain, HeaderEntry, LightChain,
     LightChainError,
 };
-use hns_light_sync::{HeaderRoundRequest, HeaderSync, PeerId, SyncConfig, SyncError, SyncStatus};
-use hns_primitives::{BlockTime, Chainwork, Height};
+use hns_light_sync::{
+    HeaderRoundRequest, HeaderSync, PeerId, SyncConfig, SyncError, SyncState, SyncStatus,
+};
+use hns_primitives::{BlockHash, BlockTime, Chainwork, Height};
 use hns_wallet_store::{EntityBatchSave, EntityKind, SharedWalletStore, StoreError, StoredEntity};
 use hns_wallet_types::AccountId;
 use serde::{Deserialize, Serialize};
@@ -39,6 +43,9 @@ const MAINNET_WALLET_CHECKPOINT_HEADER_HEX: &str = include_str!("mainnet_header_
 
 const CHECKPOINT_SUFFIX: &[u8] = b"/hns-light/checkpoint";
 const HEADER_SUFFIX: &[u8] = b"/hns-light/header/";
+const NETWORK_SERVICE_MAX_TIP_AGE_SECONDS: u64 = 2 * 60 * 60;
+const NETWORK_SERVICE_LOCATOR_LOOKBACK: u32 = 4_096;
+const NETWORK_SERVICE_MAX_HEADERS: usize = 2_000;
 
 /// Rollback floor that callers retain in platform-protected monotonic storage.
 ///
@@ -769,6 +776,80 @@ impl EncryptedHnsLightAuthority {
             return Ok(None);
         }
         load_header(&self.store, self.account_id, self.network, height).map(Some)
+    }
+
+    /// Whether the encrypted authority can truthfully back a bounded standard
+    /// `NETWORK` listener right now. A reachable socket alone is insufficient:
+    /// the latest peer-agreed tip must be fresh and its canonical header must
+    /// still be present in the authenticated archive.
+    pub(crate) fn minimal_network_service_ready(
+        &self,
+        now_unix: u64,
+    ) -> Result<bool, HnsLightError> {
+        let status = self.status();
+        let tip = status.tip;
+        if status.state != SyncState::HeaderCurrent
+            || tip.time().get() > now_unix.saturating_add(2 * 60 * 60)
+            || now_unix
+                > tip
+                    .time()
+                    .get()
+                    .saturating_add(NETWORK_SERVICE_MAX_TIP_AGE_SECONDS)
+        {
+            return Ok(false);
+        }
+        Ok(self.archived_header(tip.height().get())?.is_some())
+    }
+
+    /// Serve the canonical encrypted header archive after the first locator
+    /// that matches the recent retained chain. Search and response sizes are
+    /// independently bounded so an inbound peer cannot turn the mobile store
+    /// into an unbounded scan. An unknown or pruned locator receives the
+    /// standard empty response instead of fabricated ancestry.
+    pub(crate) fn network_headers_after_locator(
+        &self,
+        locator: &[BlockHash],
+        stop: BlockHash,
+    ) -> Result<Vec<Header>, HnsLightError> {
+        let tip_height = self.status().tip.height().get();
+        let first_retained = self.birthday_height;
+        if tip_height < first_retained || locator.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requested: HashSet<BlockHash> = locator.iter().copied().collect();
+        let search_floor = tip_height
+            .saturating_sub(NETWORK_SERVICE_LOCATOR_LOOKBACK)
+            .max(first_retained);
+        let mut matched_height = None;
+        for height in (search_floor..=tip_height).rev() {
+            let Some(header) = self.archived_header(height)? else {
+                continue;
+            };
+            if requested.contains(&header.block_hash()) {
+                matched_height = Some(height);
+                break;
+            }
+        }
+        let Some(matched_height) = matched_height else {
+            return Ok(Vec::new());
+        };
+        let mut headers = Vec::with_capacity(NETWORK_SERVICE_MAX_HEADERS);
+        let mut height = matched_height.saturating_add(1);
+        while height <= tip_height && headers.len() < NETWORK_SERVICE_MAX_HEADERS {
+            let Some(header) = self.archived_header(height)? else {
+                break;
+            };
+            let hash = header.block_hash();
+            headers.push(header);
+            if stop != BlockHash::default() && hash == stop {
+                break;
+            }
+            let Some(next) = height.checked_add(1) else {
+                break;
+            };
+            height = next;
+        }
+        Ok(headers)
     }
 }
 

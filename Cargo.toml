@@ -97,3 +97,9 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
+
+[patch.crates-io]
+# The adjacent engine exposes inbound standard serving requests instead of
+# discarding their locators. Mobile NETWORK service depends on that reviewed
+# wire/session implementation while retaining the exact published version.
+hns-light-p2p = { path = "../hns-dane-engine/crates/hns-light-p2p" }

@@ -45,7 +45,8 @@ pub use hns_wallet_hns::{
     ConnectedHnsPeer, EmbeddedHnsBackend, HnsBackend, HnsBlockScanProgress, HnsBootstrapPolicy,
     HnsClock, HnsDirectPeerConfig, HnsDirectPeerCoordinator, HnsDirectPeerError,
     HnsDirectShakescapeListener, HnsDirectShakescapeMessage, HnsDirectShakescapePeer,
-    HnsHeaderRoundProgress, HnsLightFloor, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
+    HnsHeaderRoundProgress, HnsInboundMobilePeer, HnsInboundNetworkPeer, HnsLightFloor, HnsNetwork,
+    HnsNodeRpcBackend, HnsNodeRpcConfig, HnsShakescapeDirectFailure, HnsShakescapeDiscoveryStatus,
     SystemClock as HnsReadSystemClock,
 };
 use hns_wallet_hns::{
@@ -338,6 +339,30 @@ impl MobileDirectShakescapeListener {
     /// port when the listener was bound with port zero.
     pub fn local_addr(&self) -> Result<SocketAddr, MobileWalletError> {
         self.listener.local_addr().map_err(Into::into)
+    }
+}
+
+/// One active mobile ShakeScape discovery/listening lifecycle.
+///
+/// The platform supplies an endpoint only after it has independently verified
+/// that the bound TCP listener is reachable there (public IPv6 or a temporary
+/// router mapping). The endpoint is never inferred from STUN because stock HSD
+/// `ADDR` describes a TCP Handshake peer, not a UDP candidate.
+pub struct MobileShakescapeNetworking {
+    listener: MobileDirectShakescapeListener,
+    verified_public_endpoint: SocketAddr,
+}
+
+impl MobileShakescapeNetworking {
+    /// Local bound listener, including its kernel-selected internal port.
+    pub fn local_addr(&self) -> Result<SocketAddr, MobileWalletError> {
+        self.listener.local_addr()
+    }
+
+    /// Host-verified public TCP endpoint currently eligible for advertisement.
+    #[must_use]
+    pub const fn verified_public_endpoint(&self) -> SocketAddr {
+        self.verified_public_endpoint
     }
 }
 
@@ -2404,6 +2429,113 @@ impl<C: HnsClock> MobileDirectHnsValueController<C> {
             .bind_shakescape_listener(address)
             .map(|listener| MobileDirectShakescapeListener { listener })
             .map_err(Into::into)
+    }
+
+    /// Start the complete stock-HSD-backed ShakeScape TCP discovery lifecycle.
+    ///
+    /// `verified_public_endpoint` must be the public IPv6 socket or temporary
+    /// PCP/NAT-PMP/UPnP TCP mapping that reaches `bind_address`. The Rust wallet
+    /// never substitutes a STUN UDP mapping. Startup remains successful before
+    /// ordinary HSD peers connect; a later tick performs the first publication.
+    pub fn start_wallet_owned_shakescape_networking(
+        &mut self,
+        bind_address: SocketAddr,
+        verified_public_endpoint: SocketAddr,
+    ) -> Result<MobileShakescapeNetworking, MobileWalletError> {
+        let listener = self.bind_wallet_owned_direct_shakescape_listener(bind_address)?;
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        match self
+            .coordinator
+            .advertise_shakescape_endpoint(verified_public_endpoint, now_unix)
+        {
+            Ok(_) | Err(HnsDirectPeerError::NoReadyPeers) => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(MobileShakescapeNetworking {
+            listener,
+            verified_public_endpoint,
+        })
+    }
+
+    /// Refresh bounded self-advertisement and `GETADDR`, then try at most one
+    /// due direct candidate. A returned peer has already passed Handshake and
+    /// exact ShakeScape registry/network/genesis negotiation.
+    pub fn tick_wallet_owned_shakescape_networking(
+        &mut self,
+        networking: &MobileShakescapeNetworking,
+        local_height: u32,
+    ) -> Result<Option<HnsDirectShakescapePeer>, MobileWalletError> {
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        match self
+            .coordinator
+            .advertise_shakescape_endpoint(networking.verified_public_endpoint, now_unix)
+        {
+            Ok(_) | Err(HnsDirectPeerError::NoReadyPeers) => {}
+            Err(error) => return Err(error.into()),
+        }
+        match self.coordinator.refresh_shakescape_discovery(now_unix) {
+            Ok(_) | Err(HnsDirectPeerError::NoReadyPeers) => {}
+            Err(error) => return Err(error.into()),
+        }
+        self.coordinator
+            .connect_next_discovered_shakescape_peer(local_height, now_unix)
+            .map_err(Into::into)
+    }
+
+    /// Replace the host-verified public TCP mapping after an IPv6, interface,
+    /// or router-mapping transition. The previous gossiped record cannot be
+    /// withdrawn and therefore expires by its original timestamp.
+    pub fn update_wallet_owned_shakescape_public_endpoint(
+        &mut self,
+        networking: &mut MobileShakescapeNetworking,
+        verified_public_endpoint: SocketAddr,
+    ) -> Result<(), MobileWalletError> {
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        match self
+            .coordinator
+            .advertise_shakescape_endpoint(verified_public_endpoint, now_unix)
+        {
+            Ok(_) | Err(HnsDirectPeerError::NoReadyPeers) => {
+                networking.verified_public_endpoint = verified_public_endpoint;
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Accept at most one registry-negotiated inbound peer from the active
+    /// networking lifecycle. Signed board validation remains a separate gate.
+    pub fn accept_wallet_owned_shakescape_networking_peer(
+        &mut self,
+        networking: &MobileShakescapeNetworking,
+        local_height: u32,
+    ) -> Result<Option<HnsDirectShakescapePeer>, MobileWalletError> {
+        self.accept_wallet_owned_direct_shakescape_peer(&networking.listener, local_height)
+    }
+
+    /// Return the small non-sensitive mobile networking status surface. Raw
+    /// candidate IPs, ports, and observation histories are not exposed here.
+    pub fn wallet_owned_shakescape_networking_status(
+        &mut self,
+    ) -> Result<HnsShakescapeDiscoveryStatus, MobileWalletError> {
+        let now_unix = self.value.trusted_wallet_peer_now_unix()?;
+        self.coordinator
+            .shakescape_discovery_status(now_unix)
+            .map_err(Into::into)
+    }
+
+    /// Stop discovery advertisement and consume the listener lifecycle. HSD
+    /// has no withdrawal message; the last gossiped endpoint expires normally.
+    pub fn stop_wallet_owned_shakescape_networking(
+        &mut self,
+        networking: MobileShakescapeNetworking,
+    ) -> Result<bool, MobileWalletError> {
+        let retired = self
+            .coordinator
+            .retire_shakescape_advertisement()
+            .map_err(MobileWalletError::from)?;
+        drop(networking);
+        Ok(retired)
     }
 
     /// Establish a direct Shakescape peer using the exact policy retained by this
