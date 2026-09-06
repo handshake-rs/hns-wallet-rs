@@ -2097,7 +2097,7 @@ impl HnsDirectPeerCoordinator {
         let attempts = std::thread::scope(|scope| {
             let tasks = candidates
                 .into_iter()
-                .map(|address| scope.spawn(move || self.connect_peer(address, now_unix)))
+                .map(|address| scope.spawn(move || (address, self.connect_peer(address, now_unix))))
                 .collect::<Vec<_>>();
             tasks
                 .into_iter()
@@ -2108,8 +2108,15 @@ impl HnsDirectPeerCoordinator {
         let mut last_error = None;
         for attempt in attempts {
             match attempt {
-                Ok(Ok(peer)) => connected.push(peer),
-                Ok(Err(error)) => last_error = Some(error),
+                Ok((_, Ok(peer))) => connected.push(peer),
+                Ok((address, Err(error))) => {
+                    // A failed candidate remains in the bounded known set.
+                    // Without session quarantine deterministic address
+                    // ordering selects it again on every short mobile retry,
+                    // preventing the pool from ever reaching its reserves.
+                    self.pool.retire_address(address)?;
+                    last_error = Some(error);
+                }
                 Err(_) => last_error = Some(HnsDirectPeerError::WorkerPanicked),
             }
         }
