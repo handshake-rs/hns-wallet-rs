@@ -2283,12 +2283,21 @@ impl HnsDirectPeerCoordinator {
         for response in responses {
             match response {
                 Ok((id, Ok(proof))) => {
-                    if let Ok(candidate) =
-                        self.backend.admit_name_proof(&proof, now_unix_or(now_unix))
-                    {
-                        verified.get_or_insert(candidate);
-                    } else {
+                    // Correlation already binds the response to the exact
+                    // requested root and key. Verify every peer's proof so an
+                    // invalid responder is still retired, but persist the
+                    // first valid proof only once. Rewriting identical proof
+                    // state for every honest peer needlessly advances store
+                    // revisions and, more importantly, used to collapse a
+                    // local authority/store failure into the misleading
+                    // `NoValidNameProof` peer error below.
+                    if proof.verify().is_err() {
                         failures.push(id);
+                    } else if verified.is_none() {
+                        verified = Some(
+                            self.backend
+                                .admit_name_proof(&proof, now_unix_or(now_unix))?,
+                        );
                     }
                 }
                 Ok((id, Err(_))) => failures.push(id),
