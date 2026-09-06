@@ -1199,10 +1199,11 @@ fn active_name_owner_coin(
         .current_raw
         .clone()
         .ok_or(HnsWalletError::InvalidEvidence)?;
-    let owner = view
-        .current_owner
-        .as_ref()
-        .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)?;
+    let owner = view.current_owner.as_ref().ok_or_else(|| {
+        HnsWalletError::Backend(
+            "current name owner transaction is absent from the verified direct index".to_owned(),
+        )
+    })?;
     Ok(ActiveNameOwnerCoinEvidence {
         projection_version: 1,
         binding,
@@ -1695,10 +1696,11 @@ fn embedded_name_action_context(
         .current_raw
         .clone()
         .ok_or(HnsWalletError::InvalidEvidence)?;
-    let owner = view
-        .current_owner
-        .as_ref()
-        .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)?;
+    let owner = view.current_owner.as_ref().ok_or_else(|| {
+        HnsWalletError::Backend(
+            "current name owner transaction is absent from the verified direct index".to_owned(),
+        )
+    })?;
     let active_owner = active_name_owner_coin(&view, binding)?;
     let owner_coin = active_owner.owner_coin;
     let candidate_height = u32::try_from(
@@ -1871,10 +1873,14 @@ fn embedded_block_hash(state: &EmbeddedState, height: u32) -> Result<[u8; 32], H
     }
     state
         .authority
-        .archived_header(height)
+        .name_action_header(height)
         .map_err(map_authority_error)?
         .map(|header| header.block_hash().into_bytes())
-        .ok_or(HnsWalletError::RuntimeIntegrationUnavailable)
+        .ok_or_else(|| {
+            HnsWalletError::Backend(format!(
+                "authenticated header {height} required by the name action is unavailable"
+            ))
+        })
 }
 
 fn wallet_fee_rate(state: &EmbeddedState) -> (u64, usize) {
@@ -2918,11 +2924,8 @@ mod tests {
         };
         backend
             .install_watch_set(
-                HnsLightWatchSet::new(
-                    vec![watched_name_owner],
-                    vec![name_hash.into_bytes()],
-                )
-                .unwrap(),
+                HnsLightWatchSet::new(vec![watched_name_owner], vec![name_hash.into_bytes()])
+                    .unwrap(),
                 now,
             )
             .unwrap();

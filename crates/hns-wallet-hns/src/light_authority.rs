@@ -29,6 +29,11 @@ pub const MAX_GENESIS_BOOTSTRAP_HEADERS: u32 = 500_000;
 pub const MAINNET_WALLET_CHECKPOINT_HEIGHT: u32 = 300_000;
 /// Highest birthday accepted by the checkpoint-segment acceleration path.
 pub const MAX_CHECKPOINT_BOOTSTRAP_HEIGHT: u32 = 1_000_000;
+/// Mainnet FINALIZE commits to the block at twice the 4,320-block renewal
+/// maturity behind the candidate tip. A wallet whose honest scan birthday is
+/// newer than that block must retain this separate, consensus-validated
+/// pre-birthday header window even though it must not scan those old blocks.
+pub const MAINNET_NAME_ACTION_HEADER_LOOKBACK: u32 = 8_640;
 
 const MAINNET_WALLET_CHECKPOINT_HASH: [u8; 32] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x34, 0x6b, 0x20, 0x3c, 0x4d, 0xd8, 0x66, 0xa6,
@@ -604,8 +609,10 @@ impl EncryptedHnsLightAuthority {
     }
 
     /// Initialize a pristine Mainnet restore from the product-pinned block
-    /// 300,000 consensus state and validate only the headers after that
-    /// checkpoint through the wallet birthday.
+    /// 300,000 consensus state, or replay the same authenticated stream once
+    /// to add the bounded pre-birthday header window required by name actions.
+    /// Every header after the checkpoint through the wallet birthday is
+    /// independently validated in either case.
     ///
     /// The embedded checkpoint contains the complete 147-entry consensus
     /// lookback window, including cumulative chainwork. It was independently
@@ -677,18 +684,24 @@ impl EncryptedHnsLightAuthority {
             return Err(HnsLightError::BootstrapBirthdayMismatch);
         }
         let current_tip = self.sync.chain().tip();
-        if current_tip.height() >= Height::new(expected_height) {
-            let installed_anchor_matches = self
+        let installed_anchor_matches = if current_tip.height() >= Height::new(expected_height) {
+            let matches = self
                 .archived_header(expected_height)?
                 .is_some_and(|header| header.block_hash().into_bytes() == expected_hash);
-            if installed_anchor_matches {
+            if matches && self.mainnet_name_action_support_complete()? {
                 return Ok(self.status());
             }
-            return Err(HnsLightError::BootstrapUnavailable);
-        }
-        if self.checkpoint_revision != 1
-            || self.archived_tip.is_some()
-            || current_tip.height() != Height::new(0)
+            if !matches {
+                return Err(HnsLightError::BootstrapUnavailable);
+            }
+            true
+        } else {
+            false
+        };
+        if !installed_anchor_matches
+            && (self.checkpoint_revision != 1
+                || self.archived_tip.is_some()
+                || current_tip.height() != Height::new(0))
         {
             return Err(HnsLightError::BootstrapUnavailable);
         }
@@ -703,6 +716,16 @@ impl EncryptedHnsLightAuthority {
         }
 
         let expected_count = expected_height.saturating_sub(checkpoint_height);
+        let support_floor = expected_height
+            .saturating_sub(MAINNET_NAME_ACTION_HEADER_LOOKBACK)
+            .max(checkpoint_height);
+        let mut support_headers = Vec::with_capacity(
+            usize::try_from(expected_height.saturating_sub(support_floor))
+                .map_err(|_| HnsLightError::InvalidCheckpointBootstrapTarget)?,
+        );
+        if checkpoint_height >= support_floor && checkpoint_height < expected_height {
+            support_headers.push((checkpoint_height, checkpoint_header.clone()));
+        }
         let mut count = 0_u32;
         let mut final_header = checkpoint_header;
         for header in headers_after_checkpoint {
@@ -712,7 +735,11 @@ impl EncryptedHnsLightAuthority {
             if count > expected_count {
                 return Err(HnsLightError::BootstrapHeaderCountMismatch);
             }
-            chain.append(&header, BlockTime::new(now))?;
+            let entry = chain.append(&header, BlockTime::new(now))?;
+            let height = entry.height().get();
+            if height >= support_floor && height < expected_height {
+                support_headers.push((height, header.clone()));
+            }
             final_header = header;
         }
         let final_entry = chain.tip();
@@ -723,6 +750,26 @@ impl EncryptedHnsLightAuthority {
             return Err(HnsLightError::BootstrapTargetMismatch);
         }
 
+        let mut support_saves = support_headers
+            .into_iter()
+            .map(|(height, header)| EntityBatchSave {
+                id: header_id(self.account_id, height),
+                expected_revision: 0,
+                value: StoredHnsLightRecord::Header(StoredHnsHeader::new(
+                    self.network,
+                    height,
+                    &header,
+                )),
+                updated_at_unix: now,
+            })
+            .collect::<Vec<_>>();
+        if installed_anchor_matches {
+            self.store.with_store_mut(|wallet| {
+                wallet.apply_entity_batch(EntityKind::HnsLightChain, &support_saves, &[])
+            })?;
+            return Ok(self.status());
+        }
+
         let next_archived_tip = Some((expected_height, expected_hash));
         let checkpoint = checkpoint_record(
             &chain,
@@ -730,24 +777,24 @@ impl EncryptedHnsLightAuthority {
             self.birthday_height,
             next_archived_tip,
         )?;
-        let saves = [
-            EntityBatchSave {
-                id: checkpoint_id(self.account_id),
-                expected_revision: self.checkpoint_revision,
-                value: StoredHnsLightRecord::Checkpoint(checkpoint),
-                updated_at_unix: now,
-            },
-            EntityBatchSave {
-                id: header_id(self.account_id, expected_height),
-                expected_revision: 0,
-                value: StoredHnsLightRecord::Header(StoredHnsHeader::new(
-                    self.network,
-                    expected_height,
-                    &final_header,
-                )),
-                updated_at_unix: now,
-            },
-        ];
+        let mut saves = Vec::with_capacity(support_saves.len().saturating_add(2));
+        saves.push(EntityBatchSave {
+            id: checkpoint_id(self.account_id),
+            expected_revision: self.checkpoint_revision,
+            value: StoredHnsLightRecord::Checkpoint(checkpoint),
+            updated_at_unix: now,
+        });
+        saves.append(&mut support_saves);
+        saves.push(EntityBatchSave {
+            id: header_id(self.account_id, expected_height),
+            expected_revision: 0,
+            value: StoredHnsLightRecord::Header(StoredHnsHeader::new(
+                self.network,
+                expected_height,
+                &final_header,
+            )),
+            updated_at_unix: now,
+        });
         self.store.with_store_mut(|wallet| {
             wallet.apply_entity_batch(EntityKind::HnsLightChain, &saves, &[])
         })?;
@@ -776,6 +823,63 @@ impl EncryptedHnsLightAuthority {
             return Ok(None);
         }
         load_header(&self.store, self.account_id, self.network, height).map(Some)
+    }
+
+    /// Load a consensus-validated header required by a name action. Headers at
+    /// or after the scan birthday come from the ordinary contiguous archive;
+    /// the bounded Mainnet pre-birthday window is installed atomically from
+    /// the same pinned checkpoint stream used to initialize the light chain.
+    pub(crate) fn name_action_header(&self, height: u32) -> Result<Option<Header>, HnsLightError> {
+        if height >= self.birthday_height {
+            return self.archived_header(height);
+        }
+        if self.network != Network::Mainnet || height < self.mainnet_name_action_support_floor() {
+            return Ok(None);
+        }
+        load_header_optional(&self.store, self.account_id, self.network, height)
+    }
+
+    /// Whether opening without a checkpoint segment would leave the current
+    /// Mainnet FINALIZE renewal commitment outside the authenticated archive.
+    /// Product shells use a false result to replay their pinned birthday
+    /// segment once and migrate an existing wallet without changing its honest
+    /// scan birthday or rollback floor.
+    pub(crate) fn current_name_action_header_ready(&self) -> Result<bool, HnsLightError> {
+        if self.network != Network::Mainnet {
+            return Ok(true);
+        }
+        let tip_height = self.status().tip.height().get();
+        if tip_height < self.birthday_height {
+            return Ok(false);
+        }
+        if self.mainnet_name_action_support_complete()? {
+            return Ok(true);
+        }
+        let required_height = tip_height.saturating_sub(MAINNET_NAME_ACTION_HEADER_LOOKBACK);
+        Ok(self.name_action_header(required_height)?.is_some())
+    }
+
+    fn mainnet_name_action_support_floor(&self) -> u32 {
+        self.birthday_height
+            .saturating_sub(MAINNET_NAME_ACTION_HEADER_LOOKBACK)
+            .max(MAINNET_WALLET_CHECKPOINT_HEIGHT)
+    }
+
+    fn mainnet_name_action_support_complete(&self) -> Result<bool, HnsLightError> {
+        let floor = self.mainnet_name_action_support_floor();
+        if floor >= self.birthday_height {
+            return Ok(true);
+        }
+        Ok(
+            load_header_optional(&self.store, self.account_id, self.network, floor)?.is_some()
+                && load_header_optional(
+                    &self.store,
+                    self.account_id,
+                    self.network,
+                    self.birthday_height.saturating_sub(1),
+                )?
+                .is_some(),
+        )
     }
 
     /// Whether the encrypted authority can truthfully back a bounded standard
@@ -935,14 +1039,26 @@ fn load_header(
     network: Network,
     height: u32,
 ) -> Result<Header, HnsLightError> {
+    load_header_optional(store, account_id, network, height)?
+        .ok_or(HnsLightError::MissingArchivedHeader)
+}
+
+fn load_header_optional(
+    store: &SharedWalletStore,
+    account_id: AccountId,
+    network: Network,
+    height: u32,
+) -> Result<Option<Header>, HnsLightError> {
     let id = header_id(account_id, height);
     let stored: Option<StoredEntity<StoredHnsLightRecord>> =
         store.with_store(|wallet| wallet.hns_light_chain(&id))?;
-    let stored = stored.ok_or(HnsLightError::MissingArchivedHeader)?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
     let StoredHnsLightRecord::Header(header) = stored.value else {
         return Err(HnsLightError::WrongRecordKind);
     };
-    header.decode(network, height)
+    header.decode(network, height).map(Some)
 }
 
 fn checkpoint_id(account_id: AccountId) -> Vec<u8> {
@@ -1013,6 +1129,8 @@ pub enum HnsLightError {
     CheckpointBootstrapNetworkMismatch,
     #[error("HNS checkpoint bootstrap target is outside its supported range")]
     InvalidCheckpointBootstrapTarget,
+    #[error("HNS name-action header window requires the pinned checkpoint segment")]
+    NameActionHeaderBootstrapRequired,
     #[error("HNS checkpoint bootstrap is inconsistent with its compiled trust anchor")]
     CorruptCheckpointBootstrap,
     #[error("independent header validation disagreed with the selected sync candidate")]
@@ -1218,6 +1336,16 @@ mod tests {
             status.tip.chainwork().to_be_bytes(),
             MAINNET_WALLET_CHECKPOINT_CHAINWORK
         );
+        assert!(authority.current_name_action_header_ready().unwrap());
+        assert_eq!(
+            authority
+                .name_action_header(MAINNET_WALLET_CHECKPOINT_HEIGHT)
+                .unwrap()
+                .unwrap()
+                .block_hash()
+                .into_bytes(),
+            MAINNET_WALLET_CHECKPOINT_HASH
+        );
         let floor = authority.rollback_floor();
         drop(authority);
 
@@ -1240,6 +1368,7 @@ mod tests {
             reopened.status().tip.hash().into_bytes(),
             MAINNET_WALLET_CHECKPOINT_HASH
         );
+        assert!(reopened.current_name_action_header_ready().unwrap());
     }
 
     #[test]

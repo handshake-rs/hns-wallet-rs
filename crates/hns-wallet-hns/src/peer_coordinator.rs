@@ -3092,8 +3092,10 @@ where
 
 /// Open the direct coordinator from the compiled Mainnet block-300,000
 /// checkpoint plus only the canonical header segment through the wallet
-/// birthday. The resulting controller still requires fresh direct-peer
-/// agreement before current value authority is available.
+/// birthday. The same path migrates an existing wallet that predates the
+/// bounded pre-birthday name-action header archive. The resulting controller
+/// still requires fresh direct-peer agreement before current value authority
+/// is available.
 #[allow(clippy::too_many_arguments)]
 pub fn open_wallet_direct_hns_peer_coordinator_with_floor_and_checkpoint_bootstrap<I>(
     store: SharedWalletStore,
@@ -3165,6 +3167,14 @@ where
     .map_err(|error| HnsDirectPeerError::LightAuthority(error.to_string()))?;
     initialize_authority(&mut authority)
         .map_err(|error| HnsDirectPeerError::LightAuthority(error.to_string()))?;
+    if !authority
+        .current_name_action_header_ready()
+        .map_err(|error| HnsDirectPeerError::LightAuthority(error.to_string()))?
+    {
+        return Err(HnsDirectPeerError::LightAuthority(
+            crate::HnsLightError::NameActionHeaderBootstrapRequired.to_string(),
+        ));
+    }
     let mut index = EncryptedHnsLightIndex::open_or_create(
         store.clone(),
         account.account_id,
