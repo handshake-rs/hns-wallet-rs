@@ -2126,6 +2126,15 @@ impl HnsDirectPeerCoordinator {
         {
             return Err(error);
         }
+        if !connected.is_empty() {
+            // Seed the bounded reserve while these ordinary HSD sessions are
+            // known to be live. The Android lifecycle deliberately gives the
+            // first wallet synchronization priority over the ShakeScape
+            // service tick, so deferring GETADDR to that tick can leave no
+            // replacement candidates when a connected peer cannot serve
+            // standard name proofs.
+            let _ = self.discover_from_connected(now_unix);
+        }
         Ok(connected)
     }
 
