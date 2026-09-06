@@ -1372,6 +1372,62 @@ mod tests {
     }
 
     #[test]
+    fn mainnet_name_action_header_can_precede_the_scan_birthday() {
+        let store = store();
+        let account = AccountId::new([76; 16]);
+        let birthday = MAINNET_WALLET_CHECKPOINT_HEIGHT + 1;
+        let now = 2_000_000_000;
+        let authority = EncryptedHnsLightAuthority::open_or_create(
+            store.clone(),
+            account,
+            HnsNetwork::Mainnet,
+            birthday,
+            HnsLightFloor::default(),
+            BlockTime::new(now),
+            ChainLimits::default(),
+            config(),
+        )
+        .unwrap();
+        let checkpoint_header =
+            Header::decode(&hex::decode(MAINNET_WALLET_CHECKPOINT_HEADER_HEX.trim()).unwrap())
+                .unwrap();
+        store
+            .with_store_mut(|wallet| {
+                wallet.apply_entity_batch(
+                    EntityKind::HnsLightChain,
+                    &[EntityBatchSave {
+                        id: header_id(account, MAINNET_WALLET_CHECKPOINT_HEIGHT),
+                        expected_revision: 0,
+                        value: StoredHnsLightRecord::Header(StoredHnsHeader::new(
+                            Network::Mainnet,
+                            MAINNET_WALLET_CHECKPOINT_HEIGHT,
+                            &checkpoint_header,
+                        )),
+                        updated_at_unix: now,
+                    }],
+                    &[],
+                )
+            })
+            .unwrap();
+
+        assert!(
+            authority
+                .archived_header(MAINNET_WALLET_CHECKPOINT_HEIGHT)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            authority
+                .name_action_header(MAINNET_WALLET_CHECKPOINT_HEIGHT)
+                .unwrap()
+                .unwrap()
+                .block_hash()
+                .into_bytes(),
+            MAINNET_WALLET_CHECKPOINT_HASH
+        );
+    }
+
+    #[test]
     fn genesis_verified_bootstrap_is_idempotent_after_reopen() {
         let store = store();
         let account = AccountId::new([72; 16]);

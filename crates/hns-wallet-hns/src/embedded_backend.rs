@@ -594,7 +594,11 @@ impl HnsBackend for EmbeddedHnsBackend {
         } else {
             state
                 .authority
-                .archived_header(height_u32)
+                // FINALIZE may bind a consensus-validated header from the
+                // bounded pre-birthday name-action window. That header is
+                // intentionally outside the wallet's filtered-block scan
+                // archive, but it is still authenticated block-hash evidence.
+                .name_action_header(height_u32)
                 .map_err(map_authority_error)?
                 .map(|header| header.block_hash().into_bytes())
         };
