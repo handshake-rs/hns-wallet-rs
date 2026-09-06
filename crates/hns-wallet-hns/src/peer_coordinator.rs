@@ -1193,6 +1193,44 @@ pub struct NativeHnsPeerPool {
     last_direct_failure: Mutex<Option<HnsShakescapeDirectFailure>>,
 }
 
+/// Wallet-detached standard HSD transport sessions that contain no signing
+/// authority, encrypted store, watch set, wallet projection, or pending
+/// wallet-filter traffic.
+///
+/// Values can only be produced by consuming a direct coordinator through
+/// [`HnsDirectPeerCoordinator::into_public_peer_sessions`]. That transition
+/// clears the remote BIP37 filter on every retained connection and drops any
+/// locally deferred wallet events before this handle is returned. A platform
+/// may therefore keep the handle briefly while the private wallet controller
+/// is retired, then give it back only to the same wallet/network scope.
+pub struct HnsPublicPeerSessions {
+    pool: Arc<NativeHnsPeerPool>,
+}
+
+impl std::fmt::Debug for HnsPublicPeerSessions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HnsPublicPeerSessions")
+            .field("network", &self.pool.config.network)
+            .field("connected", &self.pool.peer_count().unwrap_or_default())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HnsPublicPeerSessions {
+    /// Exact Handshake network negotiated by every retained session.
+    #[must_use]
+    pub fn network(&self) -> HnsNetwork {
+        self.pool.config.network
+    }
+
+    /// Number of sanitized standard sessions currently retained.
+    #[must_use]
+    pub fn connected_peer_count(&self) -> usize {
+        self.pool.peer_count().unwrap_or_default()
+    }
+}
+
 impl NativeHnsPeerPool {
     /// Create an empty pool and seed it with explicit user-configured peers.
     pub fn new(config: HnsDirectPeerConfig) -> Result<Self, HnsDirectPeerError> {
@@ -1221,6 +1259,54 @@ impl NativeHnsPeerPool {
     /// Number of currently registered ready sessions.
     pub fn peer_count(&self) -> Result<usize, HnsDirectPeerError> {
         Ok(self.lock_peers()?.len())
+    }
+
+    /// Remove wallet-specific BIP37 state before these standard transport
+    /// sessions cross a private-controller lifetime boundary. A connection is
+    /// retained only if its peer accepted the ordinary `FILTERCLEAR` write;
+    /// failed transports are shut down and cannot enter the reusable pool.
+    fn sanitize_wallet_state_for_reuse(&self) -> Result<usize, HnsDirectPeerError> {
+        *self
+            .shakescape_advertisement
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)? = None;
+        let handles = self.ready_handles()?;
+        let results = std::thread::scope(|scope| {
+            handles
+                .iter()
+                .map(|(id, peer)| {
+                    let id = *id;
+                    let peer = Arc::clone(peer);
+                    let task = scope.spawn(move || {
+                        let result = peer
+                            .lock()
+                            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)
+                            .and_then(|mut peer| {
+                                peer.deferred_wallet.clear();
+                                peer.connection
+                                    .send_wallet_packet(&Packet::FilterClear)
+                                    .map_err(HnsDirectPeerError::from)
+                            });
+                        (id, result)
+                    });
+                    (id, task)
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|(id, task)| (id, task.join()))
+                .collect::<Vec<_>>()
+        });
+        let failed = results
+            .into_iter()
+            .filter_map(|result| match result {
+                (_, Ok((_, Ok(())))) => None,
+                (id, Ok((_, Err(_))) | Err(_)) => Some(id),
+            })
+            .collect::<Vec<_>>();
+        for id in failed {
+            let _ = self.disconnect(id)?;
+        }
+        self.peer_count()
     }
 
     fn shakescape_candidates(
@@ -1781,14 +1867,33 @@ impl HnsDirectPeerCoordinator {
         index: EncryptedHnsLightIndex,
         config: HnsDirectPeerConfig,
     ) -> Result<Self, HnsDirectPeerError> {
+        Self::new_with_public_peer_sessions(authority, index, config, None)
+    }
+
+    /// Assemble a wallet coordinator around an optional set of already
+    /// sanitized standard HSD sessions. The sessions carry transport and
+    /// public discovery state only; this new coordinator registers their
+    /// connection identities with its freshly opened local header authority
+    /// before any request may use them.
+    pub fn new_with_public_peer_sessions(
+        authority: EncryptedHnsLightAuthority,
+        index: EncryptedHnsLightIndex,
+        config: HnsDirectPeerConfig,
+        public_peer_sessions: Option<HnsPublicPeerSessions>,
+    ) -> Result<Self, HnsDirectPeerError> {
         if authority.consensus_network() != consensus_network(config.network)
             || index.consensus_network() != consensus_network(config.network)
         {
             return Err(HnsDirectPeerError::InvalidConfiguration);
         }
-        let pool = Arc::new(NativeHnsPeerPool::new(config.clone())?);
+        config.validate()?;
+        let pool = match public_peer_sessions {
+            Some(sessions) if sessions.pool.config == config => sessions.pool,
+            Some(_) => return Err(HnsDirectPeerError::InvalidConfiguration),
+            None => Arc::new(NativeHnsPeerPool::new(config.clone())?),
+        };
         let backend = EmbeddedHnsBackend::new(authority, index, pool.clone())?;
-        Ok(Self {
+        let coordinator = Self {
             backend,
             pool,
             config,
@@ -1799,7 +1904,36 @@ impl HnsDirectPeerCoordinator {
             next_block_peer_offset: Arc::new(AtomicUsize::new(0)),
             block_scan_selection_count: Arc::new(AtomicUsize::new(0)),
             block_scan_peer_latencies: Arc::new(Mutex::new(HashMap::new())),
-        })
+        };
+        for (id, peer) in coordinator.pool.ready_handles()? {
+            let advertised_height = peer
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                .advertised_height;
+            coordinator.backend.add_header_peer(id, advertised_height)?;
+        }
+        Ok(coordinator)
+    }
+
+    /// Consume the wallet-bound coordinator and retain only sanitized public
+    /// standard-peer sessions. An unfinished header agreement is deliberately
+    /// ineligible: its late responses are correlated to the old authority and
+    /// must die with that controller rather than cross into a later one.
+    pub fn into_public_peer_sessions(self) -> Result<HnsPublicPeerSessions, HnsDirectPeerError> {
+        let HnsDirectPeerCoordinator {
+            pool,
+            pending_header,
+            ..
+        } = self;
+        if pending_header
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .is_some()
+        {
+            return Err(HnsDirectPeerError::SessionReuseUnavailable);
+        }
+        pool.sanitize_wallet_state_for_reuse()?;
+        Ok(HnsPublicPeerSessions { pool })
     }
 
     /// Wallet backend used by send, receive, names, and settlement modules.
@@ -3111,6 +3245,28 @@ pub fn open_wallet_direct_hns_peer_coordinator_with_floor(
         peer_config,
         rollback_floor,
         now_unix,
+        None,
+        |_| Ok(()),
+    )
+}
+
+/// Open the installed-wallet coordinator while adopting standard HSD sessions
+/// sanitized during retirement of the same platform wallet scope.
+pub fn open_wallet_direct_hns_peer_coordinator_with_floor_and_public_peer_sessions(
+    store: SharedWalletStore,
+    account: &HnsRuntimeConfig,
+    peer_config: HnsDirectPeerConfig,
+    rollback_floor: HnsLightFloor,
+    public_peer_sessions: HnsPublicPeerSessions,
+    now_unix: u64,
+) -> Result<HnsDirectPeerCoordinator, HnsDirectPeerError> {
+    open_wallet_direct_hns_peer_coordinator_with_initializer(
+        store,
+        account,
+        peer_config,
+        rollback_floor,
+        now_unix,
+        Some(public_peer_sessions),
         |_| Ok(()),
     )
 }
@@ -3143,6 +3299,7 @@ where
         peer_config,
         rollback_floor,
         now_unix,
+        None,
         |authority| {
             authority
                 .bootstrap_from_genesis_headers(headers, expected_height, expected_hash, now_unix)
@@ -3177,6 +3334,45 @@ where
         peer_config,
         rollback_floor,
         now_unix,
+        None,
+        |authority| {
+            authority
+                .bootstrap_from_mainnet_checkpoint_headers(
+                    headers_after_checkpoint,
+                    expected_height,
+                    expected_hash,
+                    now_unix,
+                )
+                .map(|_| ())
+        },
+    )
+}
+
+/// Open the checkpoint-accelerated installed-wallet coordinator while
+/// adopting sanitized standard HSD sessions from the same platform wallet
+/// scope.
+#[allow(clippy::too_many_arguments)]
+pub fn open_wallet_direct_hns_peer_coordinator_with_floor_checkpoint_and_public_peer_sessions<I>(
+    store: SharedWalletStore,
+    account: &HnsRuntimeConfig,
+    peer_config: HnsDirectPeerConfig,
+    rollback_floor: HnsLightFloor,
+    expected_height: u32,
+    expected_hash: [u8; 32],
+    headers_after_checkpoint: I,
+    public_peer_sessions: HnsPublicPeerSessions,
+    now_unix: u64,
+) -> Result<HnsDirectPeerCoordinator, HnsDirectPeerError>
+where
+    I: IntoIterator<Item = Header>,
+{
+    open_wallet_direct_hns_peer_coordinator_with_initializer(
+        store,
+        account,
+        peer_config,
+        rollback_floor,
+        now_unix,
+        Some(public_peer_sessions),
         |authority| {
             authority
                 .bootstrap_from_mainnet_checkpoint_headers(
@@ -3196,6 +3392,7 @@ fn open_wallet_direct_hns_peer_coordinator_with_initializer<F>(
     peer_config: HnsDirectPeerConfig,
     rollback_floor: HnsLightFloor,
     now_unix: u64,
+    public_peer_sessions: Option<HnsPublicPeerSessions>,
     initialize_authority: F,
 ) -> Result<HnsDirectPeerCoordinator, HnsDirectPeerError>
 where
@@ -3274,8 +3471,13 @@ where
     index
         .install_watch_set(watch_set, now_unix)
         .map_err(|error| HnsDirectPeerError::LightIndex(error.to_string()))?;
-    HnsDirectPeerCoordinator::new(authority, index, peer_config)
-        .map(|coordinator| coordinator.with_wallet_watch_set_source(store, account.clone()))
+    HnsDirectPeerCoordinator::new_with_public_peer_sessions(
+        authority,
+        index,
+        peer_config,
+        public_peer_sessions,
+    )
+    .map(|coordinator| coordinator.with_wallet_watch_set_source(store, account.clone()))
 }
 
 /// Preserve a complete prior direct watch set across a process restart only if
@@ -4127,6 +4329,8 @@ pub enum HnsDirectPeerError {
     Randomness,
     #[error("direct-peer runtime lock is poisoned")]
     RuntimePoisoned,
+    #[error("direct-peer sessions cannot be reused across this wallet-controller boundary")]
+    SessionReuseUnavailable,
     #[error("a direct-peer worker panicked")]
     WorkerPanicked,
     #[error("peer response exceeded the bounded event count")]
@@ -4197,11 +4401,14 @@ impl From<PeerError> for HnsDirectPeerError {
     reason = "tests fail immediately on invalid deterministic fixtures"
 )]
 mod tests {
+    use std::io::{Read, Write};
     use std::net::Ipv4Addr;
+    use std::sync::mpsc;
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use hns_p2p_wire::FrameDecoder;
     use hns_wallet_store::{SecretKind, WalletStore};
     use hns_wallet_types::{AccountId, BaseUnits, WalletId};
 
@@ -4407,6 +4614,103 @@ mod tests {
         assert_eq!(scan.watched_scripts, 4);
         assert_eq!(scan.watched_names, 0);
         assert_eq!(scan.birthday_height, 0);
+    }
+
+    #[test]
+    fn retired_wallet_sessions_clear_filter_and_rejoin_only_a_fresh_authority() {
+        let config = direct_wallet_config();
+        let mut wallet =
+            WalletStore::create(":memory:", "public session reuse test passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[83; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let store = hns_wallet_store::SharedWalletStore::new(wallet);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer_address = listener.local_addr().unwrap();
+        let mut peer_config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
+        peer_config.static_peers.push(peer_address);
+        let coordinator = open_wallet_direct_hns_peer_coordinator(
+            store.clone(),
+            &config,
+            peer_config.clone(),
+            now,
+        )
+        .unwrap();
+
+        let (release_server, await_release) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, remote) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut version = light_wallet_version(remote, [84; 8], 0, now);
+            version.services = SERVICE_NETWORK | SERVICE_BLOOM;
+            let version_frame = Frame::from_packet(&Packet::Version(version))
+                .unwrap()
+                .encode(NetworkMagic::Regtest)
+                .unwrap();
+            let verack_frame = Frame::from_packet(&Packet::Verack)
+                .unwrap()
+                .encode(NetworkMagic::Regtest)
+                .unwrap();
+            let mut decoder = FrameDecoder::new(NetworkMagic::Regtest);
+            let mut received_version = false;
+            let mut received_filter_clear = false;
+            let mut buffer = [0_u8; 8 * 1_024];
+            while !received_filter_clear {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0, "wallet peer closed before FILTERCLEAR");
+                for frame in decoder.push(&buffer[..read]).unwrap() {
+                    match frame.decode_packet().unwrap() {
+                        Packet::Version(_) if !received_version => {
+                            received_version = true;
+                            stream.write_all(&version_frame).unwrap();
+                            stream.write_all(&verack_frame).unwrap();
+                            stream.flush().unwrap();
+                        }
+                        Packet::FilterClear => received_filter_clear = true,
+                        _ => {}
+                    }
+                }
+            }
+            await_release.recv().unwrap();
+        });
+
+        coordinator.connect_peer(peer_address, now).unwrap();
+        let sessions = coordinator.into_public_peer_sessions().unwrap();
+        assert_eq!(sessions.network(), HnsNetwork::Regtest);
+        assert_eq!(sessions.connected_peer_count(), 1);
+        let reopened = open_wallet_direct_hns_peer_coordinator_with_floor_and_public_peer_sessions(
+            store,
+            &config,
+            peer_config,
+            HnsLightFloor::default(),
+            sessions,
+            now + 1,
+        )
+        .unwrap();
+        assert_eq!(reopened.pool().peer_count().unwrap(), 1);
+        assert!(
+            reopened
+                .connect_sync_quorum_available(now + 1)
+                .unwrap()
+                .is_empty()
+        );
+        release_server.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[test]

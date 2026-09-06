@@ -37,11 +37,13 @@ pub use peer_coordinator::{
     ConnectedHnsPeer, HnsBlockScanBatchTelemetry, HnsBlockScanProgress, HnsDirectPeerConfig,
     HnsDirectPeerCoordinator, HnsDirectPeerError, HnsDirectShakescapeListener,
     HnsDirectShakescapeMessage, HnsDirectShakescapePeer, HnsHeaderRoundProgress,
-    HnsInboundMobilePeer, HnsInboundNetworkPeer, HnsShakescapeCandidate,
+    HnsInboundMobilePeer, HnsInboundNetworkPeer, HnsPublicPeerSessions, HnsShakescapeCandidate,
     HnsShakescapeDirectFailure, HnsShakescapeDiscoveryStatus, NativeHnsPeerPool,
     open_wallet_direct_hns_peer_coordinator, open_wallet_direct_hns_peer_coordinator_with_floor,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_checkpoint_bootstrap,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap,
+    open_wallet_direct_hns_peer_coordinator_with_floor_and_public_peer_sessions,
+    open_wallet_direct_hns_peer_coordinator_with_floor_checkpoint_and_public_peer_sessions,
 };
 pub use shakedex_funding::{
     HnsPreparedShakedexFunding, HnsShakedexChangeReservation,

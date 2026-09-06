@@ -46,8 +46,8 @@ pub use hns_wallet_hns::{
     HnsClock, HnsDirectPeerConfig, HnsDirectPeerCoordinator, HnsDirectPeerError,
     HnsDirectShakescapeListener, HnsDirectShakescapeMessage, HnsDirectShakescapePeer,
     HnsHeaderRoundProgress, HnsInboundMobilePeer, HnsInboundNetworkPeer, HnsLightFloor, HnsNetwork,
-    HnsNodeRpcBackend, HnsNodeRpcConfig, HnsShakescapeDirectFailure, HnsShakescapeDiscoveryStatus,
-    SystemClock as HnsReadSystemClock,
+    HnsNodeRpcBackend, HnsNodeRpcConfig, HnsPublicPeerSessions, HnsShakescapeDirectFailure,
+    HnsShakescapeDiscoveryStatus, SystemClock as HnsReadSystemClock,
 };
 use hns_wallet_hns::{
     HnsAccountReadRuntime, HnsAccountRecord, HnsExistingAccountSelector, HnsRuntimeConfig,
@@ -55,6 +55,8 @@ use hns_wallet_hns::{
     NameResourceStatus, RecoveryPhrase, open_wallet_direct_hns_peer_coordinator_with_floor,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_checkpoint_bootstrap,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap,
+    open_wallet_direct_hns_peer_coordinator_with_floor_and_public_peer_sessions,
+    open_wallet_direct_hns_peer_coordinator_with_floor_checkpoint_and_public_peer_sessions,
 };
 use hns_wallet_host::{
     Clock, ClockError, HostError, HostOutput, SystemClock, SystemEntropy, WalletHost,
@@ -883,6 +885,39 @@ impl MobileWalletController {
         }
     }
 
+    /// Reopen this exact wallet authority around transport sessions that a
+    /// prior controller sanitized before retirement. Platform code must scope
+    /// the handle to the same wallet database; the native type itself contains
+    /// no wallet identity or private state.
+    pub fn open_direct_hns_peer_coordinator_with_floor_and_public_peer_sessions(
+        &mut self,
+        database_key: &MobileDatabaseKey,
+        peer_config: HnsDirectPeerConfig,
+        rollback_floor: HnsLightFloor,
+        public_peer_sessions: HnsPublicPeerSessions,
+    ) -> Result<HnsDirectPeerCoordinator, MobileWalletError> {
+        self.lock()?;
+        let store = self.session.store.clone();
+        let account_config = self.account_config.clone();
+        let passphrase = database_key.store_passphrase();
+        store.unlock(passphrase.as_str())?;
+        let now_unix = HnsReadSystemClock.now_unix()?;
+        let opened = open_wallet_direct_hns_peer_coordinator_with_floor_and_public_peer_sessions(
+            store.clone(),
+            &account_config,
+            peer_config,
+            rollback_floor,
+            public_peer_sessions,
+            now_unix,
+        );
+        let relocked = store.lock();
+        match (opened, relocked) {
+            (Ok(coordinator), Ok(())) => Ok(coordinator),
+            (Err(error), _) => Err(error.into()),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
+    }
+
     /// Open the direct coordinator from the compiled Mainnet checkpoint and
     /// the canonical header segment after block 300,000 through the wallet's
     /// exact birthday.
@@ -914,6 +949,48 @@ impl MobileWalletController {
             headers_after_checkpoint,
             now_unix,
         );
+        let relocked = store.lock();
+        match (opened, relocked) {
+            (Ok(coordinator), Ok(())) => Ok(coordinator),
+            (Err(error), _) => Err(error.into()),
+            (Ok(_), Err(error)) => Err(error.into()),
+        }
+    }
+
+    /// Checkpoint-accelerated reopen using sanitized standard HSD sessions
+    /// retained by the same platform wallet scope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_direct_hns_peer_coordinator_with_floor_checkpoint_and_public_peer_sessions<I>(
+        &mut self,
+        database_key: &MobileDatabaseKey,
+        peer_config: HnsDirectPeerConfig,
+        rollback_floor: HnsLightFloor,
+        expected_height: u32,
+        expected_hash: [u8; 32],
+        headers_after_checkpoint: I,
+        public_peer_sessions: HnsPublicPeerSessions,
+    ) -> Result<HnsDirectPeerCoordinator, MobileWalletError>
+    where
+        I: IntoIterator<Item = hns_header_consensus::Header>,
+    {
+        self.lock()?;
+        let store = self.session.store.clone();
+        let account_config = self.account_config.clone();
+        let passphrase = database_key.store_passphrase();
+        store.unlock(passphrase.as_str())?;
+        let now_unix = HnsReadSystemClock.now_unix()?;
+        let opened =
+            open_wallet_direct_hns_peer_coordinator_with_floor_checkpoint_and_public_peer_sessions(
+                store.clone(),
+                &account_config,
+                peer_config,
+                rollback_floor,
+                expected_height,
+                expected_hash,
+                headers_after_checkpoint,
+                public_peer_sessions,
+                now_unix,
+            );
         let relocked = store.lock();
         match (opened, relocked) {
             (Ok(coordinator), Ok(())) => Ok(coordinator),
