@@ -1782,7 +1782,12 @@ fn validate_name_action_context(
                 context
                     .transfer_lockup
                     .filter(|lockup| *lockup > 0)
-                    .ok_or(HnsWalletError::InvalidEvidence)?,
+                    .ok_or_else(|| {
+                        name_preparation_stage(
+                            "finalize transfer lockup",
+                            HnsWalletError::InvalidEvidence,
+                        )
+                    })?,
             );
             let eligible_height = transfer_height
                 .checked_add(lockup)
@@ -1792,36 +1797,75 @@ fn validate_name_action_context(
                 context
                     .renewal_maturity
                     .filter(|maturity| *maturity > 0)
-                    .ok_or(HnsWalletError::InvalidEvidence)?,
+                    .ok_or_else(|| {
+                        name_preparation_stage(
+                            "finalize renewal maturity",
+                            HnsWalletError::InvalidEvidence,
+                        )
+                    })?,
             );
             let period = u64::from(
                 context
                     .renewal_period
                     .filter(|period| u64::from(*period) >= maturity)
-                    .ok_or(HnsWalletError::InvalidEvidence)?,
+                    .ok_or_else(|| {
+                        name_preparation_stage(
+                            "finalize renewal period",
+                            HnsWalletError::InvalidEvidence,
+                        )
+                    })?,
             );
-            let renewal_height = context
-                .renewal_block_height
-                .ok_or(HnsWalletError::InvalidEvidence)?;
+            let renewal_height = context.renewal_block_height.ok_or_else(|| {
+                name_preparation_stage("finalize renewal height", HnsWalletError::InvalidEvidence)
+            })?;
             let finalize_mature = transfer_height != 0 && candidate_height >= eligible_height;
             let renewal_valid = candidate_height < maturity
                 || (renewal_height <= candidate_height - maturity
                     && renewal_height >= candidate_height.saturating_sub(period));
-            if transfer_height == 0
-                || transfer_height != owner_inclusion.height
-                || context.transfer_height != Some(transfer_height)
-                || context.finalize_eligible_height != Some(eligible_height)
-                || context.finalize_mature != Some(finalize_mature)
-                || renewal_height
-                    != binding
-                        .tip
-                        .height
-                        .saturating_sub(maturity.saturating_mul(2))
-                || renewal_height > binding.tip.height
-                || context.renewal_block_hash.is_none()
-                || context.renewal_valid_at_candidate != Some(renewal_valid)
-            {
-                return Err(HnsWalletError::InvalidEvidence);
+            let finalize_bindings = [
+                (transfer_height != 0, "finalize transfer presence"),
+                (
+                    transfer_height == owner_inclusion.height,
+                    "finalize transfer inclusion",
+                ),
+                (
+                    context.transfer_height == Some(transfer_height),
+                    "finalize transfer height",
+                ),
+                (
+                    context.finalize_eligible_height == Some(eligible_height),
+                    "finalize eligible height",
+                ),
+                (
+                    context.finalize_mature == Some(finalize_mature),
+                    "finalize maturity flag",
+                ),
+                (
+                    renewal_height
+                        == binding
+                            .tip
+                            .height
+                            .saturating_sub(maturity.saturating_mul(2)),
+                    "finalize renewal selection",
+                ),
+                (
+                    renewal_height <= binding.tip.height,
+                    "finalize renewal range",
+                ),
+                (
+                    context.renewal_block_hash.is_some(),
+                    "finalize renewal hash",
+                ),
+                (
+                    context.renewal_valid_at_candidate == Some(renewal_valid),
+                    "finalize renewal validity",
+                ),
+            ];
+            if let Some((_, stage)) = finalize_bindings.iter().find(|(valid, _)| !valid) {
+                return Err(name_preparation_stage(
+                    stage,
+                    HnsWalletError::InvalidEvidence,
+                ));
             }
             if !finalize_mature {
                 expected_reasons.push(NameActionIneligibility::TransferNotMature);
@@ -3372,19 +3416,28 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     ) -> Result<(NameActionContextEvidence, NameState, Coin), HnsWalletError> {
         let context = self
             .backend
-            .get_name_action_context_v2(action, name_hash, binding, mempool)?;
+            .get_name_action_context_v2(action, name_hash, binding, mempool)
+            .map_err(|error| name_preparation_stage("context evidence load", error))?;
         if context.context_version != NAME_ACTION_CONTEXT_V2_VERSION
             || !context.owner_transaction.is_empty()
         {
-            return Err(HnsWalletError::InvalidEvidence);
+            return Err(name_preparation_stage(
+                "context evidence shape",
+                HnsWalletError::InvalidEvidence,
+            ));
         }
         let owner_coin = context
             .owner_coin
             .as_ref()
-            .ok_or(HnsWalletError::InvalidEvidence)?
-            .to_canonical_coin()?;
-        let state = NameState::decode(NameHash::new(name_hash), &context.current_state)
-            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+            .ok_or_else(|| {
+                name_preparation_stage("context owner coin", HnsWalletError::InvalidEvidence)
+            })?
+            .to_canonical_coin()
+            .map_err(|error| name_preparation_stage("context owner coin decoding", error))?;
+        let state =
+            NameState::decode(NameHash::new(name_hash), &context.current_state).map_err(|_| {
+                name_preparation_stage("context state decoding", HnsWalletError::InvalidEvidence)
+            })?;
         validate_name_action_context(
             config,
             action,
@@ -3397,21 +3450,31 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             &context,
             require_eligible,
             reject_mempool_spender,
-        )?;
+        )
+        .map_err(|error| name_preparation_stage("context semantic validation", error))?;
         if let (Some(height), Some(expected_hash)) =
             (context.renewal_block_height, context.renewal_block_hash)
         {
-            let block = self.backend.get_block_hash(height, binding)?;
+            let block = self
+                .backend
+                .get_block_hash(height, binding)
+                .map_err(|error| name_preparation_stage("renewal header lookup", error))?;
             if block.binding != binding
                 || block.height != height
                 || block.block_hash != Some(expected_hash)
             {
-                return Err(HnsWalletError::InvalidEvidence);
+                return Err(name_preparation_stage(
+                    "renewal header binding",
+                    HnsWalletError::InvalidEvidence,
+                ));
             }
         }
         let cache = self.cache_read()?;
         if cache.binding != Some(binding) || cache.mempool_binding != Some(mempool) {
-            return Err(HnsWalletError::StaleNodeSnapshot);
+            return Err(name_preparation_stage(
+                "context cache binding",
+                HnsWalletError::StaleNodeSnapshot,
+            ));
         }
         Ok((context, state, owner_coin))
     }

@@ -1405,6 +1405,22 @@ impl NativeHnsPeerPool {
 
     /// Resolve configured DNS seeds into untrusted address candidates.
     pub fn discover_dns(&self) -> Result<usize, HnsDirectPeerError> {
+        self.discover_dns_with_retired_policy(false)
+    }
+
+    /// Reconsider DNS seed addresses only after the entire current candidate
+    /// generation has been exhausted. Retiring a failed address prevents one
+    /// dead endpoint from monopolizing a bounded synchronization round, but a
+    /// transport outage must not quarantine every DNS result forever for the
+    /// lifetime of an unlocked mobile controller.
+    fn recycle_retired_dns(&self) -> Result<usize, HnsDirectPeerError> {
+        self.discover_dns_with_retired_policy(true)
+    }
+
+    fn discover_dns_with_retired_policy(
+        &self,
+        reconsider_retired: bool,
+    ) -> Result<usize, HnsDirectPeerError> {
         let port = default_peer_port(self.config.network);
         let mut discovered = Vec::new();
         let mut last_error = None;
@@ -1429,7 +1445,24 @@ impl NativeHnsPeerPool {
         {
             return Err(HnsDirectPeerError::Io(kind));
         }
+        if reconsider_retired {
+            self.reconsider_retired_addresses(&discovered)?;
+        }
         self.add_known_addresses(discovered, false)
+    }
+
+    fn reconsider_retired_addresses(
+        &self,
+        addresses: &[SocketAddr],
+    ) -> Result<(), HnsDirectPeerError> {
+        let mut retired = self
+            .retired_addresses
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        for address in addresses {
+            retired.remove(address);
+        }
+        Ok(())
     }
 
     /// Connect, negotiate standard Bloom service, and retain one native peer.
@@ -2090,7 +2123,14 @@ impl HnsDirectPeerCoordinator {
         now_unix: u64,
     ) -> Result<Vec<ConnectedHnsPeer>, HnsDirectPeerError> {
         let dns_error = self.pool.discover_dns().err();
-        let candidates = self.pool.candidate_addresses()?;
+        let mut candidates = self.pool.candidate_addresses()?;
+        if candidates.is_empty() && self.pool.peer_count()? == 0 {
+            // Every address may have failed during an earlier network outage.
+            // Begin a new bounded DNS generation only after the old one is
+            // exhausted; the host controls the delay before this call.
+            let _ = self.pool.recycle_retired_dns();
+            candidates = self.pool.candidate_addresses()?;
+        }
         if candidates.is_empty() && self.pool.peer_count()? == 0 {
             return Err(dns_error.unwrap_or(HnsDirectPeerError::NoReadyPeers));
         }
@@ -4980,6 +5020,26 @@ mod tests {
         assert!(pool.candidate_addresses().unwrap().is_empty());
         assert_eq!(pool.add_known_addresses([address], true).unwrap(), 0);
         assert!(pool.candidate_addresses().unwrap().is_empty());
+    }
+
+    #[test]
+    fn exhausted_dns_generation_can_reconsider_only_resolved_addresses() {
+        let pool =
+            NativeHnsPeerPool::new(HnsDirectPeerConfig::for_network(HnsNetwork::Regtest)).unwrap();
+        let resolved: SocketAddr = "127.0.0.1:14038".parse().unwrap();
+        let unrelated: SocketAddr = "127.0.0.2:14038".parse().unwrap();
+        assert_eq!(
+            pool.add_known_addresses([resolved, unrelated], true)
+                .unwrap(),
+            2
+        );
+        pool.retire_address(resolved).unwrap();
+        pool.retire_address(unrelated).unwrap();
+
+        pool.reconsider_retired_addresses(&[resolved]).unwrap();
+        assert_eq!(pool.add_known_addresses([resolved], true).unwrap(), 1);
+        assert_eq!(pool.add_known_addresses([unrelated], true).unwrap(), 0);
+        assert_eq!(pool.candidate_addresses().unwrap(), vec![resolved]);
     }
 
     #[test]
