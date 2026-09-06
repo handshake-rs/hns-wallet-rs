@@ -3,9 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use hns_covenants::{
-    Covenant, CovenantKind, FinalizeCovenant, MAX_RESOURCE_SIZE, NameState, TransferCovenant,
-};
+use hns_covenants::{Covenant, CovenantKind, MAX_RESOURCE_SIZE, NameState, TransferCovenant};
 use hns_header_consensus::Header;
 use hns_light_sync::{HeaderRoundRequest, PeerId, SyncError, SyncState};
 use hns_light_wallet::{VerifiedWalletBlock, WalletHeaderAnchor};
@@ -193,11 +191,16 @@ impl EmbeddedHnsBackend {
     }
 
     /// Derive the exact names that must be projected because a locally
-    /// authenticated, still-unspent FINALIZE output pays one of this wallet's
-    /// installed scripts. This does not infer ownership from a peer name
-    /// response: it merely identifies the name hashes for which the ordinary
+    /// authenticated, still-unspent name output pays one of this wallet's
+    /// installed scripts. In particular, a Shakedex buyer owns the name through
+    /// a `TRANSFER` output before it can prepare the covenant `FINALIZE`.
+    /// Restricting this set to `FINALIZE` outputs omitted that current owner and
+    /// left the value runtime without the proof/context needed for approval.
+    ///
+    /// This does not infer ownership from a peer name response: it merely
+    /// identifies name hashes from verified wallet coins for which the ordinary
     /// strict proof refresh is required before snapshot reconciliation.
-    pub(crate) fn watched_finalize_name_hashes(&self) -> Result<Vec<[u8; 32]>, HnsWalletError> {
+    pub(crate) fn watched_name_output_hashes(&self) -> Result<Vec<[u8; 32]>, HnsWalletError> {
         let state = self.lock()?;
         let binding = current_binding(&state)?;
         let observations = state.index.transactions().map_err(map_index_error)?;
@@ -220,12 +223,13 @@ impl EmbeddedHnsBackend {
             {
                 return Err(HnsWalletError::InvalidEvidence);
             }
-            if covenant.kind != CovenantKind::Finalize {
+            if !covenant.kind.is_name() {
                 continue;
             }
-            let finalize = FinalizeCovenant::try_from(&covenant)
-                .map_err(|_| HnsWalletError::InvalidEvidence)?;
-            names.insert(finalize.name_hash.into_bytes());
+            let name_hash = covenant
+                .item_name_hash(0)
+                .ok_or(HnsWalletError::InvalidEvidence)?;
+            names.insert(name_hash.into_bytes());
         }
         Ok(names.into_iter().collect())
     }
@@ -2908,9 +2912,17 @@ mod tests {
 
         let name = b"wallet-authority".to_vec();
         let name_hash = hash_name(&name).unwrap();
+        let watched_name_owner = WalletAddressKey {
+            version: 0,
+            hash: vec![32; 20],
+        };
         backend
             .install_watch_set(
-                HnsLightWatchSet::new(Vec::new(), vec![name_hash.into_bytes()]).unwrap(),
+                HnsLightWatchSet::new(
+                    vec![watched_name_owner],
+                    vec![name_hash.into_bytes()],
+                )
+                .unwrap(),
                 now,
             )
             .unwrap();
@@ -3037,6 +3049,14 @@ mod tests {
         for block in &blocks {
             backend.apply_verified_block(block, now).unwrap();
         }
+
+        // A Shakedex purchase reaches the buyer as a watched TRANSFER coin.
+        // Its exact name proof must be refreshed before the later FINALIZE can
+        // pass ownership/context validation.
+        assert_eq!(
+            backend.watched_name_output_hashes().unwrap(),
+            vec![name_hash.into_bytes()]
+        );
 
         let request = backend.name_proof_request(name_hash.into_bytes()).unwrap();
         assert_eq!(request.root, proof_root);

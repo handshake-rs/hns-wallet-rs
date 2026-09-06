@@ -2408,8 +2408,9 @@ impl HnsDirectPeerCoordinator {
     /// Refresh every exact name proof needed by the next wallet snapshot.
     ///
     /// The set is assembled only from already-persisted known names and from
-    /// unspent FINALIZE outputs that the wallet's locally verified filtered
-    /// index already associated with an installed wallet script.  All hashes
+    /// unspent name outputs that the wallet's locally verified filtered index
+    /// already associated with an installed wallet script. This includes the
+    /// `TRANSFER` owner used by a pending Shakedex purchase. All hashes
     /// are installed in one forward-only name-set change, which preserves the
     /// completed historical script scan.  Only proofs absent for the current
     /// header-tree root are requested from peers.
@@ -2434,7 +2435,7 @@ impl HnsDirectPeerCoordinator {
         let mut names = persisted.name_hashes.into_iter().collect::<BTreeSet<_>>();
         names.extend(
             self.backend
-                .watched_finalize_name_hashes()
+                .watched_name_output_hashes()
                 .map_err(HnsDirectPeerError::Wallet)?,
         );
         let names = names.into_iter().collect::<Vec<_>>();
