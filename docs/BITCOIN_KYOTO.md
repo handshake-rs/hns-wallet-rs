@@ -1,7 +1,7 @@
 # Bitcoin: Kyoto only
 
 Bitcoin has one synchronization implementation: direct P2P with `bip157`
-0.6.3 and `bdk_kyoto` 0.17.0, feeding a BIP84 `bdk_wallet` 3.1.0 wallet.
+0.6.3 and `bdk_kyoto` 0.17.1, feeding a BIP84 `bdk_wallet` 3.1.0 wallet.
 There is no Esplora, Electrum, hosted indexer, or Bitcoin Core RPC production
 mode. Bitcoin Core regtest is only a deterministic qualification fixture.
 
@@ -11,6 +11,10 @@ The bounded supervisor now owns these transitions:
 
 - a header/filter discovery client starts from an explicit trusted checkpoint
   and waits under a configured deadline for Kyoto's `FiltersSynced` event;
+- mainnet initialization selects the newest bundled checkpoint strictly below
+  the wallet's earliest possible activity: block 840,000 for new/current
+  wallets, then Kyoto's taproot or segwit activation checkpoint for older
+  recovery birthdays. Other networks retain their genesis anchor;
 - a new wallet accepts only that validated current tip as its birthday and
   separately retains the non-genesis trusted discovery anchor plus bounded
   validated history as its recovery checkpoint set, so recovery neither reuses
@@ -22,18 +26,22 @@ The bounded supervisor now owns these transitions:
 - the encrypted scan record uses CAS revisions and explicit starting,
   synchronizing, reconciling, ready, and recovery-required phases;
 - one filter subscriber checks both BDK descriptor scripts and every active
-  native HTLC script. A matching block is downloaded once, applied to the BDK
-  graph when relevant, and separately admitted to the swap watcher only when
+  native HTLC script. Up to four matching blocks are requested concurrently,
+  each block is applied once to the resulting update, and it is separately
+  admitted to the swap watcher only when
   its merkle root and exact block hash match Kyoto's locally validated header
   chain;
+- recovery begins with a 20-script unused-address window and automatically
+  extends and rescans when activity reaches that window, instead of assuming
+  that only the first derived script was used;
 - encrypted per-session HTLC watches discover exact funding outpoints and
   exact signed redeem/refund spends directly from those blocks. Funding and
   spend confirmations follow the canonical checkpoint and roll back on a
   reorganization. A revealed preimage is retained monotonically because an
   orphaned publication cannot make a disclosed secret private again;
 - matched swap evidence is committed before the BDK checkpoint advances, then
-  each Kyoto update is applied and committed as a strict BDK changeset
-  snapshot before bounded transaction/output mirrors are reconciled in
+  each Kyoto update is applied and committed as one strict encrypted BDK
+  changeset delta before bounded transaction/output mirrors are reconciled in
   encrypted 512-record chunks; the ready checkpoint is committed last. This
   ordering makes a crash during a long offline catch-up rescan from the older
   wallet checkpoint instead of skipping a matched HTLC block;
@@ -46,7 +54,12 @@ The bounded supervisor now owns these transitions:
   instance; and
 - relevant transaction and wallet-output records have 4,096-record lifetime
   caps. Canonically absent records are retained for reorg evidence. Safe
-  archival/pruning is not implemented, so reaching either cap fails closed.
+  archival/pruning is not implemented, so reaching either cap fails closed;
+  and
+- progress reports the exact connection/filter/block/application/validation/
+  reconciliation phase, bounded filter and block counters, cycle elapsed time,
+  and per-phase receipt timings. A failed cycle is marked `failed` without
+  turning progress into chain authority.
 
 The supervisor returns Kyoto log receivers to the application; a product must
 drain them and must not treat informational progress or peer messages as chain
@@ -59,13 +72,19 @@ operation.
 
 ## Persistence ownership and pinned limitation
 
-One protected `bitcoin_wallet_state` entity durably owns BDK's public
-descriptors, revealed derivations, local-chain checkpoints, relevant
-transactions, and wallet outputs. Its strict envelope is format v1, uses the
-exact wallet account ID as authenticated associated data, records the exact BDK
-3.1.0 serialization contract, and is updated by CAS. Private descriptor keys
-are reconstructed from the protected mnemonic and are not serialized in that
-record. The same
+One protected `bitcoin_wallet_state` snapshot plus account-bound
+`bitcoin_wallet_changeset` journal durably own BDK's public descriptors,
+revealed derivations, local-chain checkpoints, relevant transactions, and
+wallet outputs. New writes use strict snapshot format v2 and authenticated,
+monotonic delta records; legacy format-v1 snapshots remain readable. Each
+ordinary persistence operation atomically advances an authenticated monotonic
+journal head and encrypts only its staged delta. After 32 active deltas, the
+persister commits an authoritative aggregate snapshot before pruning the
+redundant delta records while retaining the head. This prevents both crash
+gaps and stale-writer reuse of a compacted sequence number.
+The exact wallet account ID and its domain-separated commitment bind these
+records, and every write uses CAS. Private descriptor keys are reconstructed
+from the protected mnemonic and are not serialized in those records. The same
 `SharedWalletStore` authority owns birthday, supervisor sequence/phase, last
 consistent checkpoint, the distinct recovery checkpoint, bounded recent
 checkpoints, transaction/output reconciliation records, and broadcast intents.
@@ -73,13 +92,14 @@ It also owns the bounded, account-bound HTLC watch set. Swap evidence, the BDK
 snapshot, and the scan journal are deliberately ordered transactions, not one
 falsely atomic transaction.
 
-This first backend stores one aggregate changeset and therefore inherits the
-encrypted entity cleartext limit of 1 MiB. BDK's persistent script cache is
-disabled to avoid needless growth, but transaction and derivation history can
-still reach the limit. Capacity exhaustion fails closed. A normalized or
-authenticated chunked BDK backend would raise the current capacity ceiling.
-Until then, exhaustion rejects the operation rather than authorizing a partial
-wallet view.
+The compacted aggregate snapshot still inherits the encrypted entity cleartext
+limit of 1 MiB. Incremental persistence removes the prior full-aggregate
+rewrite from every address reveal and sync, and BDK's persistent script cache
+remains disabled to limit growth, but a sufficiently large transaction and
+derivation history can still reach the snapshot limit. Capacity exhaustion
+fails closed. A fully normalized BDK backend would raise this remaining
+ceiling; until then, exhaustion rejects the operation rather than authorizing
+a partial wallet view.
 
 The former standalone BDK SQLite backend is not imported, opened, truncated,
 or deleted. There is no migration tool in this revision. An upgraded product
@@ -88,12 +108,14 @@ instead of treating `WalletNotFound` as permission to create replacement state.
 
 `bip157` 0.6.3 accepts `data_dir`, but this pinned release discards the field in
 `Node::new`; it does not persist a full header/filter database or its address
-book. The wallet does not require a pruned or indexed Bitcoin node: its
-encrypted BDK checkpoint and recovery journal are the durable authority, and
-Kyoto re-fetches and revalidates the required headers and compact filters from
-ordinary untrusted Bitcoin peers after restart. Full header/filter persistence
-would improve startup cost, but is not a separate product authority or a
-prerequisite for the light-wallet model.
+book. The wallet therefore keeps a separate bounded encrypted cache of up to
+32 previously successful IPv4/IPv6 compact-filter peers. Those entries are
+preference seeds only: Kyoto repeats the version/services handshake and all
+normal chain validation. The encrypted BDK checkpoint and recovery journal
+remain the durable authority, and Kyoto re-fetches and revalidates the required
+headers and compact filters after restart. Full header/filter persistence would
+improve startup cost, but is not a separate product authority or a prerequisite
+for the light-wallet model.
 
 ## Broadcast boundary and release gate
 

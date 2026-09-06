@@ -3,9 +3,13 @@
 `hns-wallet-bitcoin-kyoto` provides the wallet-owned Bitcoin authority used by
 the HNS/BTC swap path:
 
-- direct Bitcoin P2P header and BIP157 synchronization through Kyoto;
+- direct Bitcoin P2P header and BIP157 synchronization through Kyoto, with
+  safe mainnet start checkpoints, cached successful peers, bounded concurrent
+  matched-block requests, and recovery gap-window extension;
 - BDK descriptor-wallet receive, history, coin selection, and signing;
-- encrypted, compare-and-swap persisted wallet and synchronization state;
+- encrypted, compare-and-swap persisted wallet state using incremental BDK
+  changeset deltas, an atomic monotonic journal head, and crash-safe aggregate
+  compaction;
 - session- and role-bound native Bitcoin HTLC keys; and
 - exact HTLC funding, redeem, refund, evidence, and prepared-broadcast
   primitives; and

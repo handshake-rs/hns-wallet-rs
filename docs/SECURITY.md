@@ -670,10 +670,13 @@ slice.
 
 Bitcoin's supervisor does not authorize from a peer status field. A completed
 Kyoto wallet update is committed to the strict versioned encrypted BDK
-changeset entity before encrypted transaction and output mirrors advance; the
+delta journal before encrypted transaction and output mirrors advance; the
 authenticated scan record becomes ready only after all bounded reconciliation
-chunks commit. The BDK entity and journal share the exact same non-debuggable
-store/key authority. Exact local-chain hash-membership queries identify a
+chunks commit. An aggregate snapshot is written before each 32-delta compaction
+prunes redundant records, while an authenticated monotonic head remains to
+prevent stale-writer sequence reuse; legacy snapshot format v1 remains
+loadable. The BDK records and scan journal share the exact same non-debuggable store/key
+authority. Exact local-chain hash-membership queries identify a
 retained reorg ancestor. Missing ancestry, the BDK entity's 1 MiB capacity,
 timeout of the non-cancel-safe update, or BDK/journal rollback mismatch fails
 closed and requires a new supervisor/recovery scan. A standalone legacy BDK
@@ -698,9 +701,11 @@ monotonic-clock source, which remains a Bitcoin value-release requirement.
 Pinned `bip157` 0.6.3 discards `data_dir` and does not expose persistent header,
 filter-header/filter, or address-book state. BDK checkpoints and wallet records
 are durable; Kyoto re-fetches and revalidates those public chain objects after
-restart. Bitcoin send and settlement are enabled through the connected mobile
-boundary. Live-network, installed-product, resource, and audit evidence remain
-separate release records.
+restart. The wallet's bounded encrypted successful-peer cache only influences
+reconnection preference: service handshake and chain validation remain
+mandatory. Bitcoin send and settlement are enabled through the connected
+mobile boundary. Live-network, installed-product, resource, and audit evidence
+remain separate release records.
 
 ## Reporting
 

@@ -87,7 +87,7 @@ hns-urkel-proof = { version = "=0.4.1" }
 # The only Bitcoin production synchronization implementation. The exact BDK
 # release is part of the encrypted changeset format contract.
 bdk_wallet = { version = "=3.1.0", features = ["keys-bip39"] }
-bdk_kyoto = "0.17.0"
+bdk_kyoto = "=0.17.1"
 bip157 = "0.6.3"
 bitcoin = { version = "0.32.8", features = ["serde"] }
 tokio = { version = "1.47.1", features = ["rt-multi-thread", "sync", "time"] }

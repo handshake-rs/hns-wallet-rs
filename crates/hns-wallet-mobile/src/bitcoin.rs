@@ -17,17 +17,18 @@ use bdk_wallet::bitcoin::hashes::Hash;
 use hns_wallet_bitcoin_kyoto::{
     BIP39_SEED_BYTES, BitcoinBirthdaySource, BitcoinBroadcastReceipt,
     BitcoinBroadcastRecoverySummary, BitcoinCheckpoint, BitcoinHtlcWatchRequest,
-    BitcoinTransactionRecord, BitcoinWalletError, EncryptedPersistedBitcoinWallet, HtlcSpendBranch,
-    KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor, KyotoSyncProgressHandle,
-    KyotoSyncReceipt, KyotoTipDiscovery, KyotoWalletState, PreparedBitcoinHtlcFunding,
-    StoredKyotoWalletState, VerifiedBitcoinLock, authorize_native_send,
-    bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit,
+    BitcoinTransactionRecord, BitcoinWalletError, DEFAULT_RECOVERY_GAP_LIMIT,
+    EncryptedPersistedBitcoinWallet, HtlcSpendBranch, KyotoRuntimeConfig, KyotoShutdownHandle,
+    KyotoSupervisor, KyotoSyncProgressHandle, KyotoSyncReceipt, KyotoSyncStage, KyotoTipDiscovery,
+    KyotoWalletState, PreparedBitcoinHtlcFunding, StoredKyotoWalletState, VerifiedBitcoinLock,
+    authorize_native_send, bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit,
     build_shakescape_bitcoin_htlc, create_persisted_descriptor_wallet_from_seed,
     initialize_pristine_wallet_at_creation_tip, initialize_pristine_wallet_at_recovery_checkpoint,
-    load_bitcoin_htlc_watch, load_persisted_descriptor_wallet_from_seed,
+    load_bitcoin_htlc_watch, load_cached_bitcoin_peers, load_persisted_descriptor_wallet_from_seed,
     monitor_kyoto_sync_progress, persist_prepared_bitcoin_broadcast,
     persist_prepared_bitcoin_htlc_spend_broadcast, prepare_bitcoin_htlc_funding_excluding,
-    prepare_native_send_excluding, sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
+    prepare_native_send_excluding, recommended_initialization_checkpoint,
+    sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
     unobserved_approved_broadcast_inputs, verify_htlc_funding, verify_signed_bitcoin_htlc_spend,
 };
 use hns_wallet_hns::{HnsNetwork, HnsRuntimeConfig};
@@ -42,7 +43,7 @@ use crate::{
     MobileShakescapeBitcoinWatchPermit, MobileShakescapeSettlementAction, MobileWalletError,
 };
 
-const BITCOIN_RECOVERY_SCRIPT_INDEX: u32 = 1;
+const BITCOIN_RECOVERY_GAP_LIMIT: u32 = DEFAULT_RECOVERY_GAP_LIMIT;
 const BITCOIN_SEND_APPROVAL_LIFETIME_SECONDS: u64 = 300;
 const MOBILE_ACTION_TOKEN_BYTES: usize = 32;
 const BITCOIN_INITIALIZATION_VERSION: u8 = 1;
@@ -169,8 +170,8 @@ impl MobileBitcoinDirectConfig {
             network: self.network,
             data_dir: self.data_dir.clone(),
             required_peers: self.required_peers,
-            response_timeout: Duration::from_secs(30),
-            supervisor_request_timeout: hns_wallet_bitcoin_kyoto::MAX_KYOTO_REQUEST_TIMEOUT,
+            response_timeout: Duration::from_secs(10),
+            supervisor_request_timeout: Duration::from_secs(15),
             supervisor_sync_timeout: hns_wallet_bitcoin_kyoto::MAX_KYOTO_SYNC_TIMEOUT,
             trusted_peers: Vec::new(),
         }
@@ -364,6 +365,7 @@ impl MobileBitcoinShutdownHandle {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct MobileBitcoinSyncProgress {
+    pub stage: KyotoSyncStage,
     pub successful_handshakes: u8,
     pub required_peer_count: u8,
     pub connection_failures: u16,
@@ -372,6 +374,10 @@ pub struct MobileBitcoinSyncProgress {
     pub connections_met: bool,
     pub chain_height: Option<u32>,
     pub completion_basis_points: u16,
+    pub processed_filter_count: u32,
+    pub matched_filter_count: u32,
+    pub downloaded_block_count: u32,
+    pub cycle_elapsed_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -384,6 +390,7 @@ impl MobileBitcoinSyncProgressHandle {
         };
         let progress = target.0.snapshot();
         MobileBitcoinSyncProgress {
+            stage: progress.stage,
             successful_handshakes: progress.successful_handshakes,
             required_peer_count: target.1,
             connection_failures: progress.connection_failures,
@@ -392,6 +399,10 @@ impl MobileBitcoinSyncProgressHandle {
             connections_met: progress.connections_met,
             chain_height: progress.chain_height,
             completion_basis_points: progress.completion_basis_points,
+            processed_filter_count: progress.processed_filter_count,
+            matched_filter_count: progress.matched_filter_count,
+            downloaded_block_count: progress.downloaded_block_count,
+            cycle_elapsed_ms: progress.cycle_elapsed_ms,
         }
     }
 
@@ -482,18 +493,24 @@ impl MobileBitcoinValueController {
             || (durable.is_none() && initialization.origin == MobileBitcoinWalletOrigin::Generated);
         if requires_tip_discovery {
             let _entered = runtime.enter();
-            let genesis = genesis_block(self.config.network)
-                .block_hash()
-                .to_byte_array();
-            let (tip_discovery, logging) = KyotoTipDiscovery::start(
-                self.config.kyoto_config(),
-                BitcoinCheckpoint {
-                    height: 0,
-                    block_hash: genesis,
-                },
-            )?;
+            let anchor = recommended_initialization_checkpoint(
+                self.config.network,
+                initialization.requested_recovery_height,
+            );
+            let mut kyoto_config = self.config.kyoto_config();
+            kyoto_config.trusted_peers.extend(load_cached_bitcoin_peers(
+                &self.store,
+                account_id,
+                self.config.network,
+            )?);
+            let (tip_discovery, logging) =
+                KyotoTipDiscovery::start(kyoto_config, BitcoinCheckpoint::from_kyoto(anchor))?;
             let shutdown = tip_discovery.shutdown_handle();
-            let progress = monitor_kyoto_sync_progress(runtime.handle(), logging);
+            let progress = monitor_kyoto_sync_progress(
+                runtime.handle(),
+                logging,
+                tip_discovery.progress_handle(),
+            );
             self.runtime = Some(runtime);
             self.wallet = Some(wallet);
             self.tip_discovery = Some(tip_discovery);
@@ -509,7 +526,7 @@ impl MobileBitcoinValueController {
                 KyotoWalletState::restored_wallet(
                     self.config.network,
                     None,
-                    BITCOIN_RECOVERY_SCRIPT_INDEX,
+                    BITCOIN_RECOVERY_GAP_LIMIT,
                     now_unix,
                 )?,
                 now_unix,
@@ -537,7 +554,8 @@ impl MobileBitcoinValueController {
             KyotoSupervisor::start(&wallet, self.config.kyoto_config(), durable, now_unix)?
         };
         let shutdown = supervisor.shutdown_handle();
-        let progress = monitor_kyoto_sync_progress(runtime.handle(), logging);
+        let progress =
+            monitor_kyoto_sync_progress(runtime.handle(), logging, supervisor.progress_handle());
         self.runtime = Some(runtime);
         self.wallet = Some(wallet);
         self.supervisor = Some(supervisor);
@@ -1430,7 +1448,7 @@ impl MobileBitcoinValueController {
                 KyotoWalletState::restored_wallet(
                     self.config.network,
                     Some(checkpoint),
-                    BITCOIN_RECOVERY_SCRIPT_INDEX,
+                    BITCOIN_RECOVERY_GAP_LIMIT,
                     now_unix,
                 )?
             }
@@ -1465,7 +1483,8 @@ impl MobileBitcoinValueController {
             KyotoSupervisor::start(wallet, self.config.kyoto_config(), durable, now_unix)?
         };
         let shutdown = supervisor.shutdown_handle();
-        let progress = monitor_kyoto_sync_progress(runtime.handle(), logging);
+        let progress =
+            monitor_kyoto_sync_progress(runtime.handle(), logging, supervisor.progress_handle());
         self.supervisor = Some(supervisor);
         self.install_runtime_handles(shutdown, progress)?;
         Ok(())

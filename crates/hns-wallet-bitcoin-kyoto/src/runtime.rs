@@ -1,6 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use bdk_kyoto::bip157::chain::{BlockHeaderChanges, IndexedHeader};
 use bdk_kyoto::bip157::{self, ChainState, Client, Event, SyncUpdate};
@@ -8,13 +10,17 @@ use bdk_kyoto::builder::Builder;
 use bdk_kyoto::{HashCheckpoint, Info, LoggingSubscribers, Requester, ScanType, Warning};
 use bdk_wallet::bitcoin::consensus::{deserialize, serialize};
 use bdk_wallet::bitcoin::hashes::Hash;
+use bdk_wallet::bitcoin::p2p::ServiceFlags;
+use bdk_wallet::bitcoin::p2p::address::AddrV2;
 use bdk_wallet::bitcoin::{BlockHash, Network, OutPoint, ScriptBuf, Transaction};
 use bdk_wallet::chain::keychain_txout::KeychainTxOutIndex;
 use bdk_wallet::chain::{
     BlockId, ChainPosition, CheckPoint, ConfirmationBlockTime, IndexedTxGraph, TxUpdate,
 };
 use bdk_wallet::{KeychainKind, Update, Wallet};
-use hns_wallet_store::{EntityBatchSave, SharedWalletStore, WalletStore};
+use hns_wallet_store::{
+    EntityBatchDelete, EntityBatchSave, EntityKind, SharedWalletStore, StoredEntity, WalletStore,
+};
 use hns_wallet_types::SessionId;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -38,6 +44,184 @@ pub const MAX_BROADCAST_APPROVAL_LIFETIME_SECONDS: u64 = 3_600;
 pub const MIN_REBROADCAST_INTERVAL_SECONDS: u64 = 60;
 pub const MAX_PERSISTED_BROADCAST_TRANSACTION_BYTES: usize = 200_000;
 pub const MAX_RECONCILIATION_BATCH_SAVES: usize = 512;
+pub const MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS: usize = 4;
+pub const PEER_INFO_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+pub const BITCOIN_PEER_CACHE_RECORD_VERSION: u16 = 1;
+pub const MAX_CACHED_BITCOIN_PEERS: usize = 32;
+const BITCOIN_PEER_CACHE_ID_DOMAIN: &[u8] = b"hns-wallet-rs/bitcoin-peer-cache/v1/";
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BitcoinPeerCacheRecord {
+    schema_version: u16,
+    network: Network,
+    account_commitment: [u8; 32],
+    ip: IpAddr,
+    services: u64,
+    last_success_at_unix: u64,
+}
+
+impl BitcoinPeerCacheRecord {
+    fn validate(
+        &self,
+        network: Network,
+        account_commitment: [u8; 32],
+    ) -> Result<(), BitcoinWalletError> {
+        let services = ServiceFlags::from(self.services);
+        if self.schema_version != BITCOIN_PEER_CACHE_RECORD_VERSION
+            || self.network != network
+            || self.account_commitment != account_commitment
+            || self.last_success_at_unix == 0
+            || !services.has(ServiceFlags::NETWORK)
+            || !services.has(ServiceFlags::COMPACT_FILTERS)
+            || self.ip.is_unspecified()
+            || self.ip.is_multicast()
+        {
+            return Err(BitcoinWalletError::CorruptRuntimeState);
+        }
+        Ok(())
+    }
+}
+
+fn bitcoin_peer_cache_prefix(account_id: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(BITCOIN_PEER_CACHE_ID_DOMAIN);
+    hasher.update(account_id);
+    hasher.finalize().into()
+}
+
+fn bitcoin_peer_cache_id(prefix: [u8; 32], ip: IpAddr) -> Vec<u8> {
+    let mut id = Vec::with_capacity(49);
+    id.extend_from_slice(&prefix);
+    match ip {
+        IpAddr::V4(ip) => {
+            id.push(4);
+            id.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            id.push(6);
+            id.extend_from_slice(&ip.octets());
+        }
+    }
+    id
+}
+
+/// Load previously successful compact-filter peers from the wallet's
+/// encrypted store. They are preferred seeds only; Kyoto still authenticates
+/// their version services and validates all chain data normally.
+pub fn load_cached_bitcoin_peers(
+    store: &SharedWalletStore,
+    account_id: &[u8],
+    network: Network,
+) -> Result<Vec<bdk_kyoto::TrustedPeer>, BitcoinWalletError> {
+    let prefix = bitcoin_peer_cache_prefix(account_id);
+    let records = store.try_with_store(|store| {
+        store.list_entities_by_id_prefix::<BitcoinPeerCacheRecord>(
+            EntityKind::BitcoinPeer,
+            &prefix,
+            MAX_CACHED_BITCOIN_PEERS + 1,
+        )
+    })?;
+    if records.len() > MAX_CACHED_BITCOIN_PEERS {
+        return Err(BitcoinWalletError::CorruptRuntimeState);
+    }
+    let mut records = records;
+    records.sort_by_key(|record| std::cmp::Reverse(record.value.last_success_at_unix));
+    records
+        .into_iter()
+        .map(|record| {
+            record.value.validate(network, prefix)?;
+            if record.id != bitcoin_peer_cache_id(prefix, record.value.ip) {
+                return Err(BitcoinWalletError::CorruptRuntimeState);
+            }
+            let mut peer = bdk_kyoto::TrustedPeer::from_ip(record.value.ip);
+            peer.set_services(ServiceFlags::from(record.value.services));
+            Ok(peer)
+        })
+        .collect()
+}
+
+fn cache_successful_bitcoin_peers(
+    store: &mut WalletStore,
+    account_id: &[u8],
+    network: Network,
+    peers: &[(AddrV2, ServiceFlags)],
+    now_unix: u64,
+) -> Result<(), BitcoinWalletError> {
+    let prefix = bitcoin_peer_cache_prefix(account_id);
+    let stored = store.list_entities_by_id_prefix::<BitcoinPeerCacheRecord>(
+        EntityKind::BitcoinPeer,
+        &prefix,
+        MAX_CACHED_BITCOIN_PEERS + 1,
+    )?;
+    if stored.len() > MAX_CACHED_BITCOIN_PEERS {
+        return Err(BitcoinWalletError::CorruptRuntimeState);
+    }
+    let mut records = BTreeMap::<Vec<u8>, StoredEntity<BitcoinPeerCacheRecord>>::new();
+    for record in stored {
+        record.value.validate(network, prefix)?;
+        if record.id != bitcoin_peer_cache_id(prefix, record.value.ip)
+            || records.insert(record.id.clone(), record).is_some()
+        {
+            return Err(BitcoinWalletError::CorruptRuntimeState);
+        }
+    }
+    for (address, services) in peers {
+        if !services.has(ServiceFlags::NETWORK) || !services.has(ServiceFlags::COMPACT_FILTERS) {
+            continue;
+        }
+        let ip = match address {
+            AddrV2::Ipv4(ip) => IpAddr::V4(*ip),
+            AddrV2::Ipv6(ip) => IpAddr::V6(*ip),
+            _ => continue,
+        };
+        if ip.is_unspecified() || ip.is_multicast() {
+            continue;
+        }
+        let id = bitcoin_peer_cache_id(prefix, ip);
+        let revision = records.get(&id).map_or(0, |record| record.revision);
+        records.insert(
+            id.clone(),
+            StoredEntity {
+                kind: EntityKind::BitcoinPeer,
+                id,
+                revision,
+                value: BitcoinPeerCacheRecord {
+                    schema_version: BITCOIN_PEER_CACHE_RECORD_VERSION,
+                    network,
+                    account_commitment: prefix,
+                    ip,
+                    services: services.to_u64(),
+                    last_success_at_unix: now_unix,
+                },
+                updated_at_unix: now_unix,
+            },
+        );
+    }
+    let mut ordered = records.into_values().collect::<Vec<_>>();
+    ordered.sort_by_key(|record| std::cmp::Reverse(record.value.last_success_at_unix));
+    let deletes = ordered
+        .iter()
+        .skip(MAX_CACHED_BITCOIN_PEERS)
+        .map(|record| EntityBatchDelete {
+            id: record.id.clone(),
+            expected_revision: record.revision,
+        })
+        .collect::<Vec<_>>();
+    let saves = ordered
+        .into_iter()
+        .take(MAX_CACHED_BITCOIN_PEERS)
+        .filter(|record| record.updated_at_unix == now_unix)
+        .map(|record| EntityBatchSave {
+            id: record.id,
+            expected_revision: record.revision,
+            value: record.value,
+            updated_at_unix: now_unix,
+        })
+        .collect::<Vec<_>>();
+    store.apply_entity_batch(EntityKind::BitcoinPeer, &saves, &deletes)?;
+    Ok(())
+}
 pub const MEDIAN_TIME_PAST_HEADERS: usize = 11;
 pub const MIN_DATE_BIRTHDAY_SAFETY_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const MAX_DATE_BIRTHDAY_SAFETY_SECONDS: u64 = 366 * 24 * 60 * 60;
@@ -491,6 +675,7 @@ pub struct KyotoTipDiscovery {
     sync_timeout: std::time::Duration,
     validated_tip: Option<BitcoinCheckpoint>,
     cancellation: Arc<KyotoCancellation>,
+    progress: KyotoSyncProgressHandle,
     poisoned: bool,
 }
 
@@ -531,6 +716,7 @@ impl KyotoTipDiscovery {
             let _ = node.run().await;
         }));
         let cancellation = Arc::new(KyotoCancellation::default());
+        let progress = KyotoSyncProgressHandle::new();
         Ok((
             Self {
                 network,
@@ -541,6 +727,7 @@ impl KyotoTipDiscovery {
                 sync_timeout: supervisor_sync_timeout,
                 validated_tip: None,
                 cancellation,
+                progress,
                 poisoned: false,
             },
             LoggingSubscribers {
@@ -554,6 +741,7 @@ impl KyotoTipDiscovery {
         &mut self,
     ) -> Result<DiscoveredKyotoTip, BitcoinWalletError> {
         if self.poisoned {
+            self.progress.set_stage(KyotoSyncStage::Failed);
             return Err(BitcoinWalletError::SupervisorPoisoned);
         }
         let sync_timeout = self.sync_timeout;
@@ -563,68 +751,80 @@ impl KyotoTipDiscovery {
             _ = cancellation.cancelled() => {
                 self.poisoned = true;
                 let _ = self.requester.shutdown();
-                return Err(BitcoinWalletError::KyotoNodeStopped);
+                Err(BitcoinWalletError::KyotoNodeStopped)
             }
-            result = tokio::time::timeout(sync_timeout, self.wait_for_validated_tip_inner()) => result,
+            result = tokio::time::timeout(sync_timeout, self.wait_for_validated_tip_inner()) => {
+                match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        self.poisoned = true;
+                        let _ = self.requester.shutdown();
+                        Err(BitcoinWalletError::OperationTimedOut)
+                    }
+                }
+            },
         };
-        match result {
-            Ok(result) => result,
-            Err(_) => {
-                self.poisoned = true;
-                let _ = self.requester.shutdown();
-                Err(BitcoinWalletError::OperationTimedOut)
-            }
+        if result.is_err() {
+            self.progress.set_stage(KyotoSyncStage::Failed);
         }
+        result
     }
 
     async fn wait_for_validated_tip_inner(
         &mut self,
     ) -> Result<DiscoveredKyotoTip, BitcoinWalletError> {
         while let Some(event) = self.events.recv().await {
-            if let Event::FiltersSynced(update) = event {
-                let checkpoint = BitcoinCheckpoint::from_kyoto(update.tip);
-                checkpoint.validate(self.network)?;
-                if checkpoint.height < self.anchor.height {
-                    return Err(BitcoinWalletError::InvalidCheckpoint);
+            match event {
+                Event::IndexedFilter(_) => {
+                    self.progress.record_filter(false);
                 }
-                let mut recent = update
-                    .recent_history
-                    .iter()
-                    .map(|(height, header)| BitcoinCheckpoint {
-                        height: *height,
-                        block_hash: header.block_hash().to_byte_array(),
-                    })
-                    .collect::<Vec<_>>();
-                if !recent.contains(&self.anchor) {
-                    recent.push(self.anchor);
+                Event::FiltersSynced(update) => {
+                    let checkpoint = BitcoinCheckpoint::from_kyoto(update.tip);
+                    checkpoint.validate(self.network)?;
+                    if checkpoint.height < self.anchor.height {
+                        return Err(BitcoinWalletError::InvalidCheckpoint);
+                    }
+                    let mut recent = update
+                        .recent_history
+                        .iter()
+                        .map(|(height, header)| BitcoinCheckpoint {
+                            height: *height,
+                            block_hash: header.block_hash().to_byte_array(),
+                        })
+                        .collect::<Vec<_>>();
+                    if !recent.contains(&self.anchor) {
+                        recent.push(self.anchor);
+                    }
+                    if !recent.contains(&checkpoint) {
+                        recent.push(checkpoint);
+                    }
+                    recent.sort_unstable();
+                    recent.dedup();
+                    if recent.len() > MAX_RECENT_BITCOIN_CHECKPOINTS {
+                        let mut bounded = Vec::with_capacity(MAX_RECENT_BITCOIN_CHECKPOINTS);
+                        bounded.push(self.anchor);
+                        bounded.extend(
+                            recent
+                                .iter()
+                                .rev()
+                                .filter(|candidate| **candidate != self.anchor)
+                                .take(MAX_RECENT_BITCOIN_CHECKPOINTS - 1)
+                                .copied(),
+                        );
+                        bounded.sort_unstable();
+                        bounded.dedup();
+                        recent = bounded;
+                    }
+                    self.validated_tip = Some(checkpoint);
+                    self.progress.set_stage(KyotoSyncStage::Ready);
+                    return Ok(DiscoveredKyotoTip {
+                        network: self.network,
+                        checkpoint,
+                        recovery_anchor: checkpoint,
+                        recent_checkpoints: recent,
+                    });
                 }
-                if !recent.contains(&checkpoint) {
-                    recent.push(checkpoint);
-                }
-                recent.sort_unstable();
-                recent.dedup();
-                if recent.len() > MAX_RECENT_BITCOIN_CHECKPOINTS {
-                    let mut bounded = Vec::with_capacity(MAX_RECENT_BITCOIN_CHECKPOINTS);
-                    bounded.push(self.anchor);
-                    bounded.extend(
-                        recent
-                            .iter()
-                            .rev()
-                            .filter(|candidate| **candidate != self.anchor)
-                            .take(MAX_RECENT_BITCOIN_CHECKPOINTS - 1)
-                            .copied(),
-                    );
-                    bounded.sort_unstable();
-                    bounded.dedup();
-                    recent = bounded;
-                }
-                self.validated_tip = Some(checkpoint);
-                return Ok(DiscoveredKyotoTip {
-                    network: self.network,
-                    checkpoint,
-                    recovery_anchor: checkpoint,
-                    recent_checkpoints: recent,
-                });
+                Event::ChainUpdate(_) => {}
             }
         }
         Err(BitcoinWalletError::KyotoNodeStopped)
@@ -685,6 +885,10 @@ impl KyotoTipDiscovery {
             requester: self.requester.clone(),
             cancellation: Arc::clone(&self.cancellation),
         }
+    }
+
+    pub fn progress_handle(&self) -> KyotoSyncProgressHandle {
+        self.progress.clone()
     }
 
     /// Verifies that a caller-selected birthday checkpoint is in the synced
@@ -851,6 +1055,24 @@ fn wallet_scripts(index: &KeychainTxOutIndex<KeychainKind>, to_index: u32) -> Ha
     scripts
 }
 
+fn extended_recovery_script_count(
+    last_used_index: Option<u32>,
+    current_script_count: u32,
+    gap_limit: u32,
+) -> Result<u32, BitcoinWalletError> {
+    let Some(last_used_index) = last_used_index else {
+        return Ok(current_script_count);
+    };
+    let required = last_used_index
+        .checked_add(1)
+        .and_then(|used_count| used_count.checked_add(gap_limit))
+        .ok_or(BitcoinWalletError::InvalidRecoveryScriptIndex)?;
+    if required > MAX_RECOVERY_SCRIPT_INDEX {
+        return Err(BitcoinWalletError::InvalidRecoveryScriptIndex);
+    }
+    Ok(current_script_count.max(required))
+}
+
 fn walk_back_wallet_checkpoint(checkpoint: CheckPoint) -> HashCheckpoint {
     const REORG_SAFETY_DEPTH: usize = 7;
     let mut start = HashCheckpoint::new(checkpoint.height(), checkpoint.hash());
@@ -868,6 +1090,7 @@ fn build_wallet_swap_client(
     config: KyotoRuntimeConfig,
     scan_type: ScanType,
     swap_scripts: Vec<(SessionId, ScriptBuf)>,
+    progress: KyotoSyncProgressHandle,
 ) -> Result<(Requester, LoggingSubscribers, KyotoWalletSwapSubscriber), BitcoinWalletError> {
     config.validate()?;
     if wallet.network() != config.network {
@@ -898,6 +1121,7 @@ fn build_wallet_swap_client(
         wallet,
         scan_type,
         swap_scripts,
+        progress,
     );
     bip157::tokio::task::spawn(async move { node.run().await });
     Ok((
@@ -927,6 +1151,9 @@ struct KyotoWalletSwapSubscriber {
     swap_scripts: BTreeMap<SessionId, ScriptBuf>,
     chain: CheckPoint,
     graph: IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
+    recovery_gap_limit: Option<u32>,
+    recovery_script_count: u32,
+    progress: KyotoSyncProgressHandle,
 }
 
 impl KyotoWalletSwapSubscriber {
@@ -936,9 +1163,16 @@ impl KyotoWalletSwapSubscriber {
         wallet: &Wallet,
         scan_type: ScanType,
         swap_scripts: Vec<(SessionId, ScriptBuf)>,
+        progress: KyotoSyncProgressHandle,
     ) -> Self {
         let graph = IndexedTxGraph::new(wallet.spk_index().clone());
         let wallet_scripts = wallet_scripts_for_scan(&graph.index, scan_type);
+        let recovery_gap_limit = match scan_type {
+            ScanType::Recovery {
+                used_script_index, ..
+            } => Some(used_script_index),
+            ScanType::Sync => None,
+        };
         Self {
             requester,
             receiver,
@@ -947,6 +1181,9 @@ impl KyotoWalletSwapSubscriber {
             swap_scripts: swap_scripts.into_iter().collect(),
             chain: wallet.latest_checkpoint(),
             graph,
+            recovery_gap_limit,
+            recovery_script_count: recovery_gap_limit.unwrap_or(0),
+            progress,
         }
     }
 
@@ -955,12 +1192,13 @@ impl KyotoWalletSwapSubscriber {
     }
 
     async fn update(&mut self) -> Result<KyotoWalletSwapUpdate, BitcoinWalletError> {
-        let mut swap_blocks = Vec::new();
+        let mut swap_blocks = BTreeMap::new();
         while let Some(event) = self.receiver.recv().await {
             match event {
                 Event::IndexedFilter(filter) => {
                     let wallet_match = filter.contains_any(self.wallet_scripts.iter());
                     let swap_match = filter.contains_any(self.swap_scripts.values());
+                    self.progress.record_filter(wallet_match || swap_match);
                     if wallet_match || swap_match {
                         self.queued_blocks
                             .entry(filter.block_hash())
@@ -970,20 +1208,60 @@ impl KyotoWalletSwapSubscriber {
                 }
                 Event::ChainUpdate(changes) => self.apply_chain_event(&changes),
                 Event::FiltersSynced(SyncUpdate { .. }) => {
-                    for (hash, swap_match) in core::mem::take(&mut self.queued_blocks) {
-                        let indexed = self
-                            .requester
-                            .get_block(hash)
+                    if !self.queued_blocks.is_empty() {
+                        self.progress.set_stage(KyotoSyncStage::FetchingBlocks);
+                    }
+                    let queued = core::mem::take(&mut self.queued_blocks);
+                    let mut remaining = queued.into_iter();
+                    let mut pending =
+                        VecDeque::with_capacity(MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS);
+                    loop {
+                        while pending.len() < MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS {
+                            let Some((hash, swap_match)) = remaining.next() else {
+                                break;
+                            };
+                            let receiver = self
+                                .requester
+                                .request_block(hash)
+                                .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
+                            pending.push_back((swap_match, receiver));
+                        }
+                        let Some((swap_match, receiver)) = pending.pop_front() else {
+                            break;
+                        };
+                        let indexed = receiver
                             .await
+                            .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?
                             .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
+                        self.progress.record_downloaded_block();
                         let _ = self
                             .graph
                             .apply_block_relevant(&indexed.block, indexed.height);
                         if swap_match {
-                            swap_blocks.push(MatchedBitcoinBlock {
-                                height: indexed.height,
-                                block: indexed.block,
-                            });
+                            swap_blocks.insert(
+                                indexed.block.block_hash(),
+                                MatchedBitcoinBlock {
+                                    height: indexed.height,
+                                    block: indexed.block,
+                                },
+                            );
+                        }
+                    }
+                    if let Some(gap_limit) = self.recovery_gap_limit {
+                        let required_script_count = extended_recovery_script_count(
+                            self.graph.index.last_used_indices().values().copied().max(),
+                            self.recovery_script_count,
+                            gap_limit,
+                        )?;
+                        if required_script_count > self.recovery_script_count {
+                            self.recovery_script_count = required_script_count;
+                            self.wallet_scripts
+                                .extend(wallet_scripts(&self.graph.index, required_script_count));
+                            self.requester
+                                .rescan()
+                                .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
+                            self.progress.set_stage(KyotoSyncStage::SyncingFilters);
+                            continue;
                         }
                     }
                     self.wallet_scripts
@@ -1000,7 +1278,7 @@ impl KyotoWalletSwapSubscriber {
                             chain: Some(canonical_chain.clone()),
                         },
                         canonical_chain,
-                        swap_blocks,
+                        swap_blocks: swap_blocks.into_values().collect(),
                     });
                 }
             }
@@ -1040,6 +1318,15 @@ pub struct KyotoSupervisor {
     resume_reconciliation: Option<(BitcoinCheckpoint, Option<BitcoinCheckpoint>)>,
     durable: StoredKyotoWalletState,
     store: SharedWalletStore,
+    progress: KyotoSyncProgressHandle,
+}
+
+struct KyotoSyncCycleContext {
+    started: Instant,
+    network_ms: u64,
+    wallet_apply_ms: u64,
+    chain_validation_ms: u64,
+    wallet_projection_changed: bool,
 }
 
 /// A narrow, cloneable stop signal for a running Kyoto node.
@@ -1080,9 +1367,25 @@ impl KyotoCancellation {
     }
 }
 
+/// Public phase of the direct Bitcoin synchronization pipeline.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KyotoSyncStage {
+    #[default]
+    Connecting,
+    SyncingFilters,
+    FetchingBlocks,
+    ApplyingWallet,
+    ValidatingChain,
+    Reconciling,
+    Ready,
+    Failed,
+}
+
 /// Public, bounded progress from Kyoto's own validated sync pipeline.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KyotoSyncProgress {
+    pub stage: KyotoSyncStage,
     pub successful_handshakes: u8,
     pub connection_failures: u16,
     pub peer_timeouts: u16,
@@ -1090,16 +1393,97 @@ pub struct KyotoSyncProgress {
     pub connections_met: bool,
     pub chain_height: Option<u32>,
     pub completion_basis_points: u16,
+    pub processed_filter_count: u32,
+    pub matched_filter_count: u32,
+    pub downloaded_block_count: u32,
+    pub cycle_elapsed_ms: u64,
+}
+
+#[derive(Debug)]
+struct KyotoSyncProgressState {
+    public: KyotoSyncProgress,
+    cycle_started: Instant,
+}
+
+impl Default for KyotoSyncProgressState {
+    fn default() -> Self {
+        Self {
+            public: KyotoSyncProgress::default(),
+            cycle_started: Instant::now(),
+        }
+    }
 }
 
 /// Read-only progress mailbox which contains no wallet or peer identity.
 #[derive(Clone, Debug)]
-pub struct KyotoSyncProgressHandle(Arc<Mutex<KyotoSyncProgress>>);
+pub struct KyotoSyncProgressHandle(Arc<Mutex<KyotoSyncProgressState>>);
 
 impl KyotoSyncProgressHandle {
-    pub fn snapshot(&self) -> KyotoSyncProgress {
-        self.0.lock().map(|progress| *progress).unwrap_or_default()
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(KyotoSyncProgressState::default())))
     }
+
+    pub fn snapshot(&self) -> KyotoSyncProgress {
+        let Ok(current) = self.0.lock() else {
+            return KyotoSyncProgress::default();
+        };
+        let mut snapshot = current.public;
+        snapshot.cycle_elapsed_ms = elapsed_millis(current.cycle_started);
+        snapshot
+    }
+
+    fn begin_cycle(&self) {
+        if let Ok(mut current) = self.0.lock() {
+            let prior = current.public;
+            *current = KyotoSyncProgressState {
+                public: KyotoSyncProgress {
+                    stage: if prior.connections_met {
+                        KyotoSyncStage::SyncingFilters
+                    } else {
+                        KyotoSyncStage::Connecting
+                    },
+                    successful_handshakes: prior.successful_handshakes,
+                    connection_failures: prior.connection_failures,
+                    peer_timeouts: prior.peer_timeouts,
+                    incompatible_peers: prior.incompatible_peers,
+                    connections_met: prior.connections_met,
+                    chain_height: prior.chain_height,
+                    ..KyotoSyncProgress::default()
+                },
+                cycle_started: Instant::now(),
+            };
+        }
+    }
+
+    fn set_stage(&self, stage: KyotoSyncStage) {
+        if let Ok(mut current) = self.0.lock() {
+            current.public.stage = stage;
+            current.public.cycle_elapsed_ms = elapsed_millis(current.cycle_started);
+        }
+    }
+
+    fn record_filter(&self, matched: bool) {
+        if let Ok(mut current) = self.0.lock() {
+            current.public.stage = KyotoSyncStage::SyncingFilters;
+            current.public.processed_filter_count =
+                current.public.processed_filter_count.saturating_add(1);
+            if matched {
+                current.public.matched_filter_count =
+                    current.public.matched_filter_count.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_downloaded_block(&self) {
+        if let Ok(mut current) = self.0.lock() {
+            current.public.downloaded_block_count =
+                current.public.downloaded_block_count.saturating_add(1);
+        }
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Drain Kyoto's informational channel into a bounded public mailbox. Warning
@@ -1108,9 +1492,9 @@ impl KyotoSyncProgressHandle {
 pub fn monitor_kyoto_sync_progress(
     runtime: &tokio::runtime::Handle,
     mut logging: LoggingSubscribers,
+    progress: KyotoSyncProgressHandle,
 ) -> KyotoSyncProgressHandle {
-    let progress = Arc::new(Mutex::new(KyotoSyncProgress::default()));
-    let worker_progress = Arc::clone(&progress);
+    let worker_progress = progress.clone();
     // Mobile controller methods are invoked from ordinary JNI/Swift worker
     // threads. Never depend on an ambient Tokio context here: the Kyoto
     // supervisor owns an explicit runtime and its handle is the authority for
@@ -1120,20 +1504,21 @@ pub fn monitor_kyoto_sync_progress(
             tokio::select! {
                 info = logging.info_subscriber.recv() => match info {
                     Some(Info::SuccessfulHandshake) => {
-                        if let Ok(mut current) = worker_progress.lock() {
-                            current.successful_handshakes =
-                                current.successful_handshakes.saturating_add(1);
+                        if let Ok(mut current) = worker_progress.0.lock() {
+                            current.public.successful_handshakes =
+                                current.public.successful_handshakes.saturating_add(1);
                         }
                     }
                     Some(Info::ConnectionsMet) => {
-                        if let Ok(mut current) = worker_progress.lock() {
-                            current.connections_met = true;
+                        if let Ok(mut current) = worker_progress.0.lock() {
+                            current.public.connections_met = true;
+                            current.public.stage = KyotoSyncStage::SyncingFilters;
                         }
                     }
                     Some(Info::Progress(update)) => {
-                        if let Ok(mut current) = worker_progress.lock() {
-                            current.chain_height = Some(update.chain_height());
-                            current.completion_basis_points =
+                        if let Ok(mut current) = worker_progress.0.lock() {
+                            current.public.chain_height = Some(update.chain_height());
+                            current.public.completion_basis_points =
                                 (update.fraction_complete().clamp(0.0, 1.0) * 10_000.0)
                                     .round() as u16;
                         }
@@ -1143,20 +1528,21 @@ pub fn monitor_kyoto_sync_progress(
                 },
                 warning = logging.warning_subscriber.recv() => match warning {
                     Some(Warning::CouldNotConnect) => {
-                        if let Ok(mut current) = worker_progress.lock() {
-                            current.connection_failures =
-                                current.connection_failures.saturating_add(1);
+                        if let Ok(mut current) = worker_progress.0.lock() {
+                            current.public.connection_failures =
+                                current.public.connection_failures.saturating_add(1);
                         }
                     }
                     Some(Warning::PeerTimedOut) => {
-                        if let Ok(mut current) = worker_progress.lock() {
-                            current.peer_timeouts = current.peer_timeouts.saturating_add(1);
+                        if let Ok(mut current) = worker_progress.0.lock() {
+                            current.public.peer_timeouts =
+                                current.public.peer_timeouts.saturating_add(1);
                         }
                     }
                     Some(Warning::NoCompactFilters) => {
-                        if let Ok(mut current) = worker_progress.lock() {
-                            current.incompatible_peers =
-                                current.incompatible_peers.saturating_add(1);
+                        if let Ok(mut current) = worker_progress.0.lock() {
+                            current.public.incompatible_peers =
+                                current.public.incompatible_peers.saturating_add(1);
                         }
                     }
                     Some(_) => {}
@@ -1165,7 +1551,7 @@ pub fn monitor_kyoto_sync_progress(
             }
         }
     }));
-    KyotoSyncProgressHandle(progress)
+    progress
 }
 
 impl KyotoShutdownHandle {
@@ -1182,7 +1568,7 @@ impl KyotoShutdownHandle {
 impl KyotoSupervisor {
     pub fn start(
         wallet: &EncryptedPersistedBitcoinWallet,
-        config: KyotoRuntimeConfig,
+        mut config: KyotoRuntimeConfig,
         mut durable: StoredKyotoWalletState,
         now_unix: u64,
     ) -> Result<(Self, LoggingSubscribers), BitcoinWalletError> {
@@ -1218,8 +1604,19 @@ impl KyotoSupervisor {
         let watches = store.try_with_store(|store| {
             load_bitcoin_htlc_watches(store, wallet.network(), wallet.account_id())
         })?;
-        let (requester, logging, updates) =
-            build_wallet_swap_client(wallet, config, scan_type, watched_scripts(&watches))?;
+        config.trusted_peers.extend(load_cached_bitcoin_peers(
+            &store,
+            wallet.account_id(),
+            wallet.network(),
+        )?);
+        let progress = KyotoSyncProgressHandle::new();
+        let (requester, logging, updates) = build_wallet_swap_client(
+            wallet,
+            config,
+            scan_type,
+            watched_scripts(&watches),
+            progress.clone(),
+        )?;
         let cancellation = Arc::new(KyotoCancellation::default());
         Ok((
             Self {
@@ -1233,6 +1630,7 @@ impl KyotoSupervisor {
                 resume_reconciliation,
                 durable,
                 store,
+                progress,
             },
             logging,
         ))
@@ -1251,6 +1649,10 @@ impl KyotoSupervisor {
             requester: self.requester.clone(),
             cancellation: Arc::clone(&self.cancellation),
         }
+    }
+
+    pub fn progress_handle(&self) -> KyotoSyncProgressHandle {
+        self.progress.clone()
     }
 
     /// Resolve a user-supplied earliest transaction height against Kyoto's
@@ -1342,6 +1744,20 @@ impl KyotoSupervisor {
         wallet: &mut EncryptedPersistedBitcoinWallet,
         now_unix: u64,
     ) -> Result<KyotoSyncReceipt, BitcoinWalletError> {
+        let result = self.synchronize_once_inner(wallet, now_unix).await;
+        if result.is_err() {
+            self.progress.set_stage(KyotoSyncStage::Failed);
+        }
+        result
+    }
+
+    async fn synchronize_once_inner(
+        &mut self,
+        wallet: &mut EncryptedPersistedBitcoinWallet,
+        now_unix: u64,
+    ) -> Result<KyotoSyncReceipt, BitcoinWalletError> {
+        let cycle_started = Instant::now();
+        self.progress.begin_cycle();
         if wallet.network() != self.durable.state.network
             || wallet.account_id() != self.durable.account_id.as_slice()
             || !wallet.shared_store().is_same_authority(&self.store)
@@ -1377,7 +1793,20 @@ impl KyotoSupervisor {
             };
             self.durable.persist(now_unix)?;
             return self
-                .finish_reconciliation(wallet, sequence, wallet_tip, common_ancestor, now_unix)
+                .finish_reconciliation(
+                    wallet,
+                    sequence,
+                    wallet_tip,
+                    common_ancestor,
+                    now_unix,
+                    KyotoSyncCycleContext {
+                        started: cycle_started,
+                        network_ms: 0,
+                        wallet_apply_ms: 0,
+                        chain_validation_ms: 0,
+                        wallet_projection_changed: true,
+                    },
+                )
                 .await;
         }
         let previous_tip = self.durable.state.last_consistent_checkpoint;
@@ -1387,6 +1816,8 @@ impl KyotoSupervisor {
         };
         self.durable.persist(now_unix)?;
 
+        self.progress.set_stage(KyotoSyncStage::SyncingFilters);
+        let network_started = Instant::now();
         let update_result = tokio::select! {
             biased;
             _ = self.cancellation.cancelled() => {
@@ -1404,6 +1835,7 @@ impl KyotoSupervisor {
             }
             result = tokio::time::timeout(self.sync_timeout, self.updates.update()) => result,
         };
+        let network_ms = elapsed_millis(network_started);
         let update = match update_result {
             Ok(Ok(update)) => update,
             Ok(Err(_)) => {
@@ -1428,6 +1860,9 @@ impl KyotoSupervisor {
                 return Err(BitcoinWalletError::OperationTimedOut);
             }
         };
+        self.progress.set_stage(KyotoSyncStage::ApplyingWallet);
+        let wallet_apply_started = Instant::now();
+        let wallet_projection_changed = !update.wallet_update.tx_update.is_empty();
         let announced_tip = update
             .wallet_update
             .chain
@@ -1453,7 +1888,10 @@ impl KyotoSupervisor {
             .apply_update(update.wallet_update)
             .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
         wallet.persist(now_unix)?;
+        let wallet_apply_ms = elapsed_millis(wallet_apply_started);
 
+        self.progress.set_stage(KyotoSyncStage::ValidatingChain);
+        let chain_validation_started = Instant::now();
         let wallet_tip = BitcoinCheckpoint::from_wallet(wallet);
         if wallet_tip != announced_tip {
             return Err(BitcoinWalletError::CheckpointMismatch);
@@ -1517,9 +1955,23 @@ impl KyotoSupervisor {
             common_ancestor: reorg_ancestor,
         };
         self.durable.persist(now_unix)?;
+        let chain_validation_ms = elapsed_millis(chain_validation_started);
 
-        self.finish_reconciliation(wallet, sequence, wallet_tip, reorg_ancestor, now_unix)
-            .await
+        self.finish_reconciliation(
+            wallet,
+            sequence,
+            wallet_tip,
+            reorg_ancestor,
+            now_unix,
+            KyotoSyncCycleContext {
+                started: cycle_started,
+                network_ms,
+                wallet_apply_ms,
+                chain_validation_ms,
+                wallet_projection_changed,
+            },
+        )
+        .await
     }
 
     async fn finish_reconciliation(
@@ -1529,18 +1981,46 @@ impl KyotoSupervisor {
         wallet_tip: BitcoinCheckpoint,
         reorg_ancestor: Option<BitcoinCheckpoint>,
         now_unix: u64,
+        cycle: KyotoSyncCycleContext,
     ) -> Result<KyotoSyncReceipt, BitcoinWalletError> {
-        let transaction_count = self
-            .store
-            .try_with_store_mut(|store| reconcile_transaction_records(wallet, store, now_unix))?;
-        let output_count = self
-            .store
-            .try_with_store_mut(|store| reconcile_output_records(wallet, store, now_unix))?;
-        let peer_count = tokio::time::timeout(self.request_timeout, self.requester.peer_info())
+        self.progress.set_stage(KyotoSyncStage::Reconciling);
+        let reconciliation_started = Instant::now();
+        let needs_full_reconciliation = cycle.wallet_projection_changed
+            || reorg_ancestor.is_some()
+            || self.durable.state.completed_syncs == 0;
+        let (transaction_count, output_count) = if needs_full_reconciliation {
+            let transaction_count = self.store.try_with_store_mut(|store| {
+                reconcile_transaction_records(wallet, store, now_unix)
+            })?;
+            let output_count = self
+                .store
+                .try_with_store_mut(|store| reconcile_output_records(wallet, store, now_unix))?;
+            (transaction_count, output_count)
+        } else {
+            (
+                self.durable.state.relevant_transaction_count,
+                self.durable.state.wallet_output_count,
+            )
+        };
+        let peers = tokio::time::timeout(PEER_INFO_STATUS_TIMEOUT, self.requester.peer_info())
             .await
             .ok()
-            .and_then(Result::ok)
-            .map_or(0, |peers| peers.len());
+            .and_then(Result::ok);
+        if let Some(peers) = peers.as_deref() {
+            self.store.try_with_store_mut(|store| {
+                cache_successful_bitcoin_peers(
+                    store,
+                    &self.durable.account_id,
+                    self.durable.state.network,
+                    peers,
+                    now_unix,
+                )
+            })?;
+        }
+        let peer_count = peers.as_ref().map_or(
+            usize::from(self.durable.state.connected_peer_count),
+            Vec::len,
+        );
         let peer_count = u8::try_from(peer_count).unwrap_or(u8::MAX);
 
         self.durable.state.last_consistent_checkpoint = wallet_tip;
@@ -1565,6 +2045,14 @@ impl KyotoSupervisor {
         self.durable.state.last_completed_at_unix = Some(now_unix);
         self.durable.state.phase = KyotoSyncPhase::Ready;
         self.durable.persist(now_unix)?;
+        let timings = KyotoSyncTimings {
+            network_ms: cycle.network_ms,
+            wallet_apply_ms: cycle.wallet_apply_ms,
+            chain_validation_ms: cycle.chain_validation_ms,
+            reconciliation_ms: elapsed_millis(reconciliation_started),
+            total_ms: elapsed_millis(cycle.started),
+        };
+        self.progress.set_stage(KyotoSyncStage::Ready);
 
         Ok(KyotoSyncReceipt {
             sequence,
@@ -1574,6 +2062,7 @@ impl KyotoSupervisor {
             output_count,
             connected_peer_count: peer_count,
             required_peer_count: self.required_peers,
+            timings,
         })
     }
 
@@ -1938,6 +2427,15 @@ pub fn bitcoin_value_runtime_permit() -> Result<BitcoinValueRuntimePermit, Bitco
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KyotoSyncTimings {
+    pub network_ms: u64,
+    pub wallet_apply_ms: u64,
+    pub chain_validation_ms: u64,
+    pub reconciliation_ms: u64,
+    pub total_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KyotoSyncReceipt {
     pub sequence: u64,
     pub checkpoint: BitcoinCheckpoint,
@@ -1946,6 +2444,7 @@ pub struct KyotoSyncReceipt {
     pub output_count: u32,
     pub connected_peer_count: u8,
     pub required_peer_count: u8,
+    pub timings: KyotoSyncTimings,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3023,6 +3522,8 @@ fn bitcoin_outpoint_id(txid: [u8; 32], output_index: u32) -> Vec<u8> {
 mod restart_tests {
     use super::*;
 
+    const TEST_STORE_PASSPHRASE: &str = "correct horse battery staple";
+
     fn checkpoint(height: u32, byte: u8) -> BitcoinCheckpoint {
         BitcoinCheckpoint {
             height,
@@ -3102,5 +3603,65 @@ mod restart_tests {
             .await
             .expect("a shutdown request remains visible to late waiters");
         });
+    }
+
+    #[test]
+    fn successful_peer_cache_is_encrypted_bounded_and_service_filtered() {
+        let store = SharedWalletStore::new(
+            WalletStore::create(":memory:", TEST_STORE_PASSPHRASE).expect("in-memory store"),
+        );
+        let services = ServiceFlags::NETWORK | ServiceFlags::COMPACT_FILTERS;
+        let ignored_services = ServiceFlags::NETWORK;
+        store
+            .try_with_store_mut(|wallet_store| {
+                cache_successful_bitcoin_peers(
+                    wallet_store,
+                    b"peer-cache-account",
+                    Network::Bitcoin,
+                    &[
+                        (AddrV2::Ipv4("1.1.1.1".parse().expect("IPv4")), services),
+                        (
+                            AddrV2::Ipv6("2606:4700:4700::1111".parse().expect("IPv6")),
+                            services,
+                        ),
+                        (
+                            AddrV2::Ipv4("8.8.8.8".parse().expect("IPv4")),
+                            ignored_services,
+                        ),
+                    ],
+                    10,
+                )
+            })
+            .expect("cache successful peers");
+
+        let loaded = load_cached_bitcoin_peers(&store, b"peer-cache-account", Network::Bitcoin)
+            .expect("load cached peers");
+        assert_eq!(loaded.len(), 2);
+        assert!(matches!(
+            load_cached_bitcoin_peers(&store, b"peer-cache-account", Network::Regtest),
+            Err(BitcoinWalletError::CorruptRuntimeState)
+        ));
+    }
+
+    #[test]
+    fn recovery_gap_extension_is_exact_and_fails_closed_at_capacity() {
+        assert_eq!(
+            extended_recovery_script_count(None, 20, 20).expect("no activity keeps the window"),
+            20
+        );
+        assert_eq!(
+            extended_recovery_script_count(Some(19), 20, 20)
+                .expect("last script extends the window"),
+            40
+        );
+        assert_eq!(
+            extended_recovery_script_count(Some(2), 20, 20)
+                .expect("activity inside the existing window"),
+            23
+        );
+        assert!(matches!(
+            extended_recovery_script_count(Some(MAX_RECOVERY_SCRIPT_INDEX - 1), 20, 20),
+            Err(BitcoinWalletError::InvalidRecoveryScriptIndex)
+        ));
     }
 }

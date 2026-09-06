@@ -17,7 +17,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use bdk_kyoto::builder::{Builder, BuilderExt};
-use bdk_kyoto::{LightClient, ScanType, TrustedPeer, state, wallets};
+use bdk_kyoto::{HashCheckpoint, LightClient, ScanType, TrustedPeer, state, wallets};
 use bdk_wallet::bitcoin::absolute;
 use bdk_wallet::bitcoin::blockdata::opcodes::all::{
     OP_CHECKSIG, OP_CLTV, OP_DROP, OP_ELSE, OP_ENDIF, OP_EQUALVERIFY, OP_IF, OP_SHA256,
@@ -28,7 +28,7 @@ use bdk_wallet::bitcoin::script::Builder as ScriptBuilder;
 use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1, SecretKey, ecdsa::Signature};
 use bdk_wallet::bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bdk_wallet::bitcoin::{
-    Address, Amount as BitcoinAmount, Network, OutPoint, PublicKey, ScriptBuf, Sequence,
+    Address, Amount as BitcoinAmount, BlockHash, Network, OutPoint, PublicKey, ScriptBuf, Sequence,
     Transaction, TxIn, TxOut, Witness, bip32::Xpriv, psbt::Psbt, transaction,
 };
 use bdk_wallet::template::Bip84;
@@ -62,12 +62,48 @@ pub const MAX_BITCOIN_TRANSACTION_BYTES: usize = 400_000;
 pub const BIP39_SEED_BYTES: usize = 64;
 pub const MAX_REQUIRED_PEERS: u8 = 8;
 pub const MAX_RECOVERY_SCRIPT_INDEX: u32 = 100_000;
+/// BIP-44-style unused-address window maintained during a recovery scan.
+pub const DEFAULT_RECOVERY_GAP_LIMIT: u32 = 20;
 pub const BITCOIN_SWAP_KEY_SCHEME_VERSION: u16 = 1;
 pub const MAX_BITCOIN_SWAP_ACCOUNT_INDEX: u32 = 100_000;
 pub const MAX_BITCOIN_SWAP_KEY_INDEX: u32 = 100_000;
-pub const DEFAULT_REQUIRED_PEERS: u8 = 3;
+/// Two independent compact-filter peers are required to agree before scanning.
+/// Requiring three multiplied mobile connection latency and bandwidth; one
+/// would remove Kyoto's cross-peer filter-header agreement entirely.
+pub const DEFAULT_REQUIRED_PEERS: u8 = 2;
 pub const MAX_KYOTO_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 pub const MAX_KYOTO_SYNC_TIMEOUT: Duration = Duration::from_secs(86_400);
+
+/// Return the newest bundled mainnet checkpoint strictly below a wallet's
+/// earliest possible transaction. Generated wallets have no historical
+/// activity, so they use the newest checkpoint. Other networks retain their
+/// genesis anchor because these mainnet checkpoints do not apply to them.
+///
+/// The height-840,000 checkpoint is the fourth Bitcoin subsidy halving block.
+/// Older recovery heights fall back to Kyoto's own taproot/segwit checkpoints.
+pub fn recommended_initialization_checkpoint(
+    network: Network,
+    earliest_transaction_height: Option<u32>,
+) -> HashCheckpoint {
+    if network != Network::Bitcoin {
+        return HashCheckpoint::from_genesis(network);
+    }
+    let earliest = earliest_transaction_height.unwrap_or(u32::MAX);
+    if earliest > 840_000 {
+        return HashCheckpoint::new(
+            840_000,
+            BlockHash::from_str("0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5")
+                .expect("audited Bitcoin block 840,000 checkpoint"),
+        );
+    }
+    if earliest > HashCheckpoint::taproot_activation().height {
+        return HashCheckpoint::taproot_activation();
+    }
+    if earliest > HashCheckpoint::segwit_activation().height {
+        return HashCheckpoint::segwit_activation();
+    }
+    HashCheckpoint::from_genesis(network)
+}
 /// Domain-separated commitment to an exact Bitcoin P2WSH HTLC as it appears
 /// in a signed Shakescape HNS/BTC session. It binds the bilateral network, amount,
 /// and full witness script—not merely the script hash advertised by a peer.
@@ -1931,6 +1967,34 @@ mod tests {
         assert_eq!(state.recovery_checkpoint, recovery_anchor);
         assert_eq!(state.recent_checkpoints, vec![recovery_anchor, checkpoint]);
         assert_eq!(state.scanned_checkpoint, checkpoint);
+    }
+
+    #[test]
+    fn recommended_initialization_checkpoint_is_network_and_birthday_safe() {
+        assert_eq!(
+            recommended_initialization_checkpoint(Network::Bitcoin, None).height,
+            840_000
+        );
+        assert_eq!(
+            recommended_initialization_checkpoint(Network::Bitcoin, Some(840_001)).height,
+            840_000
+        );
+        assert_eq!(
+            recommended_initialization_checkpoint(Network::Bitcoin, Some(840_000)).height,
+            HashCheckpoint::taproot_activation().height
+        );
+        assert_eq!(
+            recommended_initialization_checkpoint(
+                Network::Bitcoin,
+                Some(HashCheckpoint::taproot_activation().height)
+            )
+            .height,
+            HashCheckpoint::segwit_activation().height
+        );
+        assert_eq!(
+            recommended_initialization_checkpoint(Network::Regtest, None),
+            HashCheckpoint::from_genesis(Network::Regtest)
+        );
     }
 
     #[test]

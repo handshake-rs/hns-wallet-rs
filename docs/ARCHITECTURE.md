@@ -387,15 +387,21 @@ requires ready state, a running node and peer quorum, then records
 `submission_started` before its bounded P2P request. Timeouts are retryable from
 that record.
 
-The BDK entity and encrypted scan journal share one store/key authority but are
-independent commits, so ready-last sequencing supplies logical recovery rather
-than pretending they are one SQLite transaction. The aggregate BDK entity is
-bounded to 1 MiB. Pinned Kyoto does not durably expose headers, filter
-headers/filters, or its address book, so those public chain objects are
-re-fetched and revalidated after restart while the encrypted BDK checkpoint
-remains the durable wallet anchor. The connected mobile value path persists
-exact approved broadcasts, resumes their bytes, and excludes committed inputs
-until canonical wallet observation. Its Bitcoin value-runtime gate is enabled.
+The BDK snapshot/delta journal and encrypted scan journal share one store/key
+authority but are independent commits, so ready-last sequencing supplies
+logical recovery rather than pretending they are one SQLite transaction.
+Ordinary BDK writes atomically advance an authenticated monotonic journal head
+and append only their encrypted staged delta; every 32 deltas, an authoritative
+aggregate snapshot is committed before redundant deltas are pruned while the
+head remains. That prevents stale writers from reusing compacted sequence IDs.
+The compacted snapshot remains bounded to 1 MiB. Pinned Kyoto does not
+durably expose headers or filter headers/filters, so those public chain objects
+are re-fetched and revalidated after restart while the encrypted BDK checkpoint
+remains the durable wallet anchor. A bounded encrypted cache prefers previously
+successful compact-filter peer IPs, but each is re-handshaken and does not
+become chain authority. The connected mobile value path persists exact approved
+broadcasts, resumes their bytes, and excludes committed inputs until canonical
+wallet observation. Its Bitcoin value-runtime gate is enabled.
 
 ## Ethereum containment boundary
 

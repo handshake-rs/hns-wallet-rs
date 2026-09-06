@@ -619,11 +619,18 @@ online evidence and value paths remain behind unavailable opaque permits.
 
 ## Bitcoin Kyoto recovery journal
 
-The Bitcoin module uses one shared encrypted store authority with two ordered
-record boundaries. A strict v1 `bitcoin_wallet_state` entity contains the
-aggregate BDK-3.1.0 public descriptor/local-chain/transaction/output
-changeset. It is account-ID authenticated, deletion-protected, and updated by
-CAS. Separate encrypted records contain the authenticated birthday, distinct
+The Bitcoin module uses one shared encrypted store authority with ordered
+record boundaries. A deletion-protected, strict v2 `bitcoin_wallet_state`
+snapshot and account-bound `bitcoin_wallet_changeset` journal contain the
+aggregate BDK-3.1.0 public descriptor/local-chain/transaction/output state.
+Legacy strict-v1 snapshots remain readable. Ordinary persistence atomically
+advances an authenticated monotonic head and appends only the staged encrypted
+delta; after 32 active records, compaction writes the aggregate snapshot first
+and only then deletes redundant deltas while retaining the head. The head
+prevents a stale writer from reusing a sequence ID after pruning. IDs, sequence,
+account commitment, format, and BDK contract version are authenticated, and
+writes use CAS. Separate encrypted records contain the authenticated birthday,
+distinct
 non-genesis new-wallet recovery anchor, bounded recent checkpoints, supervisor
 sequence and phase, transaction/output reconciliation mirrors, and signed
 broadcast intents. Bounded account/session-bound HTLC watch records add exact
@@ -655,8 +662,9 @@ the mnemonic alone is not an allocation journal.
 
 A sync records `synchronizing`, authenticates matched HTLC blocks against the
 same locally validated Kyoto checkpoint, commits swap observations, applies
-the Kyoto update, commits the encrypted BDK snapshot, records `reconciling`,
-applies encrypted mirror changes in bounded chunks, and commits `ready` last.
+the Kyoto update, commits the encrypted BDK delta (and a snapshot when
+compaction is due), records `reconciling`, applies encrypted mirror changes in
+bounded chunks, and commits `ready` last.
 Committing swap observations before the BDK checkpoint ensures that a crash
 during a long catch-up cannot skip an older match: restart still scans from the
 older BDK checkpoint. Consumers must ignore an incomplete mirror unless the
@@ -666,10 +674,11 @@ another network update. A sync timeout discards the non-cancel-safe subscriber,
 shuts down the node, and persists `recovery_required`; the poisoned supervisor
 cannot be reused.
 
-The aggregate BDK snapshot has the same 1 MiB cleartext limit as every generic
-encrypted entity, and its persistent script cache is disabled. Oversize state
-fails closed; a normalized or authenticated chunked backend remains required
-before Bitcoin value qualification. Standalone BDK SQLite databases from the
+The compacted aggregate BDK snapshot has the same 1 MiB cleartext limit as
+every generic encrypted entity, and its persistent script cache is disabled.
+Delta journaling avoids rewriting that aggregate for each ordinary change, but
+oversize compacted state still fails closed; a fully normalized backend remains
+the long-term capacity path. Standalone BDK SQLite databases from the
 older source boundary are left untouched and are not imported. No migration
 tool exists yet, so callers must retain such files and must not interpret a
 missing encrypted entity as authorization to create over legacy state.
@@ -688,11 +697,14 @@ trusted or monotonic time across process and device restart.
 
 The pinned `bip157` 0.6.3 implementation ignores its configured `data_dir` and
 does not expose a durable full header/filter database or peer address book.
-Those are therefore re-fetched from untrusted peers after restart. The
-encrypted wallet checkpoint and recovery journal remain the durable local
-authority; no pruned/full indexed node or hosted relay is required. Canonically
-absent transaction/output records are retained; safe archival is still needed
-before the fixed lifetime caps are production-scale.
+Headers and filters are therefore re-fetched from untrusted peers after
+restart. A separate encrypted cache retains up to 32 successful NETWORK plus
+COMPACT_FILTERS IPv4/IPv6 peer IPs as reconnect preferences; Kyoto re-handshakes
+them and revalidates all chain data. The encrypted wallet checkpoint and
+recovery journal remain the durable local authority; no pruned/full indexed
+node or hosted relay is required. Canonically absent transaction/output records
+are retained; safe archival is still needed before the fixed lifetime caps are
+production-scale.
 
 ## Migrations and backups
 

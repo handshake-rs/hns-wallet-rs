@@ -72,6 +72,7 @@ pub enum EntityKind {
     BitcoinFilterHeader,
     BitcoinPeer,
     BitcoinWalletState,
+    BitcoinWalletChangeSet,
     BitcoinScanState,
     BitcoinSwapKeyAllocation,
     BitcoinSwapWatch,
@@ -109,6 +110,7 @@ impl EntityKind {
             Self::BitcoinFilterHeader => "bitcoin_filter_header",
             Self::BitcoinPeer => "bitcoin_peer",
             Self::BitcoinWalletState => "bitcoin_wallet_state",
+            Self::BitcoinWalletChangeSet => "bitcoin_wallet_changeset",
             Self::BitcoinScanState => "bitcoin_scan_state",
             Self::BitcoinSwapKeyAllocation => "bitcoin_swap_key_allocation",
             Self::BitcoinSwapWatch => "bitcoin_swap_watch",
@@ -1474,6 +1476,13 @@ impl WalletStore {
             bitcoin_wallet_states,
             delete_bitcoin_wallet_state,
             BitcoinWalletState
+        ),
+        (
+            save_bitcoin_wallet_changeset,
+            bitcoin_wallet_changeset,
+            bitcoin_wallet_changesets,
+            delete_bitcoin_wallet_changeset,
+            BitcoinWalletChangeSet
         ),
         (
             save_bitcoin_scan_state,
