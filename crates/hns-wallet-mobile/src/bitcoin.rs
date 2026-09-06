@@ -34,7 +34,7 @@ use hns_wallet_hns::{HnsNetwork, HnsRuntimeConfig};
 use hns_wallet_store::{SecretKind, SharedWalletStore, WalletStore};
 use hns_wallet_types::SessionId;
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -477,7 +477,7 @@ impl MobileBitcoinValueController {
             Err(BitcoinWalletError::BitcoinStateNotFound) => None,
             Err(error) => return Err(error.into()),
         };
-        let runtime = Runtime::new().map_err(|_| MobileWalletError::BitcoinRuntimeUnavailable)?;
+        let runtime = mobile_bitcoin_runtime()?;
         let requires_tip_discovery = initialization.requested_recovery_height.is_some()
             || (durable.is_none() && initialization.origin == MobileBitcoinWalletOrigin::Generated);
         if requires_tip_discovery {
@@ -1558,6 +1558,19 @@ fn now_unix() -> Result<u64, MobileWalletError> {
         .map_err(|_| MobileWalletError::BitcoinClockUnavailable)
 }
 
+/// Construct the direct Bitcoin executor without starting autonomous worker
+/// threads at wallet unlock. Every network cycle is deliberately driven by an
+/// explicit `synchronize_once`/value call, whose `block_on` also polls Kyoto's
+/// connection and progress tasks. Keeping those tasks on that calling thread
+/// prevents unrelated HNS synchronization from racing a background crypto
+/// worker and gives 32-bit mobile builds the same bounded execution lifecycle.
+fn mobile_bitcoin_runtime() -> Result<Runtime, MobileWalletError> {
+    RuntimeBuilder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| MobileWalletError::BitcoinRuntimeUnavailable)
+}
+
 fn random_nonzero_bytes<const N: usize>() -> Result<[u8; N], MobileWalletError> {
     for _ in 0..8 {
         let mut bytes = [0_u8; N];
@@ -1623,6 +1636,15 @@ const fn bitcoin_network_name(network: BitcoinNetwork) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_bitcoin_runtime_is_caller_driven() {
+        let runtime = mobile_bitcoin_runtime().expect("direct Bitcoin runtime");
+        assert_eq!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::CurrentThread,
+        );
+    }
 
     #[test]
     fn generated_and_restored_initialization_records_roundtrip_exactly() {
