@@ -22,13 +22,13 @@ use hns_wallet_bitcoin_kyoto::{
     KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor, KyotoSyncProgressHandle,
     KyotoSyncReceipt, KyotoSyncStage, KyotoTipDiscovery, KyotoWalletState,
     PreparedBitcoinHtlcFunding, StoredKyotoWalletState, VerifiedBitcoinLock, authorize_native_send,
-    bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit,
+    bitcoin_activity_page, bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit,
     build_shakescape_bitcoin_htlc, create_persisted_descriptor_wallet_from_seed,
     initialize_pristine_wallet_at_creation_tip, initialize_pristine_wallet_at_recovery_checkpoint,
     load_bitcoin_htlc_watch, load_cached_bitcoin_peers, load_persisted_descriptor_wallet_from_seed,
     monitor_kyoto_sync_progress, persist_prepared_bitcoin_broadcast,
     persist_prepared_bitcoin_htlc_spend_broadcast, prepare_bitcoin_htlc_funding_excluding,
-    prepare_native_send_excluding, recent_bitcoin_activity, recommended_initialization_checkpoint,
+    prepare_native_send_excluding, recommended_initialization_checkpoint,
     sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
     unobserved_approved_broadcast_inputs, verify_htlc_funding, verify_signed_bitcoin_htlc_spend,
 };
@@ -206,6 +206,7 @@ pub struct MobileBitcoinSnapshot {
     pub connected_peer_count: u8,
     pub required_peer_count: u8,
     pub recent_activity: Vec<MobileBitcoinActivity>,
+    pub recent_activity_total: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -229,6 +230,15 @@ pub struct MobileBitcoinActivity {
     pub block_height: Option<u32>,
     pub confirmation_count: Option<u32>,
     pub last_changed_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileBitcoinActivityPage {
+    pub offset: u32,
+    pub total: u32,
+    pub activity: Vec<MobileBitcoinActivity>,
+    pub has_more: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -755,10 +765,15 @@ impl MobileBitcoinValueController {
             } else {
                 return Err(MobileWalletError::BitcoinRuntimeInactive);
             };
-        let recent_activity = self.store.try_with_store(|store| {
-            recent_bitcoin_activity(store, self.config.network)
-                .map(|activity| mobile_bitcoin_activity(activity, synchronized_height))
+        let recent_activity_page = self.store.try_with_store(|store| {
+            bitcoin_activity_page(
+                store,
+                self.config.network,
+                0,
+                hns_wallet_bitcoin_kyoto::MAX_RECENT_BITCOIN_ACTIVITY,
+            )
         })?;
+        let activity_confirmation_height = BitcoinCheckpoint::from_wallet(wallet).height;
         Ok(MobileBitcoinSnapshot {
             network: bitcoin_network_name(self.config.network).to_owned(),
             receive_address: self.receive_address.clone().unwrap_or_else(|| {
@@ -777,7 +792,44 @@ impl MobileBitcoinValueController {
             synchronized_height,
             connected_peer_count,
             required_peer_count: self.config.required_peers,
-            recent_activity,
+            recent_activity: mobile_bitcoin_activity(
+                recent_activity_page.activity,
+                activity_confirmation_height,
+            ),
+            recent_activity_total: recent_activity_page.total,
+        })
+    }
+
+    /// Read any authenticated page from the complete retained Bitcoin
+    /// transaction history without performing network I/O.
+    pub fn activity_page(
+        &self,
+        offset: u32,
+        limit: u32,
+    ) -> Result<MobileBitcoinActivityPage, MobileWalletError> {
+        let limit = usize::try_from(limit).map_err(|_| MobileWalletError::InvalidBitcoinAction)?;
+        if limit == 0 || limit > hns_wallet_bitcoin_kyoto::MAX_RECENT_BITCOIN_ACTIVITY {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        let wallet = self
+            .wallet
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let synchronized_height = BitcoinCheckpoint::from_wallet(wallet).height;
+        let page = self.store.try_with_store(|store| {
+            bitcoin_activity_page(
+                store,
+                self.config.network,
+                usize::try_from(offset)
+                    .map_err(|_| BitcoinWalletError::BitcoinTransactionCapacity)?,
+                limit,
+            )
+        })?;
+        Ok(MobileBitcoinActivityPage {
+            offset: page.offset,
+            total: page.total,
+            activity: mobile_bitcoin_activity(page.activity, synchronized_height),
+            has_more: page.has_more,
         })
     }
 

@@ -39,7 +39,7 @@ pub const BITCOIN_UTXO_RECORD_VERSION: u16 = 1;
 pub const MAX_RECENT_BITCOIN_CHECKPOINTS: usize = 32;
 pub const MAX_TRACKED_BITCOIN_TRANSACTIONS: usize = 4_096;
 pub const MAX_TRACKED_BITCOIN_OUTPUTS: usize = 4_096;
-pub const MAX_RECENT_BITCOIN_ACTIVITY: usize = 40;
+pub const MAX_RECENT_BITCOIN_ACTIVITY: usize = 20;
 pub const MAX_BROADCAST_ATTEMPTS: u16 = 16;
 pub const MAX_BROADCAST_APPROVAL_LIFETIME_SECONDS: u64 = 3_600;
 pub const MIN_REBROADCAST_INTERVAL_SECONDS: u64 = 60;
@@ -2690,6 +2690,15 @@ pub struct BitcoinRecentActivity {
     pub last_changed_at_unix: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BitcoinRecentActivityPage {
+    pub offset: u32,
+    pub total: u32,
+    pub activity: Vec<BitcoinRecentActivity>,
+    pub has_more: bool,
+}
+
 /// Authenticate the durable transaction set and return its newest bounded
 /// activity projection. All records are validated before truncation so a
 /// corrupt older record cannot be hidden outside the UI window.
@@ -2697,12 +2706,26 @@ pub fn recent_bitcoin_activity(
     store: &WalletStore,
     network: Network,
 ) -> Result<Vec<BitcoinRecentActivity>, BitcoinWalletError> {
+    Ok(bitcoin_activity_page(store, network, 0, MAX_RECENT_BITCOIN_ACTIVITY)?.activity)
+}
+
+/// Return any page from the complete retained Bitcoin transaction set. The
+/// entire set is authenticated before the requested slice is selected.
+pub fn bitcoin_activity_page(
+    store: &WalletStore,
+    network: Network,
+    offset: usize,
+    limit: usize,
+) -> Result<BitcoinRecentActivityPage, BitcoinWalletError> {
+    if limit == 0 || limit > MAX_RECENT_BITCOIN_ACTIVITY {
+        return Err(BitcoinWalletError::InvalidConfiguration);
+    }
     let records = store
         .bitcoin_transactions::<BitcoinTransactionRecord>(MAX_TRACKED_BITCOIN_TRANSACTIONS + 1)?;
     if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
         return Err(BitcoinWalletError::BitcoinTransactionCapacity);
     }
-    let mut activity = Vec::with_capacity(records.len().min(MAX_RECENT_BITCOIN_ACTIVITY));
+    let mut activity = Vec::with_capacity(records.len());
     for stored in records {
         let record = stored.value;
         record.validate()?;
@@ -2748,8 +2771,27 @@ pub fn recent_bitcoin_activity(
             .cmp(&left.last_changed_at_unix)
             .then_with(|| right.txid.cmp(&left.txid))
     });
-    activity.truncate(MAX_RECENT_BITCOIN_ACTIVITY);
-    Ok(activity)
+    if offset > activity.len() {
+        return Err(BitcoinWalletError::InvalidConfiguration);
+    }
+    let total = u32::try_from(activity.len())
+        .map_err(|_| BitcoinWalletError::BitcoinTransactionCapacity)?;
+    let offset_u32 =
+        u32::try_from(offset).map_err(|_| BitcoinWalletError::BitcoinTransactionCapacity)?;
+    let page = activity
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let consumed = offset
+        .checked_add(page.len())
+        .ok_or(BitcoinWalletError::BitcoinTransactionCapacity)?;
+    Ok(BitcoinRecentActivityPage {
+        offset: offset_u32,
+        total,
+        activity: page,
+        has_more: consumed < total as usize,
+    })
 }
 
 /// Bounded, non-sensitive state for approved Bitcoin transaction recovery.
