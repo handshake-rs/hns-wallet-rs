@@ -39,6 +39,7 @@ pub const BITCOIN_UTXO_RECORD_VERSION: u16 = 1;
 pub const MAX_RECENT_BITCOIN_CHECKPOINTS: usize = 32;
 pub const MAX_TRACKED_BITCOIN_TRANSACTIONS: usize = 4_096;
 pub const MAX_TRACKED_BITCOIN_OUTPUTS: usize = 4_096;
+pub const MAX_RECENT_BITCOIN_ACTIVITY: usize = 20;
 pub const MAX_BROADCAST_ATTEMPTS: u16 = 16;
 pub const MAX_BROADCAST_APPROVAL_LIFETIME_SECONDS: u64 = 3_600;
 pub const MIN_REBROADCAST_INTERVAL_SECONDS: u64 = 60;
@@ -2658,6 +2659,97 @@ impl BitcoinTransactionRecord {
         }
         Ok(())
     }
+}
+
+/// Public state for one bounded Bitcoin activity item. These states preserve
+/// the distinction between local broadcast recovery and chain observation so
+/// callers never mistake peer submission for confirmation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum BitcoinActivityStatus {
+    NotObserved,
+    Prepared,
+    SubmissionStarted,
+    Submitted,
+    Unconfirmed,
+    Confirmed,
+}
+
+/// A non-sensitive projection of one locally authenticated Bitcoin record.
+/// Raw transactions, wallet inputs, scripts, addresses, and approval material
+/// deliberately remain inside the encrypted wallet runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct BitcoinRecentActivity {
+    pub txid: [u8; 32],
+    pub sent_sats: u64,
+    pub received_sats: u64,
+    pub fee_sats: Option<u64>,
+    pub status: BitcoinActivityStatus,
+    pub block_height: Option<u32>,
+    pub last_changed_at_unix: u64,
+}
+
+/// Authenticate the durable transaction set and return its newest bounded
+/// activity projection. All records are validated before truncation so a
+/// corrupt older record cannot be hidden outside the UI window.
+pub fn recent_bitcoin_activity(
+    store: &WalletStore,
+    network: Network,
+) -> Result<Vec<BitcoinRecentActivity>, BitcoinWalletError> {
+    let records = store
+        .bitcoin_transactions::<BitcoinTransactionRecord>(MAX_TRACKED_BITCOIN_TRANSACTIONS + 1)?;
+    if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
+        return Err(BitcoinWalletError::BitcoinTransactionCapacity);
+    }
+    let mut activity = Vec::with_capacity(records.len().min(MAX_RECENT_BITCOIN_ACTIVITY));
+    for stored in records {
+        let record = stored.value;
+        record.validate()?;
+        if record
+            .broadcast
+            .as_ref()
+            .is_some_and(|intent| intent.network != network)
+        {
+            return Err(BitcoinWalletError::NetworkMismatch);
+        }
+        let (status, block_height) = match record.observation {
+            BitcoinChainObservation::Confirmed { height, .. } => {
+                (BitcoinActivityStatus::Confirmed, Some(height))
+            }
+            BitcoinChainObservation::Unconfirmed { .. } => {
+                (BitcoinActivityStatus::Unconfirmed, None)
+            }
+            BitcoinChainObservation::AbsentFromCanonicalWalletView => (
+                match record.broadcast.map(|intent| intent.phase) {
+                    Some(BitcoinBroadcastPhase::Prepared) => BitcoinActivityStatus::Prepared,
+                    Some(BitcoinBroadcastPhase::SubmissionStarted) => {
+                        BitcoinActivityStatus::SubmissionStarted
+                    }
+                    Some(BitcoinBroadcastPhase::Submitted) => BitcoinActivityStatus::Submitted,
+                    None => BitcoinActivityStatus::NotObserved,
+                },
+                None,
+            ),
+        };
+        activity.push(BitcoinRecentActivity {
+            txid: record.txid,
+            sent_sats: record.sent_sats,
+            received_sats: record.received_sats,
+            fee_sats: record.fee_sats,
+            status,
+            block_height,
+            last_changed_at_unix: record.last_changed_at_unix,
+        });
+    }
+    activity.sort_unstable_by(|left, right| {
+        right
+            .last_changed_at_unix
+            .cmp(&left.last_changed_at_unix)
+            .then_with(|| right.txid.cmp(&left.txid))
+    });
+    activity.truncate(MAX_RECENT_BITCOIN_ACTIVITY);
+    Ok(activity)
 }
 
 /// Bounded, non-sensitive state for approved Bitcoin transaction recovery.

@@ -15,19 +15,20 @@ use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
 use bdk_wallet::bitcoin::consensus::deserialize;
 use bdk_wallet::bitcoin::hashes::Hash;
 use hns_wallet_bitcoin_kyoto::{
-    BIP39_SEED_BYTES, BitcoinBirthdaySource, BitcoinBroadcastReceipt,
+    BIP39_SEED_BYTES, BitcoinActivityStatus, BitcoinBirthdaySource, BitcoinBroadcastReceipt,
     BitcoinBroadcastRecoverySummary, BitcoinCheckpoint, BitcoinHtlcWatchRequest,
-    BitcoinTransactionRecord, BitcoinWalletError, DEFAULT_RECOVERY_GAP_LIMIT,
-    EncryptedPersistedBitcoinWallet, HtlcSpendBranch, KyotoRuntimeConfig, KyotoShutdownHandle,
-    KyotoSupervisor, KyotoSyncProgressHandle, KyotoSyncReceipt, KyotoSyncStage, KyotoTipDiscovery,
-    KyotoWalletState, PreparedBitcoinHtlcFunding, StoredKyotoWalletState, VerifiedBitcoinLock,
-    authorize_native_send, bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit,
+    BitcoinRecentActivity, BitcoinTransactionRecord, BitcoinWalletError,
+    DEFAULT_RECOVERY_GAP_LIMIT, EncryptedPersistedBitcoinWallet, HtlcSpendBranch,
+    KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor, KyotoSyncProgressHandle,
+    KyotoSyncReceipt, KyotoSyncStage, KyotoTipDiscovery, KyotoWalletState,
+    PreparedBitcoinHtlcFunding, StoredKyotoWalletState, VerifiedBitcoinLock, authorize_native_send,
+    bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit,
     build_shakescape_bitcoin_htlc, create_persisted_descriptor_wallet_from_seed,
     initialize_pristine_wallet_at_creation_tip, initialize_pristine_wallet_at_recovery_checkpoint,
     load_bitcoin_htlc_watch, load_cached_bitcoin_peers, load_persisted_descriptor_wallet_from_seed,
     monitor_kyoto_sync_progress, persist_prepared_bitcoin_broadcast,
     persist_prepared_bitcoin_htlc_spend_broadcast, prepare_bitcoin_htlc_funding_excluding,
-    prepare_native_send_excluding, recommended_initialization_checkpoint,
+    prepare_native_send_excluding, recent_bitcoin_activity, recommended_initialization_checkpoint,
     sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
     unobserved_approved_broadcast_inputs, verify_htlc_funding, verify_signed_bitcoin_htlc_spend,
 };
@@ -204,6 +205,30 @@ pub struct MobileBitcoinSnapshot {
     pub synchronized_height: u32,
     pub connected_peer_count: u8,
     pub required_peer_count: u8,
+    pub recent_activity: Vec<MobileBitcoinActivity>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MobileBitcoinActivityDirection {
+    Incoming,
+    Outgoing,
+    SelfTransfer,
+}
+
+/// Bounded display projection of one authenticated local Bitcoin transaction.
+/// For outgoing payments, `amount_sats` excludes the separately reported fee.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileBitcoinActivity {
+    pub txid: String,
+    pub direction: MobileBitcoinActivityDirection,
+    pub amount_sats: u64,
+    pub fee_sats: Option<u64>,
+    pub status: BitcoinActivityStatus,
+    pub block_height: Option<u32>,
+    pub confirmation_count: Option<u32>,
+    pub last_changed_at_unix: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -730,6 +755,10 @@ impl MobileBitcoinValueController {
             } else {
                 return Err(MobileWalletError::BitcoinRuntimeInactive);
             };
+        let recent_activity = self.store.try_with_store(|store| {
+            recent_bitcoin_activity(store, self.config.network)
+                .map(|activity| mobile_bitcoin_activity(activity, synchronized_height))
+        })?;
         Ok(MobileBitcoinSnapshot {
             network: bitcoin_network_name(self.config.network).to_owned(),
             receive_address: self.receive_address.clone().unwrap_or_else(|| {
@@ -748,6 +777,7 @@ impl MobileBitcoinValueController {
             synchronized_height,
             connected_peer_count,
             required_peer_count: self.config.required_peers,
+            recent_activity,
         })
     }
 
@@ -1642,6 +1672,53 @@ fn lowercase_hex(bytes: &[u8]) -> String {
         encoded.push(HEX[usize::from(byte & 0x0f)] as char);
     }
     encoded
+}
+
+fn mobile_bitcoin_activity(
+    activity: Vec<BitcoinRecentActivity>,
+    synchronized_height: u32,
+) -> Vec<MobileBitcoinActivity> {
+    activity
+        .into_iter()
+        .map(|item| {
+            let fee_sats = item.fee_sats.unwrap_or(0);
+            let (direction, amount_sats) = if item.received_sats > item.sent_sats {
+                (
+                    MobileBitcoinActivityDirection::Incoming,
+                    item.received_sats - item.sent_sats,
+                )
+            } else if item.sent_sats > item.received_sats {
+                let wallet_debit = item.sent_sats - item.received_sats;
+                let external_amount = wallet_debit.saturating_sub(fee_sats);
+                if external_amount == 0 {
+                    (MobileBitcoinActivityDirection::SelfTransfer, 0)
+                } else {
+                    (MobileBitcoinActivityDirection::Outgoing, external_amount)
+                }
+            } else {
+                (MobileBitcoinActivityDirection::SelfTransfer, 0)
+            };
+            let confirmation_count = item.block_height.and_then(|height| {
+                synchronized_height
+                    .checked_sub(height)
+                    .and_then(|depth| depth.checked_add(1))
+            });
+            let reported_fee_sats =
+                (!matches!(direction, MobileBitcoinActivityDirection::Incoming))
+                    .then_some(item.fee_sats)
+                    .flatten();
+            MobileBitcoinActivity {
+                txid: lowercase_hex(&item.txid),
+                direction,
+                amount_sats,
+                fee_sats: reported_fee_sats,
+                status: item.status,
+                block_height: item.block_height,
+                confirmation_count,
+                last_changed_at_unix: item.last_changed_at_unix,
+            }
+        })
+        .collect()
 }
 
 fn action_token_matches(expected: &[u8; MOBILE_ACTION_TOKEN_BYTES], candidate: &str) -> bool {
