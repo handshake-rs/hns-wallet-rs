@@ -598,6 +598,36 @@ impl MobileBitcoinValueController {
     pub fn synchronize_once(
         &mut self,
     ) -> Result<(KyotoSyncReceipt, MobileBitcoinSnapshot), MobileWalletError> {
+        let first_attempt = self.synchronize_once_inner();
+        if !matches!(
+            &first_attempt,
+            Err(MobileWalletError::Bitcoin(
+                BitcoinWalletError::CorruptRuntimeState
+            ))
+        ) {
+            return first_attempt;
+        }
+
+        // A process death can occur after BDK has durably applied an update
+        // but before the active supervisor has completed its scan journal.
+        // Retire every process-local runtime object and reconstruct from the
+        // authenticated wallet and journal before retrying once. This retains
+        // the descriptor wallet, approved broadcast bytes, and store records;
+        // it only discards the non-authoritative live Kyoto machinery.
+        // Preserve the platform-held wrappers so activation replaces their
+        // inner shutdown/progress handles instead of stranding stale clones.
+        let shutdown = self.shutdown.clone();
+        let progress = self.progress.clone();
+        let _ = self.deactivate();
+        self.shutdown = shutdown;
+        self.progress = progress;
+        self.activate()?;
+        self.synchronize_once_inner()
+    }
+
+    fn synchronize_once_inner(
+        &mut self,
+    ) -> Result<(KyotoSyncReceipt, MobileBitcoinSnapshot), MobileWalletError> {
         let now_unix = now_unix()?;
         if self.tip_discovery.is_some() {
             self.complete_pending_initialization(now_unix)?;
