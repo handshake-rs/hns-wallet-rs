@@ -3359,16 +3359,24 @@ fn reconcile_transaction_records(
         let raw = transaction.tx_node.tx.as_ref();
         let (sent, received) = wallet.sent_and_received(raw);
         let observation = chain_observation(transaction.chain_position);
-        let fee_sats = wallet
-            .calculate_fee(raw)
-            .ok()
-            .map(|fee| fee.to_sat())
-            .or_else(|| {
-                prior
-                    .as_ref()
-                    .and_then(|stored| stored.value.broadcast.as_ref())
-                    .map(|intent| intent.fee_sats)
-            });
+        // Once a transaction has an authenticated broadcast approval, retain
+        // the exact signed transaction shape and fee that were approved.
+        // BDK's later canonical projection is authoritative for chain
+        // position and wallet values, but recalculating its fee after the
+        // transaction has been applied can disagree with the durable approval
+        // projection and make an otherwise valid record fail its own binding.
+        let approved_raw = prior
+            .as_ref()
+            .and_then(|stored| stored.value.raw_transaction.as_deref())
+            .map(|raw| deserialize::<Transaction>(raw))
+            .transpose()
+            .map_err(|_| BitcoinWalletError::CorruptRuntimeState)?;
+        let structural_transaction = approved_raw.as_ref().unwrap_or(raw);
+        let fee_sats = prior
+            .as_ref()
+            .and_then(|stored| stored.value.broadcast.as_ref())
+            .map(|intent| intent.fee_sats)
+            .or_else(|| wallet.calculate_fee(raw).ok().map(|fee| fee.to_sat()));
         let changed = prior.as_ref().is_none_or(|stored| {
             stored.value.observation != observation
                 || stored.value.sent_sats != sent.to_sat()
@@ -3382,12 +3390,12 @@ fn reconcile_transaction_records(
         let record = BitcoinTransactionRecord {
             schema_version: BITCOIN_TRANSACTION_RECORD_VERSION,
             txid,
-            wtxid: raw.compute_wtxid().to_byte_array(),
-            input_count: u32::try_from(raw.input.len())
+            wtxid: structural_transaction.compute_wtxid().to_byte_array(),
+            input_count: u32::try_from(structural_transaction.input.len())
                 .map_err(|_| BitcoinWalletError::TransactionTooLarge)?,
-            output_count: u32::try_from(raw.output.len())
+            output_count: u32::try_from(structural_transaction.output.len())
                 .map_err(|_| BitcoinWalletError::TransactionTooLarge)?,
-            input_outpoint_commitment: input_outpoint_commitment(raw),
+            input_outpoint_commitment: input_outpoint_commitment(structural_transaction),
             sent_sats: sent.to_sat(),
             received_sats: received.to_sat(),
             fee_sats,
