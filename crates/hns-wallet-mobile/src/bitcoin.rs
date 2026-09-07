@@ -637,6 +637,7 @@ impl MobileBitcoinValueController {
         if let Some(supervisor) = self.supervisor.as_ref() {
             let state = supervisor.state();
             if !matches!(state.birthday.source, BitcoinBirthdaySource::FullScan)
+                || state.completed_syncs != 0
                 || earliest_transaction_height <= state.scanned_checkpoint.height
             {
                 return Err(MobileWalletError::InvalidBitcoinAction);
@@ -661,7 +662,9 @@ impl MobileBitcoinValueController {
         let (birthday_height, birthday_state, synchronized_height, connected_peer_count) =
             if let Some(supervisor) = self.supervisor.as_ref() {
                 let state = supervisor.state();
-                if matches!(state.birthday.source, BitcoinBirthdaySource::FullScan) {
+                if matches!(state.birthday.source, BitcoinBirthdaySource::FullScan)
+                    && state.completed_syncs == 0
+                {
                     (
                         0,
                         MobileBitcoinBirthdayState::RecoveryUnknown,

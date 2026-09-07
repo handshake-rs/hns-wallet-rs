@@ -2023,6 +2023,25 @@ impl KyotoSupervisor {
         );
         let peer_count = u8::try_from(peer_count).unwrap_or(u8::MAX);
 
+        // A restored wallet with no supplied birthday starts at genesis. Only
+        // after that first recovery scan and reconciliation are complete can
+        // the locally verified transaction graph safely choose a tighter
+        // checkpoint. Keep the predecessor of the earliest confirmed
+        // transaction so a future recovery scan still includes that block; an
+        // empty wallet can begin after the just-completed tip.
+        if matches!(
+            self.durable.state.birthday.source,
+            BitcoinBirthdaySource::FullScan
+        ) && self.durable.state.completed_syncs == 0
+        {
+            let birthday = self
+                .completed_full_scan_birthday(wallet, wallet_tip)
+                .await?;
+            self.durable.state.birthday.checkpoint = birthday;
+            self.durable.state.recovery_checkpoint = birthday;
+            self.durable.state.recent_checkpoints = wallet_recent_checkpoints(wallet, birthday)?;
+        }
+
         self.durable.state.last_consistent_checkpoint = wallet_tip;
         self.durable.state.completed_sequence = sequence;
         self.durable.state.completed_syncs = self
@@ -2064,6 +2083,62 @@ impl KyotoSupervisor {
             required_peer_count: self.required_peers,
             timings,
         })
+    }
+
+    async fn completed_full_scan_birthday(
+        &self,
+        wallet: &Wallet,
+        wallet_tip: BitcoinCheckpoint,
+    ) -> Result<BitcoinCheckpoint, BitcoinWalletError> {
+        let earliest_confirmed_height = wallet
+            .transactions()
+            .filter_map(|transaction| match transaction.chain_position {
+                ChainPosition::Confirmed { anchor, .. } => Some(anchor.block_id.height),
+                ChainPosition::Unconfirmed { .. } => None,
+            })
+            .min();
+        let checkpoint_height = earliest_confirmed_height
+            .and_then(|height| height.checked_sub(1))
+            .unwrap_or(wallet_tip.height);
+        if checkpoint_height > wallet_tip.height {
+            return Err(BitcoinWalletError::InvalidBirthday);
+        }
+        if checkpoint_height == wallet_tip.height {
+            return Ok(wallet_tip);
+        }
+        if checkpoint_height == 0 {
+            return Ok(BitcoinCheckpoint::from_kyoto(HashCheckpoint::from_genesis(
+                self.durable.state.network,
+            )));
+        }
+        let header = tokio::time::timeout(
+            self.request_timeout,
+            self.requester.get_header(checkpoint_height),
+        )
+        .await
+        .map_err(|_| BitcoinWalletError::OperationTimedOut)?
+        .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?
+        .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
+        if header.height != checkpoint_height {
+            return Err(BitcoinWalletError::InvalidCheckpoint);
+        }
+        let checkpoint = BitcoinCheckpoint {
+            height: checkpoint_height,
+            block_hash: header.header.block_hash().to_byte_array(),
+        };
+        checkpoint.validate(self.durable.state.network)?;
+        let canonical_height = tokio::time::timeout(
+            self.request_timeout,
+            self.requester
+                .height_of_hash(BlockHash::from_byte_array(checkpoint.block_hash)),
+        )
+        .await
+        .map_err(|_| BitcoinWalletError::OperationTimedOut)?
+        .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
+        if canonical_height != Some(checkpoint_height) {
+            return Err(BitcoinWalletError::InvalidCheckpoint);
+        }
+        Ok(checkpoint)
     }
 
     /// Persist and activate one exact HTLC compact-filter watch before either

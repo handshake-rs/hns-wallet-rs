@@ -299,6 +299,22 @@ impl EmbeddedHnsBackend {
         Ok(self.lock()?.index.status())
     }
 
+    /// Persist the discovered birthday of a fully scanned recovery wallet.
+    /// The index verifies exact tip alignment and derives the height only from
+    /// locally authenticated transaction observations.
+    pub(crate) fn finalize_unknown_birthday(
+        &self,
+        now_unix: u64,
+    ) -> Result<Option<u32>, HnsWalletError> {
+        let mut state = self.lock()?;
+        let EmbeddedState {
+            authority, index, ..
+        } = &mut *state;
+        index
+            .finalize_unknown_birthday(authority, now_unix)
+            .map_err(map_index_error)
+    }
+
     /// Exact public watch set from which every peer Bloom filter is built.
     pub fn light_watch_set(&self) -> Result<HnsLightWatchSet, HnsWalletError> {
         Ok(self.lock()?.index.watch_set().clone())

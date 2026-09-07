@@ -2163,6 +2163,28 @@ impl HnsDirectPeerCoordinator {
             .map_err(HnsDirectPeerError::Wallet)
     }
 
+    /// Finalize the one-time birthday discovery for a wallet imported without
+    /// a known height. This is available only to a coordinator created from
+    /// that exact encrypted wallet configuration; explicit birthdays and
+    /// generated wallets are unchanged.
+    pub fn finalize_unknown_wallet_birthday(
+        &self,
+        now_unix: u64,
+    ) -> Result<Option<u32>, HnsDirectPeerError> {
+        let source = self
+            .wallet_watch_set_source
+            .as_ref()
+            .ok_or(HnsDirectPeerError::InvalidConfiguration)?;
+        if source.account.birthday_height != 0
+            || source.current_account_config()?.birthday_height != 0
+        {
+            return Ok(None);
+        }
+        self.backend
+            .finalize_unknown_birthday(now_unix)
+            .map_err(HnsDirectPeerError::Wallet)
+    }
+
     fn with_wallet_watch_set_source(
         mut self,
         store: SharedWalletStore,

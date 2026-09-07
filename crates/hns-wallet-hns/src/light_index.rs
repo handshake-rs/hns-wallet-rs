@@ -574,6 +574,60 @@ impl EncryptedHnsLightIndex {
         }
     }
 
+    /// Promote an unknown, genesis-start recovery birthday after its first
+    /// complete verified scan. The earliest admitted transaction is the
+    /// tightest safe inclusive birthday; an empty wallet starts at the
+    /// completed tip. Known birthdays are immutable and later synchronizations
+    /// are idempotent.
+    pub(crate) fn finalize_unknown_birthday(
+        &mut self,
+        authority: &EncryptedHnsLightAuthority,
+        now_unix: u64,
+    ) -> Result<Option<u32>, HnsLightIndexError> {
+        if self.scan.birthday_height != 0 {
+            return Ok(None);
+        }
+        let authority_status = authority.status();
+        if authority.account_id() != self.account_id
+            || authority.consensus_network() != self.network
+            || authority.birthday_height() != 0
+            || authority_status.state != SyncState::HeaderCurrent
+            || self.scan.scanned_height != Some(authority_status.tip.height().get())
+            || self.scan.scanned_hash != Some(authority_status.tip.hash().into_bytes())
+        {
+            return Err(HnsLightIndexError::AuthorityMismatch);
+        }
+        let observations = self.decoded_transactions()?;
+        let birthday_height = observations
+            .iter()
+            .map(|observation| observation.height)
+            .min()
+            .unwrap_or_else(|| authority_status.tip.height().get());
+        // Genesis is already the canonical representation for this edge case;
+        // leave it eligible for promotion once the chain advances.
+        if birthday_height == 0 {
+            return Ok(None);
+        }
+        let mut next_scan = self.scan.clone();
+        next_scan.birthday_height = birthday_height;
+        next_scan.watch_digest = next_scan.watch_set.digest(self.network, birthday_height);
+        let saves = [EntityBatchSave {
+            id: scan_id(self.account_id),
+            expected_revision: self.scan_revision,
+            value: StoredHnsLightWalletRecord::Scan(next_scan.clone()),
+            updated_at_unix: now_unix,
+        }];
+        self.store.with_store_mut(|wallet| {
+            wallet.apply_entity_batch(EntityKind::HnsLightWallet, &saves, &[])
+        })?;
+        self.scan_revision = self
+            .scan_revision
+            .checked_add(1)
+            .ok_or(HnsLightIndexError::RevisionOverflow)?;
+        self.scan = next_scan;
+        Ok(Some(birthday_height))
+    }
+
     /// Wallet account bound to this index.
     #[must_use]
     pub const fn account_id(&self) -> AccountId {
@@ -993,11 +1047,15 @@ fn validate_scan(
     if scan.network != network.id() {
         return Err(HnsLightIndexError::NetworkMismatch);
     }
-    if scan.birthday_height != birthday_height {
+    // A configured birthday of zero means "unknown". Once a complete scan
+    // promotes the durable index to its discovered birthday, reopening with
+    // that original recovery configuration must retain the promoted floor.
+    // Explicit nonzero birthdays remain exact and immutable.
+    if scan.birthday_height != birthday_height && birthday_height != 0 {
         return Err(HnsLightIndexError::BirthdayMismatch);
     }
     scan.watch_set.validate()?;
-    if scan.watch_digest != scan.watch_set.digest(network, birthday_height)
+    if scan.watch_digest != scan.watch_set.digest(network, scan.birthday_height)
         || scan.scanned_height.is_some() != scan.scanned_hash.is_some()
         || scan
             .scanned_height
