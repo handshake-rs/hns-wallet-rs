@@ -499,7 +499,7 @@ impl HnsNameReceiveTarget {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct DerivationReference {
     pub role: KeyRole,
     pub account: u32,
@@ -507,7 +507,7 @@ pub struct DerivationReference {
     pub index: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeyRole {
     HnsCoin,
