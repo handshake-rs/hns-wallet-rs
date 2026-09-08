@@ -861,6 +861,87 @@ impl HnsDirectShakescapePeer {
         }
     }
 
+    /// Poll one dual-purpose mobile NETWORK/Shakescape connection. Ordinary
+    /// Handshake requests are serviced from the wallet's verified public
+    /// header backend instead of being mistaken for malformed board traffic.
+    ///
+    /// A Shakescape endpoint truthfully advertises `NETWORK`, so a full node
+    /// may ask it for headers, addresses, or unavailable objects while the
+    /// negotiated board session is idle. Those packets are independent of the
+    /// experimental registry and must not retire the board connection.
+    pub fn try_receive_shakescape_message_serving_network(
+        &mut self,
+        backend: &EmbeddedHnsBackend,
+        now_unix: u64,
+    ) -> Result<Option<HnsDirectShakescapeMessage>, HnsDirectPeerError> {
+        self.connection
+            .transport_mut()
+            .set_nonblocking(true)
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        let received = self.connection.receive_event(now_unix);
+        let restored = self
+            .connection
+            .transport_mut()
+            .set_nonblocking(false)
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()));
+        restored?;
+        let event = match received {
+            Ok(event) => event,
+            Err(PeerError::Io(std::io::ErrorKind::WouldBlock)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let response = match event {
+            PeerEvent::Experimental {
+                packet_type,
+                payload,
+            } if packet_type == SHAKESCAPE_EXTENSION_PACKET.value() => {
+                let envelope =
+                    ShakescapeExtensionEnvelope::decode(&payload, MAX_SHAKESCAPE_MARKET_PAYLOAD)
+                        .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
+                if envelope.protocol_id == hns_p2p_experimental::CROSS_CHAIN_MARKET_PROTOCOL_ID {
+                    validate_cross_chain_envelope(&payload)?;
+                    return Ok(Some(HnsDirectShakescapeMessage::CrossChain {
+                        envelope: payload,
+                    }));
+                }
+                let (registry, request_id, message) = NameMarketMessage::decode_envelope(&payload)
+                    .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
+                if registry != ShakescapeRegistryVersion::V1 || request_id == 0 {
+                    return Err(HnsDirectPeerError::Shakescape(
+                        "invalid Shakescape V1 name-market envelope".to_owned(),
+                    ));
+                }
+                validate_shakescape_market_hello(self.network, &message)?;
+                return Ok(Some(HnsDirectShakescapeMessage::NameMarket {
+                    request_id,
+                    message,
+                }));
+            }
+            PeerEvent::GetHeaders(request) => {
+                Packet::Headers(backend.network_headers_after_locator(&request)?)
+            }
+            PeerEvent::GetBlocks(_) => Packet::Inv(Vec::new()),
+            PeerEvent::GetAddresses => Packet::Addr(Vec::new()),
+            PeerEvent::Wallet(WalletPeerEvent::DataRequest(items)) => Packet::NotFound(items),
+            PeerEvent::Rejected(reject) => {
+                return Err(HnsDirectPeerError::PeerRejected(format!("{reject:?}")));
+            }
+            PeerEvent::Experimental { .. }
+            | PeerEvent::Ignored(_)
+            | PeerEvent::Addresses(_)
+            | PeerEvent::Wallet(_)
+            | PeerEvent::Ready(_)
+            | PeerEvent::Send(_)
+            | PeerEvent::Headers(_)
+            | PeerEvent::Proof(_)
+            | PeerEvent::Pong(_) => return Ok(None),
+        };
+        let frame = Frame::from_packet(&response)
+            .map_err(|error| HnsDirectPeerError::Peer(error.to_string()))?;
+        self.connection.send_frame(&frame)?;
+        Ok(None)
+    }
+
     /// Send one exact canonical Shakescape HNS/BTC session envelope over the
     /// already-negotiated direct socket. The peer remains transport only: the
     /// mobile market controller admits the specific message, correlation, and
