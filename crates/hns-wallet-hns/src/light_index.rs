@@ -1,6 +1,6 @@
 //! Durable wallet-local transaction index derived from verified filtered blocks.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use hns_covenants::{CovenantKind, NameState, TransferCovenant};
 use hns_header_consensus::Network;
@@ -19,8 +19,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    EncryptedHnsLightAuthority, HnsAccountRecord, HnsLightError, HnsNetwork, WalletAddressKey,
-    derive_hns_light_watch_set, derive_restore_addresses,
+    EncryptedHnsLightAuthority, HnsAccountRecord, HnsLightError, HnsNetwork,
+    SpendingTransactionEvidence, WalletAddressKey, derive_hns_light_watch_set,
+    derive_restore_addresses,
 };
 
 /// Version of the encrypted filtered-block index envelope.
@@ -273,7 +274,7 @@ struct HnsLightScanProjection {
     watched_scripts: BTreeSet<WalletAddressKey>,
     watched_names: BTreeSet<[u8; 32]>,
     watched_outpoints: HashSet<Outpoint>,
-    confirmed_spends: HashSet<Outpoint>,
+    confirmed_spends: HashMap<Outpoint, SpendingTransactionEvidence>,
     transaction_ids: BTreeSet<[u8; 32]>,
     transaction_count: usize,
 }
@@ -284,7 +285,7 @@ impl HnsLightScanProjection {
             watched_scripts: watch_set.scripts.iter().cloned().collect(),
             watched_names: watch_set.name_hashes.iter().copied().collect(),
             watched_outpoints: HashSet::new(),
-            confirmed_spends: HashSet::new(),
+            confirmed_spends: HashMap::new(),
             transaction_ids: BTreeSet::new(),
             transaction_count: 0,
         }
@@ -308,6 +309,9 @@ impl HnsLightScanProjection {
             )?;
             add_confirmed_spends(
                 &observation.transaction,
+                observation.txid,
+                observation.block_hash,
+                observation.height,
                 None,
                 &mut projection.confirmed_spends,
             )?;
@@ -735,7 +739,7 @@ impl EncryptedHnsLightIndex {
         // succeeds. This makes a later in-batch spend visible while preserving
         // fail-closed replay behavior after any error.
         let mut added_watched_outpoints = HashSet::new();
-        let mut added_confirmed_spends = HashSet::new();
+        let mut added_confirmed_spends = HashMap::new();
         let mut admitted_txids = BTreeSet::new();
         let mut saves = Vec::new();
         let mut admitted_total = 0usize;
@@ -804,6 +808,9 @@ impl EncryptedHnsLightIndex {
                 }
                 add_confirmed_spends(
                     transaction,
+                    TransactionHash::new(txid_bytes),
+                    entry.hash().into_bytes(),
+                    height,
                     Some(&self.scan_projection.confirmed_spends),
                     &mut added_confirmed_spends,
                 )?;
@@ -1023,7 +1030,14 @@ impl EncryptedHnsLightIndex {
     }
 
     pub(crate) fn has_confirmed_spend(&self, outpoint: &Outpoint) -> bool {
-        self.scan_projection.confirmed_spends.contains(outpoint)
+        self.scan_projection.confirmed_spends.contains_key(outpoint)
+    }
+
+    pub(crate) fn confirmed_spend(
+        &self,
+        outpoint: &Outpoint,
+    ) -> Option<SpendingTransactionEvidence> {
+        self.scan_projection.confirmed_spends.get(outpoint).copied()
     }
 
     pub(crate) fn tracks_transaction(
@@ -1173,15 +1187,25 @@ pub(crate) fn add_watched_outputs(
 
 fn add_confirmed_spends(
     transaction: &Transaction,
-    existing: Option<&HashSet<Outpoint>>,
-    added: &mut HashSet<Outpoint>,
+    transaction_id: TransactionHash,
+    block_hash: [u8; 32],
+    height: u32,
+    existing: Option<&HashMap<Outpoint, SpendingTransactionEvidence>>,
+    added: &mut HashMap<Outpoint, SpendingTransactionEvidence>,
 ) -> Result<(), HnsLightIndexError> {
-    for input in &transaction.inputs {
+    for (input_position, input) in transaction.inputs.iter().enumerate() {
         if input.previous_output.is_null() {
             continue;
         }
-        if existing.is_some_and(|spends| spends.contains(&input.previous_output))
-            || !added.insert(input.previous_output)
+        let evidence = SpendingTransactionEvidence {
+            transaction: transaction_id,
+            input_position: u32::try_from(input_position)
+                .map_err(|_| HnsLightIndexError::TransactionCapacity)?,
+            block_hash,
+            height: u64::from(height),
+        };
+        if existing.is_some_and(|spends| spends.contains_key(&input.previous_output))
+            || added.insert(input.previous_output, evidence).is_some()
         {
             return Err(HnsLightIndexError::EvidenceMismatch);
         }

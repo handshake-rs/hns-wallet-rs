@@ -912,8 +912,6 @@ impl HnsBackend for EmbeddedHnsBackend {
         }
         let state = self.lock()?;
         require_binding(&state, binding)?;
-        let observations = state.index.transactions().map_err(map_index_error)?;
-        let spends = confirmed_spends(&observations)?;
         let entries = outpoints
             .iter()
             .map(|outpoint| {
@@ -925,7 +923,7 @@ impl HnsBackend for EmbeddedHnsBackend {
                 };
                 OutpointSpendEntry {
                     outpoint: *outpoint,
-                    spending: spends.get(&canonical).copied(),
+                    spending: state.index.confirmed_spend(&canonical),
                 }
             })
             .collect();
