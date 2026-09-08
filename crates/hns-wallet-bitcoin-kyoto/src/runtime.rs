@@ -2879,6 +2879,17 @@ pub fn unobserved_approved_broadcast_inputs(
     if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
         return Err(BitcoinWalletError::BitcoinTransactionCapacity);
     }
+    Ok(
+        collect_unobserved_approved_broadcast_inputs(records, network)?
+            .into_iter()
+            .collect(),
+    )
+}
+
+fn collect_unobserved_approved_broadcast_inputs(
+    records: Vec<StoredEntity<BitcoinTransactionRecord>>,
+    network: Network,
+) -> Result<BTreeSet<OutPoint>, BitcoinWalletError> {
     let mut outpoints = BTreeSet::new();
     for stored in records {
         let record = stored.value;
@@ -2907,7 +2918,7 @@ pub fn unobserved_approved_broadcast_inputs(
             }
         }
     }
-    Ok(outpoints.into_iter().collect())
+    Ok(outpoints)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3192,13 +3203,8 @@ fn persist_approved_bitcoin_broadcast(
         if records.len() >= MAX_TRACKED_BITCOIN_TRANSACTIONS {
             return Err(BitcoinWalletError::BitcoinTransactionCapacity);
         }
-        for stored in records {
-            stored.value.validate()?;
-        }
-        let committed_inputs: BTreeSet<_> =
-            unobserved_approved_broadcast_inputs(store, approval.network)?
-                .into_iter()
-                .collect();
+        let committed_inputs =
+            collect_unobserved_approved_broadcast_inputs(records, approval.network)?;
         if transaction
             .input
             .iter()
