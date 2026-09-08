@@ -42,6 +42,13 @@ pub enum BoardOfferStatus {
     Cancelled,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BoardOfferMutation {
+    Existing,
+    Inserted,
+    Updated,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistedBoardOffer {
     pub listing_hash: ObjectHash,
@@ -311,7 +318,10 @@ impl NameMarketBoard {
     }
 
     pub fn offer(&self, hash: ObjectHash) -> Option<&PersistedBoardOffer> {
-        self.offers.iter().find(|offer| offer.listing_hash == hash)
+        self.offers
+            .binary_search_by_key(&hash, |offer| offer.listing_hash)
+            .ok()
+            .map(|index| &self.offers[index])
     }
 
     pub(crate) fn retain_transport_active_listings(
@@ -336,6 +346,16 @@ impl NameMarketBoard {
         listing: &VerifiedFixedPriceListing,
     ) -> Result<bool, ShakedexError> {
         self.validate()?;
+        Ok(!matches!(
+            self.apply_offer_to_validated_board(listing)?,
+            BoardOfferMutation::Existing
+        ))
+    }
+
+    pub(crate) fn apply_offer_to_validated_board(
+        &mut self,
+        listing: &VerifiedFixedPriceListing,
+    ) -> Result<BoardOfferMutation, ShakedexError> {
         let name_hash = listing.name_hash()?;
         let network = listing.network();
         let seller_public_key = listing.seller_public_key().to_vec();
@@ -343,7 +363,7 @@ impl NameMarketBoard {
             if existing.listing_bytes == listing.encoded()
                 && existing.sequence == listing.sequence()
             {
-                return Ok(false);
+                return Ok(BoardOfferMutation::Existing);
             }
             return Err(ShakedexError::NameMarketReplay);
         }
@@ -358,28 +378,34 @@ impl NameMarketBoard {
             return Err(ShakedexError::NameMarketBoardCapacity);
         }
 
-        let watermark = self.watermarks.iter_mut().find(|watermark| {
-            watermark.network_magic == network.magic
-                && watermark.network_genesis.into_bytes() == *network.genesis.as_bytes()
-                && watermark.name_hash == name_hash
-                && watermark.seller_public_key == seller_public_key
+        let watermark_index = self.watermarks.binary_search_by(|watermark| {
+            compare_watermark_identity(
+                watermark,
+                network.magic,
+                *network.genesis.as_bytes(),
+                name_hash.into_bytes(),
+                &seller_public_key,
+            )
         });
-        match watermark {
-            Some(watermark) if listing.sequence() <= watermark.sequence => {
+        match watermark_index {
+            Ok(index) if listing.sequence() <= self.watermarks[index].sequence => {
                 return Err(ShakedexError::NameMarketReplay);
             }
-            Some(watermark) => watermark.sequence = listing.sequence(),
-            None => {
+            Ok(index) => self.watermarks[index].sequence = listing.sequence(),
+            Err(index) => {
                 if self.watermarks.len() >= MAX_NAME_MARKET_BOARD_OFFERS {
                     return Err(ShakedexError::NameMarketBoardCapacity);
                 }
-                self.watermarks.push(SequenceWatermark {
-                    network_magic: network.magic,
-                    network_genesis: ObjectHash::new(*network.genesis.as_bytes()),
-                    name_hash,
-                    seller_public_key: seller_public_key.clone(),
-                    sequence: listing.sequence(),
-                });
+                self.watermarks.insert(
+                    index,
+                    SequenceWatermark {
+                        network_magic: network.magic,
+                        network_genesis: ObjectHash::new(*network.genesis.as_bytes()),
+                        name_hash,
+                        seller_public_key: seller_public_key.clone(),
+                        sequence: listing.sequence(),
+                    },
+                );
             }
         }
 
@@ -398,15 +424,21 @@ impl NameMarketBoard {
             cancellation_bytes: None,
             cancellation_sequence: None,
         };
-        if let Some(index) = offer_index {
-            self.offers[index] = replacement;
+        let mutation = if let Some(index) = offer_index {
+            self.offers.remove(index);
+            BoardOfferMutation::Updated
         } else {
-            self.offers.push(replacement);
-        }
-        self.offers.sort_by_key(|offer| offer.listing_hash);
-        self.watermarks
-            .sort_by(|left, right| watermark_key(left).cmp(&watermark_key(right)));
-        Ok(true)
+            BoardOfferMutation::Inserted
+        };
+        let insertion = match self
+            .offers
+            .binary_search_by_key(&replacement.listing_hash, |offer| offer.listing_hash)
+        {
+            Ok(_) => return Err(ShakedexError::CorruptNameMarketBoard),
+            Err(index) => index,
+        };
+        self.offers.insert(insertion, replacement);
+        Ok(mutation)
     }
 
     pub fn apply_cancellation(
@@ -414,11 +446,17 @@ impl NameMarketBoard {
         cancellation: &VerifiedListingCancellation,
     ) -> Result<bool, ShakedexError> {
         self.validate()?;
+        self.apply_cancellation_to_validated_board(cancellation)
+    }
+
+    pub(crate) fn apply_cancellation_to_validated_board(
+        &mut self,
+        cancellation: &VerifiedListingCancellation,
+    ) -> Result<bool, ShakedexError> {
         let offer_index = self
             .offers
-            .iter()
-            .position(|offer| offer.listing_hash == cancellation.listing_hash())
-            .ok_or(ShakedexError::InvalidCancellation)?;
+            .binary_search_by_key(&cancellation.listing_hash(), |offer| offer.listing_hash)
+            .map_err(|_| ShakedexError::InvalidCancellation)?;
         let identity = {
             let offer = &self.offers[offer_index];
             (
@@ -428,26 +466,28 @@ impl NameMarketBoard {
                 offer.seller_public_key.clone(),
             )
         };
-        let watermark = self
+        let watermark_index = self
             .watermarks
-            .iter_mut()
-            .find(|watermark| {
-                watermark.network_magic == identity.0
-                    && watermark.network_genesis == identity.1
-                    && watermark.name_hash == identity.2
-                    && watermark.seller_public_key == identity.3
+            .binary_search_by(|watermark| {
+                compare_watermark_identity(
+                    watermark,
+                    identity.0,
+                    identity.1.into_bytes(),
+                    identity.2.into_bytes(),
+                    &identity.3,
+                )
             })
-            .ok_or(ShakedexError::CorruptNameMarketBoard)?;
+            .map_err(|_| ShakedexError::CorruptNameMarketBoard)?;
         let offer = &mut self.offers[offer_index];
         if offer.cancellation_hash == Some(cancellation.cancellation_hash())
             && offer.cancellation_bytes.as_deref() == Some(cancellation.encoded())
         {
             return Ok(false);
         }
-        if cancellation.sequence() <= watermark.sequence {
+        if cancellation.sequence() <= self.watermarks[watermark_index].sequence {
             return Err(ShakedexError::NameMarketReplay);
         }
-        watermark.sequence = cancellation.sequence();
+        self.watermarks[watermark_index].sequence = cancellation.sequence();
         offer.status = BoardOfferStatus::Cancelled;
         offer.cancellation_hash = Some(cancellation.cancellation_hash());
         offer.cancellation_bytes = Some(cancellation.encoded().to_vec());
@@ -646,6 +686,26 @@ fn watermark_key(watermark: &SequenceWatermark) -> (u32, [u8; 32], [u8; 32], &[u
         watermark.name_hash.into_bytes(),
         &watermark.seller_public_key,
     )
+}
+
+fn compare_watermark_identity(
+    watermark: &SequenceWatermark,
+    network_magic: u32,
+    network_genesis: [u8; 32],
+    name_hash: [u8; 32],
+    seller_public_key: &[u8],
+) -> std::cmp::Ordering {
+    watermark
+        .network_magic
+        .cmp(&network_magic)
+        .then_with(|| watermark.network_genesis.into_bytes().cmp(&network_genesis))
+        .then_with(|| watermark.name_hash.into_bytes().cmp(&name_hash))
+        .then_with(|| {
+            watermark
+                .seller_public_key
+                .as_slice()
+                .cmp(seller_public_key)
+        })
 }
 
 fn normalized_row_id(watermark: &SequenceWatermark) -> Result<Vec<u8>, ShakedexError> {

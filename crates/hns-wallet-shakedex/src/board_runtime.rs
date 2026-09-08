@@ -10,7 +10,7 @@ use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::ObjectHash;
 
 use crate::board::{
-    load_name_market_board_offers, load_name_market_board_offers_from_snapshot,
+    BoardOfferMutation, load_name_market_board_offers, load_name_market_board_offers_from_snapshot,
     load_name_market_board_state_from_snapshot, save_loaded_name_market_board_with_guard,
 };
 use crate::{
@@ -329,9 +329,6 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakescapeBoardRuntime<'a, B, C> {
         )?;
         let (listing, current_lock) = self.bind_current_listing(authenticated)?;
         let listing_hash = listing.listing_hash();
-        let network = listing.network();
-        let name_hash = listing.name_hash()?;
-        let seller_public_key = listing.seller_public_key().to_vec();
         let updated_at_unix = listing.verified_at_unix();
 
         self.store.try_with_store_mut(move |store| {
@@ -341,19 +338,17 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakescapeBoardRuntime<'a, B, C> {
                 Ok::<_, ShakedexError>((current_lock, loaded))
             })?;
             let mut board = loaded.board.clone();
-            let replaced_identity = board.offers().iter().any(|offer| {
-                offer.network_magic == network.magic
-                    && offer.network_genesis.as_bytes() == network.genesis.as_bytes()
-                    && offer.name_hash == name_hash
-                    && offer.seller_public_key == seller_public_key
-            });
-            if !board.apply_offer(&listing)? {
-                return Ok(ShakescapeBoardOfferAdmission::Existing {
-                    request_id,
-                    listing_hash,
-                    revision: loaded.logical_revision,
-                });
-            }
+            let updated = match board.apply_offer_to_validated_board(&listing)? {
+                BoardOfferMutation::Existing => {
+                    return Ok(ShakescapeBoardOfferAdmission::Existing {
+                        request_id,
+                        listing_hash,
+                        revision: loaded.logical_revision,
+                    });
+                }
+                BoardOfferMutation::Inserted => false,
+                BoardOfferMutation::Updated => true,
+            };
             let account_prefix_lease = current_lock.into_account_prefix_lease()?;
             let revision = save_loaded_name_market_board_with_guard(
                 store,
@@ -363,7 +358,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakescapeBoardRuntime<'a, B, C> {
                 loaded,
                 account_prefix_lease,
             )?;
-            if replaced_identity {
+            if updated {
                 Ok(ShakescapeBoardOfferAdmission::Updated {
                     request_id,
                     listing_hash,
@@ -439,7 +434,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakescapeBoardRuntime<'a, B, C> {
                 context.network(),
                 context.observed_at_unix(),
             )?;
-            if !board.apply_cancellation(&cancellation)? {
+            if !board.apply_cancellation_to_validated_board(&cancellation)? {
                 return Ok(ShakescapeBoardCancellationAdmission::Existing {
                     request_id,
                     listing_hash: expected_listing_hash,
