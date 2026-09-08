@@ -8,6 +8,8 @@ file. The public crates use a shared version and follow Semantic Versioning.
 <!-- hns-wallet-release-state: 0.2.3 release -->
 Breaking clean-break migration of the wallet and atomic-swap boundary:
 
+- advance encrypted wallet storage to `rusqlite 0.40.2` and the matching
+  `libsqlite3-sys 0.38.2` native-link cohort shared by its mobile embedding;
 - preserve complete direct-peer header catch-up batches so mobile synchronization
   does not silently stop one header short;
 - retain transfer, finalize, renewal, and other name-action lifecycle state across

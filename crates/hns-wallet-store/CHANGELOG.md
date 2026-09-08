@@ -12,6 +12,10 @@ the canonical workspace `CHANGELOG.md` for the complete shared scope and release
 evidence. A source archive alone does not establish a crates.io package, Git
 tag, or installed-product qualification.
 
+The prepared source advances SQLite integration to `rusqlite 0.40.2` and the
+matching `libsqlite3-sys 0.38.2` native-link cohort without changing the wallet
+schema.
+
 ## 0.2.2 - 2026-09-03
 
 <!-- hns-wallet-release-state: 0.2.2 release -->
