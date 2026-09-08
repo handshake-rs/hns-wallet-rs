@@ -60,8 +60,16 @@ struct EmbeddedState {
     authority: EncryptedHnsLightAuthority,
     index: EncryptedHnsLightIndex,
     mempool: EmbeddedMempool,
+    confirmed_page_cache: Option<EmbeddedPageCache<ConfirmedRow>>,
+    incoming_page_cache: Option<EmbeddedPageCache<IncomingTransferCandidate>>,
+    mempool_page_cache: Option<EmbeddedPageCache<HistoryEntry>>,
     connected_peers: HashSet<PeerId>,
     peer_fee_rates: HashMap<PeerId, u64>,
+}
+
+struct EmbeddedPageCache<T> {
+    digest: [u8; 32],
+    rows: Vec<T>,
 }
 
 struct EmbeddedMempool {
@@ -109,6 +117,9 @@ impl EmbeddedHnsBackend {
                     spenders: HashMap::new(),
                     watched_outpoints: HashSet::new(),
                 },
+                confirmed_page_cache: None,
+                incoming_page_cache: None,
+                mempool_page_cache: None,
                 connected_peers: HashSet::new(),
                 peer_fee_rates: HashMap::new(),
             })),
@@ -130,6 +141,7 @@ impl EmbeddedHnsBackend {
             .map_err(map_index_error)?;
         if changed {
             clear_mempool(&mut state.mempool);
+            clear_page_caches(&mut state);
             advance_mempool_generation(&mut state.mempool)?;
         }
         Ok(changed)
@@ -164,6 +176,7 @@ impl EmbeddedHnsBackend {
             .map_err(map_index_error)?;
         if changed {
             clear_mempool(&mut state.mempool);
+            clear_page_caches(&mut state);
             advance_mempool_generation(&mut state.mempool)?;
         }
         Ok(changed)
@@ -263,6 +276,7 @@ impl EmbeddedHnsBackend {
                     .map_err(map_index_error)?;
             }
             state.mempool.watched_outpoints = watched_outpoints;
+            clear_page_caches(&mut state);
         }
         Ok(changed)
     }
@@ -548,6 +562,7 @@ impl EmbeddedHnsBackend {
         if changed {
             advance_mempool_generation(mempool)?;
         }
+        clear_page_caches(&mut state);
         Ok(admitted)
     }
 
@@ -585,6 +600,7 @@ impl EmbeddedHnsBackend {
             first_seen_unix,
             watched_outpoints,
         )?;
+        state.mempool_page_cache = None;
         Ok(Some(TransactionHash::new(txid)))
     }
 
@@ -668,7 +684,7 @@ impl HnsBackend for EmbeddedHnsBackend {
         if request.limit == 0 || request.limit as usize > MAX_SCAN_PAGE_RESULTS {
             return Err(HnsWalletError::InvalidEvidence);
         }
-        let state = self.lock()?;
+        let mut state = self.lock()?;
         let binding = current_binding(&state)?;
         if binding.tip != request.expected_tip
             || request
@@ -678,24 +694,44 @@ impl HnsBackend for EmbeddedHnsBackend {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
         require_watched_scripts(&state.index, request.scripts)?;
-        let observations = state.index.transactions().map_err(map_index_error)?;
-        let rows = confirmed_rows(&observations, request.scripts, binding.tip.height)?;
         let digest = cursor_digest(b"confirmed", request.scripts, binding, None);
-        let offset = decode_cursor(request.cursor, digest, rows.len())?;
-        let end = offset
-            .saturating_add(request.limit as usize)
-            .min(rows.len());
-        let mut history = Vec::new();
-        let mut utxos = Vec::new();
-        for row in &rows[offset..end] {
-            match row {
-                ConfirmedRow::History(entry) => history.push(*entry),
-                ConfirmedRow::Coin(coin) => utxos.push(coin.clone()),
+        if state
+            .confirmed_page_cache
+            .as_ref()
+            .is_none_or(|cache| cache.digest != digest)
+        {
+            state.confirmed_page_cache = None;
+            let observations = state.index.transactions().map_err(map_index_error)?;
+            let rows = confirmed_rows(&observations, request.scripts, binding.tip.height)?;
+            state.confirmed_page_cache = Some(EmbeddedPageCache { digest, rows });
+        }
+        let (history, utxos, end, row_count) = {
+            let rows = &state
+                .confirmed_page_cache
+                .as_ref()
+                .ok_or(HnsWalletError::InvalidEvidence)?
+                .rows;
+            let offset = decode_cursor(request.cursor, digest, rows.len())?;
+            let end = offset
+                .saturating_add(request.limit as usize)
+                .min(rows.len());
+            let mut history = Vec::new();
+            let mut utxos = Vec::new();
+            for row in &rows[offset..end] {
+                match row {
+                    ConfirmedRow::History(entry) => history.push(*entry),
+                    ConfirmedRow::Coin(coin) => utxos.push(coin.clone()),
+                }
             }
+            (history, utxos, end, rows.len())
+        };
+        let next_cursor = (end < row_count).then(|| encode_cursor(digest, end));
+        if next_cursor.is_none() {
+            state.confirmed_page_cache = None;
         }
         Ok(ConfirmedWalletPage {
             binding,
-            next_cursor: (end < rows.len()).then(|| encode_cursor(digest, end)),
+            next_cursor,
             history,
             utxos,
         })
@@ -709,23 +745,43 @@ impl HnsBackend for EmbeddedHnsBackend {
         if request.limit == 0 || request.limit as usize > MAX_SCAN_PAGE_RESULTS {
             return Err(HnsWalletError::InvalidEvidence);
         }
-        let state = self.lock()?;
+        let mut state = self.lock()?;
         require_binding(&state, request.binding)?;
         require_watched_scripts(&state.index, request.scripts)?;
-        let observations = state.index.transactions().map_err(map_index_error)?;
-        let entries = incoming_transfers(&observations, request.scripts)?;
         let digest = cursor_digest(b"incoming", request.scripts, request.binding, None);
-        let offset = decode_cursor(request.cursor, digest, entries.len())?;
+        if state
+            .incoming_page_cache
+            .as_ref()
+            .is_none_or(|cache| cache.digest != digest)
+        {
+            state.incoming_page_cache = None;
+            let observations = state.index.transactions().map_err(map_index_error)?;
+            let rows = incoming_transfers(&observations, request.scripts)?;
+            state.incoming_page_cache = Some(EmbeddedPageCache { digest, rows });
+        }
         let examined = request.scripts.len().min(MAX_SCAN_PAGE_RESULTS);
-        let end = offset
-            .saturating_add(request.limit as usize)
-            .min(entries.len());
+        let (entries, end, row_count) = {
+            let rows = &state
+                .incoming_page_cache
+                .as_ref()
+                .ok_or(HnsWalletError::InvalidEvidence)?
+                .rows;
+            let offset = decode_cursor(request.cursor, digest, rows.len())?;
+            let end = offset
+                .saturating_add(request.limit as usize)
+                .min(rows.len());
+            (rows[offset..end].to_vec(), end, rows.len())
+        };
+        let next_cursor = (end < row_count).then(|| encode_cursor(digest, end));
+        if next_cursor.is_none() {
+            state.incoming_page_cache = None;
+        }
         Ok(IncomingTransfersPage {
             projection_version: 1,
             binding: request.binding,
-            entries: entries[offset..end].to_vec(),
+            entries,
             script_examinations: examined,
-            next_cursor: (end < entries.len()).then(|| encode_cursor(digest, end)),
+            next_cursor,
         })
     }
 
@@ -737,7 +793,7 @@ impl HnsBackend for EmbeddedHnsBackend {
         if request.limit == 0 || request.limit as usize > MAX_MEMPOOL_SCAN_RESULTS {
             return Err(HnsWalletError::InvalidEvidence);
         }
-        let state = self.lock()?;
+        let mut state = self.lock()?;
         require_binding(&state, request.binding)?;
         require_watched_scripts(&state.index, request.scripts)?;
         let mempool_binding = mempool_binding(&state.mempool);
@@ -747,23 +803,43 @@ impl HnsBackend for EmbeddedHnsBackend {
         {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
-        let observations = state.index.transactions().map_err(map_index_error)?;
-        let history = mempool_history(&observations, &state.mempool, request.scripts)?;
         let digest = cursor_digest(
             b"mempool",
             request.scripts,
             request.binding,
             Some(mempool_binding),
         );
-        let offset = decode_cursor(request.cursor, digest, history.len())?;
-        let end = offset
-            .saturating_add(request.limit as usize)
-            .min(history.len());
+        if state
+            .mempool_page_cache
+            .as_ref()
+            .is_none_or(|cache| cache.digest != digest)
+        {
+            state.mempool_page_cache = None;
+            let observations = state.index.transactions().map_err(map_index_error)?;
+            let rows = mempool_history(&observations, &state.mempool, request.scripts)?;
+            state.mempool_page_cache = Some(EmbeddedPageCache { digest, rows });
+        }
+        let (history, end, row_count) = {
+            let rows = &state
+                .mempool_page_cache
+                .as_ref()
+                .ok_or(HnsWalletError::InvalidEvidence)?
+                .rows;
+            let offset = decode_cursor(request.cursor, digest, rows.len())?;
+            let end = offset
+                .saturating_add(request.limit as usize)
+                .min(rows.len());
+            (rows[offset..end].to_vec(), end, rows.len())
+        };
+        let next_cursor = (end < row_count).then(|| encode_cursor(digest, end));
+        if next_cursor.is_none() {
+            state.mempool_page_cache = None;
+        }
         Ok(MempoolWalletPage {
             binding: request.binding,
             mempool: mempool_binding,
-            next_cursor: (end < history.len()).then(|| encode_cursor(digest, end)),
-            history: history[offset..end].to_vec(),
+            next_cursor,
+            history,
         })
     }
 
@@ -2368,6 +2444,12 @@ fn clear_mempool(mempool: &mut EmbeddedMempool) {
     mempool.transactions.clear();
     mempool.spenders.clear();
     mempool.watched_outpoints.clear();
+}
+
+fn clear_page_caches(state: &mut EmbeddedState) {
+    state.confirmed_page_cache = None;
+    state.incoming_page_cache = None;
+    state.mempool_page_cache = None;
 }
 
 fn remove_mempool_transaction(mempool: &mut EmbeddedMempool, txid: [u8; 32]) -> bool {
