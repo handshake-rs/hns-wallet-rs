@@ -813,12 +813,17 @@ impl HnsDirectShakescapePeer {
                 PeerEvent::Experimental { .. }
                 | PeerEvent::Ignored(_)
                 | PeerEvent::Addresses(_)
-                | PeerEvent::Wallet(_) => {}
+                | PeerEvent::Wallet(_)
+                // A full Handshake node normally announces its compact-block
+                // preference immediately after VERSION/VERACK. The direct
+                // board socket does not consume block relay, but SENDCMPCT is
+                // ordinary peer capability traffic rather than a malformed
+                // ShakeScape response and must not retire the session.
+                | PeerEvent::Send(_) => {}
                 PeerEvent::Rejected(reject) => {
                     return Err(HnsDirectPeerError::PeerRejected(format!("{reject:?}")));
                 }
                 PeerEvent::Ready(_)
-                | PeerEvent::Send(_)
                 | PeerEvent::GetAddresses
                 | PeerEvent::GetBlocks(_)
                 | PeerEvent::GetHeaders(_)
@@ -5559,6 +5564,16 @@ mod tests {
         assert_eq!(client.negotiated_registry(), server.negotiated_registry());
         assert_eq!(client.address(), address);
         assert!(server.address().ip().is_loopback());
+        server
+            .connection
+            .send_frame(
+                &Frame::from_packet(&Packet::SendCmpct {
+                    mode: 0,
+                    version: 1,
+                })
+                .unwrap(),
+            )
+            .unwrap();
         assert_eq!(client.try_receive_shakescape_message(now).unwrap(), None);
         assert_eq!(server.try_receive_shakescape_message(now).unwrap(), None);
     }
