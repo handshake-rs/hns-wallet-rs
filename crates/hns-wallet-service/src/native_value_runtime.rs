@@ -1803,6 +1803,24 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             .map_err(chain_failure)
     }
 
+    pub fn verify_trusted_native_hns_htlc_lock(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        funding_transaction: hns_wallet_types::TransactionHash,
+        minimum_confirmations: u32,
+    ) -> Result<Option<hns_wallet_chain_api::VerifiedLock>, ServiceFailure> {
+        self.runtime
+            .runtime
+            .verify_native_htlc_lock(
+                session_id,
+                descriptor,
+                funding_transaction,
+                minimum_confirmations,
+            )
+            .map_err(chain_failure)
+    }
+
     pub fn verify_trusted_native_hns_htlc_spend(
         &self,
         session_id: SessionId,

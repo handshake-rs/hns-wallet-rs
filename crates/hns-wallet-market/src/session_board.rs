@@ -76,6 +76,15 @@ pub struct ShakescapeDirectSwapRecord {
     pub hello: Option<SwapSessionHello>,
     pub watch_ready_accepted_at_unix: Option<u64>,
     pub first_chain_watch_ready: Option<SwapWatchReady>,
+    /// Latest signed counterparty funding locator for each chain. This is
+    /// coordination metadata only; local chain verification remains required.
+    pub peer_funding_statuses: Vec<ShakescapePeerFundingStatusRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShakescapePeerFundingStatusRecord {
+    pub accepted_at_unix: u64,
+    pub status: SwapFundingStatus,
 }
 
 impl ShakescapeDirectSwapRecord {
@@ -109,7 +118,11 @@ impl ShakescapeDirectSwapRecord {
             offered_refund_at_unix: terms.map(|terms| terms.offered_refund_deadline.value),
             received_refund_at_unix: terms.map(|terms| terms.received_refund_deadline.value),
             last_accepted_at_unix: self
-                .watch_ready_accepted_at_unix
+                .peer_funding_statuses
+                .iter()
+                .map(|status| status.accepted_at_unix)
+                .max()
+                .or(self.watch_ready_accepted_at_unix)
                 .or(self.hello_accepted_at_unix)
                 .or(self.proposal_accepted_at_unix)
                 .unwrap_or(self.take_accepted_at_unix),
@@ -192,6 +205,15 @@ struct PersistedShakescapeDirectSwap {
     watch_ready_accepted_at_unix: Option<u64>,
     #[serde(default)]
     first_chain_watch_ready_hex: Option<String>,
+    #[serde(default)]
+    peer_funding_statuses: Vec<PersistedPeerFundingStatus>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedPeerFundingStatus {
+    accepted_at_unix: u64,
+    status_hex: String,
 }
 
 pub fn load_shakescape_direct_swap(
@@ -274,6 +296,7 @@ pub fn admit_shakescape_direct_offer_take(
         hello_hex: None,
         watch_ready_accepted_at_unix: None,
         first_chain_watch_ready_hex: None,
+        peer_funding_statuses: Vec::new(),
     };
     let revision = store.save_entity(
         EntityKind::SwapSession,
@@ -295,6 +318,7 @@ pub fn admit_shakescape_direct_offer_take(
         hello: None,
         watch_ready_accepted_at_unix: None,
         first_chain_watch_ready: None,
+        peer_funding_statuses: Vec::new(),
     };
     Ok(ShakescapeDirectSwapAdmission::Created(record.snapshot()))
 }
@@ -493,6 +517,62 @@ pub fn validate_shakescape_direct_swap_peer_status(
     Ok(status)
 }
 
+/// Validate peer coordination status and retain only the latest signed
+/// funding locator for each chain. The locator is never treated as funding
+/// evidence; it lets the local chain adapter fetch and verify the transaction.
+pub fn admit_shakescape_direct_swap_peer_status(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    envelope_bytes: &[u8],
+    now_unix: u64,
+) -> Result<ShakescapeDirectSwapPeerStatus, MarketError> {
+    let status =
+        validate_shakescape_direct_swap_peer_status(store, policy, envelope_bytes, now_unix)?;
+    let ShakescapeDirectSwapPeerStatus::Funding(funding) = &status else {
+        return Ok(status);
+    };
+    let session_id = SessionId::new(funding.swap_session_id);
+    let mut record = load_shakescape_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
+    if let Some(existing) = record
+        .peer_funding_statuses
+        .iter()
+        .find(|existing| existing.status.chain == funding.chain)
+    {
+        if existing.status == *funding {
+            return Ok(status);
+        }
+        if funding.header.sequence <= existing.status.header.sequence {
+            return Err(MarketError::ShakescapeDirectSwapConflict);
+        }
+    }
+    record
+        .peer_funding_statuses
+        .retain(|existing| existing.status.chain != funding.chain);
+    record
+        .peer_funding_statuses
+        .push(ShakescapePeerFundingStatusRecord {
+            accepted_at_unix: now_unix,
+            status: funding.clone(),
+        });
+    record
+        .peer_funding_statuses
+        .sort_by_key(|existing| existing.status.chain);
+    if record.peer_funding_statuses.len() > 2 {
+        return Err(MarketError::CorruptShakescapeDirectSwap);
+    }
+    let persisted = encode_persisted(policy, &record)?;
+    let revision = store.save_entity(
+        EntityKind::SwapSession,
+        &record_id(policy, session_id),
+        record.store_revision,
+        &persisted,
+        now_unix,
+    )?;
+    debug_assert_ne!(revision, 0);
+    Ok(status)
+}
+
 fn decode_stored_swap(
     policy: &ShakescapeDirectSwapPolicy,
     stored: StoredEntity<PersistedShakescapeDirectSwap>,
@@ -529,6 +609,16 @@ fn decode_stored_swap(
         .as_deref()
         .map(decode_hex)
         .transpose()?;
+    let peer_funding_statuses = value
+        .peer_funding_statuses
+        .into_iter()
+        .map(|status| {
+            Ok(ShakescapePeerFundingStatusRecord {
+                accepted_at_unix: status.accepted_at_unix,
+                status: decode_hex(&status.status_hex)?,
+            })
+        })
+        .collect::<Result<Vec<_>, MarketError>>()?;
     let record = ShakescapeDirectSwapRecord {
         store_revision: stored.revision,
         take_request_id: value.take_request_id,
@@ -542,6 +632,7 @@ fn decode_stored_swap(
         hello,
         watch_ready_accepted_at_unix: value.watch_ready_accepted_at_unix,
         first_chain_watch_ready,
+        peer_funding_statuses,
     };
     if let (Some(proposal), Some(at)) = (&record.proposal, record.proposal_accepted_at_unix) {
         proposal
@@ -570,6 +661,22 @@ fn decode_stored_swap(
         || ready
             .verify_for_session(hello, policy.network(), at)
             .is_err())
+    {
+        return Err(MarketError::CorruptShakescapeDirectSwap);
+    }
+    if record.peer_funding_statuses.len() > 2
+        || record
+            .peer_funding_statuses
+            .windows(2)
+            .any(|window| window[0].status.chain >= window[1].status.chain)
+        || record.peer_funding_statuses.iter().any(|funding| {
+            record.hello.as_ref().is_none_or(|hello| {
+                funding
+                    .status
+                    .verify_for_session(hello, policy.network(), funding.accepted_at_unix)
+                    .is_err()
+            })
+        })
     {
         return Err(MarketError::CorruptShakescapeDirectSwap);
     }
@@ -604,6 +711,16 @@ fn encode_persisted(
             .as_ref()
             .map(encode_hex)
             .transpose()?,
+        peer_funding_statuses: record
+            .peer_funding_statuses
+            .iter()
+            .map(|status| {
+                Ok(PersistedPeerFundingStatus {
+                    accepted_at_unix: status.accepted_at_unix,
+                    status_hex: encode_hex(&status.status)?,
+                })
+            })
+            .collect::<Result<Vec<_>, MarketError>>()?,
     })
 }
 
@@ -647,6 +764,7 @@ canonical_direct_object!(
     DirectOfferTake,
     SwapSessionProposal,
     SwapSessionHello,
+    SwapFundingStatus,
     SwapWatchReady,
 );
 

@@ -322,6 +322,7 @@ pub struct MobileBitcoinHtlcFundingApproval {
 pub struct MobileBitcoinHtlcFundingReceipt {
     pub session_id: String,
     pub txid: String,
+    pub output_index: u32,
     pub attempt_count: u16,
     pub submitted_at_unix: Option<u64>,
 }
@@ -1006,9 +1007,13 @@ impl MobileBitcoinValueController {
         if expires_at_unix <= now_unix {
             return Err(MobileWalletError::BitcoinActionExpired);
         }
-        let binding =
-            build_shakescape_bitcoin_htlc(hello, hns_marketplace_protocol::SwapAssetSide::Offered)?;
-        if binding.commitment.into_bytes() != hello.offered_lock_commitment {
+        let side = permit.side();
+        let binding = build_shakescape_bitcoin_htlc(hello, side)?;
+        let expected_commitment = match side {
+            hns_marketplace_protocol::SwapAssetSide::Offered => hello.offered_lock_commitment,
+            hns_marketplace_protocol::SwapAssetSide::Received => hello.received_lock_commitment,
+        };
+        if binding.commitment.into_bytes() != expected_commitment {
             return Err(MobileWalletError::InvalidBitcoinAction);
         }
         let runtime = self
@@ -1039,7 +1044,14 @@ impl MobileBitcoinValueController {
                         session_id: SessionId::new(hello.swap_session_id),
                         htlc: binding.htlc,
                         expected_value_sats: value_sats,
-                        minimum_confirmations: hello.offered_minimum_confirmations,
+                        minimum_confirmations: match side {
+                            hns_marketplace_protocol::SwapAssetSide::Offered => {
+                                hello.offered_minimum_confirmations
+                            }
+                            hns_marketplace_protocol::SwapAssetSide::Received => {
+                                hello.received_minimum_confirmations
+                            }
+                        },
                     },
                     now_unix,
                 )?;
@@ -1055,7 +1067,14 @@ impl MobileBitcoinValueController {
             amount_sats: prepared.value_sats,
             fee_sats: prepared.fee_sats,
             maximum_fee_sats,
-            refund_at_unix: hello.offered_refund_deadline.value,
+            refund_at_unix: match side {
+                hns_marketplace_protocol::SwapAssetSide::Offered => {
+                    hello.offered_refund_deadline.value
+                }
+                hns_marketplace_protocol::SwapAssetSide::Received => {
+                    hello.received_refund_deadline.value
+                }
+            },
             expires_at_unix,
         };
         self.pending_htlc_funding = Some(PendingMobileBitcoinHtlcFunding {
@@ -1063,7 +1082,14 @@ impl MobileBitcoinValueController {
             session_id,
             prepared,
             maximum_fee_sats,
-            refund_at_unix: hello.offered_refund_deadline.value,
+            refund_at_unix: match side {
+                hns_marketplace_protocol::SwapAssetSide::Offered => {
+                    hello.offered_refund_deadline.value
+                }
+                hns_marketplace_protocol::SwapAssetSide::Received => {
+                    hello.received_refund_deadline.value
+                }
+            },
             expires_at_unix,
         });
         Ok(approval)
@@ -1077,9 +1103,13 @@ impl MobileBitcoinValueController {
     ) -> Result<(), MobileWalletError> {
         let now_unix = now_unix()?;
         let hello = permit.hello();
-        let binding =
-            build_shakescape_bitcoin_htlc(hello, hns_marketplace_protocol::SwapAssetSide::Offered)?;
-        if binding.commitment.into_bytes() != hello.offered_lock_commitment {
+        let side = permit.side();
+        let binding = build_shakescape_bitcoin_htlc(hello, side)?;
+        let expected_commitment = match side {
+            hns_marketplace_protocol::SwapAssetSide::Offered => hello.offered_lock_commitment,
+            hns_marketplace_protocol::SwapAssetSide::Received => hello.received_lock_commitment,
+        };
+        if binding.commitment.into_bytes() != expected_commitment {
             return Err(MobileWalletError::InvalidBitcoinAction);
         }
         match (&mut self.supervisor, &self.wallet) {
@@ -1090,7 +1120,14 @@ impl MobileBitcoinValueController {
                         session_id: SessionId::new(hello.swap_session_id),
                         htlc: binding.htlc,
                         expected_value_sats: binding.value_sats,
-                        minimum_confirmations: hello.offered_minimum_confirmations,
+                        minimum_confirmations: match side {
+                            hns_marketplace_protocol::SwapAssetSide::Offered => {
+                                hello.offered_minimum_confirmations
+                            }
+                            hns_marketplace_protocol::SwapAssetSide::Received => {
+                                hello.received_minimum_confirmations
+                            }
+                        },
                     },
                     now_unix,
                 )?;
@@ -1178,6 +1215,7 @@ impl MobileBitcoinValueController {
         Ok(MobileBitcoinHtlcFundingReceipt {
             session_id: lowercase_hex(pending.session_id.as_bytes()),
             txid: lowercase_hex(&receipt.txid),
+            output_index: verified.output_index,
             attempt_count: receipt.attempt_count,
             submitted_at_unix: receipt.submitted_at_unix,
         })
@@ -1214,11 +1252,13 @@ impl MobileBitcoinValueController {
             .checked_add(BITCOIN_SEND_APPROVAL_LIFETIME_SECONDS)
             .ok_or(MobileWalletError::InvalidBitcoinAction)?;
         let hello = permit.hello().clone();
-        let binding = build_shakescape_bitcoin_htlc(
-            &hello,
-            hns_marketplace_protocol::SwapAssetSide::Offered,
-        )?;
-        if binding.commitment.into_bytes() != hello.offered_lock_commitment {
+        let side = permit.side();
+        let binding = build_shakescape_bitcoin_htlc(&hello, side)?;
+        let expected_commitment = match side {
+            hns_marketplace_protocol::SwapAssetSide::Offered => hello.offered_lock_commitment,
+            hns_marketplace_protocol::SwapAssetSide::Received => hello.received_lock_commitment,
+        };
+        if binding.commitment.into_bytes() != expected_commitment {
             return Err(MobileWalletError::InvalidBitcoinAction);
         }
         let branch = match permit.action() {

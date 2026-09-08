@@ -31,22 +31,32 @@ pub use direct_board::{
 };
 pub use direct_maker::{
     ShakescapeBtcForHnsMakerProposal, ShakescapeBtcForHnsMakerProposalRequest,
-    ShakescapeBtcForHnsOfferRequest, ShakescapeLocalDirectOffer,
+    ShakescapeBtcForHnsOfferRequest, ShakescapeDirectMakerProposal,
+    ShakescapeDirectMakerProposalRequest, ShakescapeDirectOfferRequest,
+    ShakescapeHnsForBtcOfferRequest, ShakescapeLocalDirectOffer,
     cancel_shakescape_local_direct_offer, create_shakescape_btc_for_hns_maker_proposal,
-    create_shakescape_btc_for_hns_offer, derive_local_btc_for_hns_maker_key,
+    create_shakescape_btc_for_hns_offer, create_shakescape_direct_maker_proposal,
+    create_shakescape_direct_offer, create_shakescape_hns_for_btc_offer,
+    derive_local_btc_for_hns_maker_key, derive_local_direct_maker_key,
     list_local_shakescape_direct_offers, load_shakescape_btc_for_hns_maker_preimage,
-    reserved_local_shakescape_btc_maker_sats,
+    load_shakescape_direct_maker_preimage, reserved_local_shakescape_btc_maker_sats,
+    reserved_local_shakescape_hns_maker_dollarydoos,
 };
 pub use direct_taker::{
-    ShakescapeHnsForBtcTakeRequest, ShakescapeLocalDirectTake, ShakescapeTakerAcceptedSession,
-    accept_shakescape_hns_for_btc_maker_proposal, create_shakescape_hns_for_btc_take,
+    ShakescapeBtcForHnsTakeRequest, ShakescapeDirectTakeRequest, ShakescapeHnsForBtcTakeRequest,
+    ShakescapeLocalDirectTake, ShakescapeTakerAcceptedSession,
+    accept_shakescape_direct_maker_proposal, accept_shakescape_hns_for_btc_maker_proposal,
+    create_shakescape_btc_for_hns_take, create_shakescape_direct_take,
+    create_shakescape_hns_for_btc_take, derive_local_direct_taker_key,
     derive_local_hns_for_btc_taker_key, list_local_shakescape_direct_takes,
+    reserved_local_shakescape_taker_amount,
 };
 pub use session_board::{
     MAX_SHAKESCAPE_DIRECT_SWAPS, ShakescapeDirectSwapAdmission, ShakescapeDirectSwapPeerStatus,
     ShakescapeDirectSwapPolicy, ShakescapeDirectSwapRecord, ShakescapeDirectSwapSnapshot,
-    ShakescapeDirectSwapStage, admit_shakescape_direct_offer_take,
-    admit_shakescape_direct_swap_hello, admit_shakescape_direct_swap_proposal,
+    ShakescapeDirectSwapStage, ShakescapePeerFundingStatusRecord,
+    admit_shakescape_direct_offer_take, admit_shakescape_direct_swap_hello,
+    admit_shakescape_direct_swap_peer_status, admit_shakescape_direct_swap_proposal,
     admit_shakescape_direct_swap_watch_ready, load_shakescape_direct_swap,
     load_shakescape_direct_swaps, validate_shakescape_direct_swap_peer_status,
 };

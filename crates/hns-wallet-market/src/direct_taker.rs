@@ -1,7 +1,7 @@
 //! Wallet-derived taker authority for exact direct BTC-for-HNS offers.
 
 use hns_marketplace_protocol::{
-    CrossChainMessage, DirectOfferTake, MARKETPLACE_PROTOCOL_VERSION, MarketPair,
+    AssetId, CrossChainMessage, DirectOfferTake, MARKETPLACE_PROTOCOL_VERSION, MarketPair,
     SignedObjectHeader, SwapSessionHello,
 };
 use hns_wallet_store::{EntityKind, WalletStore};
@@ -29,6 +29,27 @@ pub struct ShakescapeHnsForBtcTakeRequest {
     pub nonce: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShakescapeBtcForHnsTakeRequest {
+    pub wallet_id: WalletId,
+    pub offer_id: ObjectHash,
+    pub bitcoin_fee_reserve_sats: u64,
+    pub created_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub nonce: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShakescapeDirectTakeRequest {
+    pub wallet_id: WalletId,
+    pub offer_id: ObjectHash,
+    /// Fee reserve in the taker's asset (the offer's received asset).
+    pub received_fee_reserve: u64,
+    pub created_at_unix: u64,
+    pub expires_at_unix: u64,
+    pub nonce: [u8; 32],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShakescapeLocalDirectTake {
     pub offer_id: ObjectHash,
@@ -36,6 +57,11 @@ pub struct ShakescapeLocalDirectTake {
     pub btc_amount_sats: u64,
     pub hns_amount_dollarydoos: u64,
     pub hns_fee_reserve_dollarydoos: u64,
+    pub received_fee_reserve: u64,
+    pub offered_asset: AssetId,
+    pub offered_amount: u64,
+    pub received_asset: AssetId,
+    pub received_amount: u64,
     pub created_at_unix: u64,
     pub expires_at_unix: u64,
     pub envelope: Vec<u8>,
@@ -66,7 +92,45 @@ pub fn create_shakescape_hns_for_btc_take(
     policy: &ShakescapeDirectSwapPolicy,
     request: ShakescapeHnsForBtcTakeRequest,
 ) -> Result<ShakescapeLocalDirectTake, MarketError> {
-    validate_request(request)?;
+    create_shakescape_direct_take(
+        store,
+        policy,
+        ShakescapeDirectTakeRequest {
+            wallet_id: request.wallet_id,
+            offer_id: request.offer_id,
+            received_fee_reserve: request.hns_fee_reserve_dollarydoos,
+            created_at_unix: request.created_at_unix,
+            expires_at_unix: request.expires_at_unix,
+            nonce: request.nonce,
+        },
+    )
+}
+
+pub fn create_shakescape_btc_for_hns_take(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    request: ShakescapeBtcForHnsTakeRequest,
+) -> Result<ShakescapeLocalDirectTake, MarketError> {
+    create_shakescape_direct_take(
+        store,
+        policy,
+        ShakescapeDirectTakeRequest {
+            wallet_id: request.wallet_id,
+            offer_id: request.offer_id,
+            received_fee_reserve: request.bitcoin_fee_reserve_sats,
+            created_at_unix: request.created_at_unix,
+            expires_at_unix: request.expires_at_unix,
+            nonce: request.nonce,
+        },
+    )
+}
+
+pub fn create_shakescape_direct_take(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    request: ShakescapeDirectTakeRequest,
+) -> Result<ShakescapeLocalDirectTake, MarketError> {
+    validate_direct_take_request(request)?;
     let offer =
         load_shakescape_direct_offer(store, &policy.board_policy(), request.offer_id.into_bytes())?
             .ok_or(MarketError::UnknownShakescapeDirectOffer)?;
@@ -129,7 +193,9 @@ pub fn create_shakescape_hns_for_btc_take(
         wallet_id: request.wallet_id,
         offer_id: request.offer_id,
         session_id,
-        hns_fee_reserve_dollarydoos: request.hns_fee_reserve_dollarydoos,
+        // Storage field predates bidirectional takes. It now holds the fee
+        // reserve in the offer's received asset base unit.
+        hns_fee_reserve_dollarydoos: request.received_fee_reserve,
         created_at_unix: request.created_at_unix,
     };
     store.save_entity(
@@ -145,6 +211,16 @@ pub fn create_shakescape_hns_for_btc_take(
 /// Verify and countersign the maker proposal, admit the accepted hello, and
 /// open the restart-safe execution journal before returning bytes to send.
 pub fn accept_shakescape_hns_for_btc_maker_proposal(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    session_id: SessionId,
+    now_unix: u64,
+) -> Result<ShakescapeTakerAcceptedSession, MarketError> {
+    accept_shakescape_direct_maker_proposal(store, policy, wallet_id, session_id, now_unix)
+}
+
+pub fn accept_shakescape_direct_maker_proposal(
     store: &mut WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
     wallet_id: WalletId,
@@ -229,8 +305,66 @@ pub fn list_local_shakescape_direct_takes(
         .collect()
 }
 
+/// Sum funds still committed by this wallet's accepted takes for one asset.
+/// A taker funds the offer's received asset on the second chain, so the
+/// reservation remains live until that funding is independently confirmed.
+pub fn reserved_local_shakescape_taker_amount(
+    store: &WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    asset: AssetId,
+    now_unix: u64,
+) -> Result<u64, MarketError> {
+    if !matches!(asset, AssetId::BTC | AssetId::HNS) || now_unix == 0 {
+        return Err(MarketError::InvalidShakescapeDirectSwap);
+    }
+    let mut total = 0_u64;
+    for take in list_local_shakescape_direct_takes(store, policy, wallet_id)? {
+        if take.received_asset != asset {
+            continue;
+        }
+        let execution = store.load_workflow::<SwapSession>(
+            crate::shakescape_execution_workflow_id(take.session_id),
+        )?;
+        let reserve = match execution.map(|stored| stored.state.state) {
+            Some(
+                crate::SwapState::TermsFrozen
+                | crate::SwapState::RefundsPrepared
+                | crate::SwapState::FirstFundingPending
+                | crate::SwapState::FirstFunded
+                | crate::SwapState::SecondFundingPending,
+            ) => true,
+            Some(_) => false,
+            None => take.expires_at_unix > now_unix,
+        };
+        if reserve {
+            total = total
+                .checked_add(take.received_amount)
+                .and_then(|value| value.checked_add(take.received_fee_reserve))
+                .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
+        }
+    }
+    Ok(total)
+}
+
 #[doc(hidden)]
 pub fn derive_local_hns_for_btc_taker_key(
+    store: &WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    session_id: SessionId,
+) -> Result<(crate::CrossChainSwapKey, u64), MarketError> {
+    let result = derive_local_direct_taker_key(store, policy, wallet_id, session_id)?;
+    let record = load_shakescape_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
+    if record.offer.offered_asset != AssetId::BTC || record.offer.received_asset != AssetId::HNS {
+        return Err(MarketError::ShakescapeDirectSwapConflict);
+    }
+    Ok(result)
+}
+
+#[doc(hidden)]
+pub fn derive_local_direct_taker_key(
     store: &WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
     wallet_id: WalletId,
@@ -243,8 +377,10 @@ pub fn derive_local_hns_for_btc_taker_key(
     if record.offer.offer_id != local.offer_id.into_bytes()
         || record.hello.as_ref().is_none_or(|hello| {
             hello.swap_session_id != session_id.into_bytes()
-                || hello.offered_asset != hns_marketplace_protocol::AssetId::BTC
-                || hello.received_asset != hns_marketplace_protocol::AssetId::HNS
+                || !matches!(
+                    (hello.offered_asset, hello.received_asset),
+                    (AssetId::BTC, AssetId::HNS) | (AssetId::HNS, AssetId::BTC)
+                )
         })
     {
         return Err(MarketError::ShakescapeDirectSwapConflict);
@@ -266,10 +402,10 @@ pub fn derive_local_hns_for_btc_taker_key(
     Ok((key, local.hns_fee_reserve_dollarydoos))
 }
 
-fn validate_request(request: ShakescapeHnsForBtcTakeRequest) -> Result<(), MarketError> {
+fn validate_direct_take_request(request: ShakescapeDirectTakeRequest) -> Result<(), MarketError> {
     if request.wallet_id.as_bytes().iter().all(|byte| *byte == 0)
         || request.offer_id.as_bytes().iter().all(|byte| *byte == 0)
-        || request.hns_fee_reserve_dollarydoos == 0
+        || request.received_fee_reserve == 0
         || request.created_at_unix == 0
         || request.expires_at_unix <= request.created_at_unix
         || request.nonce.iter().all(|byte| *byte == 0)
@@ -292,10 +428,16 @@ fn project_local_take(
     {
         return Err(MarketError::CorruptShakescapeDirectSwap);
     }
-    let btc_amount_sats = u64::try_from(record.offer.offered_amount.get())
+    let offered_amount = u64::try_from(record.offer.offered_amount.get())
         .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
-    let hns_amount_dollarydoos = u64::try_from(record.offer.received_amount.get())
+    let received_amount = u64::try_from(record.offer.received_amount.get())
         .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
+    let (btc_amount_sats, hns_amount_dollarydoos) =
+        match (record.offer.offered_asset, record.offer.received_asset) {
+            (AssetId::BTC, AssetId::HNS) => (offered_amount, received_amount),
+            (AssetId::HNS, AssetId::BTC) => (received_amount, offered_amount),
+            _ => return Err(MarketError::InvalidPair),
+        };
     let envelope = CrossChainMessage::TakeDirectOffer(record.take.clone())
         .encode_envelope(record.take_request_id)
         .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
@@ -305,6 +447,11 @@ fn project_local_take(
         btc_amount_sats,
         hns_amount_dollarydoos,
         hns_fee_reserve_dollarydoos: local.hns_fee_reserve_dollarydoos,
+        received_fee_reserve: local.hns_fee_reserve_dollarydoos,
+        offered_asset: record.offer.offered_asset,
+        offered_amount,
+        received_asset: record.offer.received_asset,
+        received_amount,
         created_at_unix: local.created_at_unix,
         expires_at_unix: record.take.header.expires_at,
         envelope,
@@ -366,8 +513,10 @@ mod tests {
     use super::*;
     use crate::{
         ShakescapeBtcForHnsMakerProposalRequest, ShakescapeBtcForHnsOfferRequest,
-        ShakescapeDirectOfferBoardPolicy, create_shakescape_btc_for_hns_maker_proposal,
-        create_shakescape_btc_for_hns_offer,
+        ShakescapeDirectOfferBoardPolicy, ShakescapeHnsForBtcOfferRequest,
+        accept_shakescape_direct_maker_proposal, create_shakescape_btc_for_hns_maker_proposal,
+        create_shakescape_btc_for_hns_offer, create_shakescape_direct_maker_proposal,
+        create_shakescape_hns_for_btc_offer,
     };
 
     const PASSPHRASE: &str = "two-party direct atomic swap test";
@@ -522,5 +671,122 @@ mod tests {
         .expect("idempotent acceptance");
         assert_eq!(retried.envelope, accepted.envelope);
         assert_eq!(retried.execution, accepted.execution);
+    }
+
+    #[test]
+    fn hns_maker_and_btc_taker_reach_countersigned_execution() {
+        let policy = policy();
+        let maker_id = WalletId::new([5; 16]);
+        let taker_id = WalletId::new([6; 16]);
+        let mut maker_store = store(maker_id, 0x51);
+        let mut taker_store = store(taker_id, 0x61);
+        let offer = create_shakescape_hns_for_btc_offer(
+            &mut maker_store,
+            &policy.board_policy(),
+            ShakescapeHnsForBtcOfferRequest {
+                wallet_id: maker_id,
+                hns_amount_dollarydoos: 2_000_000,
+                btc_amount_sats: 9_000,
+                hns_fee_reserve_dollarydoos: 10_000,
+                created_at_unix: START,
+                expires_at_unix: START + 10_000,
+                nonce: [9; 32],
+            },
+        )
+        .expect("HNS maker offer");
+        let signed_offer = load_shakescape_direct_offer(
+            &maker_store,
+            &policy.board_policy(),
+            offer.offer.offer_id.into_bytes(),
+        )
+        .expect("load HNS offer")
+        .expect("HNS offer exists")
+        .offer;
+        let offer_envelope = CrossChainMessage::DirectOffer(signed_offer)
+            .encode_envelope(1)
+            .expect("offer envelope");
+        crate::admit_shakescape_direct_offer(
+            &mut taker_store,
+            &policy.board_policy(),
+            &offer_envelope,
+            START,
+        )
+        .expect("BTC taker admits offer");
+
+        let take = create_shakescape_btc_for_hns_take(
+            &mut taker_store,
+            &policy,
+            ShakescapeBtcForHnsTakeRequest {
+                wallet_id: taker_id,
+                offer_id: offer.offer.offer_id,
+                bitcoin_fee_reserve_sats: 1_000,
+                created_at_unix: START + 10,
+                expires_at_unix: START + 10_000,
+                nonce: [10; 32],
+            },
+        )
+        .expect("BTC taker signs take");
+        crate::admit_shakescape_direct_offer_take(
+            &mut maker_store,
+            &policy,
+            &take.envelope,
+            START + 10,
+        )
+        .expect("HNS maker admits take");
+
+        let proposal = create_shakescape_direct_maker_proposal(
+            &mut maker_store,
+            &policy,
+            ShakescapeBtcForHnsMakerProposalRequest {
+                wallet_id: maker_id,
+                session_id: offer.offer.session_id,
+                now_unix: START + 20,
+                funding_window_seconds: 600,
+                second_refund_after_seconds: 3_600,
+                refund_safety_margin_seconds: 3_600,
+                bitcoin_minimum_confirmations: 1,
+                hns_minimum_confirmations: 1,
+            },
+        )
+        .expect("HNS maker proposal");
+        assert_eq!(proposal.proposal.terms().offered_asset, AssetId::HNS);
+        assert_eq!(proposal.proposal.terms().received_asset, AssetId::BTC);
+        assert_eq!(
+            proposal.proposal.terms().first_funding_chain,
+            ChainId::HANDSHAKE
+        );
+        crate::admit_shakescape_direct_swap_proposal(
+            &mut taker_store,
+            &policy,
+            &proposal.envelope,
+            START + 20,
+        )
+        .expect("BTC taker admits proposal");
+        let accepted = accept_shakescape_direct_maker_proposal(
+            &mut taker_store,
+            &policy,
+            taker_id,
+            offer.offer.session_id,
+            START + 30,
+        )
+        .expect("BTC taker accepts proposal");
+        crate::admit_shakescape_direct_swap_hello(
+            &mut maker_store,
+            &policy,
+            &accepted.envelope,
+            START + 30,
+        )
+        .expect("HNS maker admits hello");
+        let maker_execution = open_shakescape_execution(
+            &mut maker_store,
+            &policy,
+            offer.offer.session_id,
+            START + 30,
+        )
+        .expect("maker execution");
+        assert_eq!(accepted.execution, maker_execution);
+        assert_eq!(accepted.execution.state, crate::SwapState::TermsFrozen);
+        assert_eq!(take.offered_asset, AssetId::HNS);
+        assert_eq!(take.received_asset, AssetId::BTC);
     }
 }

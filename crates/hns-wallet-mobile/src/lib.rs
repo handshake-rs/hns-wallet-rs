@@ -19,13 +19,14 @@ pub use hns_wallet_bitcoin_kyoto::{
     BitcoinBroadcastRecoverySummary, VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock,
 };
 pub use market::{
-    MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary,
+    MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDirectOfferSummary,
+    MobileDirectOfferTakeApproval, MobileDirectOfferTakeSummary, MobileHnsForBtcOfferApproval,
     MobileShakescapeBitcoinFundingPermit, MobileShakescapeBitcoinSettlementPermit,
     MobileShakescapeBitcoinWatchPermit, MobileShakescapeDirectAdmission,
     MobileShakescapeDirectTransportReport, MobileShakescapeExecutionSummary,
     MobileShakescapeHnsFundingPermit, MobileShakescapeHnsSettlementPermit,
-    MobileShakescapeHnsVerificationPermit, MobileShakescapeSessionController,
-    MobileShakescapeSettlementAction,
+    MobileShakescapeHnsVerificationPermit, MobileShakescapeHnsWatchPermit,
+    MobileShakescapeSessionController, MobileShakescapeSettlementAction,
 };
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
@@ -490,6 +491,7 @@ pub struct MobileShakescapeHnsFundingApproval {
 pub struct MobileShakescapeHnsFundingReceipt {
     pub session_id: String,
     pub transaction_id: String,
+    pub output_index: u32,
     pub accepted_at_unix: u64,
 }
 
@@ -2070,14 +2072,41 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             return Err(MobileWalletError::InvalidValueAction);
         }
         let hello = permit.hello();
+        let side = permit.side();
         let binding = hello
             .build_hns_htlc(
-                hns_marketplace_protocol::SwapAssetSide::Received,
-                hello.maker_settlement_public_key,
-                hello.taker_settlement_public_key,
+                side,
+                match side {
+                    hns_marketplace_protocol::SwapAssetSide::Offered => {
+                        hello.taker_settlement_public_key
+                    }
+                    hns_marketplace_protocol::SwapAssetSide::Received => {
+                        hello.maker_settlement_public_key
+                    }
+                },
+                match side {
+                    hns_marketplace_protocol::SwapAssetSide::Offered => {
+                        hello.maker_settlement_public_key
+                    }
+                    hns_marketplace_protocol::SwapAssetSide::Received => {
+                        hello.taker_settlement_public_key
+                    }
+                },
             )
             .map_err(|_| MobileWalletError::InvalidValueAction)?;
-        if binding.descriptor_hash != hello.received_lock_commitment
+        let (amount, refund_at, commitment) = match side {
+            hns_marketplace_protocol::SwapAssetSide::Offered => (
+                hello.offered_amount,
+                hello.offered_refund_deadline.value,
+                hello.offered_lock_commitment,
+            ),
+            hns_marketplace_protocol::SwapAssetSide::Received => (
+                hello.received_amount,
+                hello.received_refund_deadline.value,
+                hello.received_lock_commitment,
+            ),
+        };
+        if binding.descriptor_hash != commitment
             || binding.descriptor.refund_public_key != permit.settlement_key().public_key()
         {
             return Err(MobileWalletError::InvalidValueAction);
@@ -2094,8 +2123,8 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .service
             .trusted_native_hns_settlement_transaction_id(&prepared.0)
             .map_err(mobile_service_failure)?;
-        let amount_dollarydoos = u64::try_from(hello.received_amount.get())
-            .map_err(|_| MobileWalletError::InvalidValueAction)?;
+        let amount_dollarydoos =
+            u64::try_from(amount.get()).map_err(|_| MobileWalletError::InvalidValueAction)?;
         let fee_dollarydoos = u64::try_from(prepared.0.fee.get())
             .map_err(|_| MobileWalletError::InvalidValueAction)?;
         let action_token = random_nonzero_bytes()?;
@@ -2106,7 +2135,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             amount_dollarydoos,
             fee_dollarydoos,
             maximum_fee_dollarydoos,
-            refund_at_unix: hello.received_refund_deadline.value,
+            refund_at_unix: refund_at,
             expires_at_unix: prepared.0.expires_at_unix,
         };
         self.pending_shakescape_hns_funding = Some(PendingMobileShakescapeHnsFunding {
@@ -2141,6 +2170,9 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         Ok(MobileShakescapeHnsFundingReceipt {
             session_id: lowercase_hex(pending.session_id.as_bytes()),
             transaction_id: lowercase_hex(receipt.txid.as_bytes()),
+            // Native HNS payment construction always places the requested
+            // destination before an optional change output.
+            output_index: 0,
             accepted_at_unix: receipt.accepted_at_unix,
         })
     }
@@ -2178,14 +2210,41 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             return Err(MobileWalletError::InvalidValueAction);
         }
         let hello = permit.hello().clone();
+        let side = permit.side();
         let binding = hello
             .build_hns_htlc(
-                hns_marketplace_protocol::SwapAssetSide::Received,
-                hello.maker_settlement_public_key,
-                hello.taker_settlement_public_key,
+                side,
+                match side {
+                    hns_marketplace_protocol::SwapAssetSide::Offered => {
+                        hello.taker_settlement_public_key
+                    }
+                    hns_marketplace_protocol::SwapAssetSide::Received => {
+                        hello.maker_settlement_public_key
+                    }
+                },
+                match side {
+                    hns_marketplace_protocol::SwapAssetSide::Offered => {
+                        hello.maker_settlement_public_key
+                    }
+                    hns_marketplace_protocol::SwapAssetSide::Received => {
+                        hello.taker_settlement_public_key
+                    }
+                },
             )
             .map_err(|_| MobileWalletError::InvalidValueAction)?;
-        if binding.descriptor_hash != hello.received_lock_commitment {
+        let (amount, confirmations, commitment) = match side {
+            hns_marketplace_protocol::SwapAssetSide::Offered => (
+                hello.offered_amount,
+                hello.offered_minimum_confirmations,
+                hello.offered_lock_commitment,
+            ),
+            hns_marketplace_protocol::SwapAssetSide::Received => (
+                hello.received_amount,
+                hello.received_minimum_confirmations,
+                hello.received_lock_commitment,
+            ),
+        };
+        if binding.descriptor_hash != commitment {
             return Err(MobileWalletError::InvalidValueAction);
         }
         let expected_key = match permit.action() {
@@ -2202,7 +2261,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .verify_trusted_native_persisted_hns_htlc_lock(
                 session_id,
                 binding.descriptor,
-                hello.received_minimum_confirmations,
+                confirmations,
             )
             .map_err(mobile_service_failure)?
             .ok_or(MobileWalletError::InvalidValueAction)?;
@@ -2241,8 +2300,8 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .service
             .trusted_native_hns_settlement_transaction_id(&prepared)
             .map_err(mobile_service_failure)?;
-        let input_amount_dollarydoos = u64::try_from(hello.received_amount.get())
-            .map_err(|_| MobileWalletError::InvalidValueAction)?;
+        let input_amount_dollarydoos =
+            u64::try_from(amount.get()).map_err(|_| MobileWalletError::InvalidValueAction)?;
         let fee_dollarydoos =
             u64::try_from(prepared.fee.get()).map_err(|_| MobileWalletError::InvalidValueAction)?;
         let output_amount_dollarydoos = input_amount_dollarydoos
@@ -2328,24 +2387,59 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         permit: MobileShakescapeHnsVerificationPermit,
     ) -> Result<Option<hns_wallet_chain_api::VerifiedLock>, MobileWalletError> {
         let hello = permit.hello();
+        let side = permit.side();
         let binding = hello
             .build_hns_htlc(
-                hns_marketplace_protocol::SwapAssetSide::Received,
-                hello.maker_settlement_public_key,
-                hello.taker_settlement_public_key,
+                side,
+                match side {
+                    hns_marketplace_protocol::SwapAssetSide::Offered => {
+                        hello.taker_settlement_public_key
+                    }
+                    hns_marketplace_protocol::SwapAssetSide::Received => {
+                        hello.maker_settlement_public_key
+                    }
+                },
+                match side {
+                    hns_marketplace_protocol::SwapAssetSide::Offered => {
+                        hello.maker_settlement_public_key
+                    }
+                    hns_marketplace_protocol::SwapAssetSide::Received => {
+                        hello.taker_settlement_public_key
+                    }
+                },
             )
             .map_err(|_| MobileWalletError::InvalidValueAction)?;
-        if binding.descriptor_hash != hello.received_lock_commitment {
+        let (commitment, confirmations) = match side {
+            hns_marketplace_protocol::SwapAssetSide::Offered => (
+                hello.offered_lock_commitment,
+                hello.offered_minimum_confirmations,
+            ),
+            hns_marketplace_protocol::SwapAssetSide::Received => (
+                hello.received_lock_commitment,
+                hello.received_minimum_confirmations,
+            ),
+        };
+        if binding.descriptor_hash != commitment {
             return Err(MobileWalletError::InvalidValueAction);
         }
-        self.session
-            .service
-            .verify_trusted_native_persisted_hns_htlc_lock(
-                hns_wallet_types::SessionId::new(hello.swap_session_id),
+        let session_id = hns_wallet_types::SessionId::new(hello.swap_session_id);
+        match permit.funding_transaction() {
+            Some(transaction) => self.session.service.verify_trusted_native_hns_htlc_lock(
+                session_id,
                 binding.descriptor,
-                hello.received_minimum_confirmations,
-            )
-            .map_err(mobile_service_failure)
+                transaction,
+                confirmations,
+            ),
+            None => self
+                .session
+                .service
+                .verify_trusted_native_persisted_hns_htlc_lock(
+                    session_id,
+                    binding.descriptor,
+                    confirmations,
+                ),
+        }
+        .map_err(mobile_service_failure)
     }
 
     pub fn verified_shakescape_hns_spend(
@@ -2353,27 +2447,59 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         permit: MobileShakescapeHnsVerificationPermit,
     ) -> Result<Option<hns_wallet_hns::VerifiedNativeHtlcSpend>, MobileWalletError> {
         let hello = permit.hello();
+        let side = permit.side();
         let binding = hello
             .build_hns_htlc(
-                hns_marketplace_protocol::SwapAssetSide::Received,
-                hello.maker_settlement_public_key,
-                hello.taker_settlement_public_key,
+                side,
+                match side {
+                    hns_marketplace_protocol::SwapAssetSide::Offered => {
+                        hello.taker_settlement_public_key
+                    }
+                    hns_marketplace_protocol::SwapAssetSide::Received => {
+                        hello.maker_settlement_public_key
+                    }
+                },
+                match side {
+                    hns_marketplace_protocol::SwapAssetSide::Offered => {
+                        hello.maker_settlement_public_key
+                    }
+                    hns_marketplace_protocol::SwapAssetSide::Received => {
+                        hello.taker_settlement_public_key
+                    }
+                },
             )
             .map_err(|_| MobileWalletError::InvalidValueAction)?;
-        if binding.descriptor_hash != hello.received_lock_commitment {
+        let (commitment, confirmations) = match side {
+            hns_marketplace_protocol::SwapAssetSide::Offered => (
+                hello.offered_lock_commitment,
+                hello.offered_minimum_confirmations,
+            ),
+            hns_marketplace_protocol::SwapAssetSide::Received => (
+                hello.received_lock_commitment,
+                hello.received_minimum_confirmations,
+            ),
+        };
+        if binding.descriptor_hash != commitment {
             return Err(MobileWalletError::InvalidValueAction);
         }
         let session_id = hns_wallet_types::SessionId::new(hello.swap_session_id);
-        let Some(lock) = self
-            .session
-            .service
-            .verify_trusted_native_persisted_hns_htlc_lock(
+        let verified = match permit.funding_transaction() {
+            Some(transaction) => self.session.service.verify_trusted_native_hns_htlc_lock(
                 session_id,
-                binding.descriptor,
-                hello.received_minimum_confirmations,
-            )
-            .map_err(mobile_service_failure)?
-        else {
+                binding.descriptor.clone(),
+                transaction,
+                confirmations,
+            ),
+            None => self
+                .session
+                .service
+                .verify_trusted_native_persisted_hns_htlc_lock(
+                    session_id,
+                    binding.descriptor.clone(),
+                    confirmations,
+                ),
+        };
+        let Some(lock) = verified.map_err(mobile_service_failure)? else {
             return Ok(None);
         };
         self.session
@@ -3547,6 +3673,8 @@ pub enum MobileWalletError {
     InvalidDirectOfferAction,
     #[error("confirmed Bitcoin does not cover active offers, this offer, and its fee reserve")]
     InsufficientBitcoinForDirectOffer,
+    #[error("insufficient confirmed HNS for direct offer")]
+    InsufficientHnsForDirectOffer,
     #[error("private wallet host/service response was unexpected")]
     UnexpectedResponse,
     #[error("private mobile wallet controller failed closed and must be reopened")]
