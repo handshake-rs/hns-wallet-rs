@@ -1837,7 +1837,7 @@ impl KyotoSupervisor {
             result = tokio::time::timeout(self.sync_timeout, self.updates.update()) => result,
         };
         let network_ms = elapsed_millis(network_started);
-        let update = match update_result {
+        let mut update = match update_result {
             Ok(Ok(update)) => update,
             Ok(Err(_)) => {
                 self.poisoned = true;
@@ -1874,6 +1874,17 @@ impl KyotoSupervisor {
             })
             .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
         announced_tip.validate(self.durable.state.network)?;
+        let dense_wallet_chain = update
+            .wallet_update
+            .chain
+            .as_ref()
+            .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
+        update.wallet_update.chain = Some(sparse_wallet_chain_update(
+            wallet,
+            dense_wallet_chain,
+            &update.wallet_update.tx_update,
+            self.durable.state.recovery_checkpoint,
+        )?);
         self.store.try_with_store_mut(|store| {
             reconcile_bitcoin_htlc_watches(
                 store,
@@ -3410,6 +3421,60 @@ pub fn initialize_pristine_wallet_at_recovery_checkpoint(
     Ok(())
 }
 
+/// Reduce Kyoto's per-header chain to the checkpoints BDK actually needs.
+///
+/// Kyoto intentionally accumulates every connected header while scanning so
+/// callers can validate arbitrary matched blocks. Persisting that dense chain
+/// is unnecessary for a descriptor wallet and makes an initial recovery
+/// changeset grow linearly with the birthday-to-tip distance. Keep the dense
+/// chain for swap-evidence reconciliation, but give BDK a sparse update that
+/// still has an unambiguous connection to its current chain, a bounded reorg
+/// window, the recovery anchor when it remains canonical, and every new wallet
+/// transaction anchor.
+fn sparse_wallet_chain_update(
+    wallet: &Wallet,
+    canonical_chain: &CheckPoint,
+    transaction_update: &TxUpdate<ConfirmationBlockTime>,
+    recovery_checkpoint: BitcoinCheckpoint,
+) -> Result<CheckPoint, BitcoinWalletError> {
+    let mut retained = BTreeMap::<u32, BlockHash>::new();
+
+    // Include the canonical block at every height BDK currently stores. This
+    // both preserves agreement points and explicitly invalidates a replaced
+    // sparse checkpoint during a reorganization.
+    for current in wallet.checkpoints() {
+        let canonical = canonical_chain
+            .get(current.height())
+            .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
+        retained.insert(canonical.height(), canonical.hash());
+    }
+
+    for recent in canonical_chain.iter().take(MAX_RECENT_BITCOIN_CHECKPOINTS) {
+        retained.insert(recent.height(), recent.hash());
+    }
+
+    if let Some(recovery) = canonical_chain.get(recovery_checkpoint.height)
+        && recovery.hash().to_byte_array() == recovery_checkpoint.block_hash
+    {
+        retained.insert(recovery.height(), recovery.hash());
+    }
+
+    for (anchor, _) in &transaction_update.anchors {
+        let canonical = canonical_chain
+            .get(anchor.block_id.height)
+            .filter(|checkpoint| checkpoint.hash() == anchor.block_id.hash)
+            .ok_or(BitcoinWalletError::InvalidEvidence)?;
+        retained.insert(canonical.height(), canonical.hash());
+    }
+
+    CheckPoint::from_block_ids(
+        retained
+            .into_iter()
+            .map(|(height, hash)| BlockId { height, hash }),
+    )
+    .map_err(|_| BitcoinWalletError::InvalidCheckpoint)
+}
+
 fn wallet_recent_checkpoints(
     wallet: &Wallet,
     recovery_checkpoint: BitcoinCheckpoint,
@@ -3752,6 +3817,181 @@ mod restart_tests {
             height,
             block_hash: [byte; 32],
         }
+    }
+
+    fn block_hash(height: u32) -> BlockHash {
+        let mut bytes = [0_u8; 32];
+        bytes[..4].copy_from_slice(&height.to_be_bytes());
+        bytes[4..8].copy_from_slice(&height.wrapping_mul(2_654_435_761).to_be_bytes());
+        BlockHash::from_byte_array(bytes)
+    }
+
+    #[test]
+    fn initial_filter_scan_persists_a_sparse_wallet_chain() {
+        const BIRTHDAY: u32 = 900_000;
+        const TIP: u32 = 966_025;
+
+        let store = SharedWalletStore::new(
+            WalletStore::create(":memory:", TEST_STORE_PASSPHRASE).expect("in-memory store"),
+        );
+        let seed = [7_u8; crate::BIP39_SEED_BYTES];
+        let mut wallet = crate::create_persisted_descriptor_wallet_from_seed(
+            &seed,
+            Network::Regtest,
+            store.clone(),
+            b"dense-filter-scan",
+            1,
+        )
+        .expect("persisted descriptor wallet");
+        let genesis = wallet.latest_checkpoint().block_id();
+        let birthday_id = BlockId {
+            height: BIRTHDAY,
+            hash: block_hash(BIRTHDAY),
+        };
+        wallet
+            .apply_update(Update {
+                chain: Some(
+                    CheckPoint::new(genesis)
+                        .push(birthday_id)
+                        .expect("birthday follows genesis"),
+                ),
+                ..Update::default()
+            })
+            .expect("install birthday");
+        assert!(wallet.persist(2).expect("persist birthday"));
+
+        let dense = wallet
+            .latest_checkpoint()
+            .extend(((BIRTHDAY + 1)..=TIP).map(|height| BlockId {
+                height,
+                hash: block_hash(height),
+            }))
+            .expect("ascending dense chain");
+        assert_eq!(dense.iter().count(), (TIP - BIRTHDAY + 2) as usize);
+        let recovery_checkpoint = BitcoinCheckpoint {
+            height: BIRTHDAY,
+            block_hash: birthday_id.hash.to_byte_array(),
+        };
+        let sparse =
+            sparse_wallet_chain_update(&wallet, &dense, &TxUpdate::default(), recovery_checkpoint)
+                .expect("sparse wallet update");
+        assert!(sparse.iter().count() <= MAX_RECENT_BITCOIN_CHECKPOINTS + 2);
+        assert_eq!(sparse.height(), TIP);
+        assert_eq!(
+            sparse.get(BIRTHDAY).map(|checkpoint| checkpoint.hash()),
+            Some(birthday_id.hash)
+        );
+
+        wallet
+            .apply_update(Update {
+                chain: Some(sparse),
+                ..Update::default()
+            })
+            .expect("apply sparse scan result");
+        assert!(wallet.persist(3).expect("persist sparse scan result"));
+
+        let loaded = crate::load_persisted_descriptor_wallet_from_seed(
+            &seed,
+            Network::Regtest,
+            store,
+            b"dense-filter-scan",
+            4,
+        )
+        .expect("reload sparse scan result");
+        assert_eq!(loaded.latest_checkpoint().height(), TIP);
+        assert!(loaded.checkpoints().count() <= MAX_RECENT_BITCOIN_CHECKPOINTS + 2);
+    }
+
+    #[test]
+    fn sparse_wallet_chain_explicitly_connects_reorgs_and_retains_transaction_anchors() {
+        let mut wallet = crate::create_descriptor_wallet_from_seed(
+            &[11_u8; crate::BIP39_SEED_BYTES],
+            Network::Regtest,
+        )
+        .expect("descriptor wallet");
+        let genesis = wallet.latest_checkpoint().block_id();
+        let agreement = BlockId {
+            height: 100,
+            hash: block_hash(100),
+        };
+        let replaced = BlockId {
+            height: 500,
+            hash: BlockHash::from_byte_array([0x55; 32]),
+        };
+        wallet
+            .apply_update(Update {
+                chain: Some(
+                    CheckPoint::from_block_ids([genesis, agreement, replaced])
+                        .expect("old sparse chain"),
+                ),
+                ..Update::default()
+            })
+            .expect("install old branch");
+
+        let canonical_at_replaced_height = BlockId {
+            height: replaced.height,
+            hash: block_hash(replaced.height),
+        };
+        let canonical = CheckPoint::from_block_ids(
+            [genesis, agreement, canonical_at_replaced_height]
+                .into_iter()
+                .chain((501..=1_000).map(|height| BlockId {
+                    height,
+                    hash: block_hash(height),
+                })),
+        )
+        .expect("replacement branch");
+        let anchor = ConfirmationBlockTime {
+            block_id: BlockId {
+                height: 750,
+                hash: block_hash(750),
+            },
+            confirmation_time: 1_700_000_000,
+        };
+        let mut transaction_update = TxUpdate::default();
+        transaction_update.anchors.insert((
+            anchor,
+            bdk_wallet::bitcoin::Txid::from_byte_array([0x77; 32]),
+        ));
+
+        let sparse = sparse_wallet_chain_update(
+            &wallet,
+            &canonical,
+            &transaction_update,
+            BitcoinCheckpoint {
+                height: agreement.height,
+                block_hash: agreement.hash.to_byte_array(),
+            },
+        )
+        .expect("sparse reorganization update");
+        assert_eq!(
+            sparse
+                .get(replaced.height)
+                .map(|checkpoint| checkpoint.hash()),
+            Some(canonical_at_replaced_height.hash)
+        );
+        assert_eq!(
+            sparse
+                .get(anchor.block_id.height)
+                .map(|checkpoint| checkpoint.hash()),
+            Some(anchor.block_id.hash)
+        );
+
+        wallet
+            .apply_update(Update {
+                tx_update: transaction_update,
+                chain: Some(sparse),
+                ..Update::default()
+            })
+            .expect("sparse chain unambiguously replaces the old branch");
+        assert_eq!(wallet.latest_checkpoint().height(), 1_000);
+        assert_eq!(
+            wallet
+                .latest_checkpoint()
+                .get(replaced.height)
+                .map(|checkpoint| checkpoint.hash()),
+            Some(canonical_at_replaced_height.hash)
+        );
     }
 
     #[test]
