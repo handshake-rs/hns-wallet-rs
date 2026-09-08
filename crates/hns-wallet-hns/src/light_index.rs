@@ -273,6 +273,7 @@ struct HnsLightScanProjection {
     watched_scripts: BTreeSet<WalletAddressKey>,
     watched_names: BTreeSet<[u8; 32]>,
     watched_outpoints: HashSet<Outpoint>,
+    confirmed_spends: HashSet<Outpoint>,
     transaction_ids: BTreeSet<[u8; 32]>,
     transaction_count: usize,
 }
@@ -283,6 +284,7 @@ impl HnsLightScanProjection {
             watched_scripts: watch_set.scripts.iter().cloned().collect(),
             watched_names: watch_set.name_hashes.iter().copied().collect(),
             watched_outpoints: HashSet::new(),
+            confirmed_spends: HashSet::new(),
             transaction_ids: BTreeSet::new(),
             transaction_count: 0,
         }
@@ -303,6 +305,11 @@ impl HnsLightScanProjection {
                 CanonicalTransactionHash::new(txid),
                 &projection.watched_scripts,
                 &mut projection.watched_outpoints,
+            )?;
+            add_confirmed_spends(
+                &observation.transaction,
+                None,
+                &mut projection.confirmed_spends,
             )?;
         }
         projection.transaction_count = observations.len();
@@ -728,6 +735,7 @@ impl EncryptedHnsLightIndex {
         // succeeds. This makes a later in-batch spend visible while preserving
         // fail-closed replay behavior after any error.
         let mut added_watched_outpoints = HashSet::new();
+        let mut added_confirmed_spends = HashSet::new();
         let mut admitted_txids = BTreeSet::new();
         let mut saves = Vec::new();
         let mut admitted_total = 0usize;
@@ -794,6 +802,11 @@ impl EncryptedHnsLightIndex {
                 if !relevant {
                     continue;
                 }
+                add_confirmed_spends(
+                    transaction,
+                    Some(&self.scan_projection.confirmed_spends),
+                    &mut added_confirmed_spends,
+                )?;
                 admitted_txids.insert(txid_bytes);
                 let raw = transaction.encode()?;
                 let stored = StoredHnsLightTransaction {
@@ -852,6 +865,9 @@ impl EncryptedHnsLightIndex {
         self.scan_projection
             .watched_outpoints
             .extend(added_watched_outpoints);
+        self.scan_projection
+            .confirmed_spends
+            .extend(added_confirmed_spends);
         self.scan_projection.transaction_ids.extend(admitted_txids);
         self.scan_projection.transaction_count = self
             .scan_projection
@@ -983,6 +999,61 @@ impl EncryptedHnsLightIndex {
         self.decoded_transactions()
     }
 
+    /// Load and authenticate one confirmed observation without decoding the
+    /// account's complete retained history.
+    pub(crate) fn transaction(
+        &self,
+        txid: TransactionHash,
+    ) -> Result<Option<VerifiedHnsTransactionObservation>, HnsLightIndexError> {
+        let txid = txid.into_bytes();
+        let id = transaction_id(self.account_id, txid);
+        let stored: Option<StoredEntity<StoredHnsLightWalletRecord>> = self
+            .store
+            .with_store(|wallet| wallet.hns_light_wallet(&id))?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        let StoredHnsLightWalletRecord::Transaction(transaction) = stored.value else {
+            return Err(HnsLightIndexError::WrongRecordKind);
+        };
+        if stored.id != id || transaction.txid != txid {
+            return Err(HnsLightIndexError::CorruptTransactionRecord);
+        }
+        transaction.decode(self.network).map(Some)
+    }
+
+    pub(crate) fn has_confirmed_spend(&self, outpoint: &Outpoint) -> bool {
+        self.scan_projection.confirmed_spends.contains(outpoint)
+    }
+
+    pub(crate) fn tracks_transaction(
+        &self,
+        transaction: &Transaction,
+        pending_watched_outpoints: &HashSet<Outpoint>,
+    ) -> bool {
+        transaction_relevant_with_pending_outpoints(
+            transaction,
+            &self.scan_projection.watched_scripts,
+            &self.scan_projection.watched_names,
+            &self.scan_projection.watched_outpoints,
+            pending_watched_outpoints,
+        )
+    }
+
+    pub(crate) fn collect_watched_outputs(
+        &self,
+        transaction: &Transaction,
+        txid: CanonicalTransactionHash,
+        outpoints: &mut HashSet<Outpoint>,
+    ) -> Result<(), HnsLightIndexError> {
+        add_watched_outputs(
+            transaction,
+            txid,
+            &self.scan_projection.watched_scripts,
+            outpoints,
+        )
+    }
+
     fn stored_transactions(
         &self,
     ) -> Result<Vec<StoredEntity<StoredHnsLightWalletRecord>>, HnsLightIndexError> {
@@ -1095,6 +1166,24 @@ pub(crate) fn add_watched_outputs(
                 transaction_hash: txid,
                 index: u32::try_from(index).map_err(|_| HnsLightIndexError::TransactionCapacity)?,
             });
+        }
+    }
+    Ok(())
+}
+
+fn add_confirmed_spends(
+    transaction: &Transaction,
+    existing: Option<&HashSet<Outpoint>>,
+    added: &mut HashSet<Outpoint>,
+) -> Result<(), HnsLightIndexError> {
+    for input in &transaction.inputs {
+        if input.previous_output.is_null() {
+            continue;
+        }
+        if existing.is_some_and(|spends| spends.contains(&input.previous_output))
+            || !added.insert(input.previous_output)
+        {
+            return Err(HnsLightIndexError::EvidenceMismatch);
         }
     }
     Ok(())

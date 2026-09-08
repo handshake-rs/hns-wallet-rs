@@ -3728,13 +3728,17 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             &account_entity_prefix(&config),
             MAX_HISTORY_RESULTS,
         )?;
+        let existing_hashes = existing
+            .iter()
+            .map(|stored| stored.value.name_hash)
+            .collect::<BTreeSet<_>>();
+        let existing_revisions = existing
+            .iter()
+            .map(|stored| (stored.id.as_slice(), stored.revision))
+            .collect::<BTreeMap<_, _>>();
         let novel = imported
             .iter()
-            .filter(|name| {
-                !existing
-                    .iter()
-                    .any(|stored| stored.value.name_hash == name.name_hash)
-            })
+            .filter(|name| !existing_hashes.contains(&name.name_hash))
             .count();
         if existing
             .len()
@@ -3749,10 +3753,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 let id = namespaced_name_id(&config, name.name_hash);
                 EntityBatchSave {
                     id: id.to_vec(),
-                    expected_revision: existing
-                        .iter()
-                        .find(|stored| stored.id.as_slice() == id.as_slice())
-                        .map_or(0, |stored| stored.revision),
+                    expected_revision: existing_revisions
+                        .get(id.as_slice())
+                        .copied()
+                        .unwrap_or_default(),
                     value: name.clone(),
                     updated_at_unix: now,
                 }
@@ -7124,6 +7128,10 @@ fn reconcile_hns_read_names<B: HnsBackend>(
         .cloned()
         .collect::<Vec<_>>();
     validate_wallet_name_addresses(&wallet_name_addresses)?;
+    let wallet_name_addresses_by_derivation = wallet_name_addresses
+        .iter()
+        .map(|address| (address.derivation, address))
+        .collect::<BTreeMap<_, _>>();
     let mut discovered = BTreeMap::new();
     for coin in coins {
         if !is_wallet_name_control_derivation(coin.derivation) {
@@ -7133,9 +7141,9 @@ fn reconcile_hns_read_names<B: HnsBackend>(
         if canonical_coin.covenant.kind != CovenantKind::Finalize {
             continue;
         }
-        let address = wallet_name_addresses
-            .iter()
-            .find(|address| address.derivation == coin.derivation)
+        let address = wallet_name_addresses_by_derivation
+            .get(&coin.derivation)
+            .copied()
             .ok_or(HnsWalletError::InvalidEvidence)?;
         if address.program != coin.address_program
             || canonical_coin.address.version != 0

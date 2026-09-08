@@ -1509,14 +1509,15 @@ impl NativeHnsPeerPool {
     ) -> Result<usize, HnsDirectPeerError> {
         let port = default_peer_port(self.config.network);
         let mut discovered = Vec::new();
+        let mut discovered_set = HashSet::new();
         let mut last_error = None;
         for seed in &self.config.dns_seeds {
             match (seed.as_str(), port).to_socket_addrs() {
                 Ok(addresses) => {
                     for address in addresses {
                         if self.address_allowed(address, false)
-                            && !discovered.contains(&address)
                             && discovered.len() < MAX_DISCOVERED_ADDRESSES
+                            && discovered_set.insert(address)
                         {
                             discovered.push(address);
                         }

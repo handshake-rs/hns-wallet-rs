@@ -13,7 +13,6 @@ use hns_transaction::{Coin, Output, Transaction};
 use hns_wallet_types::{BaseUnits, TransactionHash};
 use sha2::{Digest, Sha256};
 
-use crate::light_index::{add_watched_outputs, transaction_relevant};
 use crate::{
     ActiveNameOwnerCoinEvidence, ActiveNameOwnerCoinSourceBinding, BlockHashEvidence, ChainTip,
     ConfirmedWalletPage, ConfirmedWalletPageRequest, DEFAULT_FEE_TARGET_BLOCKS,
@@ -69,6 +68,8 @@ struct EmbeddedMempool {
     instance_nonce: [u8; 32],
     generation: u64,
     transactions: BTreeMap<[u8; 32], MempoolTransaction>,
+    spenders: HashMap<Outpoint, [u8; 32]>,
+    watched_outpoints: HashSet<Outpoint>,
 }
 
 #[derive(Clone)]
@@ -105,6 +106,8 @@ impl EmbeddedHnsBackend {
                     instance_nonce,
                     generation: 1,
                     transactions: BTreeMap::new(),
+                    spenders: HashMap::new(),
+                    watched_outpoints: HashSet::new(),
                 },
                 connected_peers: HashSet::new(),
                 peer_fee_rates: HashMap::new(),
@@ -126,7 +129,7 @@ impl EmbeddedHnsBackend {
             .install_watch_set(watch_set, now_unix)
             .map_err(map_index_error)?;
         if changed {
-            state.mempool.transactions.clear();
+            clear_mempool(&mut state.mempool);
             advance_mempool_generation(&mut state.mempool)?;
         }
         Ok(changed)
@@ -160,7 +163,7 @@ impl EmbeddedHnsBackend {
             .extend_watch_set_without_rewind(extended, now_unix)
             .map_err(map_index_error)?;
         if changed {
-            state.mempool.transactions.clear();
+            clear_mempool(&mut state.mempool);
             advance_mempool_generation(&mut state.mempool)?;
         }
         Ok(changed)
@@ -242,10 +245,26 @@ impl EmbeddedHnsBackend {
         account: &crate::HnsAccountRecord,
         now_unix: u64,
     ) -> Result<bool, HnsWalletError> {
-        self.lock()?
+        let mut state = self.lock()?;
+        let changed = state
             .index
             .extend_locally_allocated_change_watch_set(account, now_unix)
-            .map_err(map_index_error)
+            .map_err(map_index_error)?;
+        if changed {
+            let mut watched_outpoints = HashSet::new();
+            for (txid, item) in &state.mempool.transactions {
+                state
+                    .index
+                    .collect_watched_outputs(
+                        &item.transaction,
+                        hns_primitives::TransactionHash::new(*txid),
+                        &mut watched_outpoints,
+                    )
+                    .map_err(map_index_error)?;
+            }
+            state.mempool.watched_outpoints = watched_outpoints;
+        }
+        Ok(changed)
     }
 
     /// Current authenticated header-sync status owned by this wallet.
@@ -523,7 +542,7 @@ impl EmbeddedHnsBackend {
                     .transaction_hash()
                     .map_err(|_| HnsWalletError::InvalidEvidence)?
                     .into_bytes();
-                changed |= mempool.transactions.remove(&txid).is_some();
+                changed |= remove_mempool_transaction(mempool, txid);
             }
         }
         if changed {
@@ -549,7 +568,23 @@ impl EmbeddedHnsBackend {
         if !mempool_transaction_relevant(&state, &transaction)? {
             return Ok(None);
         }
-        admit_mempool(&mut state.mempool, txid, transaction, raw, first_seen_unix)?;
+        let mut watched_outpoints = HashSet::new();
+        state
+            .index
+            .collect_watched_outputs(
+                &transaction,
+                hns_primitives::TransactionHash::new(txid),
+                &mut watched_outpoints,
+            )
+            .map_err(map_index_error)?;
+        admit_mempool(
+            &mut state.mempool,
+            txid,
+            transaction,
+            raw,
+            first_seen_unix,
+            watched_outpoints,
+        )?;
         Ok(Some(TransactionHash::new(txid)))
     }
 
@@ -744,28 +779,28 @@ impl HnsBackend for EmbeddedHnsBackend {
         if expected_mempool.is_some_and(|expected| expected != mempool) {
             return Err(HnsWalletError::StaleNodeSnapshot);
         }
-        let observations = state.index.transactions().map_err(map_index_error)?;
-        if let Some(observation) = observations.iter().find(|item| item.txid == txid) {
+        if let Some(observation) = state.index.transaction(txid).map_err(map_index_error)? {
             let confirmations = confirmation_count(binding.tip.height, observation.height)?;
+            let inclusion = inclusion(&observation);
             return Ok(TransactionEvidence {
                 binding,
                 mempool,
-                raw: Some(observation.raw.clone()),
+                raw: Some(observation.raw),
                 status: TransactionStatus {
                     in_mempool: false,
                     confirmation_count: confirmations,
                     conflicted: false,
                 },
-                inclusion: Some(inclusion(observation)),
+                inclusion: Some(inclusion),
             });
         }
         if let Some(transaction) = state.mempool.transactions.get(txid.as_bytes()) {
             let conflicted = mempool_transaction_conflicted(
                 txid.into_bytes(),
                 &transaction.transaction,
-                &observations,
+                &state.index,
                 &state.mempool,
-            )?;
+            );
             return Ok(TransactionEvidence {
                 binding,
                 mempool,
@@ -1867,19 +1902,11 @@ fn embedded_mempool_spender(
         transaction_hash: hns_primitives::TransactionHash::new(owner.transaction.into_bytes()),
         index: owner.output_index,
     };
-    let mut spender = None;
-    for (txid, transaction) in &mempool.transactions {
-        if transaction
-            .transaction
-            .inputs
-            .iter()
-            .any(|input| input.previous_output == owner)
-            && spender.replace(TransactionHash::new(*txid)).is_some()
-        {
-            return Err(HnsWalletError::InvalidEvidence);
-        }
-    }
-    Ok(spender)
+    Ok(mempool
+        .spenders
+        .get(&owner)
+        .copied()
+        .map(TransactionHash::new))
 }
 
 fn embedded_block_hash(state: &EmbeddedState, height: u32) -> Result<[u8; 32], HnsWalletError> {
@@ -1943,12 +1970,10 @@ fn mempool_transaction_relevant(
         return Err(HnsWalletError::InvalidEvidence);
     }
 
-    let observations = state.index.transactions().map_err(map_index_error)?;
-    let confirmed = confirmed_spends(&observations)?;
     if transaction
         .inputs
         .iter()
-        .any(|input| confirmed.contains_key(&input.previous_output))
+        .any(|input| state.index.has_confirmed_spend(&input.previous_output))
     {
         return Err(HnsWalletError::InvalidEvidence);
     }
@@ -1956,62 +1981,18 @@ fn mempool_transaction_relevant(
         .transaction_hash()
         .map_err(|_| HnsWalletError::InvalidEvidence)?
         .into_bytes();
-    if state
-        .mempool
-        .transactions
-        .iter()
-        .any(|(candidate_txid, candidate)| {
-            *candidate_txid != txid
-                && candidate.transaction.inputs.iter().any(|input| {
-                    transaction
-                        .inputs
-                        .iter()
-                        .any(|current| current.previous_output == input.previous_output)
-                })
-        })
-    {
+    if unique_inputs.iter().any(|outpoint| {
+        state
+            .mempool
+            .spenders
+            .get(outpoint)
+            .is_some_and(|candidate_txid| *candidate_txid != txid)
+    }) {
         return Err(HnsWalletError::InvalidEvidence);
     }
-
-    let watched_scripts = state
+    Ok(state
         .index
-        .watch_set()
-        .scripts
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let watched_names = state
-        .index
-        .watch_set()
-        .name_hashes
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let mut watched_outpoints = HashSet::new();
-    for observation in &observations {
-        add_watched_outputs(
-            &observation.transaction,
-            hns_primitives::TransactionHash::new(observation.txid.into_bytes()),
-            &watched_scripts,
-            &mut watched_outpoints,
-        )
-        .map_err(map_index_error)?;
-    }
-    for (candidate_txid, candidate) in &state.mempool.transactions {
-        add_watched_outputs(
-            &candidate.transaction,
-            hns_primitives::TransactionHash::new(*candidate_txid),
-            &watched_scripts,
-            &mut watched_outpoints,
-        )
-        .map_err(map_index_error)?;
-    }
-    Ok(transaction_relevant(
-        transaction,
-        &watched_scripts,
-        &watched_names,
-        &watched_outpoints,
-    ))
+        .tracks_transaction(transaction, &state.mempool.watched_outpoints))
 }
 
 fn confirmed_rows(
@@ -2298,29 +2279,25 @@ fn confirmed_spends(
 fn mempool_transaction_conflicted(
     txid: [u8; 32],
     transaction: &Transaction,
-    confirmed: &[VerifiedHnsTransactionObservation],
+    index: &EncryptedHnsLightIndex,
     mempool: &EmbeddedMempool,
-) -> Result<bool, HnsWalletError> {
-    let confirmed_spends = confirmed_spends(confirmed)?;
+) -> bool {
     for input in &transaction.inputs {
         if input.previous_output.is_null() {
             continue;
         }
-        if confirmed_spends.contains_key(&input.previous_output) {
-            return Ok(true);
+        if index.has_confirmed_spend(&input.previous_output) {
+            return true;
         }
-        if mempool.transactions.iter().any(|(other_txid, other)| {
-            *other_txid != txid
-                && other
-                    .transaction
-                    .inputs
-                    .iter()
-                    .any(|candidate| candidate.previous_output == input.previous_output)
-        }) {
-            return Ok(true);
+        if mempool
+            .spenders
+            .get(&input.previous_output)
+            .is_some_and(|other_txid| *other_txid != txid)
+        {
+            return true;
         }
     }
-    Ok(false)
+    false
 }
 
 fn confirmation_count(tip_height: u64, height: u32) -> Result<u32, HnsWalletError> {
@@ -2352,6 +2329,7 @@ fn admit_mempool(
     transaction: Transaction,
     raw: Vec<u8>,
     first_seen_unix: u64,
+    watched_outpoints: HashSet<Outpoint>,
 ) -> Result<(), HnsWalletError> {
     if mempool.transactions.len() >= MAX_MEMPOOL_SCAN_RESULTS
         && !mempool.transactions.contains_key(&txid)
@@ -2364,6 +2342,17 @@ fn admit_mempool(
         }
         return Err(HnsWalletError::InvalidEvidence);
     }
+    if transaction.inputs.iter().any(|input| {
+        !input.previous_output.is_null() && mempool.spenders.contains_key(&input.previous_output)
+    }) {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    for input in &transaction.inputs {
+        if !input.previous_output.is_null() {
+            mempool.spenders.insert(input.previous_output, txid);
+        }
+    }
+    mempool.watched_outpoints.extend(watched_outpoints);
     mempool.transactions.insert(
         txid,
         MempoolTransaction {
@@ -2373,6 +2362,34 @@ fn admit_mempool(
         },
     );
     advance_mempool_generation(mempool)
+}
+
+fn clear_mempool(mempool: &mut EmbeddedMempool) {
+    mempool.transactions.clear();
+    mempool.spenders.clear();
+    mempool.watched_outpoints.clear();
+}
+
+fn remove_mempool_transaction(mempool: &mut EmbeddedMempool, txid: [u8; 32]) -> bool {
+    let Some(removed) = mempool.transactions.remove(&txid) else {
+        return false;
+    };
+    for input in &removed.transaction.inputs {
+        if mempool.spenders.get(&input.previous_output) == Some(&txid) {
+            mempool.spenders.remove(&input.previous_output);
+        }
+    }
+    let canonical_txid = hns_primitives::TransactionHash::new(txid);
+    for index in 0..removed.transaction.outputs.len() {
+        let Ok(index) = u32::try_from(index) else {
+            break;
+        };
+        mempool.watched_outpoints.remove(&Outpoint {
+            transaction_hash: canonical_txid,
+            index,
+        });
+    }
+    true
 }
 
 fn advance_mempool_generation(mempool: &mut EmbeddedMempool) -> Result<(), HnsWalletError> {
