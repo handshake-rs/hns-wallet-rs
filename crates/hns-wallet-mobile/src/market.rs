@@ -741,18 +741,11 @@ impl MobileShakescapeSessionController {
             AssetId::HNS => confirmed_hns_dollarydoos,
             _ => return Err(MobileWalletError::InvalidDirectOfferAction),
         };
-        let already_reserved = self
-            .store
-            .try_with_store(|store| {
-                hns_wallet_market::reserved_local_shakescape_taker_amount(
-                    store,
-                    &self.policy,
-                    self.wallet_id,
-                    record.offer.received_asset,
-                    now_unix,
-                )
-            })
-            .map_err(MobileWalletError::from)?;
+        let already_reserved = match record.offer.received_asset {
+            AssetId::BTC => self.reserved_bitcoin_sats(now_unix)?,
+            AssetId::HNS => self.reserved_hns_dollarydoos(now_unix)?,
+            _ => return Err(MobileWalletError::InvalidDirectOfferAction),
+        };
         if already_reserved
             .checked_add(total)
             .is_none_or(|required| required > confirmed)
