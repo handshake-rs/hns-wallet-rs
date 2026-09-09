@@ -19,14 +19,15 @@ pub use hns_wallet_bitcoin_kyoto::{
     BitcoinBroadcastRecoverySummary, VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock,
 };
 pub use market::{
-    MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDirectOfferSummary,
-    MobileDirectOfferTakeApproval, MobileDirectOfferTakeSummary, MobileHnsForBtcOfferApproval,
-    MobileShakescapeBitcoinFundingPermit, MobileShakescapeBitcoinSettlementPermit,
-    MobileShakescapeBitcoinWatchPermit, MobileShakescapeDirectAdmission,
-    MobileShakescapeDirectTransportReport, MobileShakescapeExecutionSummary,
-    MobileShakescapeHnsFundingPermit, MobileShakescapeHnsSettlementPermit,
-    MobileShakescapeHnsVerificationPermit, MobileShakescapeHnsWatchPermit,
-    MobileShakescapeSessionController, MobileShakescapeSettlementAction,
+    MINIMUM_BITCOIN_FEE_RESERVE_SATS, MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary,
+    MobileDirectOfferSummary, MobileDirectOfferTakeApproval, MobileDirectOfferTakeSummary,
+    MobileHnsForBtcOfferApproval, MobileShakescapeBitcoinFundingPermit,
+    MobileShakescapeBitcoinSettlementPermit, MobileShakescapeBitcoinWatchPermit,
+    MobileShakescapeDirectAdmission, MobileShakescapeDirectTransportReport,
+    MobileShakescapeExecutionSummary, MobileShakescapeHnsFundingPermit,
+    MobileShakescapeHnsSettlementPermit, MobileShakescapeHnsVerificationPermit,
+    MobileShakescapeHnsWatchPermit, MobileShakescapeSessionController,
+    MobileShakescapeSettlementAction,
 };
 
 use hns_primitives::BlockHash as ProtocolBlockHash;

@@ -45,10 +45,11 @@ pub use direct_maker::{
 pub use direct_taker::{
     ShakescapeBtcForHnsTakeRequest, ShakescapeDirectTakeRequest, ShakescapeHnsForBtcTakeRequest,
     ShakescapeLocalDirectTake, ShakescapeTakerAcceptedSession,
-    accept_shakescape_direct_maker_proposal, accept_shakescape_hns_for_btc_maker_proposal,
-    create_shakescape_btc_for_hns_take, create_shakescape_direct_take,
-    create_shakescape_hns_for_btc_take, derive_local_direct_taker_key,
-    derive_local_hns_for_btc_taker_key, list_local_shakescape_direct_takes,
+    abandon_pending_local_shakescape_direct_take, accept_shakescape_direct_maker_proposal,
+    accept_shakescape_hns_for_btc_maker_proposal, create_shakescape_btc_for_hns_take,
+    create_shakescape_direct_take, create_shakescape_hns_for_btc_take,
+    derive_local_direct_taker_key, derive_local_hns_for_btc_taker_key,
+    list_local_shakescape_direct_takes, list_pending_local_shakescape_direct_takes,
     reserved_local_shakescape_taker_amount,
 };
 pub use session_board::{

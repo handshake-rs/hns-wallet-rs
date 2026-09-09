@@ -18,6 +18,8 @@ use crate::{
 
 const STORAGE_VERSION: u16 = 1;
 const RECORD_PREFIX: &[u8] = b"local-direct-take/v1/";
+const ABANDONMENT_STORAGE_VERSION: u16 = 1;
+const ABANDONMENT_RECORD_PREFIX: &[u8] = b"local-direct-take-abandonment/v1/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShakescapeHnsForBtcTakeRequest {
@@ -85,6 +87,19 @@ struct PersistedLocalDirectTake {
     created_at_unix: u64,
 }
 
+/// Durable local-only tombstone for an acceptance abandoned before exact
+/// terms were countersigned. Keeping a tombstone instead of deleting the take
+/// prevents a delayed maker proposal from reactivating released funds.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedLocalDirectTakeAbandonment {
+    storage_version: u16,
+    wallet_id: WalletId,
+    offer_id: ObjectHash,
+    session_id: SessionId,
+    abandoned_at_unix: u64,
+}
+
 /// Sign and durably admit one exact take. The session identifier comes from
 /// the signed offer; the taker has no authority to replace it.
 pub fn create_shakescape_hns_for_btc_take(
@@ -143,6 +158,9 @@ pub fn create_shakescape_direct_take(
     let session_id = SessionId::new(offer.offer.swap_session_id);
     if let Some(existing) = load_local_take(store, request.wallet_id, session_id)? {
         if existing.offer_id != request.offer_id {
+            return Err(MarketError::ShakescapeDirectSwapConflict);
+        }
+        if load_local_take_abandonment(store, request.wallet_id, session_id)?.is_some() {
             return Err(MarketError::ShakescapeDirectSwapConflict);
         }
         return project_local_take(store, policy, existing);
@@ -232,6 +250,15 @@ pub fn accept_shakescape_direct_maker_proposal(
     }
     let local = load_local_take(store, wallet_id, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
+    if load_local_take_abandonment(store, wallet_id, session_id)?.is_some()
+        || load_shakescape_direct_offer(store, &policy.board_policy(), local.offer_id.into_bytes())?
+            .is_none_or(|offer| !offer.is_active_at(now_unix))
+    {
+        // Treat a delayed proposal for a locally released acceptance as
+        // unknown. The transport can safely ignore it without dropping an
+        // otherwise healthy peer connection.
+        return Err(MarketError::UnknownShakescapeDirectSwap);
+    }
     let record = load_shakescape_direct_swap(store, policy, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     if local.offer_id != ObjectHash::new(record.offer.offer_id) {
@@ -305,6 +332,73 @@ pub fn list_local_shakescape_direct_takes(
         .collect()
 }
 
+/// List local takes which still reserve funds but have not reached a durable
+/// countersigned execution. These are the only takes a user may abandon.
+pub fn list_pending_local_shakescape_direct_takes(
+    store: &WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    now_unix: u64,
+) -> Result<Vec<ShakescapeLocalDirectTake>, MarketError> {
+    if now_unix == 0 {
+        return Err(MarketError::InvalidShakescapeDirectSwap);
+    }
+    let mut pending = Vec::new();
+    for take in list_local_shakescape_direct_takes(store, policy, wallet_id)? {
+        if local_take_has_execution(store, take.session_id)?
+            || local_take_is_released(store, policy, wallet_id, &take, now_unix)?
+        {
+            continue;
+        }
+        pending.push(take);
+    }
+    Ok(pending)
+}
+
+/// Release one local acceptance before exact terms are countersigned. This
+/// cannot abandon a terms-frozen or funded execution. The durable tombstone
+/// also makes all delayed maker proposals for the session non-actionable.
+pub fn abandon_pending_local_shakescape_direct_take(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    session_id: SessionId,
+    now_unix: u64,
+) -> Result<ShakescapeLocalDirectTake, MarketError> {
+    if now_unix == 0 {
+        return Err(MarketError::InvalidShakescapeDirectSwap);
+    }
+    let local = load_local_take(store, wallet_id, session_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
+    let projected = project_local_take(store, policy, local.clone())?;
+    let swap = load_shakescape_direct_swap(store, policy, session_id)?
+        .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
+    if swap.hello.is_some() || local_take_has_execution(store, session_id)? {
+        return Err(MarketError::ShakescapeDirectSwapConflict);
+    }
+    if let Some(existing) = load_local_take_abandonment(store, wallet_id, session_id)? {
+        if existing.offer_id != local.offer_id {
+            return Err(MarketError::CorruptShakescapeDirectSwap);
+        }
+        return Ok(projected);
+    }
+    let abandonment = PersistedLocalDirectTakeAbandonment {
+        storage_version: ABANDONMENT_STORAGE_VERSION,
+        wallet_id,
+        offer_id: local.offer_id,
+        session_id,
+        abandoned_at_unix: now_unix,
+    };
+    store.save_entity(
+        EntityKind::ShakescapeBoardObject,
+        &abandonment_record_id(wallet_id, session_id),
+        0,
+        &abandonment,
+        now_unix,
+    )?;
+    Ok(projected)
+}
+
 /// Sum funds still committed by this wallet's accepted takes for one asset.
 /// A taker funds the offer's received asset on the second chain, so the
 /// reservation remains live until that funding is independently confirmed.
@@ -335,7 +429,7 @@ pub fn reserved_local_shakescape_taker_amount(
                 | crate::SwapState::SecondFundingPending,
             ) => true,
             Some(_) => false,
-            None => take.expires_at_unix > now_unix,
+            None => !local_take_is_released(store, policy, wallet_id, &take, now_unix)?,
         };
         if reserve {
             total = total
@@ -472,6 +566,61 @@ fn load_local_take(
         .transpose()
 }
 
+fn local_take_has_execution(
+    store: &WalletStore,
+    session_id: SessionId,
+) -> Result<bool, MarketError> {
+    Ok(store
+        .load_workflow::<SwapSession>(crate::shakescape_execution_workflow_id(session_id))?
+        .is_some())
+}
+
+fn local_take_is_released(
+    store: &WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    take: &ShakescapeLocalDirectTake,
+    now_unix: u64,
+) -> Result<bool, MarketError> {
+    if take.expires_at_unix <= now_unix
+        || load_local_take_abandonment(store, wallet_id, take.session_id)?.is_some()
+    {
+        return Ok(true);
+    }
+    Ok(
+        load_shakescape_direct_offer(store, &policy.board_policy(), take.offer_id.into_bytes())?
+            .is_some_and(|offer| !offer.is_active_at(now_unix)),
+    )
+}
+
+fn load_local_take_abandonment(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    session_id: SessionId,
+) -> Result<Option<PersistedLocalDirectTakeAbandonment>, MarketError> {
+    store
+        .load_entity::<PersistedLocalDirectTakeAbandonment>(
+            EntityKind::ShakescapeBoardObject,
+            &abandonment_record_id(wallet_id, session_id),
+        )?
+        .map(|stored| {
+            let row = stored.value;
+            if stored.revision != 1
+                || row.storage_version != ABANDONMENT_STORAGE_VERSION
+                || row.wallet_id != wallet_id
+                || row.session_id != session_id
+                || row.offer_id.as_bytes().iter().all(|byte| *byte == 0)
+                || row.abandoned_at_unix == 0
+                || row.abandoned_at_unix != stored.updated_at_unix
+                || stored.id != abandonment_record_id(wallet_id, session_id)
+            {
+                return Err(MarketError::CorruptShakescapeDirectSwap);
+            }
+            Ok(row)
+        })
+        .transpose()
+}
+
 fn validate_stored(
     wallet_id: WalletId,
     stored: hns_wallet_store::StoredEntity<PersistedLocalDirectTake>,
@@ -504,6 +653,14 @@ fn record_id(wallet_id: WalletId, session_id: SessionId) -> Vec<u8> {
     id
 }
 
+fn abandonment_record_id(wallet_id: WalletId, session_id: SessionId) -> Vec<u8> {
+    let mut id = Vec::with_capacity(ABANDONMENT_RECORD_PREFIX.len() + 16 + 32);
+    id.extend_from_slice(ABANDONMENT_RECORD_PREFIX);
+    id.extend_from_slice(wallet_id.as_bytes());
+    id.extend_from_slice(session_id.as_bytes());
+    id
+}
+
 #[cfg(test)]
 mod tests {
     use hns_marketplace_protocol::{ChainId, NetworkBinding};
@@ -514,9 +671,9 @@ mod tests {
     use crate::{
         ShakescapeBtcForHnsMakerProposalRequest, ShakescapeBtcForHnsOfferRequest,
         ShakescapeDirectOfferBoardPolicy, ShakescapeHnsForBtcOfferRequest,
-        accept_shakescape_direct_maker_proposal, create_shakescape_btc_for_hns_maker_proposal,
-        create_shakescape_btc_for_hns_offer, create_shakescape_direct_maker_proposal,
-        create_shakescape_hns_for_btc_offer,
+        accept_shakescape_direct_maker_proposal, cancel_shakescape_local_direct_offer,
+        create_shakescape_btc_for_hns_maker_proposal, create_shakescape_btc_for_hns_offer,
+        create_shakescape_direct_maker_proposal, create_shakescape_hns_for_btc_offer,
     };
 
     const PASSPHRASE: &str = "two-party direct atomic swap test";
@@ -788,5 +945,242 @@ mod tests {
         assert_eq!(accepted.execution.state, crate::SwapState::TermsFrozen);
         assert_eq!(take.offered_asset, AssetId::HNS);
         assert_eq!(take.received_asset, AssetId::BTC);
+    }
+
+    #[test]
+    fn abandoned_unfunded_take_releases_hns_and_rejects_a_late_proposal() {
+        let policy = policy();
+        let maker_id = WalletId::new([7; 16]);
+        let taker_id = WalletId::new([8; 16]);
+        let mut maker_store = store(maker_id, 0x71);
+        let mut taker_store = store(taker_id, 0x81);
+        let offer = create_shakescape_btc_for_hns_offer(
+            &mut maker_store,
+            &policy.board_policy(),
+            ShakescapeBtcForHnsOfferRequest {
+                wallet_id: maker_id,
+                btc_amount_sats: 9_000,
+                hns_amount_dollarydoos: 1_000_000,
+                bitcoin_fee_reserve_sats: 1_000,
+                created_at_unix: START,
+                expires_at_unix: START + 10_000,
+                nonce: [11; 32],
+            },
+        )
+        .expect("maker offer");
+        let signed_offer = load_shakescape_direct_offer(
+            &maker_store,
+            &policy.board_policy(),
+            offer.offer.offer_id.into_bytes(),
+        )
+        .expect("load offer")
+        .expect("offer exists")
+        .offer;
+        let offer_envelope = CrossChainMessage::DirectOffer(signed_offer)
+            .encode_envelope(1)
+            .expect("offer envelope");
+        crate::admit_shakescape_direct_offer(
+            &mut taker_store,
+            &policy.board_policy(),
+            &offer_envelope,
+            START,
+        )
+        .expect("admit offer");
+        let take = create_shakescape_hns_for_btc_take(
+            &mut taker_store,
+            &policy,
+            ShakescapeHnsForBtcTakeRequest {
+                wallet_id: taker_id,
+                offer_id: offer.offer.offer_id,
+                hns_fee_reserve_dollarydoos: 50_000,
+                created_at_unix: START + 10,
+                expires_at_unix: START + 10_000,
+                nonce: [12; 32],
+            },
+        )
+        .expect("take");
+        assert_eq!(
+            reserved_local_shakescape_taker_amount(
+                &taker_store,
+                &policy,
+                taker_id,
+                AssetId::HNS,
+                START + 11,
+            )
+            .expect("reservation"),
+            1_050_000,
+        );
+        assert_eq!(
+            list_pending_local_shakescape_direct_takes(
+                &taker_store,
+                &policy,
+                taker_id,
+                START + 11,
+            )
+            .expect("pending takes"),
+            vec![take.clone()],
+        );
+
+        abandon_pending_local_shakescape_direct_take(
+            &mut taker_store,
+            &policy,
+            taker_id,
+            take.session_id,
+            START + 12,
+        )
+        .expect("abandon take");
+        assert_eq!(
+            reserved_local_shakescape_taker_amount(
+                &taker_store,
+                &policy,
+                taker_id,
+                AssetId::HNS,
+                START + 13,
+            )
+            .expect("released reservation"),
+            0,
+        );
+        assert!(
+            list_pending_local_shakescape_direct_takes(
+                &taker_store,
+                &policy,
+                taker_id,
+                START + 13,
+            )
+            .expect("pending takes")
+            .is_empty()
+        );
+
+        crate::admit_shakescape_direct_offer_take(
+            &mut maker_store,
+            &policy,
+            &take.envelope,
+            START + 14,
+        )
+        .expect("maker admits take");
+        let proposal = create_shakescape_btc_for_hns_maker_proposal(
+            &mut maker_store,
+            &policy,
+            ShakescapeBtcForHnsMakerProposalRequest {
+                wallet_id: maker_id,
+                session_id: take.session_id,
+                now_unix: START + 20,
+                funding_window_seconds: 600,
+                second_refund_after_seconds: 3_600,
+                refund_safety_margin_seconds: 3_600,
+                bitcoin_minimum_confirmations: 1,
+                hns_minimum_confirmations: 1,
+            },
+        )
+        .expect("late maker proposal");
+        crate::admit_shakescape_direct_swap_proposal(
+            &mut taker_store,
+            &policy,
+            &proposal.envelope,
+            START + 20,
+        )
+        .expect("admit late proposal for audit");
+        assert!(matches!(
+            accept_shakescape_direct_maker_proposal(
+                &mut taker_store,
+                &policy,
+                taker_id,
+                take.session_id,
+                START + 21,
+            ),
+            Err(MarketError::UnknownShakescapeDirectSwap)
+        ));
+    }
+
+    #[test]
+    fn signed_offer_cancellation_automatically_releases_an_unfunded_take() {
+        let policy = policy();
+        let maker_id = WalletId::new([9; 16]);
+        let taker_id = WalletId::new([10; 16]);
+        let mut maker_store = store(maker_id, 0x91);
+        let mut taker_store = store(taker_id, 0xa1);
+        let offer = create_shakescape_btc_for_hns_offer(
+            &mut maker_store,
+            &policy.board_policy(),
+            ShakescapeBtcForHnsOfferRequest {
+                wallet_id: maker_id,
+                btc_amount_sats: 9_000,
+                hns_amount_dollarydoos: 1_000_000,
+                bitcoin_fee_reserve_sats: 1_000,
+                created_at_unix: START,
+                expires_at_unix: START + 10_000,
+                nonce: [13; 32],
+            },
+        )
+        .expect("maker offer");
+        let signed_offer = load_shakescape_direct_offer(
+            &maker_store,
+            &policy.board_policy(),
+            offer.offer.offer_id.into_bytes(),
+        )
+        .expect("load offer")
+        .expect("offer exists")
+        .offer;
+        let offer_envelope = CrossChainMessage::DirectOffer(signed_offer)
+            .encode_envelope(1)
+            .expect("offer envelope");
+        crate::admit_shakescape_direct_offer(
+            &mut taker_store,
+            &policy.board_policy(),
+            &offer_envelope,
+            START,
+        )
+        .expect("admit offer");
+        create_shakescape_hns_for_btc_take(
+            &mut taker_store,
+            &policy,
+            ShakescapeHnsForBtcTakeRequest {
+                wallet_id: taker_id,
+                offer_id: offer.offer.offer_id,
+                hns_fee_reserve_dollarydoos: 50_000,
+                created_at_unix: START + 10,
+                expires_at_unix: START + 10_000,
+                nonce: [14; 32],
+            },
+        )
+        .expect("take");
+        let cancelled = cancel_shakescape_local_direct_offer(
+            &mut maker_store,
+            &policy.board_policy(),
+            maker_id,
+            offer.offer.offer_id.into_bytes(),
+            START + 20,
+        )
+        .expect("cancel offer");
+        let cancellation = load_shakescape_direct_offer(
+            &maker_store,
+            &policy.board_policy(),
+            cancelled.offer_id.into_bytes(),
+        )
+        .expect("load cancelled offer")
+        .expect("cancelled offer exists")
+        .cancellation
+        .expect("signed cancellation");
+        let cancellation_envelope = CrossChainMessage::CancelDirectOffer(cancellation)
+            .encode_envelope(2)
+            .expect("cancellation envelope");
+        crate::admit_shakescape_direct_offer_cancellation(
+            &mut taker_store,
+            &policy.board_policy(),
+            &cancellation_envelope,
+            START + 20,
+        )
+        .expect("admit cancellation");
+        assert_eq!(
+            reserved_local_shakescape_taker_amount(
+                &taker_store,
+                &policy,
+                taker_id,
+                AssetId::HNS,
+                START + 21,
+            )
+            .expect("released reservation"),
+            0,
+        );
     }
 }
