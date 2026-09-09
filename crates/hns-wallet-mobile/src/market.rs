@@ -4,8 +4,8 @@ use hns_marketplace_protocol::{
     AssetId, CrossChainMessage, FundingState, SignedObjectHeader, SwapAssetSide, SwapFundingStatus,
     SwapSessionHello,
 };
-use hns_wallet_bitcoin_kyoto::build_shakescape_bitcoin_htlc;
-use hns_wallet_hns::HnsDirectShakescapePeer;
+use hns_wallet_bitcoin_kyoto::{MIN_HTLC_DUST_SATS, build_shakescape_bitcoin_htlc};
+use hns_wallet_hns::{DEFAULT_DUST_THRESHOLD, HnsDirectShakescapePeer};
 use hns_wallet_market::{
     ShakescapeBtcForHnsOfferRequest, ShakescapeDirectOfferAdmission,
     ShakescapeDirectOfferCancellationAdmission, ShakescapeDirectSwapAdmission,
@@ -398,8 +398,8 @@ impl MobileShakescapeSessionController {
             return Err(MobileWalletError::DirectOfferActionPending);
         }
         if now_unix == 0
-            || btc_amount_sats == 0
-            || hns_amount_dollarydoos == 0
+            || btc_amount_sats < MIN_HTLC_DUST_SATS
+            || u128::from(hns_amount_dollarydoos) < DEFAULT_DUST_THRESHOLD
             || bitcoin_fee_reserve_sats == 0
             || !(MIN_DIRECT_OFFER_LIFETIME_SECONDS..=MAX_DIRECT_OFFER_LIFETIME_SECONDS)
                 .contains(&listing_lifetime_seconds)
@@ -530,8 +530,8 @@ impl MobileShakescapeSessionController {
             return Err(MobileWalletError::DirectOfferActionPending);
         }
         if now_unix == 0
-            || hns_amount_dollarydoos == 0
-            || btc_amount_sats == 0
+            || u128::from(hns_amount_dollarydoos) < DEFAULT_DUST_THRESHOLD
+            || btc_amount_sats < MIN_HTLC_DUST_SATS
             || hns_fee_reserve_dollarydoos == 0
             || !(MIN_DIRECT_OFFER_LIFETIME_SECONDS..=MAX_DIRECT_OFFER_LIFETIME_SECONDS)
                 .contains(&listing_lifetime_seconds)
@@ -667,7 +667,11 @@ impl MobileShakescapeSessionController {
             .map(|offers| {
                 offers
                     .into_iter()
-                    .filter(|offer| !local_ids.contains(&offer.offer_id))
+                    .filter(|offer| {
+                        !local_ids.contains(&offer.offer_id)
+                            && offer.btc_amount_sats >= MIN_HTLC_DUST_SATS
+                            && u128::from(offer.hns_amount_dollarydoos) >= DEFAULT_DUST_THRESHOLD
+                    })
                     .collect()
             })
     }
@@ -702,6 +706,22 @@ impl MobileShakescapeSessionController {
             .map_err(|_| MobileWalletError::InvalidDirectOfferAction)?;
         let received_amount = u64::try_from(record.offer.received_amount.get())
             .map_err(|_| MobileWalletError::InvalidDirectOfferAction)?;
+        let bitcoin_amount = match (record.offer.offered_asset, record.offer.received_asset) {
+            (AssetId::BTC, AssetId::HNS) => offered_amount,
+            (AssetId::HNS, AssetId::BTC) => received_amount,
+            _ => return Err(MobileWalletError::InvalidDirectOfferAction),
+        };
+        if bitcoin_amount < MIN_HTLC_DUST_SATS {
+            return Err(MobileWalletError::InvalidDirectOfferAction);
+        }
+        let hns_amount = match (record.offer.offered_asset, record.offer.received_asset) {
+            (AssetId::BTC, AssetId::HNS) => received_amount,
+            (AssetId::HNS, AssetId::BTC) => offered_amount,
+            _ => return Err(MobileWalletError::InvalidDirectOfferAction),
+        };
+        if u128::from(hns_amount) < DEFAULT_DUST_THRESHOLD {
+            return Err(MobileWalletError::InvalidDirectOfferAction);
+        }
         let total = received_amount
             .checked_add(received_fee_reserve)
             .ok_or(MobileWalletError::InvalidDirectOfferAction)?;
@@ -2206,6 +2226,22 @@ impl MobileShakescapeSessionController {
         if canonical != envelope {
             return Err(MobileWalletError::InvalidShakescapeSessionMessage);
         }
+        if let CrossChainMessage::DirectOffer(offer) = &message {
+            let (bitcoin_amount, hns_amount) = match (offer.offered_asset, offer.received_asset) {
+                (AssetId::BTC, AssetId::HNS) => {
+                    (offer.offered_amount.get(), offer.received_amount.get())
+                }
+                (AssetId::HNS, AssetId::BTC) => {
+                    (offer.received_amount.get(), offer.offered_amount.get())
+                }
+                _ => return Err(MobileWalletError::InvalidShakescapeSessionMessage),
+            };
+            if bitcoin_amount < u128::from(MIN_HTLC_DUST_SATS)
+                || hns_amount < DEFAULT_DUST_THRESHOLD
+            {
+                return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+            }
+        }
         self.store
             .try_with_store_mut(|store| match message {
                 CrossChainMessage::DirectOffer(_) => admit_shakescape_direct_offer(
@@ -2278,6 +2314,22 @@ impl MobileShakescapeSessionController {
             })
             .map_err(MobileWalletError::from)?;
         peer.send_cross_chain_message(&CrossChainMessage::DirectOfferInventory(inventory))?;
+        // Active offer IDs alone cannot tell a peer that a previously learned
+        // offer was cancelled. Replay every still-retained signed tombstone
+        // with the periodic inventory so a missed packet or replaced socket
+        // converges without waiting for the offer's expiry.
+        let cancellations = self
+            .store
+            .try_with_store(|store| {
+                load_shakescape_direct_offers(store, &self.policy.board_policy(), now_unix)
+            })
+            .map_err(MobileWalletError::from)?
+            .into_iter()
+            .filter_map(|record| record.cancellation)
+            .collect::<Vec<_>>();
+        for cancellation in cancellations {
+            peer.send_cross_chain_message(&CrossChainMessage::CancelDirectOffer(cancellation))?;
+        }
         Ok(())
     }
 
@@ -2627,6 +2679,58 @@ mod tests {
             )
             .expect("seed");
         store
+    }
+
+    #[test]
+    fn direct_offer_preparation_enforces_both_chain_dust_boundaries() {
+        let wallet_id = WalletId::new([0x18; 16]);
+        let make_controller = || {
+            MobileShakescapeSessionController::new(
+                SharedWalletStore::new(seeded_store(wallet_id, 0x28)),
+                policy(),
+                wallet_id,
+            )
+        };
+
+        let mut below_bitcoin_dust = make_controller();
+        assert!(matches!(
+            below_bitcoin_dust.prepare_btc_for_hns_offer(
+                100_000,
+                MIN_HTLC_DUST_SATS - 1,
+                1_000_000,
+                1_000,
+                MIN_DIRECT_OFFER_LIFETIME_SECONDS,
+                START,
+            ),
+            Err(MobileWalletError::InvalidDirectOfferAction)
+        ));
+
+        let mut below_hns_dust = make_controller();
+        assert!(matches!(
+            below_hns_dust.prepare_hns_for_btc_offer(
+                2_000_000,
+                u64::try_from(DEFAULT_DUST_THRESHOLD).expect("HNS dust fits u64") - 1,
+                MIN_HTLC_DUST_SATS,
+                100_000,
+                MIN_DIRECT_OFFER_LIFETIME_SECONDS,
+                START,
+            ),
+            Err(MobileWalletError::InvalidDirectOfferAction)
+        ));
+
+        let mut exact_boundaries = make_controller();
+        assert!(
+            exact_boundaries
+                .prepare_hns_for_btc_offer(
+                    2_000_000,
+                    u64::try_from(DEFAULT_DUST_THRESHOLD).expect("HNS dust fits u64"),
+                    MIN_HTLC_DUST_SATS,
+                    100_000,
+                    MIN_DIRECT_OFFER_LIFETIME_SECONDS,
+                    START,
+                )
+                .is_ok()
+        );
     }
 
     #[test]
