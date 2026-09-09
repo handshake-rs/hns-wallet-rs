@@ -250,15 +250,6 @@ pub fn accept_shakescape_direct_maker_proposal(
     }
     let local = load_local_take(store, wallet_id, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
-    if load_local_take_abandonment(store, wallet_id, session_id)?.is_some()
-        || load_shakescape_direct_offer(store, &policy.board_policy(), local.offer_id.into_bytes())?
-            .is_none_or(|offer| !offer.is_active_at(now_unix))
-    {
-        // Treat a delayed proposal for a locally released acceptance as
-        // unknown. The transport can safely ignore it without dropping an
-        // otherwise healthy peer connection.
-        return Err(MarketError::UnknownShakescapeDirectSwap);
-    }
     let record = load_shakescape_direct_swap(store, policy, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     if local.offer_id != ObjectHash::new(record.offer.offer_id) {
@@ -277,6 +268,16 @@ pub fn accept_shakescape_direct_maker_proposal(
             execution,
             envelope,
         });
+    }
+    if load_local_take_abandonment(store, wallet_id, session_id)?.is_some()
+        || load_shakescape_direct_offer(store, &policy.board_policy(), local.offer_id.into_bytes())?
+            .is_none_or(|offer| !offer.is_active_at(now_unix))
+    {
+        // Treat a delayed proposal for a locally released acceptance as
+        // unknown. The transport can safely ignore it without dropping an
+        // otherwise healthy peer connection. An already-countersigned hello
+        // above remains replayable after its board offer expires or cancels.
+        return Err(MarketError::UnknownShakescapeDirectSwap);
     }
     let proposal = record
         .proposal
