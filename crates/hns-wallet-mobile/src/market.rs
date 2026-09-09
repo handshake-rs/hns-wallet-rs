@@ -915,12 +915,17 @@ impl MobileShakescapeSessionController {
             .collect()
     }
 
-    /// Fail only pre-funding executions whose jointly signed funding deadline
-    /// has passed. `TermsFrozen` has not crossed either chain-specific funding
-    /// authorization gate; `RefundsPrepared` is the restart checkpoint just
-    /// before that gate. Later states may have an unobserved broadcast and are
-    /// deliberately never expired by wall-clock time alone.
-    pub fn fail_expired_unfunded_executions(
+    /// Reconcile terminal pre-funding state and the public listing lifecycle.
+    ///
+    /// Only executions which provably never crossed a chain-specific funding
+    /// authorization gate are failed by time. Later states may have an
+    /// unobserved broadcast and are deliberately never expired from wall-clock
+    /// time alone. Independently, a single-session public offer is retired as
+    /// soon as its hello is countersigned, or when its maker proposal expires
+    /// without a hello. The signed cancellation tombstone is then propagated
+    /// by ordinary inventory reconciliation; anonymous peers never need an
+    /// out-of-band cleanup conversation.
+    pub fn reconcile_direct_offer_lifecycle(
         &mut self,
         now_unix: u64,
     ) -> Result<usize, MobileWalletError> {
@@ -964,7 +969,38 @@ impl MobileShakescapeSessionController {
                         &mut journal,
                     )?;
                 }
-                Ok::<_, hns_wallet_market::MarketError>(expired.len())
+                let mut retired_offers = 0usize;
+                let active_offers = list_local_shakescape_direct_offers(
+                    store,
+                    &policy.board_policy(),
+                    self.wallet_id,
+                    now_unix,
+                )?;
+                for offer in active_offers {
+                    let Some(record) =
+                        load_shakescape_direct_swap(store, &policy, offer.session_id)?
+                    else {
+                        continue;
+                    };
+                    let negotiation_expired = record.hello.is_none()
+                        && (now_unix >= record.take.header.expires_at
+                            || record.proposal.as_ref().is_some_and(|proposal| {
+                                now_unix >= proposal.terms().header.expires_at
+                            }));
+                    if record.hello.is_some() || negotiation_expired {
+                        cancel_shakescape_local_direct_offer(
+                            store,
+                            &policy.board_policy(),
+                            self.wallet_id,
+                            offer.offer.offer_id.into_bytes(),
+                            now_unix,
+                        )?;
+                        retired_offers = retired_offers.saturating_add(1);
+                    }
+                }
+                Ok::<_, hns_wallet_market::MarketError>(
+                    expired.len().saturating_add(retired_offers),
+                )
             })
             .map_err(MobileWalletError::from)
     }
@@ -3157,7 +3193,7 @@ mod tests {
         );
         assert_eq!(
             controller
-                .fail_expired_unfunded_executions(START + 621)
+                .reconcile_direct_offer_lifecycle(START + 621)
                 .expect("do not expire after the funding gate"),
             0
         );
@@ -3167,6 +3203,111 @@ mod tests {
                 .expect("durable execution after deadline")[0]
                 .state,
             SwapState::FirstFundingPending
+        );
+    }
+
+    #[test]
+    fn expired_maker_proposal_retires_offer_without_counterparty_coordination() {
+        let policy = policy();
+        let maker_id = WalletId::new([0x1d; 16]);
+        let taker_id = WalletId::new([0x1e; 16]);
+        let mut maker = seeded_store(maker_id, 0x2d);
+        let mut taker = seeded_store(taker_id, 0x2e);
+        let offer = create_shakescape_btc_for_hns_offer(
+            &mut maker,
+            &policy.board_policy(),
+            ShakescapeBtcForHnsOfferRequest {
+                wallet_id: maker_id,
+                btc_amount_sats: 9_000,
+                hns_amount_dollarydoos: 2_000_000,
+                bitcoin_fee_reserve_sats: 1_000,
+                created_at_unix: START,
+                expires_at_unix: START + 10_000,
+                nonce: [0x4d; 32],
+            },
+        )
+        .expect("offer");
+        let signed_offer = load_shakescape_direct_offer(
+            &maker,
+            &policy.board_policy(),
+            offer.offer.offer_id.into_bytes(),
+        )
+        .expect("load offer")
+        .expect("offer exists")
+        .offer;
+        let offer_envelope = CrossChainMessage::DirectOffer(signed_offer)
+            .encode_envelope(1)
+            .expect("offer envelope");
+        admit_shakescape_direct_offer(&mut taker, &policy.board_policy(), &offer_envelope, START)
+            .expect("admit offer");
+        let take = create_shakescape_hns_for_btc_take(
+            &mut taker,
+            &policy,
+            ShakescapeHnsForBtcTakeRequest {
+                wallet_id: taker_id,
+                offer_id: offer.offer.offer_id,
+                hns_fee_reserve_dollarydoos: 10_000,
+                created_at_unix: START + 10,
+                expires_at_unix: START + 10_000,
+                nonce: [0x4e; 32],
+            },
+        )
+        .expect("take");
+        admit_shakescape_direct_offer_take(&mut maker, &policy, &take.envelope, START + 10)
+            .expect("maker admits take");
+        create_shakescape_btc_for_hns_maker_proposal(
+            &mut maker,
+            &policy,
+            ShakescapeBtcForHnsMakerProposalRequest {
+                wallet_id: maker_id,
+                session_id: offer.offer.session_id,
+                now_unix: START + 20,
+                funding_window_seconds: 600,
+                second_refund_after_seconds: 3_600,
+                refund_safety_margin_seconds: 3_600,
+                bitcoin_minimum_confirmations: 1,
+                hns_minimum_confirmations: 1,
+            },
+        )
+        .expect("maker proposal");
+        // The anonymous taker disappears and never returns a countersignature.
+        let shared = SharedWalletStore::new(maker);
+        let mut controller =
+            MobileShakescapeSessionController::new(shared.clone(), policy, maker_id);
+        assert_eq!(
+            controller
+                .reconcile_direct_offer_lifecycle(START + 620)
+                .expect("retire expired negotiation"),
+            1
+        );
+        shared
+            .try_with_store(|store| {
+                assert!(
+                    list_local_shakescape_direct_offers(
+                        store,
+                        &policy.board_policy(),
+                        maker_id,
+                        START + 620,
+                    )?
+                    .is_empty()
+                );
+                assert_eq!(
+                    list_local_shakescape_direct_offer_cancellations(
+                        store,
+                        &policy.board_policy(),
+                        maker_id,
+                    )?
+                    .len(),
+                    1
+                );
+                Ok::<_, hns_wallet_market::MarketError>(())
+            })
+            .expect("expired offer tombstone");
+        assert_eq!(
+            controller
+                .reserved_bitcoin_sats(START + 620)
+                .expect("maker reservation released"),
+            0
         );
     }
 
@@ -3281,6 +3422,35 @@ mod tests {
         let shared = SharedWalletStore::new(maker);
         let mut controller =
             MobileShakescapeSessionController::new(shared.clone(), policy, maker_id);
+        assert_eq!(
+            controller
+                .reconcile_direct_offer_lifecycle(START + 36)
+                .expect("retire consumed public offer"),
+            1
+        );
+        shared
+            .try_with_store(|store| {
+                assert!(
+                    list_local_shakescape_direct_offers(
+                        store,
+                        &policy.board_policy(),
+                        maker_id,
+                        START + 36,
+                    )?
+                    .is_empty()
+                );
+                assert_eq!(
+                    list_local_shakescape_direct_offer_cancellations(
+                        store,
+                        &policy.board_policy(),
+                        maker_id,
+                    )?
+                    .len(),
+                    1
+                );
+                Ok::<_, hns_wallet_market::MarketError>(())
+            })
+            .expect("consumed offer tombstone");
         let resumed = controller.durable_executions().expect("durable executions");
         assert_eq!(resumed.len(), 1);
         assert_eq!(resumed[0].state, SwapState::RefundsPrepared);
