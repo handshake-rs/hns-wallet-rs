@@ -1,9 +1,9 @@
 //! Durable admission for one direct fixed-terms HNS/BTC swap session.
 
 use hns_marketplace_protocol::{
-    AssetId, CrossChainMessage, DirectOffer, DirectOfferTake, MarketPair, NetworkBinding,
-    SwapFundingStatus, SwapRedeemStatus, SwapRefundStatus, SwapSessionHello, SwapSessionProposal,
-    SwapWatchReady,
+    AssetId, CrossChainMessage, DirectOffer, DirectOfferTake, MarketPair, MarketplaceError,
+    NetworkBinding, SwapFundingStatus, SwapRedeemStatus, SwapRefundStatus, SwapSessionHello,
+    SwapSessionProposal, SwapWatchReady,
 };
 use hns_wallet_store::{EntityKind, StoredEntity, WalletStore};
 use hns_wallet_types::{ObjectHash, SessionId};
@@ -343,7 +343,19 @@ pub fn admit_shakescape_direct_swap_proposal(
         if record.proposal_request_id == Some(request_id) && existing == &proposal {
             return Ok(ShakescapeDirectSwapAdmission::Existing(record.snapshot()));
         }
-        return Err(MarketError::ShakescapeDirectSwapConflict);
+        // A maker-only proposal is a bounded invitation to begin funding, not
+        // a countersigned agreement. If that invitation expired in transit,
+        // permit the same maker to refresh its time bounds for the exact
+        // signed offer/take pair. Once the taker has countersigned, every term
+        // is frozen and even an expired proposal remains immutable.
+        let expired_maker_only = record.hello.is_none()
+            && matches!(
+                existing.verify_at(policy.network(), accepted_at_unix),
+                Err(MarketplaceError::Expired { .. })
+            );
+        if !expired_maker_only {
+            return Err(MarketError::ShakescapeDirectSwapConflict);
+        }
     }
     proposal
         .verify_for_direct_offer(

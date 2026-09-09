@@ -8,8 +8,8 @@
 use hkdf::Hkdf;
 use hns_marketplace_protocol::{
     AssetAmount, AssetId, CrossChainMessage, DeadlineKind, DirectOffer, DirectOfferCancellation,
-    MARKETPLACE_PROTOCOL_VERSION, MarketPair, SettlementDeadline, SignedObjectHeader,
-    SwapAssetSide, SwapSessionHello, SwapSessionProposal,
+    MARKETPLACE_PROTOCOL_VERSION, MarketPair, MarketplaceError, SettlementDeadline,
+    SignedObjectHeader, SwapAssetSide, SwapSessionHello, SwapSessionProposal,
 };
 use hns_wallet_bitcoin_kyoto::build_shakescape_bitcoin_htlc;
 use hns_wallet_chain_api::Preimage;
@@ -294,11 +294,29 @@ pub fn create_shakescape_direct_maker_proposal(
     {
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
-    if let Some(proposal) = record.proposal {
-        let envelope = CrossChainMessage::SwapSessionProposal(proposal.clone())
-            .encode_envelope(record.take_request_id)
-            .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
-        return Ok(ShakescapeBtcForHnsMakerProposal { proposal, envelope });
+    if let Some(proposal) = record.proposal.as_ref() {
+        match proposal.verify_at(policy.network(), request.now_unix) {
+            Ok(()) => {
+                let proposal = proposal.clone();
+                let envelope = CrossChainMessage::SwapSessionProposal(proposal.clone())
+                    .encode_envelope(record.take_request_id)
+                    .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
+                return Ok(ShakescapeBtcForHnsMakerProposal { proposal, envelope });
+            }
+            Err(MarketplaceError::Expired { .. }) if record.hello.is_some() => {
+                let proposal = proposal.clone();
+                let envelope = CrossChainMessage::SwapSessionProposal(proposal.clone())
+                    .encode_envelope(record.take_request_id)
+                    .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
+                return Ok(ShakescapeBtcForHnsMakerProposal { proposal, envelope });
+            }
+            // No taker signature, watch, funding, or execution can exist
+            // before the hello. Rebuild the exact proposal with a fresh
+            // bounded funding interval while retaining the same session,
+            // offer, take, settlement key, and deterministic preimage.
+            Err(MarketplaceError::Expired { .. }) => {}
+            Err(_) => return Err(MarketError::CorruptShakescapeDirectSwap),
+        }
     }
     let funding_expires_at = request
         .now_unix
@@ -1226,7 +1244,10 @@ mod tests {
         let (request_id, wire) =
             CrossChainMessage::decode_envelope(&made.envelope).expect("decode proposal envelope");
         assert_eq!(request_id, 77);
-        assert_eq!(wire, CrossChainMessage::SwapSessionProposal(made.proposal));
+        assert_eq!(
+            wire,
+            CrossChainMessage::SwapSessionProposal(made.proposal.clone())
+        );
         let retried = create_shakescape_btc_for_hns_maker_proposal(
             &mut store,
             &swap_policy,
@@ -1243,5 +1264,33 @@ mod tests {
         )
         .expect("idempotent retry");
         assert_eq!(retried.envelope, made.envelope);
+
+        let refreshed = create_shakescape_btc_for_hns_maker_proposal(
+            &mut store,
+            &swap_policy,
+            ShakescapeBtcForHnsMakerProposalRequest {
+                wallet_id,
+                session_id: created.offer.session_id,
+                now_unix: START + 700,
+                funding_window_seconds: 600,
+                second_refund_after_seconds: 3_600,
+                refund_safety_margin_seconds: 3_600,
+                bitcoin_minimum_confirmations: 1,
+                hns_minimum_confirmations: 1,
+            },
+        )
+        .expect("expired maker-only proposal refreshes");
+        assert_ne!(refreshed.envelope, made.envelope);
+        assert_eq!(refreshed.proposal.terms().header.created_at, START + 700);
+        assert_eq!(
+            refreshed.proposal.terms().hashlock,
+            made.proposal.terms().hashlock
+        );
+        let stored =
+            crate::load_shakescape_direct_swap(&store, &swap_policy, created.offer.session_id)
+                .expect("load refreshed swap")
+                .expect("refreshed swap exists");
+        assert_eq!(stored.proposal.as_ref(), Some(&refreshed.proposal));
+        assert!(stored.hello.is_none());
     }
 }
