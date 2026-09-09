@@ -827,9 +827,10 @@ impl MobileShakescapeSessionController {
                 )
             })
             .map_err(MobileWalletError::from)?;
-        let (_, message) = CrossChainMessage::decode_envelope(&take.envelope)
-            .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
-        peer.send_cross_chain_message(&message)?;
+        // Send the exact envelope retained with the durable take. Re-encoding
+        // it under the socket's transient request counter makes recovery
+        // ambiguous after reconnects and prevents byte-for-byte retry.
+        peer.send_cross_chain_envelope(&take.envelope)?;
         Ok(MobileDirectOfferTakeSummary {
             offer_id: super::lowercase_hex(pending.offer_id.as_bytes()),
             session_id: super::lowercase_hex(take.session_id.as_bytes()),
@@ -2366,9 +2367,10 @@ impl MobileShakescapeSessionController {
             .map_err(MobileWalletError::from)
     }
 
-    /// Announce the locally retained active-offer inventory to one negotiated
-    /// peer. The peer receives only opaque offer identifiers; it cannot learn
-    /// a price policy or change which exact signed terms the wallet will use.
+    /// Reconcile locally retained board inventory and recover unfunded takes
+    /// with one negotiated peer. Offers are announced by opaque identifier;
+    /// signed takes are replayed byte-for-byte only while they still reserve
+    /// funds and have not reached a countersigned durable execution.
     pub fn announce_direct_offer_inventory(
         &self,
         peer: &mut HnsDirectShakescapePeer,
@@ -2396,6 +2398,20 @@ impl MobileShakescapeSessionController {
             .collect::<Vec<_>>();
         for cancellation in cancellations {
             peer.send_cross_chain_message(&CrossChainMessage::CancelDirectOffer(cancellation))?;
+        }
+        let pending_takes = self
+            .store
+            .try_with_store(|store| {
+                list_pending_local_shakescape_direct_takes(
+                    store,
+                    &self.policy,
+                    self.wallet_id,
+                    now_unix,
+                )
+            })
+            .map_err(MobileWalletError::from)?;
+        for take in pending_takes {
+            peer.send_cross_chain_envelope(&take.envelope)?;
         }
         Ok(())
     }

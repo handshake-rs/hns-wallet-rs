@@ -270,10 +270,13 @@ pub fn admit_shakescape_direct_offer_take(
         .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let session_id = SessionId::new(take.swap_session_id);
     if let Some(existing) = load_shakescape_direct_swap(store, policy, session_id)? {
-        if existing.take_request_id == request_id
-            && existing.offer == offer.offer
-            && existing.take == take
-        {
+        // The transport correlation ID is deliberately outside the signed
+        // take. A reconnecting wallet may replay the same durable take on a
+        // new socket whose request-ID sequence is different. Treat the exact
+        // signed offer/take pair as idempotent and retain the first admitted
+        // request ID so an already-created proposal/hello exchange keeps its
+        // original correlation.
+        if existing.offer == offer.offer && existing.take == take {
             return Ok(ShakescapeDirectSwapAdmission::Existing(existing.snapshot()));
         }
         return Err(MarketError::ShakescapeDirectSwapConflict);

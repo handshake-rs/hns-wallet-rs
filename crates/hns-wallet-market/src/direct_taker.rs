@@ -767,6 +767,23 @@ mod tests {
             START + 10,
         )
         .expect("maker admits take");
+        let (original_request_id, replay_message) =
+            CrossChainMessage::decode_envelope(&take.envelope).expect("decode durable take");
+        let replay_envelope = replay_message
+            .encode_envelope(original_request_id + 1)
+            .expect("re-encode replay on a new socket sequence");
+        let replay = crate::admit_shakescape_direct_offer_take(
+            &mut maker_store,
+            &policy,
+            &replay_envelope,
+            START + 11,
+        )
+        .expect("identical signed take is idempotent across request IDs");
+        assert!(matches!(
+            replay,
+            crate::ShakescapeDirectSwapAdmission::Existing(snapshot)
+                if snapshot.take_request_id == original_request_id
+        ));
 
         let proposal = create_shakescape_btc_for_hns_maker_proposal(
             &mut maker_store,
