@@ -651,6 +651,45 @@ pub fn list_local_shakescape_direct_offers(
     Ok(offers)
 }
 
+/// Return only cancellation tombstones signed by this wallet's local board
+/// identity. A wallet may retain and display remote cancellations, but must
+/// never publish them as proof that its current transport owns the maker
+/// route for that offer.
+pub fn list_local_shakescape_direct_offer_cancellations(
+    store: &WalletStore,
+    policy: &ShakescapeDirectOfferBoardPolicy,
+    wallet_id: WalletId,
+) -> Result<Vec<DirectOfferCancellation>, MarketError> {
+    let prefix = local_record_prefix(wallet_id);
+    let stored = store.list_entities_by_id_prefix::<PersistedLocalDirectOffer>(
+        EntityKind::ShakescapeBoardObject,
+        &prefix,
+        crate::MAX_SHAKESCAPE_DIRECT_OFFERS,
+    )?;
+    let mut cancellations = Vec::new();
+    for stored in stored {
+        let record = stored.value;
+        if stored.revision != 1
+            || record.storage_version != STORAGE_VERSION
+            || record.wallet_id != wallet_id
+            || record.intent_id.as_bytes().iter().all(|byte| *byte == 0)
+            || record.created_at_unix != stored.updated_at_unix
+        {
+            return Err(MarketError::CorruptShakescapeDirectOfferBoard);
+        }
+        let offer =
+            crate::load_shakescape_direct_offer(store, policy, record.offer_id.into_bytes())?
+                .ok_or(MarketError::CorruptShakescapeDirectOfferBoard)?;
+        if offer.offer.swap_session_id != record.session_id.into_bytes() {
+            return Err(MarketError::CorruptShakescapeDirectOfferBoard);
+        }
+        if let Some(cancellation) = offer.cancellation {
+            cancellations.push(cancellation);
+        }
+    }
+    Ok(cancellations)
+}
+
 /// Sum Bitcoin still committed by local maker offers. Once a countersigned
 /// execution exists, its durable state—not board expiry—controls reservation:
 /// funds remain reserved through pending first funding and are released only
@@ -1076,6 +1115,14 @@ mod tests {
             list_local_shakescape_direct_offers(&store, &policy(), wallet_id, 201)
                 .expect("live offers")
                 .is_empty()
+        );
+        let cancellations =
+            list_local_shakescape_direct_offer_cancellations(&store, &policy(), wallet_id)
+                .expect("local cancellations");
+        assert_eq!(cancellations.len(), 1);
+        assert_eq!(
+            cancellations[0].offer_id,
+            created.offer.offer_id.into_bytes()
         );
     }
 

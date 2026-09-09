@@ -18,11 +18,11 @@ use hns_wallet_market::{
     admit_shakescape_direct_swap_proposal, admit_shakescape_direct_swap_watch_ready,
     cancel_shakescape_local_direct_offer, create_shakescape_btc_for_hns_offer,
     create_shakescape_direct_maker_proposal, create_shakescape_direct_take,
-    create_shakescape_hns_for_btc_offer, list_local_shakescape_direct_offers,
-    list_local_shakescape_direct_takes, list_pending_local_shakescape_direct_takes,
-    list_shakescape_executions, load_shakescape_direct_offer, load_shakescape_direct_offers,
-    load_shakescape_direct_swap, open_shakescape_execution, shakescape_direct_offer_inventory,
-    shakescape_execution_workflow_id,
+    create_shakescape_hns_for_btc_offer, list_local_shakescape_direct_offer_cancellations,
+    list_local_shakescape_direct_offers, list_local_shakescape_direct_takes,
+    list_pending_local_shakescape_direct_takes, list_shakescape_executions,
+    load_shakescape_direct_offer, load_shakescape_direct_offers, load_shakescape_direct_swap,
+    open_shakescape_execution, shakescape_execution_workflow_id,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::{TransactionHash, WalletId};
@@ -2376,12 +2376,21 @@ impl MobileShakescapeSessionController {
         peer: &mut HnsDirectShakescapePeer,
         now_unix: u64,
     ) -> Result<(), MobileWalletError> {
-        let inventory = self
+        let local_offers = self
             .store
             .try_with_store(|store| {
-                shakescape_direct_offer_inventory(store, &self.policy.board_policy(), now_unix)
+                list_local_shakescape_direct_offers(
+                    store,
+                    &self.policy.board_policy(),
+                    self.wallet_id,
+                    now_unix,
+                )
             })
             .map_err(MobileWalletError::from)?;
+        let inventory = local_offers
+            .into_iter()
+            .map(|offer| offer.offer.offer_id.into_bytes())
+            .collect();
         peer.send_cross_chain_message(&CrossChainMessage::DirectOfferInventory(inventory))?;
         // Active offer IDs alone cannot tell a peer that a previously learned
         // offer was cancelled. Replay every still-retained signed tombstone
@@ -2390,12 +2399,13 @@ impl MobileShakescapeSessionController {
         let cancellations = self
             .store
             .try_with_store(|store| {
-                load_shakescape_direct_offers(store, &self.policy.board_policy(), now_unix)
+                list_local_shakescape_direct_offer_cancellations(
+                    store,
+                    &self.policy.board_policy(),
+                    self.wallet_id,
+                )
             })
-            .map_err(MobileWalletError::from)?
-            .into_iter()
-            .filter_map(|record| record.cancellation)
-            .collect::<Vec<_>>();
+            .map_err(MobileWalletError::from)?;
         for cancellation in cancellations {
             peer.send_cross_chain_message(&CrossChainMessage::CancelDirectOffer(cancellation))?;
         }
