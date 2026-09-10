@@ -38,9 +38,10 @@ pub use direct_maker::{
     create_shakescape_btc_for_hns_offer, create_shakescape_direct_maker_proposal,
     create_shakescape_direct_offer, create_shakescape_hns_for_btc_offer,
     derive_local_btc_for_hns_maker_key, derive_local_direct_maker_key,
-    list_local_shakescape_direct_offer_cancellations, list_local_shakescape_direct_offers,
-    load_shakescape_btc_for_hns_maker_preimage, load_shakescape_direct_maker_preimage,
-    reserved_local_shakescape_btc_maker_sats, reserved_local_shakescape_hns_maker_dollarydoos,
+    is_local_shakescape_direct_maker, list_local_shakescape_direct_offer_cancellations,
+    list_local_shakescape_direct_offers, load_shakescape_btc_for_hns_maker_preimage,
+    load_shakescape_direct_maker_preimage, reserved_local_shakescape_btc_maker_sats,
+    reserved_local_shakescape_hns_maker_dollarydoos,
 };
 pub use direct_taker::{
     ShakescapeBtcForHnsTakeRequest, ShakescapeDirectTakeRequest, ShakescapeHnsForBtcTakeRequest,
@@ -49,8 +50,8 @@ pub use direct_taker::{
     accept_shakescape_hns_for_btc_maker_proposal, create_shakescape_btc_for_hns_take,
     create_shakescape_direct_take, create_shakescape_hns_for_btc_take,
     derive_local_direct_taker_key, derive_local_hns_for_btc_taker_key,
-    list_local_shakescape_direct_takes, list_pending_local_shakescape_direct_takes,
-    reserved_local_shakescape_taker_amount,
+    is_local_shakescape_direct_taker, list_local_shakescape_direct_takes,
+    list_pending_local_shakescape_direct_takes, reserved_local_shakescape_taker_amount,
 };
 pub use session_board::{
     MAX_SHAKESCAPE_DIRECT_SWAPS, ShakescapeDirectSwapAdmission, ShakescapeDirectSwapPeerStatus,

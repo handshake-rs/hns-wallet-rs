@@ -497,6 +497,26 @@ pub fn derive_local_direct_maker_key(
     Ok((key, local.bitcoin_fee_reserve_sats))
 }
 
+/// Identify a locally-created maker session from its validated durable offer
+/// record without deriving settlement key material. This is suitable for
+/// bounded native status projections; transaction authorization still derives
+/// and proves the exact session key independently.
+pub fn is_local_shakescape_direct_maker(
+    store: &WalletStore,
+    policy: &crate::ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    session_id: SessionId,
+) -> Result<bool, MarketError> {
+    let Some(record) = load_shakescape_direct_swap(store, policy, session_id)? else {
+        return Ok(false);
+    };
+    match load_local_offer(store, wallet_id, record.offer.offer_id) {
+        Ok(local) => Ok(local.session_id == session_id),
+        Err(MarketError::UnknownShakescapeDirectOffer) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn is_hns_btc_direction(offered: AssetId, received: AssetId) -> bool {
     matches!(
         (offered, received),

@@ -339,6 +339,10 @@ pub struct MobileShakescapeExecutionSummary {
     pub offered_amount: u128,
     pub received_asset: String,
     pub received_amount: u128,
+    /// This wallet's participant role in the immutable session terms. Native
+    /// clients use it to expose funding actions only to the chain owner that
+    /// can actually authorize them.
+    pub local_role: String,
     pub first_refund_at_unix: u64,
     pub second_refund_at_unix: u64,
     pub first_funding_confirmed: bool,
@@ -908,11 +912,91 @@ impl MobileShakescapeSessionController {
         &self,
     ) -> Result<Vec<MobileShakescapeExecutionSummary>, MobileWalletError> {
         self.store
-            .try_with_store(|store| list_shakescape_executions(store, &self.policy))
-            .map_err(MobileWalletError::from)?
-            .into_iter()
-            .map(execution_summary)
-            .collect()
+            .try_with_store(|store| {
+                list_shakescape_executions(store, &self.policy)?
+                    .into_iter()
+                    .map(|session| {
+                        let local_role = if hns_wallet_market::is_local_shakescape_direct_maker(
+                            store,
+                            &self.policy,
+                            self.wallet_id,
+                            session.id,
+                        )? {
+                            "maker"
+                        } else if hns_wallet_market::is_local_shakescape_direct_taker(
+                            store,
+                            self.wallet_id,
+                            session.id,
+                        )? {
+                            "taker"
+                        } else {
+                            return Err(
+                                hns_wallet_market::MarketError::CorruptShakescapeDirectSwap,
+                            );
+                        };
+                        execution_summary(session, local_role).map_err(|_| {
+                            hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    /// Advance a locally-owned first-chain funding gate after the counterparty
+    /// has signed and installed the exact watch. This validates refund safety
+    /// and local key ownership, but never constructs, signs, or broadcasts a
+    /// funding transaction. Native UI still requires an explicit approval for
+    /// the irreversible chain action.
+    pub fn advance_local_first_funding_readiness(
+        &mut self,
+        now_unix: u64,
+    ) -> Result<usize, MobileWalletError> {
+        if now_unix == 0 {
+            return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+        }
+        let candidates = self
+            .store
+            .try_with_store(|store| {
+                let mut candidates = Vec::new();
+                for execution in list_shakescape_executions(store, &self.policy)? {
+                    if !matches!(
+                        execution.state,
+                        SwapState::TermsFrozen | SwapState::RefundsPrepared
+                    ) {
+                        continue;
+                    }
+                    let Some(record) =
+                        load_shakescape_direct_swap(store, &self.policy, execution.id)?
+                    else {
+                        return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+                    };
+                    let Some(hello) = record.hello else {
+                        return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+                    };
+                    if record.first_chain_watch_ready.is_some() {
+                        candidates.push((execution.id, hello.offered_asset));
+                    }
+                }
+                Ok::<_, hns_wallet_market::MarketError>(candidates)
+            })
+            .map_err(MobileWalletError::from)?;
+        let mut advanced = 0usize;
+        for (session_id, offered_asset) in candidates {
+            let authorized = match offered_asset {
+                AssetId::BTC => self
+                    .authorize_local_btc_first_funding(session_id, now_unix)
+                    .is_ok(),
+                AssetId::HNS => self
+                    .authorize_local_hns_first_funding(session_id, now_unix)
+                    .is_ok(),
+                _ => false,
+            };
+            if authorized {
+                advanced = advanced.saturating_add(1);
+            }
+        }
+        Ok(advanced)
     }
 
     /// Reconcile terminal pre-funding state and the public listing lifecycle.
@@ -2831,6 +2915,7 @@ fn asset_name(asset: AssetId) -> &'static str {
 
 fn execution_summary(
     session: hns_wallet_market::SwapSession,
+    local_role: &str,
 ) -> Result<MobileShakescapeExecutionSummary, MobileWalletError> {
     let chain = |module| -> Result<String, MobileWalletError> {
         match module {
@@ -2860,6 +2945,7 @@ fn execution_summary(
         offered_amount: session.offered.base_units.get(),
         received_asset: asset(session.received.asset)?,
         received_amount: session.received.base_units.get(),
+        local_role: local_role.to_owned(),
         first_refund_at_unix: session.timeouts.first_chain_refund_at,
         second_refund_at_unix: session.timeouts.second_chain_refund_at,
         first_funding_confirmed: session.first_funding.is_some(),
@@ -3401,6 +3487,19 @@ mod tests {
         let ready = taker_controller
             .confirm_counterparty_bitcoin_watch(watch_permit, START + 34)
             .expect("persist taker watch readiness");
+        let taker_execution = taker_controller
+            .durable_executions()
+            .expect("taker execution projection")
+            .pop()
+            .expect("taker execution");
+        assert_eq!(taker_execution.local_role, "taker");
+        assert_eq!(taker_execution.state, SwapState::FirstFundingPending);
+        assert_eq!(
+            taker_controller
+                .advance_local_first_funding_readiness(START + 34)
+                .expect("taker cannot advance maker funding"),
+            0
+        );
         let ready_envelope = ready.encode_envelope(0).expect("watch-ready envelope");
         admit_shakescape_direct_swap_watch_ready(&mut maker, &policy, &ready_envelope, START + 34)
             .expect("maker admits receiver watch readiness");
@@ -3451,9 +3550,16 @@ mod tests {
                 Ok::<_, hns_wallet_market::MarketError>(())
             })
             .expect("consumed offer tombstone");
+        assert_eq!(
+            controller
+                .advance_local_first_funding_readiness(START + 37)
+                .expect("advance local maker funding readiness"),
+            1
+        );
         let resumed = controller.durable_executions().expect("durable executions");
         assert_eq!(resumed.len(), 1);
-        assert_eq!(resumed[0].state, SwapState::RefundsPrepared);
+        assert_eq!(resumed[0].state, SwapState::FirstFundingPending);
+        assert_eq!(resumed[0].local_role, "maker");
         assert_eq!(
             resumed[0].session_id,
             crate::lowercase_hex(offer.offer.session_id.as_bytes())

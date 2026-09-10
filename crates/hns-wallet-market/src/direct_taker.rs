@@ -567,6 +567,16 @@ fn load_local_take(
         .transpose()
 }
 
+/// Identify a locally-created taker session from its validated durable take
+/// record without deriving settlement key material.
+pub fn is_local_shakescape_direct_taker(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    session_id: SessionId,
+) -> Result<bool, MarketError> {
+    load_local_take(store, wallet_id, session_id).map(|record| record.is_some())
+}
+
 fn local_take_has_execution(
     store: &WalletStore,
     session_id: SessionId,
