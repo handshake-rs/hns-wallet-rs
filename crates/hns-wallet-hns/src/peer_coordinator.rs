@@ -56,6 +56,10 @@ const PEER_ID_DOMAIN: &[u8] = b"hns-wallet-rs/direct-peer-id/v1";
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 const DEFAULT_EVENT_POLL_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_DIRECT_PEERS: usize = 64;
+/// Avoid diagnosing a filtered Handshake port from one stale or offline
+/// endpoint. Three independently addressed peers is the smallest bounded set
+/// that provides useful evidence of a path-wide timeout.
+const MIN_OUTBOUND_PORT_BLOCK_DIAGNOSIS_PEERS: usize = 3;
 const MAX_RESPONSE_EVENTS: usize = 4_096;
 const MAX_DISCOVERED_ADDRESSES: usize = 1_024;
 const MAX_SCAN_BLOCKS_PER_CALL: u32 = 2_000;
@@ -2388,7 +2392,8 @@ impl HnsDirectPeerCoordinator {
                 .collect::<Vec<_>>()
         });
         let mut connected = Vec::new();
-        let mut last_error = None;
+        let mut failures = Vec::new();
+        let mut worker_panicked = false;
         for attempt in attempts {
             match attempt {
                 Ok((_, Ok(peer))) => connected.push(peer),
@@ -2398,16 +2403,29 @@ impl HnsDirectPeerCoordinator {
                     // ordering selects it again on every short mobile retry,
                     // preventing the pool from ever reaching its reserves.
                     self.pool.retire_address(address)?;
-                    last_error = Some(error);
+                    failures.push((address, error));
                 }
-                Err(_) => last_error = Some(HnsDirectPeerError::WorkerPanicked),
+                Err(_) => worker_panicked = true,
             }
         }
-        if connected.is_empty()
-            && self.pool.peer_count()? == 0
-            && let Some(error) = last_error
-        {
-            return Err(error);
+        if connected.is_empty() && self.pool.peer_count()? == 0 {
+            if !worker_panicked
+                && let Some(timed_out_peers) = likely_blocked_mainnet_peer_port(
+                    self.config.network,
+                    failures.iter().map(|(address, error)| (*address, error)),
+                )
+            {
+                return Err(HnsDirectPeerError::OutboundPortLikelyBlocked {
+                    port: default_peer_port(self.config.network),
+                    timed_out_peers,
+                });
+            }
+            if worker_panicked {
+                return Err(HnsDirectPeerError::WorkerPanicked);
+            }
+            if let Some((_, error)) = failures.pop() {
+                return Err(error);
+            }
         }
         if !connected.is_empty() {
             // Seed the bounded reserve while these ordinary HSD sessions are
@@ -4305,6 +4323,27 @@ const fn default_peer_port(network: HnsNetwork) -> u16 {
     }
 }
 
+fn likely_blocked_mainnet_peer_port<'a>(
+    network: HnsNetwork,
+    failures: impl Iterator<Item = (SocketAddr, &'a HnsDirectPeerError)>,
+) -> Option<usize> {
+    if network != HnsNetwork::Mainnet {
+        return None;
+    }
+    let expected_port = default_peer_port(network);
+    let mut distinct_peers = HashSet::new();
+    for (address, error) in failures {
+        if address.port() != expected_port
+            || !matches!(error, HnsDirectPeerError::Io(std::io::ErrorKind::TimedOut))
+        {
+            return None;
+        }
+        distinct_peers.insert(address.ip());
+    }
+    (distinct_peers.len() >= MIN_OUTBOUND_PORT_BLOCK_DIAGNOSIS_PEERS)
+        .then_some(distinct_peers.len())
+}
+
 const fn default_dns_seeds(network: HnsNetwork) -> &'static [&'static str] {
     match network {
         HnsNetwork::Mainnet => &["hs-mainnet.bcoin.ninja", "seed.htools.work"],
@@ -4422,6 +4461,10 @@ pub enum HnsDirectPeerError {
     Peer(String),
     #[error("standard Handshake peer I/O failed: {0:?}")]
     Io(std::io::ErrorKind),
+    #[error(
+        "all {timed_out_peers} distinct peers timed out on outbound TCP port {port}; the current network appears to block that port"
+    )]
+    OutboundPortLikelyBlocked { port: u16, timed_out_peers: usize },
     #[error("direct-peer configuration is invalid")]
     InvalidConfiguration,
     #[error("peer address is not allowed by the selected network policy")]
@@ -4477,6 +4520,16 @@ pub enum HnsDirectPeerError {
 }
 
 impl HnsDirectPeerError {
+    /// The standard Handshake port for which a bounded set of distinct peers
+    /// all timed out, if this is a path-wide connectivity diagnosis.
+    #[must_use]
+    pub const fn likely_blocked_outbound_port(&self) -> Option<u16> {
+        match self {
+            Self::OutboundPortLikelyBlocked { port, .. } => Some(*port),
+            _ => None,
+        }
+    }
+
     /// Whether the header quorum was temporarily unavailable over otherwise
     /// ordinary standard Handshake peer connections.
     ///
@@ -4520,6 +4573,41 @@ mod tests {
     use hns_p2p_wire::FrameDecoder;
     use hns_wallet_store::{SecretKind, WalletStore};
     use hns_wallet_types::{AccountId, BaseUnits, WalletId};
+
+    #[test]
+    fn outbound_port_diagnosis_requires_distinct_mainnet_timeout_failures() {
+        let timeout = HnsDirectPeerError::Io(std::io::ErrorKind::TimedOut);
+        let failures = [
+            ("1.1.1.1:12038".parse().unwrap(), &timeout),
+            ("8.8.8.8:12038".parse().unwrap(), &timeout),
+            ("9.9.9.9:12038".parse().unwrap(), &timeout),
+        ];
+
+        assert_eq!(
+            likely_blocked_mainnet_peer_port(HnsNetwork::Mainnet, failures.into_iter()),
+            Some(3),
+        );
+        assert_eq!(
+            likely_blocked_mainnet_peer_port(
+                HnsNetwork::Mainnet,
+                failures[..2]
+                    .iter()
+                    .map(|(address, error)| (*address, *error)),
+            ),
+            None,
+        );
+        assert_eq!(
+            likely_blocked_mainnet_peer_port(HnsNetwork::Testnet, failures.into_iter()),
+            None,
+        );
+
+        let refused = HnsDirectPeerError::Io(std::io::ErrorKind::ConnectionRefused);
+        let mixed = [failures[0], failures[1], (failures[2].0, &refused)];
+        assert_eq!(
+            likely_blocked_mainnet_peer_port(HnsNetwork::Mainnet, mixed.into_iter()),
+            None,
+        );
+    }
 
     #[test]
     fn temporary_header_agreement_failures_remain_distinguishable_from_wallet_faults() {
