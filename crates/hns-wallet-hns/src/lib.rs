@@ -1599,6 +1599,19 @@ const fn is_wallet_name_control_derivation(derivation: DerivationReference) -> b
     matches!(derivation.role, KeyRole::HnsCoin | KeyRole::HnsName) && derivation.change == 0
 }
 
+/// Returns whether a derived script may legitimately contain a tracked active
+/// name UTXO. The ShakeDex branch is deliberately absent from
+/// `is_wallet_name_control_derivation`: its P2WSH program does not give the
+/// wallet ordinary single-key name authority. During an atomic name offer,
+/// however, that program is the consensus owner between FINALIZE and the
+/// contract spend and therefore must remain admissible wallet evidence.
+const fn is_wallet_tracked_name_utxo_derivation(derivation: DerivationReference) -> bool {
+    matches!(
+        derivation.role,
+        KeyRole::HnsCoin | KeyRole::HnsName | KeyRole::HnsShakedex
+    ) && derivation.change == 0
+}
+
 fn wallet_name_derivation(
     address: &Address,
     wallet_name_addresses: &[DerivedHnsAddress],
@@ -2688,7 +2701,7 @@ impl TrackedHnsCoin {
             return Err(HnsWalletError::InvalidEvidence);
         }
         if self.coin.value.is_zero()
-            && (!is_wallet_name_control_derivation(self.derivation)
+            && (!is_wallet_tracked_name_utxo_derivation(self.derivation)
                 || !is_active_name_owner_covenant(covenant.kind))
         {
             return Err(HnsWalletError::InvalidEvidence);
@@ -14107,6 +14120,38 @@ mod tests {
             zero_shakedex.to_canonical_coin(),
             Err(HnsWalletError::InvalidEvidence)
         ));
+    }
+
+    #[test]
+    fn exact_coin_evidence_accepts_finalized_name_on_shakedex_script() {
+        let shakedex_address = test_derived_address(KeyRole::HnsShakedex, 64);
+        let (_, finalized_coin, _) = zero_value_finalize_owner(&shakedex_address);
+        let tracked = TrackedHnsCoin {
+            coin: WalletCoin {
+                outpoint: HnsOutpoint {
+                    transaction: TransactionHash::new(
+                        finalized_coin.outpoint.transaction_hash.into_bytes(),
+                    ),
+                    output_index: finalized_coin.outpoint.index,
+                },
+                value: BaseUnits::ZERO,
+                confirmation_count: 1,
+                confirmed_height: Some(finalized_coin.height.get()),
+                coinbase: finalized_coin.coinbase,
+                covenant: finalized_coin.covenant.encode().expect("FINALIZE covenant"),
+                name_locked: true,
+            },
+            derivation: shakedex_address.derivation,
+            address_program: shakedex_address.program.clone(),
+        };
+
+        let canonical = tracked
+            .to_canonical_coin()
+            .expect("confirmed FINALIZE on tracked ShakeDex P2WSH");
+        assert_eq!(canonical.address.version, 0);
+        assert_eq!(canonical.address.hash, shakedex_address.program);
+        assert_eq!(canonical.value, Dollarydoos::new(0));
+        assert_eq!(canonical.covenant.kind, CovenantKind::Finalize);
     }
 
     #[test]
