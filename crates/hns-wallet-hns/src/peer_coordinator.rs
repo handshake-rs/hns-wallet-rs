@@ -13,7 +13,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use hns_covenants::{hash_name, validate_name};
+use hns_covenants::{NameState, hash_name, validate_name};
 use hns_header_consensus::{Header, Network};
 use hns_light_chain::ChainLimits;
 use hns_light_p2p::{
@@ -40,6 +40,7 @@ use hns_p2p_wire::{
     SERVICE_NETWORK,
 };
 use hns_primitives::{BlockHash, BlockTime, NameHash, TreeRoot};
+use hns_swap::FixedPriceListing;
 use hns_transaction::Transaction;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -63,6 +64,11 @@ const MIN_OUTBOUND_PORT_BLOCK_DIAGNOSIS_PEERS: usize = 3;
 const MAX_RESPONSE_EVENTS: usize = 4_096;
 const MAX_DISCOVERED_ADDRESSES: usize = 1_024;
 const MAX_SCAN_BLOCKS_PER_CALL: u32 = 2_000;
+// One remote listing can require one historical owner block plus the current
+// name-tree interval. Bound that network work to one distinct missing lock per
+// service tick; later inventory retries make progress through larger offer
+// batches without allowing one peer message to trigger dozens of block sets.
+const MAX_NAME_MARKET_EVIDENCE_BACKFILLS_PER_CALL: usize = 1;
 // Handshake permits large `getdata` vectors, but retaining a modest request
 // window bounds memory, a peer's outstanding work, and the amount that must
 // be retried after a transport failure. It also removes the per-height round
@@ -2727,6 +2733,244 @@ impl HnsDirectPeerCoordinator {
         self.synchronize_name_proof(name_hash, now_unix)
     }
 
+    /// Backfill only the authenticated chain evidence needed to decide remote
+    /// Shakedex offers carried by one already-negotiated board message.
+    ///
+    /// The listing and its time/network binding are checked before any peer
+    /// request. For each distinct name, ordinary Handshake peers provide a
+    /// current-root Urkel proof plus Merkle-verified filtered blocks for the
+    /// proof owner's FINALIZE height and the current uncommitted name-tree
+    /// interval. The encrypted index records matching name transactions as
+    /// evidence-only and does not move the wallet scan frontier.
+    pub fn synchronize_name_market_message_evidence(
+        &self,
+        message: &NameMarketMessage,
+        now_unix: u64,
+    ) -> Result<usize, HnsDirectPeerError> {
+        let listings = match message {
+            NameMarketMessage::Offer(listing) => std::slice::from_ref(listing),
+            NameMarketMessage::Offers(listings) => listings.as_slice(),
+            _ => return Ok(0),
+        };
+        let expected_network = crate::direct_shakescape_network_binding(self.config.network)?;
+        let mut seen = BTreeSet::new();
+        let mut admitted = 0usize;
+        let mut backfills = 0usize;
+        for listing in listings {
+            let active = listing
+                .is_active_at(now_unix)
+                .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?;
+            if !active {
+                return Err(HnsDirectPeerError::Shakescape(
+                    "name-market listing is outside its signed active interval".to_owned(),
+                ));
+            }
+            if listing.network() != expected_network {
+                return Err(HnsDirectPeerError::Shakescape(
+                    "name-market listing belongs to another Handshake network".to_owned(),
+                ));
+            }
+            let name_hash = listing
+                .name_hash()
+                .map_err(|error| HnsDirectPeerError::Shakescape(error.to_string()))?
+                .into_bytes();
+            let outpoint = listing.proof.locking_outpoint;
+            if !seen.insert((
+                name_hash,
+                outpoint.transaction_hash.into_bytes(),
+                outpoint.index,
+            )) {
+                continue;
+            }
+            if self
+                .backend
+                .has_verified_name_outpoint(name_hash, outpoint)?
+            {
+                continue;
+            }
+            if backfills >= MAX_NAME_MARKET_EVIDENCE_BACKFILLS_PER_CALL {
+                break;
+            }
+            admitted = admitted
+                .checked_add(
+                    self.synchronize_name_market_listing_evidence(listing, name_hash, now_unix)?,
+                )
+                .ok_or(HnsDirectPeerError::Arithmetic)?;
+            backfills = backfills.saturating_add(1);
+        }
+        Ok(admitted)
+    }
+
+    fn synchronize_name_market_listing_evidence(
+        &self,
+        listing: &FixedPriceListing,
+        name_hash: [u8; 32],
+        now_unix: u64,
+    ) -> Result<usize, HnsDirectPeerError> {
+        let name = std::str::from_utf8(&listing.proof.name)
+            .map_err(|_| HnsDirectPeerError::Shakescape("listing name is not UTF-8".to_owned()))?;
+        self.extend_wallet_name_proof_watch_set(name_hash, now_unix)?;
+        let proof = self.synchronize_name_proof(name_hash, now_unix)?;
+        let state = proof
+            .state
+            .as_deref()
+            .ok_or_else(|| {
+                HnsDirectPeerError::Shakescape(
+                    "listing name is absent from the authenticated name tree".to_owned(),
+                )
+            })
+            .and_then(|raw| {
+                NameState::decode(NameHash::new(name_hash), raw).map_err(|_| {
+                    HnsDirectPeerError::Shakescape(
+                        "listing name state failed strict decoding".to_owned(),
+                    )
+                })
+            })?;
+        if state.name != name.as_bytes() || state.is_null() {
+            return Err(HnsDirectPeerError::Shakescape(
+                "listing name does not match authenticated name state".to_owned(),
+            ));
+        }
+
+        let tip_height = proof.observed_tip_height;
+        let interval = name_tree_interval(self.config.network);
+        let committed_height = if tip_height == 0 {
+            0
+        } else {
+            let parent = tip_height - 1;
+            parent - parent % interval
+        };
+        let mut heights = BTreeSet::new();
+        // A Shakedex locking coin is a FINALIZE output, and FINALIZE sets the
+        // authenticated state's renewal height to that output's block height.
+        // If an even newer listing lock is still in the uncommitted interval,
+        // the complete bounded interval below discovers it instead.
+        if state.owner == listing.proof.locking_outpoint
+            && state.renewal.get() != 0
+            && state.renewal.get() <= tip_height
+        {
+            heights.insert(state.renewal.get());
+        }
+        if committed_height < tip_height {
+            heights.extend(committed_height.saturating_add(1)..=tip_height);
+        }
+        if heights.is_empty() {
+            return Err(HnsDirectPeerError::WalletEvidence(
+                "authenticated listing state did not identify a fetchable owner height".to_owned(),
+            ));
+        }
+        let blocks = self.fetch_verified_wallet_blocks_at_heights(
+            &heights.into_iter().collect::<Vec<_>>(),
+            now_unix,
+        )?;
+        let admitted = self.backend.apply_verified_name_evidence_blocks(
+            &blocks,
+            name_hash,
+            now_unix_or(now_unix),
+        )?;
+        if !self
+            .backend
+            .has_verified_name_outpoint(name_hash, listing.proof.locking_outpoint)?
+        {
+            return Err(HnsDirectPeerError::WalletEvidence(
+                "independent peers did not prove the listing's current locking outpoint".to_owned(),
+            ));
+        }
+        Ok(admitted)
+    }
+
+    fn fetch_verified_wallet_blocks_at_heights(
+        &self,
+        heights: &[u32],
+        now_unix: u64,
+    ) -> Result<Vec<VerifiedWalletBlock>, HnsDirectPeerError> {
+        if heights.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut available_handles = self.pool.ready_handles()?;
+        if available_handles.len() < self.pool.config.minimum_block_views {
+            return Err(HnsDirectPeerError::InsufficientBlockViews {
+                required: self.pool.config.minimum_block_views,
+                actual: available_handles.len(),
+            });
+        }
+        let filter = wallet_bloom_filter(&self.backend.light_bloom_elements()?)?;
+        let original_ids = available_handles
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        available_handles = install_filter_on_peers(available_handles, &filter)?;
+        let installed_ids = available_handles
+            .iter()
+            .map(|(id, _)| *id)
+            .collect::<HashSet<_>>();
+        for id in original_ids {
+            if !installed_ids.contains(&id) {
+                self.disconnect_peer(id)?;
+            }
+        }
+        if available_handles.len() < self.pool.config.minimum_block_views {
+            return Err(HnsDirectPeerError::InsufficientBlockViews {
+                required: self.pool.config.minimum_block_views,
+                actual: available_handles.len(),
+            });
+        }
+
+        let mut merged_blocks = Vec::with_capacity(heights.len());
+        for height_chunk in heights.chunks(FILTERED_BLOCK_REQUEST_WINDOW as usize) {
+            let anchors = height_chunk
+                .iter()
+                .map(|height| self.backend.wallet_header_anchor(*height))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut views = Vec::new();
+            let mut attempted_ids = HashSet::new();
+            while views.len() < self.pool.config.minimum_block_views {
+                let required = self.pool.config.minimum_block_views - views.len();
+                let candidates = available_handles
+                    .iter()
+                    .filter(|(id, _)| !attempted_ids.contains(id))
+                    .map(|(id, peer)| (*id, Arc::clone(peer)))
+                    .collect::<Vec<_>>();
+                if candidates.len() < required {
+                    return Err(HnsDirectPeerError::InsufficientBlockViews {
+                        required: self.pool.config.minimum_block_views,
+                        actual: views.len(),
+                    });
+                }
+                let selected = self.block_scan_quorum_handles(&candidates, required)?;
+                attempted_ids.extend(selected.iter().map(|(id, _)| *id));
+                let responses = request_block_view_batches(&selected, &anchors, now_unix);
+                let mut failed_ids = HashSet::new();
+                for ((id, _), response) in selected.into_iter().zip(responses) {
+                    match response.result {
+                        Ok(blocks) if blocks.len() == anchors.len() => {
+                            self.record_block_scan_peer_latency(id, response.elapsed)?;
+                            views.push(blocks);
+                        }
+                        Ok(_) | Err(_) => {
+                            failed_ids.insert(id);
+                        }
+                    }
+                }
+                for id in &failed_ids {
+                    self.disconnect_peer(*id)?;
+                }
+                available_handles.retain(|(id, _)| !failed_ids.contains(id));
+            }
+            for index in 0..anchors.len() {
+                let block_views = views
+                    .iter()
+                    .map(|peer_blocks| peer_blocks[index].clone())
+                    .collect::<Vec<_>>();
+                merged_blocks.push(
+                    VerifiedWalletBlock::merge_peer_views(&block_views)
+                        .map_err(|error| HnsDirectPeerError::WalletEvidence(error.to_string()))?,
+                );
+            }
+        }
+        Ok(merged_blocks)
+    }
+
     /// Refresh every exact name proof needed by the next wallet snapshot.
     ///
     /// The set is assembled only from already-persisted known names and from
@@ -4302,6 +4546,14 @@ const fn consensus_network(network: HnsNetwork) -> Network {
         HnsNetwork::Testnet => Network::Testnet,
         HnsNetwork::Regtest => Network::Regtest,
         HnsNetwork::Simnet => Network::Simnet,
+    }
+}
+
+const fn name_tree_interval(network: HnsNetwork) -> u32 {
+    match network {
+        HnsNetwork::Mainnet | HnsNetwork::Testnet => 36,
+        HnsNetwork::Regtest => 5,
+        HnsNetwork::Simnet => 2,
     }
 }
 

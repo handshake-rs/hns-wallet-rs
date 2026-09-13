@@ -566,6 +566,76 @@ impl EmbeddedHnsBackend {
         Ok(admitted)
     }
 
+    /// Commit verified historical evidence for one watched name without
+    /// moving the account's sequential wallet-scan frontier. This permits a
+    /// light wallet to validate a remote seller's current Shakedex lock even
+    /// when that FINALIZE transaction predates the wallet birthday.
+    pub fn apply_verified_name_evidence_blocks(
+        &self,
+        blocks: &[VerifiedWalletBlock],
+        name_hash: [u8; 32],
+        now_unix: u64,
+    ) -> Result<usize, HnsWalletError> {
+        if blocks.is_empty() {
+            return Ok(0);
+        }
+        let mut state = self.lock()?;
+        let EmbeddedState {
+            authority,
+            index,
+            mempool,
+            ..
+        } = &mut *state;
+        let admitted = index
+            .apply_verified_name_evidence_blocks(authority, blocks, name_hash, now_unix)
+            .map_err(map_index_error)?;
+        let mut changed = false;
+        for block in blocks {
+            for transaction in block.transactions() {
+                let txid = transaction
+                    .transaction_hash()
+                    .map_err(|_| HnsWalletError::InvalidEvidence)?
+                    .into_bytes();
+                changed |= remove_mempool_transaction(mempool, txid);
+            }
+        }
+        if changed {
+            advance_mempool_generation(mempool)?;
+        }
+        clear_page_caches(&mut state);
+        Ok(admitted)
+    }
+
+    /// Whether the encrypted verified index contains the exact named output
+    /// referenced by a remote listing. This is an evidence-presence check,
+    /// not a current-state or script-validity decision; the Shakedex runtime
+    /// performs those stronger checks immediately afterward.
+    pub fn has_verified_name_outpoint(
+        &self,
+        name_hash: [u8; 32],
+        outpoint: Outpoint,
+    ) -> Result<bool, HnsWalletError> {
+        let state = self.lock()?;
+        let Some(observation) = state
+            .index
+            .transaction(TransactionHash::new(outpoint.transaction_hash.into_bytes()))
+            .map_err(map_index_error)?
+        else {
+            return Ok(false);
+        };
+        Ok(observation
+            .transaction
+            .outputs
+            .get(outpoint.index as usize)
+            .is_some_and(|output| {
+                output.covenant.kind.is_name()
+                    && output
+                        .covenant
+                        .item_name_hash(0)
+                        .is_some_and(|hash| hash.into_bytes() == name_hash)
+            }))
+    }
+
     /// Admit one bloom-matched transaction returned by a connected peer.
     pub fn admit_mempool_transaction(
         &self,
