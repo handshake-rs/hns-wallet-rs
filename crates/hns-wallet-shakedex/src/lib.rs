@@ -675,6 +675,8 @@ pub enum ShakedexError {
     RecoveryRequired,
     #[error("wallet persistence failed")]
     Persistence,
+    #[error("Handshake wallet backend failed: {0}")]
+    HnsBackend(String),
     #[error("Handshake value-runtime evidence or authority failed")]
     HnsIntegration,
 }
@@ -711,6 +713,7 @@ impl From<hns_wallet_hns::HnsWalletError> for ShakedexError {
                 Self::ValueRuntimeUnavailable
             }
             HnsWalletError::StoreAuthorityMismatch => Self::StoreAuthorityMismatch,
+            HnsWalletError::Backend(message) => Self::HnsBackend(message),
             _ => Self::HnsIntegration,
         }
     }

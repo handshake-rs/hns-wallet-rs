@@ -627,6 +627,33 @@ pub trait HnsBackend {
         &self,
         request: MempoolWalletPageRequest<'_>,
     ) -> Result<MempoolWalletPage, HnsWalletError>;
+    /// Acquire one process-instance/generation fence for current Shakedex
+    /// lock verification. Full-node adapters retain the default exact-script
+    /// page query. A filtered direct-wallet adapter may override this only
+    /// when its peer coordinator has installed and refreshed a filter that
+    /// covers the exact remote lock outpoints before invoking the verifier.
+    fn get_shakedex_mempool_snapshot(
+        &self,
+        scripts: &[WalletAddressKey],
+        binding: SnapshotBinding,
+        expected_mempool: Option<MempoolSnapshotBinding>,
+    ) -> Result<MempoolSnapshotBinding, HnsWalletError> {
+        let page = self.get_mempool_wallet_page(MempoolWalletPageRequest {
+            scripts,
+            binding,
+            expected_mempool,
+            cursor: None,
+            limit: 1,
+        })?;
+        if page.binding != binding
+            || page.mempool.instance_nonce == [0; 32]
+            || expected_mempool.is_some_and(|expected| page.mempool != expected)
+            || page.history.len() > 1
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        Ok(page.mempool)
+    }
     /// Returns raw bytes, status, and inclusion from one canonical snapshot.
     /// A pruned node may omit raw bytes, but not the other fields.
     fn get_transaction_evidence(

@@ -2112,21 +2112,7 @@ fn query_shakedex_lock_mempool<B: HnsBackend>(
     binding: SnapshotBinding,
     expected_mempool: Option<MempoolSnapshotBinding>,
 ) -> Result<MempoolSnapshotBinding, HnsWalletError> {
-    let page = backend.get_mempool_wallet_page(MempoolWalletPageRequest {
-        scripts,
-        binding,
-        expected_mempool,
-        cursor: None,
-        limit: 1,
-    })?;
-    if page.binding != binding
-        || page.mempool.instance_nonce == [0; 32]
-        || expected_mempool.is_some_and(|expected| page.mempool != expected)
-        || page.history.len() > 1
-    {
-        return Err(HnsWalletError::StaleNodeSnapshot);
-    }
-    Ok(page.mempool)
+    backend.get_shakedex_mempool_snapshot(scripts, binding, expected_mempool)
 }
 
 /// Query-scoped current-lock authority for the non-value account runtime.

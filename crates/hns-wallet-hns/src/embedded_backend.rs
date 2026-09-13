@@ -913,6 +913,29 @@ impl HnsBackend for EmbeddedHnsBackend {
         })
     }
 
+    fn get_shakedex_mempool_snapshot(
+        &self,
+        scripts: &[WalletAddressKey],
+        binding: SnapshotBinding,
+        expected_mempool: Option<MempoolSnapshotBinding>,
+    ) -> Result<MempoolSnapshotBinding, HnsWalletError> {
+        // These are remote seller lock programs, not buyer derivation
+        // scripts. The coordinator makes their current owner outpoints part
+        // of the direct filter and refreshes the mempool before this fence is
+        // acquired, so applying the wallet-owned script gate here would
+        // reject every legitimate remote listing.
+        validate_page_scripts(scripts)?;
+        let state = self.lock()?;
+        require_binding(&state, binding)?;
+        let current = mempool_binding(&state.mempool);
+        if current.instance_nonce == [0; 32]
+            || expected_mempool.is_some_and(|expected| expected != current)
+        {
+            return Err(HnsWalletError::StaleNodeSnapshot);
+        }
+        Ok(current)
+    }
+
     fn get_transaction_evidence(
         &self,
         txid: TransactionHash,

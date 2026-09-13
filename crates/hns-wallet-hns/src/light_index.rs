@@ -311,6 +311,7 @@ impl HnsLightScanProjection {
                 &observation.transaction,
                 CanonicalTransactionHash::new(txid),
                 &projection.watched_scripts,
+                &projection.watched_names,
                 &mut projection.watched_outpoints,
             )?;
             add_confirmed_spends(
@@ -842,6 +843,7 @@ impl EncryptedHnsLightIndex {
                     transaction,
                     canonical_txid,
                     watched_scripts,
+                    watched_names,
                     &mut added_watched_outpoints,
                 )?;
                 if !relevant {
@@ -1028,6 +1030,7 @@ impl EncryptedHnsLightIndex {
                     transaction,
                     canonical_txid,
                     &self.scan_projection.watched_scripts,
+                    &self.scan_projection.watched_names,
                     &mut added_watched_outpoints,
                 )?;
                 add_confirmed_spends(
@@ -1281,6 +1284,7 @@ impl EncryptedHnsLightIndex {
             transaction,
             txid,
             &self.scan_projection.watched_scripts,
+            &self.scan_projection.watched_names,
             outpoints,
         )
     }
@@ -1442,6 +1446,7 @@ pub(crate) fn add_watched_outputs(
     transaction: &Transaction,
     txid: CanonicalTransactionHash,
     scripts: &BTreeSet<WalletAddressKey>,
+    names: &BTreeSet<[u8; 32]>,
     outpoints: &mut HashSet<Outpoint>,
 ) -> Result<(), HnsLightIndexError> {
     for (index, output) in transaction.outputs.iter().enumerate() {
@@ -1449,7 +1454,12 @@ pub(crate) fn add_watched_outputs(
             version: output.address.version,
             hash: output.address.hash.clone(),
         };
-        if scripts.contains(&key) {
+        let watched_name = output.covenant.kind.is_name()
+            && output
+                .covenant
+                .item_name_hash(0)
+                .is_some_and(|name| names.contains(&name.into_bytes()));
+        if scripts.contains(&key) || watched_name {
             outpoints.insert(Outpoint {
                 transaction_hash: txid,
                 index: u32::try_from(index).map_err(|_| HnsLightIndexError::TransactionCapacity)?,

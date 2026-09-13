@@ -2876,6 +2876,11 @@ impl HnsDirectPeerCoordinator {
                 "independent peers did not prove the listing's current locking outpoint".to_owned(),
             ));
         }
+        // The evidence commit adds the exact remote name-owner outpoint to
+        // the persistent direct filter. Reinstall that enlarged filter and
+        // request the existing mempool before the board runtime treats an
+        // absent spender as authoritative.
+        self.refresh_mempool(now_unix)?;
         Ok(admitted)
     }
 
@@ -3299,6 +3304,15 @@ impl HnsDirectPeerCoordinator {
             });
         }
         let handles = self.fastest_block_scan_quorum_handles(handles, required)?;
+        let elements = self.backend.light_bloom_elements()?;
+        let filter = wallet_bloom_filter(&elements)?;
+        let handles = install_filter_on_peers(handles, &filter)?;
+        if handles.len() < required {
+            return Err(HnsDirectPeerError::InsufficientBlockViews {
+                required,
+                actual: handles.len(),
+            });
+        }
         let wait = self.pool.config.event_poll_timeout;
         let results = std::thread::scope(|scope| {
             let tasks = handles
