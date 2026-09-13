@@ -369,6 +369,14 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         Ok(())
     }
 
+    /// Recover marketplace publications after the embedding application has
+    /// completed one verified HNS reconciliation. This remains a separate,
+    /// explicitly fallible boundary so a corrupt or unavailable marketplace
+    /// workflow cannot invalidate an otherwise valid balance snapshot.
+    pub fn recover_trusted_native_shakedex_after_reconcile(&self) -> Result<(), ServiceFailure> {
+        self.recover_shakedex_after_reconcile()
+    }
+
     fn reconcile(&self) -> Result<AccountSummary, ServiceFailure> {
         let before = self.exact_account()?;
         // Direct wallets keep their verified light index in the same encrypted
@@ -1838,6 +1846,15 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
     /// destination, amount, fee, or signing authority crosses this boundary.
     pub fn rebroadcast_trusted_native_dropped_hns_sends(&self) -> Result<usize, ServiceFailure> {
         self.runtime.rebroadcast_dropped_pending_sends()
+    }
+
+    /// Recover durable ShakeDex seller publications after the embedding
+    /// application has completed one verified HNS reconciliation. This is
+    /// separate from the returned wallet snapshot so marketplace failure does
+    /// not suppress authenticated balance and history reads.
+    pub fn recover_trusted_native_shakedex_after_reconcile(&self) -> Result<(), ServiceFailure> {
+        self.runtime
+            .recover_trusted_native_shakedex_after_reconcile()
     }
 
     /// Begin one wallet-owned direct Shakescape board exchange. The supplied peer

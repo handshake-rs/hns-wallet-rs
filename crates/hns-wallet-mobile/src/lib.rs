@@ -1750,6 +1750,23 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .map_err(mobile_service_failure)
     }
 
+    /// Recover seller publications only after this controller has completed a
+    /// verified HNS reconciliation. Embeddings deliberately call this after
+    /// accepting the wallet snapshot and handle a marketplace-only failure
+    /// separately, so offer recovery can never suppress valid wallet reads.
+    pub fn recover_shakedex_after_reconcile(&mut self) -> Result<(), MobileWalletError> {
+        if self.pending.is_some() {
+            return Err(MobileWalletError::ValueActionPending);
+        }
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        self.session
+            .service
+            .recover_trusted_native_shakedex_after_reconcile()
+            .map_err(mobile_service_failure)
+    }
+
     /// Return the ordinary HNS payment receive target deterministically
     /// derived from the unlocked local wallet. No HNS, Bitcoin, Shakescape, or
     /// clock operation occurs here; fund state and value operations still
@@ -4403,6 +4420,25 @@ mod tests {
         assert!(probe.snapshot_calls.load(Ordering::SeqCst) > 1);
         assert!(probe.confirmed_calls.load(Ordering::SeqCst) > 0);
         assert!(probe.mempool_calls.load(Ordering::SeqCst) > 0);
+        let synchronized_backend_calls = (
+            probe.snapshot_calls.load(Ordering::SeqCst),
+            probe.tip_calls.load(Ordering::SeqCst),
+            probe.confirmed_calls.load(Ordering::SeqCst),
+            probe.mempool_calls.load(Ordering::SeqCst),
+        );
+        value
+            .recover_shakedex_after_reconcile()
+            .expect("market recovery after explicit verified sync");
+        assert_eq!(
+            synchronized_backend_calls,
+            (
+                probe.snapshot_calls.load(Ordering::SeqCst),
+                probe.tip_calls.load(Ordering::SeqCst),
+                probe.confirmed_calls.load(Ordering::SeqCst),
+                probe.mempool_calls.load(Ordering::SeqCst),
+            ),
+            "post-reconcile marketplace recovery must not start a second chain read",
+        );
     }
 
     #[test]
