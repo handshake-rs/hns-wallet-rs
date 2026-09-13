@@ -677,8 +677,8 @@ pub enum ShakedexError {
     Persistence,
     #[error("Handshake wallet backend failed: {0}")]
     HnsBackend(String),
-    #[error("Handshake value-runtime evidence or authority failed")]
-    HnsIntegration,
+    #[error("Handshake value-runtime preparation failed: {0}")]
+    HnsIntegration(String),
 }
 
 impl From<StoreError> for ShakedexError {
@@ -705,16 +705,20 @@ impl From<hns_wallet_hns::HnsWalletError> for ShakedexError {
             | HnsWalletError::InvalidFeeQuote
             | HnsWalletError::FeeLimit => Self::InvalidFeeEvidence,
             HnsWalletError::StaleNodeSnapshot
-            | HnsWalletError::InvalidEvidence
-            | HnsWalletError::InvalidPreparedArtifact
-            | HnsWalletError::InvalidWorkflow => Self::InvalidEvidence,
+            | HnsWalletError::StaleAccountRead
+            | HnsWalletError::StaleAddressReservation => Self::StaleRevision,
             HnsWalletError::Store => Self::Persistence,
             HnsWalletError::RuntimeIntegrationUnavailable | HnsWalletError::MainnetDisabled => {
                 Self::ValueRuntimeUnavailable
             }
             HnsWalletError::StoreAuthorityMismatch => Self::StoreAuthorityMismatch,
             HnsWalletError::Backend(message) => Self::HnsBackend(message),
-            _ => Self::HnsIntegration,
+            // Every remaining display string comes from the closed
+            // `HnsWalletError` enum. Preserve that safe classification so a
+            // caller can distinguish insufficient unreserved coins and other
+            // closed preparation failures instead of reducing all of them to
+            // one unactionable error.
+            error => Self::HnsIntegration(error.to_string()),
         }
     }
 }
@@ -793,6 +797,26 @@ mod tests {
         assert_eq!(buyer.state, BuyerState::FulfillmentPrepared);
         assert_eq!(buyer.revision, 10);
         assert_eq!(journal.buyer.len(), 1);
+    }
+
+    #[test]
+    fn hns_integration_errors_preserve_closed_safe_classification() {
+        let insufficient = ShakedexError::from(hns_wallet_hns::HnsWalletError::InsufficientFunds);
+        assert!(matches!(
+            insufficient,
+            ShakedexError::HnsIntegration(ref detail)
+                if detail == "insufficient spendable funds"
+        ));
+
+        assert!(matches!(
+            ShakedexError::from(hns_wallet_hns::HnsWalletError::StaleAddressReservation),
+            ShakedexError::StaleRevision,
+        ));
+        assert!(matches!(
+            ShakedexError::from(hns_wallet_hns::HnsWalletError::InvalidPreparedArtifact),
+            ShakedexError::HnsIntegration(ref detail)
+                if detail == "prepared transaction artifact is invalid"
+        ));
     }
 
     #[test]

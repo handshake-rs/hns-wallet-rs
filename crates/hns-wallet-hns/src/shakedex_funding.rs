@@ -1531,12 +1531,7 @@ where
             && candidate.coin.confirmation_count >= minimum_confirmations
             && candidate.coin.outpoint != source_outpoint
     });
-    candidates.sort_by(|left, right| {
-        left.coin
-            .value
-            .cmp(&right.coin.value)
-            .then_with(|| left.coin.outpoint.cmp(&right.coin.outpoint))
-    });
+    prioritize_shakedex_funding_candidates(&mut candidates);
 
     let mut selected = Vec::new();
     let mut total = 0_u128;
@@ -1627,6 +1622,20 @@ where
         }
     }
     Err(HnsWalletError::InsufficientFunds)
+}
+
+/// Put the greatest amount of spendable value inside the bounded input
+/// prefix. The previous ascending order examined at most 512 dust/small
+/// outputs and could report insufficient funds while a larger confirmed coin
+/// remained immediately beyond that prefix.
+fn prioritize_shakedex_funding_candidates(candidates: &mut [TrackedHnsCoin]) {
+    candidates.sort_by(|left, right| {
+        right
+            .coin
+            .value
+            .cmp(&left.coin.value)
+            .then_with(|| left.coin.outpoint.cmp(&right.coin.outpoint))
+    });
 }
 
 fn shakedex_change_output(address: Address, value: u64) -> Result<Output, HnsWalletError> {
@@ -2256,6 +2265,115 @@ mod tests {
             },
             address_program: vec![tag; 20],
         }
+    }
+
+    #[test]
+    fn bounded_shakedex_funding_prefix_keeps_largest_confirmed_value() {
+        let funding_scope = scope(1, 2, 3);
+        let mut candidates = (1_u8..=8)
+            .map(|tag| {
+                let mut candidate = funding_input(&funding_scope, tag);
+                candidate.coin.value = BaseUnits::new(u128::from(tag) * 10_000);
+                candidate
+            })
+            .collect::<Vec<_>>();
+
+        prioritize_shakedex_funding_candidates(&mut candidates);
+
+        assert_eq!(candidates[0].coin.value, BaseUnits::new(80_000));
+        assert_eq!(candidates[1].coin.value, BaseUnits::new(70_000));
+        assert_eq!(candidates[2].coin.value, BaseUnits::new(60_000));
+        assert_eq!(
+            candidates[..3]
+                .iter()
+                .map(|candidate| candidate.coin.value.get())
+                .sum::<u128>(),
+            210_000,
+            "the bounded prefix must maximize available funding value",
+        );
+    }
+
+    #[test]
+    fn shakedex_selection_funds_from_large_coin_beyond_old_small_coin_prefix() {
+        let funding_scope = scope(1, 2, 3);
+        let values = [1_000_u128, 2_000, 3_000, 4_000, 150_000];
+        let candidates = values
+            .into_iter()
+            .enumerate()
+            .map(|(offset, value)| {
+                let mut candidate = funding_input(
+                    &funding_scope,
+                    u8::try_from(offset + 1).expect("bounded tag"),
+                );
+                candidate.coin.value = BaseUnits::new(value);
+                candidate
+            })
+            .collect::<Vec<_>>();
+        let source_address = Address::new(0, vec![0x90; 20]).expect("source address");
+        let source_coin = Coin {
+            outpoint: Outpoint {
+                transaction_hash: hns_primitives::TransactionHash::new([0xa0; 32]),
+                index: 0,
+            },
+            value: Dollarydoos::new(75_000),
+            height: hns_primitives::Height::new(10),
+            coinbase: false,
+            address: source_address.clone(),
+            covenant: Covenant::default(),
+        };
+        let ordinary_value = BaseUnits::new(100_000);
+        let mut build = |mut funding_inputs: Vec<Input>,
+                         _funding_coins: Vec<Coin>,
+                         mut funding_outputs: Vec<Output>,
+                         expected_fee: u64| {
+            let mut inputs = vec![Input {
+                previous_output: source_coin.outpoint,
+                sequence: u32::MAX,
+                witness: Witness {
+                    items: vec![vec![1]],
+                },
+            }];
+            inputs.append(&mut funding_inputs);
+            let mut outputs = vec![Output {
+                value: source_coin.value,
+                address: source_address.clone(),
+                covenant: Covenant::default(),
+            }];
+            outputs.append(&mut funding_outputs);
+            outputs.push(Output {
+                value: Dollarydoos::new(
+                    u64::try_from(ordinary_value.get()).expect("ordinary value"),
+                ),
+                address: source_address.clone(),
+                covenant: Covenant::default(),
+            });
+            let transaction = Transaction {
+                version: 0,
+                inputs,
+                outputs,
+                locktime: 0,
+            };
+            let encoded = transaction.encode().expect("candidate transaction");
+            Ok::<_, HnsWalletError>((encoded, expected_fee))
+        };
+
+        let selection = select_shakedex_funding(
+            &source_coin,
+            candidates,
+            Address::new(0, vec![0x91; 20]).expect("change address"),
+            ordinary_value,
+            BaseUnits::new(1_000),
+            BaseUnits::new(10_000),
+            BaseUnits::new(DEFAULT_DUST_THRESHOLD),
+            1,
+            3,
+            &mut build,
+        )
+        .expect("large confirmed coin funds within bounded prefix");
+
+        assert_eq!(selection.selected.len(), 1);
+        assert_eq!(selection.selected[0].coin.value, BaseUnits::new(150_000));
+        assert!(selection.fee <= BaseUnits::new(10_000));
     }
 
     #[test]

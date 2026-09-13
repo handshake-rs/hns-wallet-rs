@@ -2587,7 +2587,7 @@ fn inventory_response_plan_fences_account_mutation_during_clock_without_backend_
     .expect("GetOfferInventory request");
     assert!(matches!(
         prepare_shakescape_board_inventory_response(&request, &board),
-        Err(ShakedexError::HnsIntegration)
+        Err(ShakedexError::StaleRevision)
     ));
     assert_eq!(control.query_count.load(Ordering::SeqCst), 0);
     assert_eq!(
@@ -3027,7 +3027,7 @@ fn single_offer_response_plan_fences_account_mutation_during_clock_observation()
 
     assert!(matches!(
         prepare_shakescape_board_offer_response(&request, &mutating_board),
-        Err(ShakedexError::HnsIntegration)
+        Err(ShakedexError::StaleRevision)
     ));
     assert!(control.query_count.load(Ordering::SeqCst) > 0);
     assert_eq!(

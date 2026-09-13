@@ -76,6 +76,10 @@ pub const TRUSTED_NATIVE_HNS_VALUE_ORIGIN: &str = "http://localhost";
 pub const NATIVE_HNS_SEND_PRE_BROADCAST_RETRY_MESSAGE: &str =
     "HNS send requires a refreshed authenticated wallet snapshot before retrying";
 
+/// Bound current-chain reacquisition when headers or the mempool advance
+/// during buyer preparation. No attempt authorizes, signs, or broadcasts.
+const MAX_SHAKEDEX_PREPARATION_ATTEMPTS: usize = 3;
+
 /// One coherent, minimized full-runtime projection for trusted native UI.
 /// Chain/mempool bindings, coins, scripts, raw transactions, and keys remain
 /// inside the HNS runtime.
@@ -588,16 +592,29 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
             return Err(invalid_request("buyer maximum fee must be nonzero"));
         }
         let listing_hash = parse_object_hash(&params.listing_id, "listingId")?;
-        self.reconcile()?;
-        let preview = self
-            .recovered_shakedex_runtime()?
-            .prepare_buyer_fulfillment(PrepareBuyerTrade {
-                listing_hash,
-                request_nonce: call.request_nonce,
-                maximum_fee: params.maximum_fee,
-            })
-            .map_err(shakedex_failure)?;
-        Ok((params, preview))
+        for attempt in 0..MAX_SHAKEDEX_PREPARATION_ATTEMPTS {
+            self.reconcile()?;
+            match self
+                .recovered_shakedex_runtime()?
+                .prepare_buyer_fulfillment(PrepareBuyerTrade {
+                    listing_hash,
+                    request_nonce: call.request_nonce,
+                    maximum_fee: params.maximum_fee,
+                }) {
+                Ok(preview) => return Ok((params, preview)),
+                Err(ShakedexError::StaleRevision)
+                    if attempt + 1 < MAX_SHAKEDEX_PREPARATION_ATTEMPTS =>
+                {
+                    // Header or mempool state may legitimately advance after
+                    // synchronization but before the exact current-lock and
+                    // change-reservation fences close. Preparation has not
+                    // authorized or broadcast anything, so reacquire the
+                    // complete snapshot under the same immutable request.
+                }
+                Err(error) => return Err(shakedex_failure(error)),
+            }
+        }
+        unreachable!("bounded buyer preparation loop always returns")
     }
 
     fn prepare_script_finalize(
@@ -2473,11 +2490,36 @@ fn shakedex_failure(error: ShakedexError) -> ServiceFailure {
         | ShakedexError::InvalidTransition => {
             invalid_request("name-market request or current state is invalid")
         }
+        ShakedexError::InvalidFeeEvidence => ServiceFailure {
+            code: ServiceErrorCode::RuntimeFailure,
+            message: "Handshake swap fee evidence is invalid or exceeds the approved maximum"
+                .to_owned(),
+            unsupported_capability: None,
+        },
+        ShakedexError::InvalidEvidence => ServiceFailure {
+            code: ServiceErrorCode::RuntimeFailure,
+            message: "Handshake swap listing, lock, or funding evidence failed authentication"
+                .to_owned(),
+            unsupported_capability: None,
+        },
+        ShakedexError::StaleRevision => ServiceFailure {
+            code: ServiceErrorCode::RuntimeFailure,
+            message: "Handshake swap state changed while the action was being prepared".to_owned(),
+            unsupported_capability: None,
+        },
         ShakedexError::Persistence
         | ShakedexError::CorruptNameMarketBoard
         | ShakedexError::CorruptShakescapeOutbox => ServiceFailure {
             code: ServiceErrorCode::PersistenceFailure,
             message: "persisted Shakedex state failed authentication".to_owned(),
+            unsupported_capability: None,
+        },
+        ShakedexError::HnsIntegration(detail) => ServiceFailure {
+            code: ServiceErrorCode::RuntimeFailure,
+            // `detail` is produced only from the closed `HnsWalletError`
+            // display implementation. It contains no names, addresses,
+            // transaction identifiers, scripts, or filesystem paths.
+            message: format!("Handshake swap preparation failed: {detail}"),
             unsupported_capability: None,
         },
         _ => ServiceFailure {
@@ -2616,6 +2658,28 @@ mod tests {
         assert_eq!(
             chain_failure(ChainError::InvalidRequest("unclassified request")).message,
             "HNS value request is invalid",
+        );
+    }
+
+    #[test]
+    fn shakedex_preparation_failure_preserves_safe_hns_reason() {
+        let failure = shakedex_failure(ShakedexError::from(HnsWalletError::InsufficientFunds));
+        assert_eq!(failure.code, ServiceErrorCode::RuntimeFailure);
+        assert_eq!(
+            failure.message,
+            "Handshake swap preparation failed: insufficient spendable funds",
+        );
+        assert_eq!(
+            shakedex_failure(ShakedexError::InvalidFeeEvidence).message,
+            "Handshake swap fee evidence is invalid or exceeds the approved maximum",
+        );
+        assert_eq!(
+            shakedex_failure(ShakedexError::InvalidEvidence).message,
+            "Handshake swap listing, lock, or funding evidence failed authentication",
+        );
+        assert_eq!(
+            shakedex_failure(ShakedexError::StaleRevision).message,
+            "Handshake swap state changed while the action was being prepared",
         );
     }
 }
