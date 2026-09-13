@@ -817,6 +817,18 @@ pub(crate) struct ShakescapeAcceptedReplay {
     pub(crate) request_id: u64,
 }
 
+/// One exact, still-live seller publication that reached a terminal transport
+/// state and may therefore be replayed to a newly negotiated direct peer.
+/// Direct announcement is a per-connection operation: the durable terminal
+/// state proves only that one earlier socket write completed, not that every
+/// later peer has received the publication.
+pub(crate) struct ShakescapeDirectReplay {
+    pub(crate) envelope_bytes: Vec<u8>,
+    pub(crate) created_at_unix: u64,
+    pub(crate) message_kind: ShakescapeOutboxMessageKind,
+    pub(crate) request_id: u64,
+}
+
 pub struct StoredShakescapePublicationOutbox {
     pub revision: u64,
     pub updated_at_unix: u64,
@@ -857,6 +869,56 @@ pub(crate) fn accepted_shakescape_replays(
             })
         })
         .collect()
+}
+
+pub(crate) fn live_completed_shakescape_direct_replays(
+    store: &WalletStore,
+    now_unix: u64,
+) -> Result<Vec<ShakescapeDirectReplay>, ShakedexError> {
+    let stored = load_shakescape_publication_outbox(store)?;
+    let mut replays = stored
+        .outbox
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.state,
+                ShakescapeOutboxState::RelayAccepted { .. }
+                    | ShakescapeOutboxState::DirectAnnounced { .. }
+            )
+        })
+        .filter_map(|entry| {
+            let (_, _, message) = match NameMarketMessage::decode_envelope(&entry.envelope_bytes) {
+                Ok(decoded) => decoded,
+                Err(_) => return Some(Err(ShakedexError::CorruptShakescapeOutbox)),
+            };
+            let live = match message {
+                NameMarketMessage::Offer(listing) => {
+                    listing.created_at <= now_unix && now_unix < listing.expires_at
+                }
+                NameMarketMessage::Cancel(cancellation) => {
+                    cancellation.created_at <= now_unix && now_unix < cancellation.expires_at
+                }
+                _ => return Some(Err(ShakedexError::CorruptShakescapeOutbox)),
+            };
+            live.then(|| {
+                Ok(ShakescapeDirectReplay {
+                    envelope_bytes: entry.envelope_bytes.clone(),
+                    created_at_unix: entry.created_at_unix,
+                    message_kind: entry.message_kind,
+                    request_id: entry.request_id,
+                })
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    replays.sort_by_key(|replay| {
+        (
+            replay.created_at_unix,
+            replay.message_kind,
+            replay.request_id,
+        )
+    });
+    Ok(replays)
 }
 
 pub fn load_shakescape_publication_outbox(
@@ -2593,6 +2655,17 @@ mod tests {
             load_prepared_shakescape_handoff(&store)
                 .expect("terminal direct state")
                 .is_none()
+        );
+        let replay = live_completed_shakescape_direct_replays(&store, CREATED_AT + 3)
+            .expect("live publication replay");
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].envelope_bytes, offer);
+        assert_eq!(replay[0].message_kind, ShakescapeOutboxMessageKind::Offer);
+        assert_eq!(replay[0].request_id, 101);
+        assert!(
+            live_completed_shakescape_direct_replays(&store, CREATED_AT + 3_600)
+                .expect("expired publication is ignored")
+                .is_empty()
         );
     }
 

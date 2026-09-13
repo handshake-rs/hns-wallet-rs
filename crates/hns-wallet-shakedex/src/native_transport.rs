@@ -19,9 +19,11 @@ use hns_wallet_types::ObjectHash;
 use thiserror::Error;
 
 use crate::{
-    ShakedexError, ShakescapeBoardRuntime, ShakescapeHandoffPreparation,
+    ShakedexError, ShakescapeBoardCancellationAdmission, ShakescapeBoardOfferAdmission,
+    ShakescapeBoardRuntime, ShakescapeHandoffPreparation,
     board_runtime::CurrentShakescapeBoardOffersResolution, load_shakescape_publication_outbox,
-    prepare_next_shakescape_handoff, record_shakescape_handoff_direct_announcement,
+    outbox::live_completed_shakescape_direct_replays, prepare_next_shakescape_handoff,
+    record_shakescape_handoff_direct_announcement,
 };
 
 /// Hard upper bound for one caller-driven direct board exchange. A caller can
@@ -37,6 +39,7 @@ pub struct DirectShakescapeBoardSyncReport {
     pub offers_admitted: usize,
     pub cancellations_admitted: usize,
     pub marketplace_records_rejected: usize,
+    pub seller_publications_replayed: usize,
 }
 
 /// Failure at the wallet-owned direct marketplace boundary.
@@ -88,6 +91,31 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeShakescapeTransport<'a, B, C> {
         report.messages_sent = report.messages_sent.saturating_add(1);
         peer.send_name_market(&NameMarketMessage::GetOfferInventory)?;
         report.messages_sent = report.messages_sent.saturating_add(1);
+        let inventory = self.board.current_inventory()?;
+        peer.send_name_market(&NameMarketMessage::OfferInventory(
+            inventory
+                .listing_hashes()
+                .iter()
+                .map(|hash| hash.into_bytes())
+                .collect(),
+        ))?;
+        report.messages_sent = report.messages_sent.saturating_add(1);
+        let now_unix = self.hns.trusted_now_unix()?;
+        let replays = self
+            .store
+            .try_with_store(|store| live_completed_shakescape_direct_replays(store, now_unix))?;
+        for replay in replays {
+            let (registry, request_id, message) =
+                NameMarketMessage::decode_envelope(&replay.envelope_bytes)
+                    .map_err(|_| WalletNativeShakescapeTransportError::InvalidEnvelope)?;
+            if registry != ShakescapeRegistryVersion::V1 || request_id != replay.request_id {
+                return Err(WalletNativeShakescapeTransportError::InvalidEnvelope);
+            }
+            peer.send_name_market_with_request_id(request_id, &message)?;
+            report.messages_sent = report.messages_sent.saturating_add(1);
+            report.seller_publications_replayed =
+                report.seller_publications_replayed.saturating_add(1);
+        }
         Ok(report)
     }
 
@@ -281,10 +309,11 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeShakescapeTransport<'a, B, C> {
                     .board
                     .admit_cancellation(&envelope, listing_hash, cancellation_hash)
                 {
-                    Ok(_) => {
+                    Ok(ShakescapeBoardCancellationAdmission::Applied { .. }) => {
                         report.cancellations_admitted =
                             report.cancellations_admitted.saturating_add(1)
                     }
+                    Ok(ShakescapeBoardCancellationAdmission::Existing { .. }) => {}
                     Err(error) if rejected_marketplace_record(&error) => {
                         report.marketplace_records_rejected =
                             report.marketplace_records_rejected.saturating_add(1);
@@ -330,7 +359,11 @@ impl<'a, B: HnsBackend, C: HnsClock> WalletNativeShakescapeTransport<'a, B, C> {
         report: &mut DirectShakescapeBoardSyncReport,
     ) -> Result<(), WalletNativeShakescapeTransportError> {
         match self.board.admit_offer(envelope, listing_hash) {
-            Ok(_) => report.offers_admitted = report.offers_admitted.saturating_add(1),
+            Ok(
+                ShakescapeBoardOfferAdmission::Inserted { .. }
+                | ShakescapeBoardOfferAdmission::Updated { .. },
+            ) => report.offers_admitted = report.offers_admitted.saturating_add(1),
+            Ok(ShakescapeBoardOfferAdmission::Existing { .. }) => {}
             Err(error) if rejected_marketplace_record(&error) => {
                 report.marketplace_records_rejected =
                     report.marketplace_records_rejected.saturating_add(1);
@@ -367,6 +400,9 @@ fn merge_report(into: &mut DirectShakescapeBoardSyncReport, next: DirectShakesca
     into.marketplace_records_rejected = into
         .marketplace_records_rejected
         .saturating_add(next.marketplace_records_rejected);
+    into.seller_publications_replayed = into
+        .seller_publications_replayed
+        .saturating_add(next.seller_publications_replayed);
 }
 
 fn rejected_marketplace_record(error: &ShakedexError) -> bool {
