@@ -2493,10 +2493,25 @@ fn direct_shakescape_failure(
 ) -> ServiceFailure {
     match error {
         hns_wallet_shakedex::WalletNativeShakescapeTransportError::Board(error) => {
-            shakedex_failure(error)
+            // These descriptions are closed enum text: they contain no names,
+            // addresses, transaction identifiers, scripts, or store paths.
+            // Retaining the category here is important because the mobile
+            // socket owner must distinguish a local evidence/persistence gap
+            // from malformed peer framing before deciding whether to retire a
+            // negotiated connection.
+            let detail = error.to_string();
+            let mut failure = shakedex_failure(error);
+            failure.message = format!("Shakescape name-market exchange failed: {detail}");
+            failure
         }
         hns_wallet_shakedex::WalletNativeShakescapeTransportError::Wallet(error) => {
-            hns_runtime_failure(error)
+            // `HnsWalletError` also has deliberately bounded, non-sensitive
+            // display text. Do not collapse a missing current-lock observation
+            // into the unrelated account-selector diagnostic.
+            let detail = error.to_string();
+            let mut failure = hns_runtime_failure(error);
+            failure.message = format!("Shakescape Handshake evidence failed: {detail}");
+            failure
         }
         hns_wallet_shakedex::WalletNativeShakescapeTransportError::DirectPeer(_)
         | hns_wallet_shakedex::WalletNativeShakescapeTransportError::InvalidMessageLimit
