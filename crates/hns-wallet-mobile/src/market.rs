@@ -200,7 +200,12 @@ impl MobileShakescapeBitcoinFundingPermit {
 }
 
 const DIRECT_OFFER_APPROVAL_LIFETIME_SECONDS: u64 = 300;
-const MIN_DIRECT_OFFER_LIFETIME_SECONDS: u64 = 600;
+/// The maker commits this much time to first-chain funding after receiving a
+/// take. A take is unusable unless the listing remains valid for this complete
+/// interval. Two windows make a newly published offer useful for up to one
+/// hour of ordinary board propagation and user review.
+const DIRECT_SWAP_FUNDING_WINDOW_SECONDS: u64 = 60 * 60;
+const MIN_DIRECT_OFFER_LIFETIME_SECONDS: u64 = 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS;
 const MAX_DIRECT_OFFER_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Product floor for Bitcoin funding/refund headroom committed by a mobile
 /// direct offer participant. Values below this cannot pass the downstream
@@ -671,7 +676,7 @@ impl MobileShakescapeSessionController {
             })
             .map_err(MobileWalletError::from)?
             .into_iter()
-            .filter(|record| record.is_active_at(now_unix))
+            .filter(|record| direct_offer_has_funding_horizon(record, now_unix))
             .map(|record| direct_board_offer_summary(record, false))
             .collect::<Result<Vec<_>, _>>()
             .map(|offers| {
@@ -764,7 +769,7 @@ impl MobileShakescapeSessionController {
             .checked_add(DIRECT_OFFER_APPROVAL_LIFETIME_SECONDS)
             .ok_or(MobileWalletError::InvalidDirectOfferAction)?;
         let take_expires_at_unix = record.offer.header.expires_at;
-        if take_expires_at_unix <= now_unix {
+        if !direct_offer_has_funding_horizon(&record, now_unix) {
             return Err(MobileWalletError::DirectOfferActionExpired);
         }
         let action_token = super::random_nonzero_bytes()?;
@@ -2580,7 +2585,10 @@ impl MobileShakescapeSessionController {
                 )
             })
             .map_err(MobileWalletError::from)?;
-        for cancellation in cancellations {
+        for cancellation in cancellations
+            .into_iter()
+            .filter(|cancellation| cancellation.header.expires_at > now_unix)
+        {
             peer.send_cross_chain_message(&CrossChainMessage::CancelDirectOffer(cancellation))?;
         }
         let pending_takes = self
@@ -2737,7 +2745,7 @@ impl MobileShakescapeSessionController {
                             // reconnect a transient mobile route before the
                             // first funding gate. Keep this bounded but do not
                             // make ordinary mobile scheduling race ten minutes.
-                            funding_window_seconds: 60 * 60,
+                            funding_window_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
                             second_refund_after_seconds: 2 * 60 * 60,
                             refund_safety_margin_seconds: 60 * 60,
                             bitcoin_minimum_confirmations: 1,
@@ -2791,6 +2799,16 @@ impl MobileShakescapeSessionController {
         }
         Ok(report)
     }
+}
+
+fn direct_offer_has_funding_horizon(
+    record: &hns_wallet_market::ShakescapeDirectOfferRecord,
+    now_unix: u64,
+) -> bool {
+    record.is_active_at(now_unix)
+        && now_unix
+            .checked_add(DIRECT_SWAP_FUNDING_WINDOW_SECONDS)
+            .is_some_and(|funding_expires_at| funding_expires_at <= record.offer.header.expires_at)
 }
 
 fn summary(
@@ -3080,6 +3098,19 @@ mod tests {
             Err(MobileWalletError::InvalidDirectOfferAction)
         ));
 
+        let mut insufficient_settlement_horizon = make_controller();
+        assert!(matches!(
+            insufficient_settlement_horizon.prepare_btc_for_hns_offer(
+                100_000,
+                MIN_HTLC_DUST_SATS,
+                1_000_000,
+                MINIMUM_BITCOIN_FEE_RESERVE_SATS,
+                MIN_DIRECT_OFFER_LIFETIME_SECONDS - 1,
+                START,
+            ),
+            Err(MobileWalletError::InvalidDirectOfferAction)
+        ));
+
         let mut exact_bitcoin_fee_reserve = make_controller();
         assert!(
             exact_bitcoin_fee_reserve
@@ -3171,6 +3202,59 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn offers_without_a_complete_funding_window_are_not_actionable() {
+        let policy = policy();
+        let maker_id = WalletId::new([0x4a; 16]);
+        let taker_id = WalletId::new([0x4b; 16]);
+        let mut maker = seeded_store(maker_id, 0x5a);
+        let offer = create_shakescape_btc_for_hns_offer(
+            &mut maker,
+            &policy.board_policy(),
+            ShakescapeBtcForHnsOfferRequest {
+                wallet_id: maker_id,
+                btc_amount_sats: MIN_HTLC_DUST_SATS,
+                hns_amount_dollarydoos: 100_000,
+                bitcoin_fee_reserve_sats: MINIMUM_BITCOIN_FEE_RESERVE_SATS,
+                created_at_unix: START,
+                expires_at_unix: START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                nonce: [0x6a; 32],
+            },
+        )
+        .expect("short-lived protocol offer");
+        let signed_offer = load_shakescape_direct_offer(
+            &maker,
+            &policy.board_policy(),
+            offer.offer.offer_id.into_bytes(),
+        )
+        .expect("load offer")
+        .expect("offer exists")
+        .offer;
+        let envelope = CrossChainMessage::DirectOffer(signed_offer)
+            .encode_envelope(1)
+            .expect("offer envelope");
+        let mut taker = MobileShakescapeSessionController::new(
+            SharedWalletStore::new(seeded_store(taker_id, 0x5b)),
+            policy,
+            taker_id,
+        );
+        taker
+            .admit_direct_envelope(&envelope, START)
+            .expect("admit offer");
+
+        assert!(taker.available_direct_offers(START + 1).unwrap().is_empty());
+        assert!(matches!(
+            taker.prepare_direct_offer_take(
+                &crate::lowercase_hex(offer.offer.offer_id.as_bytes()),
+                0,
+                1_000_000,
+                100_000,
+                START + 1,
+            ),
+            Err(MobileWalletError::DirectOfferActionExpired)
+        ));
     }
 
     #[test]
