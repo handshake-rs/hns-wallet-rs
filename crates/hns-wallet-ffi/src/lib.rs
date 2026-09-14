@@ -705,6 +705,9 @@ pub enum ApprovalSummary {
         payment: Amount,
         recipient: String,
         maximum_fee: Amount,
+        /// Present only when the approval also grants a bounded unattended
+        /// fee for the recipient-fixed FINALIZE after the consensus lockup.
+        automatic_finalize_maximum_fee: Option<Amount>,
         warnings: BTreeSet<ApprovalWarning>,
     },
     DirectOffer {
@@ -866,6 +869,7 @@ impl ApprovalSummary {
                 payment,
                 recipient,
                 maximum_fee,
+                automatic_finalize_maximum_fee,
                 warnings,
             } => {
                 if payment.asset != WalletAsset::Hns || maximum_fee.asset != WalletAsset::Hns {
@@ -874,6 +878,11 @@ impl ApprovalSummary {
                 validate_public_string(name)?;
                 validate_public_string(listing_id)?;
                 validate_value_movement(*payment, recipient, *maximum_fee, warnings)?;
+                if let Some(automatic) = automatic_finalize_maximum_fee
+                    && (automatic.asset != WalletAsset::Hns || automatic.base_units.is_zero())
+                {
+                    return Err(AbiError::InvalidApproval);
+                }
             }
             Self::DirectOffer {
                 direct_offer_id,

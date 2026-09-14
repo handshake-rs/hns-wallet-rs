@@ -1,5 +1,5 @@
 use hns_wallet_hns::{
-    HnsBackend, HnsClock, HnsShakedexFundingPurpose, HnsShakedexKeyAllocationRequest,
+    HnsBackend, HnsClock, HnsNetwork, HnsShakedexFundingPurpose, HnsShakedexKeyAllocationRequest,
     HnsWalletError, HnsWalletRuntime,
 };
 use hns_wallet_store::SharedWalletStore;
@@ -26,6 +26,9 @@ pub struct PrepareBuyerTrade {
     pub listing_hash: ObjectHash,
     pub request_nonce: u64,
     pub maximum_fee: BaseUnits,
+    /// A separately disclosed cap for the delayed script FINALIZE. `None`
+    /// retains the legacy one-more-approval behavior.
+    pub automatic_finalize_maximum_fee: Option<BaseUnits>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +59,29 @@ pub struct ShakedexTradePreview {
     pub recipient: String,
     pub seller_payment_address: Option<String>,
     pub transaction: Option<hns_wallet_types::TransactionHash>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShakedexPurchaseFinalizePhase {
+    TransferPending,
+    FinalizeWaiting,
+    FinalizeAvailable,
+    FinalizePending,
+}
+
+/// A minimized, restart-safe view of a buyer fulfillment that has not yet
+/// reached a confirmed script FINALIZE. The buyer session remains internal to
+/// native code; hosts display the name, transaction and block progress only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShakedexPurchaseFinalizeNotice {
+    pub buyer_session_id: WorkflowId,
+    pub name: Vec<u8>,
+    pub transfer_transaction: hns_wallet_types::TransactionHash,
+    pub phase: ShakedexPurchaseFinalizePhase,
+    pub current_height: u64,
+    pub finalize_eligible_height: Option<u64>,
+    pub maximum_fee: BaseUnits,
+    pub automatic_finalize_maximum_fee: Option<BaseUnits>,
 }
 
 impl ShakedexTradePreview {
@@ -333,6 +359,9 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
                 .iter()
                 .all(|byte| *byte == 0)
             || request.maximum_fee.is_zero()
+            || request
+                .automatic_finalize_maximum_fee
+                .is_some_and(BaseUnits::is_zero)
         {
             return Err(ShakedexError::InvalidTransition);
         }
@@ -346,6 +375,11 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         let workflow_id =
             shakedex_value_workflow_id(parent_workflow_id, ShakedexValueAction::BuyerFulfillment);
         if let Some(existing) = self.value.load(workflow_id)? {
+            if existing.workflow.automatic_finalize_maximum_fee()
+                != request.automatic_finalize_maximum_fee
+            {
+                return Err(ShakedexError::InvalidTransition);
+            }
             validate_existing_trade(
                 &existing,
                 parent_workflow_id,
@@ -402,6 +436,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
             &prepared,
             reservation,
             maximum_fee,
+            request.automatic_finalize_maximum_fee,
             config.minimum_confirmations,
             expires_at_unix,
         )?;
@@ -674,6 +709,173 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         }
         Ok(report)
     }
+
+    /// Return every buyer purchase which still has a live TRANSFER-to-
+    /// FINALIZE obligation. This derives height from the authenticated chain
+    /// observation persisted by reconciliation, never from a host clock or UI
+    /// field.
+    pub fn purchase_finalize_notices(
+        &self,
+    ) -> Result<Vec<ShakedexPurchaseFinalizeNotice>, ShakedexError> {
+        let config = self.hns.configured_runtime_config()?;
+        let transfer_lockup = match config.network {
+            HnsNetwork::Mainnet | HnsNetwork::Testnet => 288,
+            HnsNetwork::Regtest => 10,
+            HnsNetwork::Simnet => 5,
+        };
+        let mut notices = Vec::new();
+        for stored in self.value.list()? {
+            let buyer = &stored.workflow;
+            if buyer.action() != ShakedexValueAction::BuyerFulfillment
+                || matches!(
+                    buyer.stage(),
+                    ShakedexValueStage::Prepared
+                        | ShakedexValueStage::Authorized
+                        | ShakedexValueStage::Expired
+                        | ShakedexValueStage::Cancelled
+                        | ShakedexValueStage::Conflicted
+                )
+            {
+                continue;
+            }
+            let Some(transfer_transaction) = buyer.transaction() else {
+                continue;
+            };
+            let finalize_id = shakedex_value_workflow_id(
+                buyer.parent_workflow_id(),
+                ShakedexValueAction::SellerScriptFinalize,
+            );
+            if let Some(finalize) = self.value.load(finalize_id)? {
+                if matches!(
+                    finalize.workflow.stage(),
+                    ShakedexValueStage::Confirmed | ShakedexValueStage::ReservationsReleased
+                ) {
+                    continue;
+                }
+                if matches!(
+                    finalize.workflow.stage(),
+                    ShakedexValueStage::Broadcast
+                        | ShakedexValueStage::Mempool
+                        | ShakedexValueStage::Confirming
+                        | ShakedexValueStage::RequiresRebroadcast
+                ) {
+                    let observation = finalize
+                        .workflow
+                        .last_chain_observation()
+                        .or_else(|| buyer.last_chain_observation());
+                    let current_height = observation
+                        .map(|observation| observation.binding.tip.height)
+                        .unwrap_or_default();
+                    notices.push(ShakedexPurchaseFinalizeNotice {
+                        buyer_session_id: buyer.workflow_id(),
+                        name: buyer.name().to_vec(),
+                        transfer_transaction,
+                        phase: ShakedexPurchaseFinalizePhase::FinalizePending,
+                        current_height,
+                        finalize_eligible_height: buyer
+                            .last_chain_observation()
+                            .and_then(|observation| observation.inclusion)
+                            .and_then(|inclusion| inclusion.height.checked_add(transfer_lockup)),
+                        maximum_fee: buyer.maximum_fee(),
+                        automatic_finalize_maximum_fee: buyer.automatic_finalize_maximum_fee(),
+                    });
+                    continue;
+                }
+            }
+            let Some(observation) = buyer.last_chain_observation() else {
+                continue;
+            };
+            let current_height = observation.binding.tip.height;
+            let (phase, finalize_eligible_height) = match observation.inclusion {
+                None => (ShakedexPurchaseFinalizePhase::TransferPending, None),
+                Some(inclusion) => {
+                    let eligible = inclusion
+                        .height
+                        .checked_add(transfer_lockup)
+                        .ok_or(ShakedexError::Invariant)?;
+                    let phase = if current_height >= eligible {
+                        ShakedexPurchaseFinalizePhase::FinalizeAvailable
+                    } else {
+                        ShakedexPurchaseFinalizePhase::FinalizeWaiting
+                    };
+                    (phase, Some(eligible))
+                }
+            };
+            notices.push(ShakedexPurchaseFinalizeNotice {
+                buyer_session_id: buyer.workflow_id(),
+                name: buyer.name().to_vec(),
+                transfer_transaction,
+                phase,
+                current_height,
+                finalize_eligible_height,
+                maximum_fee: buyer.maximum_fee(),
+                automatic_finalize_maximum_fee: buyer.automatic_finalize_maximum_fee(),
+            });
+        }
+        notices.sort_by(|left, right| {
+            left.name.cmp(&right.name).then_with(|| {
+                left.buyer_session_id
+                    .as_bytes()
+                    .cmp(right.buyer_session_id.as_bytes())
+            })
+        });
+        Ok(notices)
+    }
+
+    /// Consume only the fee authority explicitly committed by the original
+    /// buyer approval. The name recipient is already fixed by the confirmed
+    /// TRANSFER; this method cannot create or redirect another purchase.
+    pub fn recover_approved_mature_purchases(
+        &self,
+    ) -> Result<Vec<ShakedexTradePreview>, ShakedexError> {
+        let mut submitted = Vec::new();
+        for notice in self.purchase_finalize_notices()? {
+            if notice.phase != ShakedexPurchaseFinalizePhase::FinalizeAvailable {
+                continue;
+            }
+            let Some(maximum_fee) = notice.automatic_finalize_maximum_fee else {
+                continue;
+            };
+            let prepared = self.prepare_script_finalize(PrepareScriptFinalize {
+                parent_value_workflow_id: notice.buyer_session_id,
+                maximum_fee,
+            })?;
+            if prepared.stage != ShakedexValueStage::Prepared {
+                continue;
+            }
+            let now_unix = self.hns.shakedex_now_unix()?;
+            let expires_at_unix = prepared.expires_at_unix;
+            if expires_at_unix <= now_unix {
+                return Err(ShakedexError::InvalidTransition);
+            }
+            let approval_id =
+                automatic_finalize_approval_id(prepared.workflow_id, prepared.revision);
+            self.register_approval(
+                prepared.workflow_id,
+                approval_id,
+                "native://automatic-shakedex-finalize",
+                expires_at_unix,
+            )?;
+            let authorized = self.authorize(
+                prepared.workflow_id,
+                approval_id,
+                "native://automatic-shakedex-finalize",
+            )?;
+            submitted.push(self.submit(authorized.workflow_id)?);
+        }
+        Ok(submitted)
+    }
+}
+
+fn automatic_finalize_approval_id(workflow_id: WorkflowId, revision: u64) -> ApprovalId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"hns-wallet-rs/automatic-shakedex-finalize-approval/v1");
+    hasher.update(workflow_id.as_bytes());
+    hasher.update(revision.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut id = [0_u8; 16];
+    id.copy_from_slice(&digest[..16]);
+    ApprovalId::new(id)
 }
 
 pub fn buyer_trade_workflow_id(

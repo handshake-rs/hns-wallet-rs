@@ -419,6 +419,7 @@ pub enum MobileHnsValueIntent {
     AcceptOffer {
         listing_id: String,
         maximum_fee: BaseUnits,
+        automatic_finalize_maximum_fee: Option<BaseUnits>,
     },
     FinalizePurchase {
         session_id: String,
@@ -2040,6 +2041,33 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         })
     }
 
+    /// Prepare the next mature pre-upgrade Shakedex purchase without taking a
+    /// host-supplied session identifier. New purchases carrying an explicit
+    /// automatic-finalize grant never reach this path.
+    pub fn prepare_next_shakedex_finalize(
+        &mut self,
+    ) -> Result<Option<MobileHnsValueApproval>, MobileWalletError> {
+        if self.session.failed {
+            return Err(MobileWalletError::ControllerFailed);
+        }
+        if self.pending.is_some() {
+            return Err(MobileWalletError::ValueActionPending);
+        }
+        let Some((session_id, maximum_fee)) = self
+            .session
+            .service
+            .next_trusted_native_shakedex_finalize()
+            .map_err(mobile_service_failure)?
+        else {
+            return Ok(None);
+        };
+        self.prepare_value_action(MobileHnsValueIntent::FinalizePurchase {
+            session_id: lowercase_hex(session_id.as_bytes()),
+            maximum_fee,
+        })
+        .map(Some)
+    }
+
     /// Consume the process-local token exactly once, then re-prepare and
     /// execute the approval-bound action through the HNS runtime.
     pub fn approve_value_action(&mut self, action_token: &str) -> Result<Value, MobileWalletError> {
@@ -3136,6 +3164,7 @@ impl MobileHnsValueIntent {
             Self::AcceptOffer {
                 listing_id,
                 maximum_fee,
+                automatic_finalize_maximum_fee,
             } => (
                 ApprovalKind::NameMarketPurchase,
                 ProviderMethod::NameMarketAcceptOffer,
@@ -3143,6 +3172,7 @@ impl MobileHnsValueIntent {
                     "account": market_account,
                     "listingId": listing_id,
                     "maximumFee": maximum_fee,
+                    "automaticFinalizeMaximumFee": automatic_finalize_maximum_fee,
                 }),
             ),
             Self::FinalizePurchase {
@@ -4637,6 +4667,21 @@ mod tests {
             serde_json::from_value::<MobileHnsValueIntent>(encoded)
                 .expect("deserialize native transfer"),
             transfer
+        );
+
+        let acceptance = MobileHnsValueIntent::AcceptOffer {
+            listing_id: "22".repeat(32),
+            maximum_fee: BaseUnits::new(100_000),
+            automatic_finalize_maximum_fee: Some(BaseUnits::new(100_000)),
+        };
+        let encoded = serde_json::to_value(&acceptance).expect("serialize native acceptance");
+        assert_eq!(encoded["action"], "acceptOffer");
+        assert_eq!(encoded["maximumFee"], "100000");
+        assert_eq!(encoded["automaticFinalizeMaximumFee"], "100000");
+        assert_eq!(
+            serde_json::from_value::<MobileHnsValueIntent>(encoded)
+                .expect("deserialize native acceptance"),
+            acceptance
         );
 
         let query = MobileShakedexQuery::GetSession {

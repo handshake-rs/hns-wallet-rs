@@ -34,9 +34,10 @@ use hns_wallet_shakedex::{
     MAX_SHAKEDEX_OFFER_PAGE_SIZE, PrepareBuyerTrade, PrepareScriptFinalize, PrepareSellerOffer,
     SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED, SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED,
     SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, SellerOfferPreview, SellerOfferStage, ShakedexError,
-    ShakedexOfferPage, ShakedexSellerPolicy, ShakedexTradePreview, ShakedexTradeRuntime,
-    ShakedexValueAction, ShakedexValueStage, ShakescapePublicationAcceptancePolicy,
-    ShakescapeTransportRuntime, WalletNativeShakescapeTransport,
+    ShakedexOfferPage, ShakedexPurchaseFinalizePhase, ShakedexSellerPolicy, ShakedexTradePreview,
+    ShakedexTradeRuntime, ShakedexValueAction, ShakedexValueStage,
+    ShakescapePublicationAcceptancePolicy, ShakescapeTransportRuntime,
+    WalletNativeShakescapeTransport,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::{
@@ -252,6 +253,8 @@ struct NameMarketAcceptOfferParams {
     account: String,
     listing_id: String,
     maximum_fee: BaseUnits,
+    #[serde(default)]
+    automatic_finalize_maximum_fee: Option<BaseUnits>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -366,6 +369,11 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         }
         let trade = self.unrecovered_shakedex_runtime()?;
         trade.recover_startup().map_err(shakedex_failure)?;
+        // Automatic purchase completion is retriable maintenance authorized
+        // by the original exact acceptance. A temporary fee, coin, or peer
+        // condition must not make the board or unrelated recovery unavailable;
+        // every later synchronized pass retries it from durable state.
+        let _ = trade.recover_approved_mature_purchases();
         trade
             .recover_seller_publications()
             .map_err(shakedex_failure)?;
@@ -591,6 +599,14 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         if params.maximum_fee.is_zero() {
             return Err(invalid_request("buyer maximum fee must be nonzero"));
         }
+        if params
+            .automatic_finalize_maximum_fee
+            .is_some_and(BaseUnits::is_zero)
+        {
+            return Err(invalid_request(
+                "automatic finalize maximum fee must be nonzero",
+            ));
+        }
         let listing_hash = parse_object_hash(&params.listing_id, "listingId")?;
         for attempt in 0..MAX_SHAKEDEX_PREPARATION_ATTEMPTS {
             self.reconcile()?;
@@ -600,6 +616,7 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
                     listing_hash,
                     request_nonce: call.request_nonce,
                     maximum_fee: params.maximum_fee,
+                    automatic_finalize_maximum_fee: params.automatic_finalize_maximum_fee,
                 }) {
                 Ok(preview) => return Ok((params, preview)),
                 Err(ShakedexError::StaleRevision)
@@ -1469,6 +1486,12 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                         asset: WalletAsset::Hns,
                         base_units: params.maximum_fee,
                     },
+                    automatic_finalize_maximum_fee: params.automatic_finalize_maximum_fee.map(
+                        |base_units| Amount {
+                            asset: WalletAsset::Hns,
+                            base_units,
+                        },
+                    ),
                     warnings: BTreeSet::from([
                         ApprovalWarning::FeeEstimateMayChange,
                         ApprovalWarning::SettlementCanBeDelayed,
@@ -1500,6 +1523,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                         asset: WalletAsset::Hns,
                         base_units: params.maximum_fee,
                     },
+                    automatic_finalize_maximum_fee: None,
                     warnings: BTreeSet::from([
                         ApprovalWarning::FeeEstimateMayChange,
                         ApprovalWarning::SettlementCanBeDelayed,
@@ -1982,11 +2006,51 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             .runtime
             .list_name_operations()
             .map_err(hns_runtime_failure)?;
-        let finalize_notices = self.runtime.native_finalize_notices(
+        let mut finalize_notices = self.runtime.native_finalize_notices(
             &snapshot.known_names,
             &operations,
             snapshot.binding.chain.tip.height,
         )?;
+        // Marketplace recovery is best-effort for the read snapshot, but when
+        // it succeeds it also advances buyer fulfillments, performs any
+        // previously approved automatic FINALIZE, and supplies durable
+        // TRANSFER maturity notices to the same native status surface.
+        let _ = self.runtime.recover_shakedex_after_reconcile();
+        if let Ok(trade) = self.runtime.unrecovered_shakedex_runtime()
+            && let Ok(purchases) = trade.purchase_finalize_notices()
+        {
+            for purchase in purchases {
+                if finalize_notices
+                    .iter()
+                    .any(|notice| notice.name.as_bytes() == purchase.name.as_slice())
+                {
+                    continue;
+                }
+                let name = String::from_utf8(purchase.name)
+                    .map_err(|_| hns_read_failure(HnsWalletError::InvalidName))?;
+                finalize_notices.push(NativeHnsFinalizeNotice {
+                    name,
+                    transaction_id: lowercase_hex(purchase.transfer_transaction.as_bytes()),
+                    phase: match purchase.phase {
+                        ShakedexPurchaseFinalizePhase::TransferPending => {
+                            NativeHnsFinalizeNoticePhase::TransferPending
+                        }
+                        ShakedexPurchaseFinalizePhase::FinalizeWaiting => {
+                            NativeHnsFinalizeNoticePhase::FinalizeWaiting
+                        }
+                        ShakedexPurchaseFinalizePhase::FinalizeAvailable => {
+                            NativeHnsFinalizeNoticePhase::FinalizeAvailable
+                        }
+                        ShakedexPurchaseFinalizePhase::FinalizePending => {
+                            NativeHnsFinalizeNoticePhase::FinalizePending
+                        }
+                    },
+                    current_height: purchase.current_height,
+                    finalize_eligible_height: purchase.finalize_eligible_height,
+                });
+            }
+            finalize_notices.sort_by(|left, right| left.name.cmp(&right.name));
+        }
         let known_names = snapshot
             .known_names
             .iter()
@@ -2024,6 +2088,25 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             return Err(hns_runtime_failure(HnsWalletError::InvalidEvidence));
         }
         Ok(target)
+    }
+
+    /// Select the first mature legacy buyer fulfillment which did not carry
+    /// an automatic fee grant. Native mobile code uses this to raise one
+    /// ordinary approval without asking the user to copy a workflow ID.
+    pub fn next_trusted_native_shakedex_finalize(
+        &self,
+    ) -> Result<Option<(WorkflowId, BaseUnits)>, ServiceFailure> {
+        let _ = self.runtime.recover_shakedex_after_reconcile();
+        let trade = self.runtime.unrecovered_shakedex_runtime()?;
+        Ok(trade
+            .purchase_finalize_notices()
+            .map_err(shakedex_failure)?
+            .into_iter()
+            .find(|notice| {
+                notice.phase == ShakedexPurchaseFinalizePhase::FinalizeAvailable
+                    && notice.automatic_finalize_maximum_fee.is_none()
+            })
+            .map(|notice| (notice.buyer_session_id, notice.maximum_fee)))
     }
 
     /// Return seconds from the exact clock authority retained by the signing

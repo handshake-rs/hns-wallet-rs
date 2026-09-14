@@ -653,6 +653,11 @@ pub struct ShakedexValueWorkflow {
     value_base_units: BaseUnits,
     fee_base_units: BaseUnits,
     maximum_fee: BaseUnits,
+    /// Buyer consent, committed by the exact fulfillment approval, for the
+    /// later recipient-fixed script FINALIZE fee. Historical workflows omit
+    /// it and must receive one fresh native approval at maturity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    automatic_finalize_maximum_fee: Option<BaseUnits>,
     minimum_confirmations: u32,
     prepared_transaction: Vec<u8>,
     expires_at_unix: u64,
@@ -676,6 +681,7 @@ impl ShakedexValueWorkflow {
         prepared: &PreparedBuyerFulfillment,
         funding_reservation: HnsShakedexFundingReservation,
         maximum_fee: BaseUnits,
+        automatic_finalize_maximum_fee: Option<BaseUnits>,
         minimum_confirmations: u32,
         expires_at_unix: u64,
     ) -> Result<Self, ShakedexError> {
@@ -695,7 +701,7 @@ impl ShakedexValueWorkflow {
             prepared.transaction_bytes(),
         )?;
         let value_base_units = BaseUnits::new(u128::from(listing.price_base_units()));
-        Self::prepared(
+        let mut workflow = Self::prepared(
             ShakedexValueAction::BuyerFulfillment,
             StructuralPlan::Buyer { plan },
             funding_reservation,
@@ -708,7 +714,10 @@ impl ShakedexValueWorkflow {
             minimum_confirmations,
             prepared.transaction_bytes(),
             expires_at_unix,
-        )
+        )?;
+        workflow.automatic_finalize_maximum_fee = automatic_finalize_maximum_fee;
+        workflow.validate()?;
+        Ok(workflow)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -852,6 +861,7 @@ impl ShakedexValueWorkflow {
             value_base_units,
             fee_base_units: BaseUnits::new(u128::from(fee_base_units)),
             maximum_fee,
+            automatic_finalize_maximum_fee: None,
             minimum_confirmations,
             prepared_transaction: prepared_transaction.to_vec(),
             expires_at_unix,
@@ -900,6 +910,10 @@ impl ShakedexValueWorkflow {
 
     pub const fn maximum_fee(&self) -> BaseUnits {
         self.maximum_fee
+    }
+
+    pub const fn automatic_finalize_maximum_fee(&self) -> Option<BaseUnits> {
+        self.automatic_finalize_maximum_fee
     }
 
     pub const fn expires_at_unix(&self) -> u64 {
@@ -1422,8 +1436,16 @@ impl ShakedexValueWorkflow {
             || self.value_base_units.is_zero()
             || self.fee_base_units.is_zero()
             || self.maximum_fee < self.fee_base_units
+            || self
+                .automatic_finalize_maximum_fee
+                .is_some_and(BaseUnits::is_zero)
             || self.minimum_confirmations == 0
             || self.expires_at_unix == 0
+        {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        if self.action != ShakedexValueAction::BuyerFulfillment
+            && self.automatic_finalize_maximum_fee.is_some()
         {
             return Err(ShakedexError::InvalidEvidence);
         }
@@ -1883,6 +1905,7 @@ impl ShakedexValueWorkflow {
             && self.value_base_units == other.value_base_units
             && self.fee_base_units == other.fee_base_units
             && self.maximum_fee == other.maximum_fee
+            && self.automatic_finalize_maximum_fee == other.automatic_finalize_maximum_fee
             && self.minimum_confirmations == other.minimum_confirmations
             && self.prepared_transaction == other.prepared_transaction
             && self.expires_at_unix == other.expires_at_unix

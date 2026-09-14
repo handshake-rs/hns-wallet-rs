@@ -75,8 +75,9 @@ pub use seller_offer::{
 };
 pub use trade_runtime::{
     MAX_SHAKEDEX_OFFER_PAGE_SIZE, PrepareBuyerTrade, PrepareScriptFinalize, ShakedexOfferPage,
-    ShakedexOfferPreview, ShakedexStartupRecoveryEntry, ShakedexStartupRecoveryReport,
-    ShakedexTradePreview, ShakedexTradeRuntime, buyer_trade_workflow_id,
+    ShakedexOfferPreview, ShakedexPurchaseFinalizeNotice, ShakedexPurchaseFinalizePhase,
+    ShakedexStartupRecoveryEntry, ShakedexStartupRecoveryReport, ShakedexTradePreview,
+    ShakedexTradeRuntime, buyer_trade_workflow_id,
 };
 pub use transactions::{
     CurrentPreparedSellerRecovery, MAX_SHAKEDEX_FUNDING_INPUTS, PreparedBuyerFulfillment,
