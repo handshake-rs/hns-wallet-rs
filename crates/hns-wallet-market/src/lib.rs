@@ -548,15 +548,27 @@ pub fn apply_locally_verified_shakescape_funding(
         return Err(MarketError::CorruptShakescapeDirectSwap);
     }
     verify_local_funding_against_shakescape_terms(&hello, &funding)?;
+    let funding_evidence = funding_evidence_id(&funding);
+    // Re-scanning the exact confirmed lock is expected after reconnects,
+    // upgrades, and reorg checks. Treat already-journaled chain evidence as
+    // idempotent so the coordination layer can repair or replay its locator
+    // without attempting an impossible second state transition.
+    if (funding.module() == stored.state.first_module
+        && stored.state.first_funding == Some(funding_evidence))
+        || (funding.module() == stored.state.second_module
+            && stored.state.second_funding == Some(funding_evidence))
+    {
+        return Ok(stored.state);
+    }
     let evidence = match stored.state.state {
         SwapState::FirstFundingPending if funding.module() == stored.state.first_module => {
             vec![VerifiedEvidence::FirstFundingConfirmed {
-                evidence: funding_evidence_id(&funding),
+                evidence: funding_evidence,
             }]
         }
         SwapState::SecondFundingPending if funding.module() == stored.state.second_module => {
             vec![VerifiedEvidence::SecondFundingConfirmed {
-                evidence: funding_evidence_id(&funding),
+                evidence: funding_evidence,
             }]
         }
         // The party that does not construct the second lock has no local
@@ -567,7 +579,7 @@ pub fn apply_locally_verified_shakescape_funding(
             vec![
                 VerifiedEvidence::SecondFundingReady,
                 VerifiedEvidence::SecondFundingConfirmed {
-                    evidence: funding_evidence_id(&funding),
+                    evidence: funding_evidence,
                 },
             ]
         }

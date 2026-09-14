@@ -5,7 +5,7 @@ use hns_marketplace_protocol::{
     SwapSessionHello,
 };
 use hns_wallet_bitcoin_kyoto::{MIN_HTLC_DUST_SATS, build_shakescape_bitcoin_htlc};
-use hns_wallet_hns::{DEFAULT_DUST_THRESHOLD, HnsDirectShakescapePeer};
+use hns_wallet_hns::{DEFAULT_DUST_THRESHOLD, HnsDirectPeerCoordinator, HnsDirectShakescapePeer};
 use hns_wallet_market::{
     ShakescapeBtcForHnsOfferRequest, ShakescapeDirectOfferAdmission,
     ShakescapeDirectOfferCancellationAdmission, ShakescapeDirectSwapAdmission,
@@ -18,18 +18,42 @@ use hns_wallet_market::{
     admit_shakescape_direct_swap_proposal, admit_shakescape_direct_swap_watch_ready,
     cancel_shakescape_local_direct_offer, create_shakescape_btc_for_hns_offer,
     create_shakescape_direct_maker_proposal, create_shakescape_direct_take,
-    create_shakescape_hns_for_btc_offer, list_local_shakescape_direct_offer_cancellations,
-    list_local_shakescape_direct_offers, list_local_shakescape_direct_takes,
-    list_pending_local_shakescape_direct_takes, list_shakescape_executions,
-    load_shakescape_direct_offer, load_shakescape_direct_offers, load_shakescape_direct_swap,
-    load_shakescape_direct_swaps, load_shakescape_execution, open_shakescape_execution,
-    shakescape_execution_workflow_id,
+    create_shakescape_hns_for_btc_offer, is_local_shakescape_direct_taker,
+    list_local_shakescape_direct_offer_cancellations, list_local_shakescape_direct_offers,
+    list_local_shakescape_direct_takes, list_pending_local_shakescape_direct_takes,
+    list_shakescape_executions, load_shakescape_direct_offer, load_shakescape_direct_offers,
+    load_shakescape_direct_swap, load_shakescape_direct_swaps, load_shakescape_execution,
+    open_shakescape_execution, shakescape_execution_workflow_id,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::{TransactionHash, WalletId};
 use serde::{Deserialize, Serialize};
 
 use crate::MobileWalletError;
+
+// Public offer expiry is the deadline for beginning a new negotiation, not
+// the lifetime of an already-funded settlement.  Funding locators remain
+// hints only (each wallet independently verifies the exact HTLC on-chain), so
+// give every newly signed status a bounded replay window beyond the current
+// time.  The chain refund deadlines are also retained as a lower bound so a
+// slow but still live swap is not cut off by its old listing deadline.
+const FUNDING_STATUS_REPLAY_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+/// Settlement spends currently pay their chain fee from the locked output.
+/// The advertised lock amount must therefore leave a standard, non-dust
+/// receiver output even if the whole agreed fee reserve is needed. Checking
+/// the amount and reserve independently admits locks which can be funded but
+/// can never be redeemed or refunded.
+fn amount_covers_settlement_fee_reserve(asset: AssetId, amount: u64, fee_reserve: u64) -> bool {
+    let minimum_output = match asset {
+        AssetId::BTC => u128::from(MIN_HTLC_DUST_SATS),
+        AssetId::HNS => DEFAULT_DUST_THRESHOLD,
+        _ => return false,
+    };
+    u128::from(amount)
+        .checked_sub(u128::from(fee_reserve))
+        .is_some_and(|output| output >= minimum_output)
+}
 
 /// One wallet-owned bridge from a direct Shakescape packet to the existing durable
 /// HNS/BTC handshake journal. It exposes neither generic message execution
@@ -212,6 +236,10 @@ const MAX_DIRECT_OFFER_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// direct offer participant. Values below this cannot pass the downstream
 /// Bitcoin transaction fee policy and therefore must not become signed terms.
 pub const MINIMUM_BITCOIN_FEE_RESERVE_SATS: u64 = 1_000;
+/// Product floor already used by the Android/iOS native approval surfaces for
+/// Handshake value actions. Keeping it in signed swap admission prevents a
+/// tiny user-entered cap from creating a funded but non-relayable HTLC spend.
+pub const MINIMUM_HNS_FEE_RESERVE_DOLLARYDOOS: u64 = 100_000;
 
 #[derive(Clone, Debug)]
 struct PendingBtcForHnsOffer {
@@ -414,7 +442,11 @@ impl MobileShakescapeSessionController {
             return Err(MobileWalletError::DirectOfferActionPending);
         }
         if now_unix == 0
-            || btc_amount_sats < MIN_HTLC_DUST_SATS
+            || !amount_covers_settlement_fee_reserve(
+                AssetId::BTC,
+                btc_amount_sats,
+                bitcoin_fee_reserve_sats,
+            )
             || u128::from(hns_amount_dollarydoos) < DEFAULT_DUST_THRESHOLD
             || bitcoin_fee_reserve_sats < MINIMUM_BITCOIN_FEE_RESERVE_SATS
             || !(MIN_DIRECT_OFFER_LIFETIME_SECONDS..=MAX_DIRECT_OFFER_LIFETIME_SECONDS)
@@ -546,9 +578,13 @@ impl MobileShakescapeSessionController {
             return Err(MobileWalletError::DirectOfferActionPending);
         }
         if now_unix == 0
-            || u128::from(hns_amount_dollarydoos) < DEFAULT_DUST_THRESHOLD
+            || !amount_covers_settlement_fee_reserve(
+                AssetId::HNS,
+                hns_amount_dollarydoos,
+                hns_fee_reserve_dollarydoos,
+            )
             || btc_amount_sats < MIN_HTLC_DUST_SATS
-            || hns_fee_reserve_dollarydoos == 0
+            || hns_fee_reserve_dollarydoos < MINIMUM_HNS_FEE_RESERVE_DOLLARYDOOS
             || !(MIN_DIRECT_OFFER_LIFETIME_SECONDS..=MAX_DIRECT_OFFER_LIFETIME_SECONDS)
                 .contains(&listing_lifetime_seconds)
         {
@@ -741,6 +777,18 @@ impl MobileShakescapeSessionController {
         if record.offer.received_asset == AssetId::BTC
             && received_fee_reserve < MINIMUM_BITCOIN_FEE_RESERVE_SATS
         {
+            return Err(MobileWalletError::InvalidDirectOfferAction);
+        }
+        if record.offer.received_asset == AssetId::HNS
+            && received_fee_reserve < MINIMUM_HNS_FEE_RESERVE_DOLLARYDOOS
+        {
+            return Err(MobileWalletError::InvalidDirectOfferAction);
+        }
+        if !amount_covers_settlement_fee_reserve(
+            record.offer.received_asset,
+            received_amount,
+            received_fee_reserve,
+        ) {
             return Err(MobileWalletError::InvalidDirectOfferAction);
         }
         let total = received_amount
@@ -949,6 +997,78 @@ impl MobileShakescapeSessionController {
             .map_err(MobileWalletError::from)
     }
 
+    /// Reconstruct and install every non-terminal session's native HNS HTLC
+    /// watch from jointly signed durable terms.
+    ///
+    /// This method is the authority bridge between the private swap journal
+    /// and the public filtered-block client: the platform receives neither a
+    /// caller-selected script nor a transaction claimed by the counterparty.
+    /// A failed session remains watched because it may already contain funds
+    /// that require an authenticated refund; only completed or fully refunded
+    /// sessions are terminal for watch purposes.
+    pub fn install_active_hns_htlc_watch_set(
+        &self,
+        coordinator: &HnsDirectPeerCoordinator,
+        now_unix: u64,
+    ) -> Result<bool, MobileWalletError> {
+        if now_unix == 0 {
+            return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+        }
+        let policy = self.policy;
+        let descriptors = self
+            .store
+            .try_with_store(|store| {
+                let mut descriptors = Vec::new();
+                for execution in list_shakescape_executions(store, &policy)? {
+                    if matches!(execution.state, SwapState::Completed | SwapState::Refunded)
+                        || (execution.first_module != hns_wallet_types::ModuleId::Handshake
+                            && execution.second_module != hns_wallet_types::ModuleId::Handshake)
+                    {
+                        continue;
+                    }
+                    let record = load_shakescape_direct_swap(store, &policy, execution.id)?
+                        .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                    let hello = record
+                        .hello
+                        .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                    hello
+                        .verify_agreement(policy.network())
+                        .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                    let (side, receiver, refund, commitment) = if hello.offered_asset
+                        == AssetId::HNS
+                    {
+                        (
+                            SwapAssetSide::Offered,
+                            hello.taker_settlement_public_key,
+                            hello.maker_settlement_public_key,
+                            hello.offered_lock_commitment,
+                        )
+                    } else if hello.received_asset == AssetId::HNS {
+                        (
+                            SwapAssetSide::Received,
+                            hello.maker_settlement_public_key,
+                            hello.taker_settlement_public_key,
+                            hello.received_lock_commitment,
+                        )
+                    } else {
+                        return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+                    };
+                    let binding = hello
+                        .build_hns_htlc(side, receiver, refund)
+                        .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                    if binding.descriptor_hash != commitment {
+                        return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+                    }
+                    descriptors.push(binding.descriptor);
+                }
+                Ok::<_, hns_wallet_market::MarketError>(descriptors)
+            })
+            .map_err(MobileWalletError::from)?;
+        coordinator
+            .install_shakescape_hns_htlc_watch_set(&descriptors, now_unix)
+            .map_err(MobileWalletError::DirectHns)
+    }
+
     /// Advance a locally-owned first-chain funding gate after the counterparty
     /// has signed and installed the exact watch. This validates refund safety
     /// and local key ownership, but never constructs, signs, or broadcasts a
@@ -1043,10 +1163,14 @@ impl MobileShakescapeSessionController {
                 }
                 let mut expired = Vec::new();
                 for execution in list_shakescape_executions(store, &policy)? {
+                    let expired_second_funder = execution.state == SwapState::FirstFundingPending
+                        && execution.first_funding.is_none()
+                        && is_local_shakescape_direct_taker(store, self.wallet_id, execution.id)?;
                     if !matches!(
                         execution.state,
                         SwapState::TermsFrozen | SwapState::RefundsPrepared
-                    ) {
+                    ) && !expired_second_funder
+                    {
                         continue;
                     }
                     let record = load_shakescape_direct_swap(store, &policy, execution.id)?
@@ -1341,8 +1465,26 @@ impl MobileShakescapeSessionController {
                     .filter(|session| {
                         (session.state == SwapState::FirstFundingPending
                             && session.first_module == hns_wallet_types::ModuleId::Handshake)
+                            // The counterparty does not execute the local
+                            // second-funding authorization that advances this
+                            // checkpoint.  Its independently verified HNS
+                            // locator must be allowed to cross FirstFunded ->
+                            // SecondFundingPending -> BothFunded atomically.
+                            || (session.state == SwapState::FirstFunded
+                                && session.second_module
+                                    == hns_wallet_types::ModuleId::Handshake)
                             || (session.state == SwapState::SecondFundingPending
                                 && session.second_module == hns_wallet_types::ModuleId::Handshake)
+                            // A previous binary may have verified the local
+                            // lock before it durably retained a replayable
+                            // funding locator. Re-read the same exact lock in
+                            // BothFunded so idempotent application can repair
+                            // that coordination record after an upgrade.
+                            || (session.state == SwapState::BothFunded
+                                && (session.first_module
+                                    == hns_wallet_types::ModuleId::Handshake
+                                    || session.second_module
+                                        == hns_wallet_types::ModuleId::Handshake))
                     })
                     .map(|session| {
                         load_shakescape_direct_swap(store, &policy, session.id)?
@@ -1779,6 +1921,15 @@ impl MobileShakescapeSessionController {
         lock: hns_wallet_bitcoin_kyoto::VerifiedBitcoinLock,
         now_unix: u64,
     ) -> Result<SwapState, MobileWalletError> {
+        self.retain_local_funding_status(
+            session_id,
+            hns_marketplace_protocol::ChainId::BITCOIN,
+            *lock.funding_txid.as_bytes(),
+            lock.output_index,
+            lock.confirmation_count,
+            FundingState::Confirmed,
+            now_unix,
+        )?;
         let policy = self.policy;
         self.store
             .try_with_store_mut(|store| {
@@ -1800,6 +1951,17 @@ impl MobileShakescapeSessionController {
         lock: hns_wallet_chain_api::VerifiedLock,
         now_unix: u64,
     ) -> Result<SwapState, MobileWalletError> {
+        self.retain_local_funding_status(
+            session_id,
+            hns_marketplace_protocol::ChainId::HANDSHAKE,
+            *lock.funding_id.as_bytes(),
+            // Native HNS HTLC construction always places the exact lock
+            // before its optional change output.
+            0,
+            lock.confirmation_count,
+            FundingState::Confirmed,
+            now_unix,
+        )?;
         let policy = self.policy;
         self.store
             .try_with_store_mut(|store| {
@@ -1826,9 +1988,26 @@ impl MobileShakescapeSessionController {
         output_index: u32,
         now_unix: u64,
     ) -> Result<(), MobileWalletError> {
-        if transaction_id == [0; 32] || now_unix == 0 {
+        let Some(envelope) = self.retain_local_funding_status(
+            session_id,
+            self.local_funding_chain(session_id)?,
+            transaction_id,
+            output_index,
+            0,
+            FundingState::Broadcast,
+            now_unix,
+        )?
+        else {
             return Err(MobileWalletError::InvalidShakescapeSessionMessage);
-        }
+        };
+        peer.send_cross_chain_envelope(&envelope)?;
+        Ok(())
+    }
+
+    fn local_funding_chain(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+    ) -> Result<hns_marketplace_protocol::ChainId, MobileWalletError> {
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         let (hello, settlement_key) = self
@@ -1851,31 +2030,124 @@ impl MobileShakescapeSessionController {
                 Ok::<_, hns_wallet_market::MarketError>((hello, settlement_key))
             })
             .map_err(MobileWalletError::from)?;
-        let chain = if settlement_key.public_key() == hello.maker_settlement_public_key {
+        if settlement_key.public_key() == hello.maker_settlement_public_key {
+            Ok(hello.offered_asset.chain())
+        } else if settlement_key.public_key() == hello.taker_settlement_public_key {
+            Ok(hello.received_asset.chain())
+        } else {
+            Err(MobileWalletError::InvalidShakescapeSessionMessage)
+        }
+    }
+
+    /// Sign and durably retain one local funding locator before attempting
+    /// delivery.  Retention makes reconnect replay exact and also lets a
+    /// post-confirmation scan recover a locator whose one-shot broadcast
+    /// announcement failed.  A locally verified counterparty lock is not
+    /// re-signed: only the participant that funds this chain may create it.
+    fn retain_local_funding_status(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+        chain: hns_marketplace_protocol::ChainId,
+        transaction_id: [u8; 32],
+        output_index: u32,
+        confirmations: u32,
+        state: FundingState,
+        now_unix: u64,
+    ) -> Result<Option<Vec<u8>>, MobileWalletError> {
+        if transaction_id == [0; 32]
+            || now_unix == 0
+            || (state == FundingState::Confirmed) != (confirmations > 0)
+        {
+            return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+        }
+        let policy = self.policy;
+        let wallet_id = self.wallet_id;
+        let (hello, settlement_key, retained_statuses) = self
+            .store
+            .try_with_store(|store| {
+                let record = load_shakescape_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+                let settlement_key = hns_wallet_market::derive_local_direct_maker_key(
+                    store, &policy, wallet_id, session_id,
+                )
+                .or_else(|_| {
+                    hns_wallet_market::derive_local_direct_taker_key(
+                        store, &policy, wallet_id, session_id,
+                    )
+                })?
+                .0;
+                Ok::<_, hns_wallet_market::MarketError>((
+                    hello,
+                    settlement_key,
+                    record.peer_funding_statuses,
+                ))
+            })
+            .map_err(MobileWalletError::from)?;
+        let local_chain = if settlement_key.public_key() == hello.maker_settlement_public_key {
             hello.offered_asset.chain()
         } else if settlement_key.public_key() == hello.taker_settlement_public_key {
             hello.received_asset.chain()
         } else {
             return Err(MobileWalletError::InvalidShakescapeSessionMessage);
         };
+        if chain != local_chain {
+            return Ok(None);
+        }
+        let existing = retained_statuses
+            .iter()
+            .find(|retained| retained.status.chain == chain);
+        if let Some(existing) = existing
+            && existing.status.transaction_id == transaction_id
+            && existing.status.output_index == output_index
+            && existing.status.state == state
+            && existing.status.confirmations >= confirmations
+            && existing.status.header.expires_at > now_unix
+        {
+            return CrossChainMessage::SwapFundingStatus(existing.status.clone())
+                .encode_envelope(0)
+                .map(Some)
+                .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage);
+        }
         let (amount, lock_commitment) = if chain == hello.offered_asset.chain() {
             (hello.offered_amount, hello.offered_lock_commitment)
         } else {
             (hello.received_amount, hello.received_lock_commitment)
         };
+        let state_sequence_offset: u64 = match state {
+            FundingState::Broadcast => 2,
+            FundingState::Seen => 3,
+            FundingState::Confirmed => 4,
+            FundingState::Reorged => 5,
+        };
+        let replay_expires_at = now_unix
+            .checked_add(FUNDING_STATUS_REPLAY_LIFETIME_SECONDS)
+            .ok_or(MobileWalletError::InvalidShakescapeSessionMessage)?;
+        let sequence = hello
+            .header
+            .sequence
+            .checked_add(state_sequence_offset)
+            .ok_or(MobileWalletError::InvalidShakescapeSessionMessage)?
+            .max(now_unix)
+            .max(
+                existing
+                    .map(|retained| retained.status.header.sequence.saturating_add(1))
+                    .unwrap_or(0),
+            );
         let mut status = SwapFundingStatus {
             header: SignedObjectHeader {
                 version: hello.header.version,
                 network: hello.header.network,
                 pair: hello.header.pair,
                 signer_public_key: [0; 33],
-                sequence: hello
-                    .header
-                    .sequence
-                    .checked_add(2)
-                    .ok_or(MobileWalletError::InvalidShakescapeSessionMessage)?,
+                sequence,
                 created_at: now_unix,
-                expires_at: hello.header.expires_at,
+                expires_at: replay_expires_at
+                    .max(hello.header.expires_at)
+                    .max(hello.offered_refund_deadline.value)
+                    .max(hello.received_refund_deadline.value),
             },
             swap_session_id: hello.swap_session_id,
             chain,
@@ -1883,15 +2155,22 @@ impl MobileShakescapeSessionController {
             transaction_id,
             output_index,
             amount,
-            confirmations: 0,
-            state: FundingState::Broadcast,
+            confirmations,
+            state,
             signature: [0; 64],
         };
         settlement_key
             .sign_funding_status(&mut status, &hello, now_unix)
             .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
-        peer.send_cross_chain_message(&CrossChainMessage::SwapFundingStatus(status))?;
-        Ok(())
+        let envelope = CrossChainMessage::SwapFundingStatus(status)
+            .encode_envelope(0)
+            .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
+        self.store
+            .try_with_store_mut(|store| {
+                admit_shakescape_direct_swap_peer_status(store, &policy, &envelope, now_unix)
+            })
+            .map_err(MobileWalletError::from)?;
+        Ok(Some(envelope))
     }
 
     pub fn apply_local_verified_hns_spend(
@@ -2704,6 +2983,24 @@ impl MobileShakescapeSessionController {
                         );
                     }
                 }
+                // Funding locators are settlement recovery records, not
+                // public listings. Replay every still-valid signed locator
+                // even after the original offer/hello listing window closed.
+                // Recipients independently retrieve and verify the exact HTLC
+                // before advancing any durable execution state.
+                for record in load_shakescape_direct_swaps(store, &self.policy)? {
+                    for funding in record.peer_funding_statuses {
+                        if funding.status.header.expires_at > now_unix {
+                            envelopes.push(
+                                CrossChainMessage::SwapFundingStatus(funding.status)
+                                    .encode_envelope(0)
+                                    .map_err(|_| {
+                                        hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
+                                    })?,
+                            );
+                        }
+                    }
+                }
                 Ok::<_, hns_wallet_market::MarketError>(envelopes)
             })
             .map_err(MobileWalletError::from)
@@ -3132,7 +3429,7 @@ mod tests {
         assert!(matches!(
             below_bitcoin_fee_reserve.prepare_btc_for_hns_offer(
                 100_000,
-                MIN_HTLC_DUST_SATS,
+                MIN_HTLC_DUST_SATS + MINIMUM_BITCOIN_FEE_RESERVE_SATS,
                 1_000_000,
                 MINIMUM_BITCOIN_FEE_RESERVE_SATS - 1,
                 MIN_DIRECT_OFFER_LIFETIME_SECONDS,
@@ -3145,7 +3442,7 @@ mod tests {
         assert!(matches!(
             insufficient_settlement_horizon.prepare_btc_for_hns_offer(
                 100_000,
-                MIN_HTLC_DUST_SATS,
+                MIN_HTLC_DUST_SATS + MINIMUM_BITCOIN_FEE_RESERVE_SATS,
                 1_000_000,
                 MINIMUM_BITCOIN_FEE_RESERVE_SATS,
                 MIN_DIRECT_OFFER_LIFETIME_SECONDS - 1,
@@ -3159,7 +3456,7 @@ mod tests {
             exact_bitcoin_fee_reserve
                 .prepare_btc_for_hns_offer(
                     100_000,
-                    MIN_HTLC_DUST_SATS,
+                    MIN_HTLC_DUST_SATS + MINIMUM_BITCOIN_FEE_RESERVE_SATS,
                     1_000_000,
                     MINIMUM_BITCOIN_FEE_RESERVE_SATS,
                     MIN_DIRECT_OFFER_LIFETIME_SECONDS,
@@ -3173,7 +3470,7 @@ mod tests {
             exact_boundaries
                 .prepare_hns_for_btc_offer(
                     2_000_000,
-                    u64::try_from(DEFAULT_DUST_THRESHOLD).expect("HNS dust fits u64"),
+                    u64::try_from(DEFAULT_DUST_THRESHOLD).expect("HNS dust fits u64") + 100_000,
                     MIN_HTLC_DUST_SATS,
                     100_000,
                     MIN_DIRECT_OFFER_LIFETIME_SECONDS,
@@ -3194,8 +3491,8 @@ mod tests {
             &policy.board_policy(),
             ShakescapeHnsForBtcOfferRequest {
                 wallet_id: maker_id,
-                hns_amount_dollarydoos: 100_000,
-                btc_amount_sats: MIN_HTLC_DUST_SATS,
+                hns_amount_dollarydoos: 100_546,
+                btc_amount_sats: MIN_HTLC_DUST_SATS + MINIMUM_BITCOIN_FEE_RESERVE_SATS,
                 hns_fee_reserve_dollarydoos: 50_000,
                 created_at_unix: START,
                 expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
@@ -3259,7 +3556,7 @@ mod tests {
             ShakescapeBtcForHnsOfferRequest {
                 wallet_id: maker_id,
                 btc_amount_sats: MIN_HTLC_DUST_SATS,
-                hns_amount_dollarydoos: 100_000,
+                hns_amount_dollarydoos: 100_546,
                 bitcoin_fee_reserve_sats: MINIMUM_BITCOIN_FEE_RESERVE_SATS,
                 created_at_unix: START,
                 expires_at_unix: START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
@@ -3428,15 +3725,21 @@ mod tests {
         assert_eq!(
             controller
                 .reconcile_direct_offer_lifecycle(START + 621)
-                .expect("do not expire after the funding gate"),
-            0
+                .expect("expire untouched second-funder reservation"),
+            1
         );
         assert_eq!(
             controller
                 .durable_executions()
                 .expect("durable execution after deadline")[0]
                 .state,
-            SwapState::FirstFundingPending
+            SwapState::Failed
+        );
+        assert_eq!(
+            controller
+                .reserved_hns_dollarydoos(START + 621)
+                .expect("expired taker reservation released"),
+            0
         );
     }
 

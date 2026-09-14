@@ -40,7 +40,7 @@ use hns_p2p_wire::{
     SERVICE_NETWORK,
 };
 use hns_primitives::{BlockHash, BlockTime, NameHash, TreeRoot};
-use hns_swap::FixedPriceListing;
+use hns_swap::{FixedPriceListing, HnsHtlc};
 use hns_transaction::Transaction;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -48,7 +48,7 @@ use thiserror::Error;
 use crate::{
     EmbeddedHnsBackend, EncryptedHnsLightAuthority, EncryptedHnsLightIndex, HnsLightFloor,
     HnsLightNetwork, HnsNetwork, HnsRuntimeConfig, HnsWalletError, PersistedHeaderRound,
-    VerifiedHnsNameProof, derive_hns_light_watch_set,
+    VerifiedHnsNameProof, WalletAddressKey, derive_hns_light_watch_set,
     derive_hns_light_watch_set_with_restore_extension,
 };
 use hns_wallet_store::SharedWalletStore;
@@ -654,10 +654,13 @@ impl HnsDirectShakescapePeer {
     /// Shakescape V1 atomic-market profile.
     ///
     /// The accepted remote's source port is necessarily ephemeral, so inbound
-    /// admission applies the network's public/private-address policy but does
-    /// not require the ordinary Handshake listening port. The socket remains a
-    /// transport only: every received board record still crosses the wallet's
-    /// independent current-chain validation boundary.
+    /// admission does not require the source address to be publicly routable
+    /// or use the ordinary Handshake listening port. An already-accepted
+    /// connection may legitimately arrive from a LAN or authenticated overlay
+    /// address, and its ephemeral source is never advertised or dialed. The
+    /// socket remains a transport only: the normal Handshake/ShakeScape
+    /// negotiation and every board record still cross their independent
+    /// validation boundaries.
     pub fn accept(
         config: &HnsDirectPeerConfig,
         stream: TcpStream,
@@ -682,7 +685,7 @@ impl HnsDirectShakescapePeer {
         let address = stream
             .peer_addr()
             .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
-        if !inbound_shakescape_address_allowed(config, address) {
+        if !inbound_source_address_allowed(address) {
             return Err(HnsDirectPeerError::AddressNotAllowed);
         }
         let request_id = nonzero_shakescape_request_id()?;
@@ -1225,6 +1228,13 @@ fn direct_address_allowed(
 
 fn inbound_shakescape_address_allowed(config: &HnsDirectPeerConfig, address: SocketAddr) -> bool {
     address.port() != 0 && (config.allow_private_addresses || is_public_peer_ip(address.ip()))
+}
+
+fn inbound_source_address_allowed(address: SocketAddr) -> bool {
+    // This is the observed source of an established inbound socket, not a
+    // discovery or advertisement candidate. Its port is ephemeral and its IP
+    // may correctly be private on a LAN, VPN, or userspace overlay.
+    address.port() != 0
 }
 
 fn shakescape_net_address_allowed(
@@ -1894,6 +1904,11 @@ pub struct HnsDirectPeerCoordinator {
     pool: Arc<NativeHnsPeerPool>,
     config: HnsDirectPeerConfig,
     wallet_watch_set_source: Option<WalletWatchSetSource>,
+    // Public script identifiers reconstructed only from authenticated active
+    // swap sessions in this process. Persisted non-wallet scripts are not
+    // trusted across restart; the session controller must validate and
+    // repopulate this overlay before the next wallet scan.
+    shakescape_hns_htlc_watch_scripts: Arc<Mutex<BTreeSet<WalletAddressKey>>>,
     pending_header: Arc<Mutex<Option<PendingHeaderRound>>>,
     // Serialize the complete begin/request/finish lifecycle across coordinator
     // clones. Without this gate, two foreground/background callers can both
@@ -1995,6 +2010,7 @@ impl HnsDirectPeerCoordinator {
             pool,
             config,
             wallet_watch_set_source: None,
+            shakescape_hns_htlc_watch_scripts: Arc::new(Mutex::new(BTreeSet::new())),
             pending_header: Arc::new(Mutex::new(None)),
             header_round_operation: Arc::new(Mutex::new(())),
             next_header_peer_offset: Arc::new(AtomicUsize::new(0)),
@@ -2244,12 +2260,31 @@ impl HnsDirectPeerCoordinator {
         let candidate = largest_candidate.ok_or(HnsDirectPeerError::Wallet(
             HnsWalletError::ScanCapacityExhausted,
         ))?;
+        let overlay = self
+            .shakescape_hns_htlc_watch_scripts
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        let mut candidate_scripts = candidate.scripts;
+        candidate_scripts.extend(overlay.iter().cloned());
+        let mut candidate_names = candidate.name_hashes;
+        candidate_names.extend(installed.name_hashes.iter().copied());
+        let candidate = crate::HnsLightWatchSet::new(candidate_scripts, candidate_names)
+            .map_err(|_| HnsDirectPeerError::Wallet(HnsWalletError::InvalidEvidence))?;
+        let mut required_scripts = base.scripts.clone();
+        required_scripts.extend(overlay.iter().cloned());
+        let mut required_names = base.name_hashes.clone();
+        required_names.extend(installed.name_hashes.iter().copied());
+        let required = crate::HnsLightWatchSet::new(required_scripts, required_names)
+            .map_err(|_| HnsDirectPeerError::Wallet(HnsWalletError::InvalidEvidence))?;
+        drop(overlay);
         // A completed recovery can advance only one derivation branch by a
         // non-window-aligned amount. The previously pre-expanded set remains
         // complete in that case even though it is no longer exactly equal to
         // `current base + N whole windows`. Keep that authenticated coverage
         // until the required base actually reaches an unscanned script.
-        if installed != base && deterministic_watch_set_covers(&installed, &base, &candidate) {
+        if installed != required
+            && deterministic_watch_set_covers(&installed, &required, &candidate)
+        {
             return Ok(false);
         }
         if candidate == installed {
@@ -2257,6 +2292,61 @@ impl HnsDirectPeerCoordinator {
         }
         self.backend
             .install_watch_set(candidate, now_unix)
+            .map_err(HnsDirectPeerError::Wallet)
+    }
+
+    /// Install every authenticated active ShakeScape HNS HTLC as a direct
+    /// filtered-block interest before either participant may acknowledge that
+    /// it is watching the first chain or publish a later-chain lock.
+    ///
+    /// The descriptors supplied here must have been reconstructed from the
+    /// wallet's durable, jointly signed session hellos. This boundary verifies
+    /// their network again and derives the exact P2WSH programs internally;
+    /// neither a platform host nor a remote transaction locator supplies a
+    /// watch script. A newly added session program rewinds the derived wallet
+    /// index to its configured birthday. That one-time authenticated replay is
+    /// deliberately conservative: it repairs locks confirmed by an older
+    /// binary before the program was watched without trusting a peer-provided
+    /// height or unauthenticated raw transaction.
+    pub fn install_shakescape_hns_htlc_watch_set(
+        &self,
+        descriptors: &[HnsHtlc],
+        now_unix: u64,
+    ) -> Result<bool, HnsDirectPeerError> {
+        if now_unix == 0 {
+            return Err(HnsDirectPeerError::InvalidConfiguration);
+        }
+        let binding = crate::shakedex_network_binding(self.config.network)
+            .map_err(HnsDirectPeerError::Wallet)?;
+        let installed = self
+            .backend
+            .light_watch_set()
+            .map_err(HnsDirectPeerError::Wallet)?;
+        let mut authenticated_scripts = BTreeSet::new();
+        for descriptor in descriptors {
+            descriptor
+                .verify_for_network(binding)
+                .map_err(|_| HnsDirectPeerError::Wallet(HnsWalletError::InvalidEvidence))?;
+            authenticated_scripts.insert(WalletAddressKey {
+                version: 0,
+                hash: descriptor
+                    .script_hash()
+                    .map_err(|_| HnsDirectPeerError::Wallet(HnsWalletError::InvalidEvidence))?
+                    .to_vec(),
+            });
+        }
+        let mut overlay = self
+            .shakescape_hns_htlc_watch_scripts
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        overlay.extend(authenticated_scripts);
+        let mut scripts = installed.scripts.clone();
+        scripts.extend(overlay.iter().cloned());
+        drop(overlay);
+        let watch_set = crate::HnsLightWatchSet::new(scripts, installed.name_hashes)
+            .map_err(|_| HnsDirectPeerError::Wallet(HnsWalletError::InvalidEvidence))?;
+        self.backend
+            .install_watch_set(watch_set, now_unix)
             .map_err(HnsDirectPeerError::Wallet)
     }
 
@@ -4837,8 +4927,10 @@ mod tests {
 
     use super::*;
     use hns_p2p_wire::FrameDecoder;
+    use hns_primitives::Dollarydoos;
     use hns_wallet_store::{SecretKind, WalletStore};
     use hns_wallet_types::{AccountId, BaseUnits, WalletId};
+    use k256::ecdsa::SigningKey;
 
     #[test]
     fn outbound_port_diagnosis_requires_distinct_mainnet_timeout_failures() {
@@ -5077,6 +5169,88 @@ mod tests {
         assert_eq!(scan.watched_scripts, 4);
         assert_eq!(scan.watched_names, 0);
         assert_eq!(scan.birthday_height, 0);
+    }
+
+    #[test]
+    fn active_shakescape_htlc_watch_is_network_bound_durable_and_idempotent() {
+        let config = direct_wallet_config();
+        let mut wallet =
+            WalletStore::create(":memory:", "direct HTLC watch test passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[74; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let coordinator = open_wallet_direct_hns_peer_coordinator(
+            hns_wallet_store::SharedWalletStore::new(wallet),
+            &config,
+            HnsDirectPeerConfig::for_network(HnsNetwork::Regtest),
+            now,
+        )
+        .unwrap();
+        let compressed_key = |scalar: u8| {
+            SigningKey::from_bytes((&[scalar; 32]).into())
+                .unwrap()
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap()
+        };
+        let descriptor = HnsHtlc {
+            network: crate::shakedex_network_binding(HnsNetwork::Regtest).unwrap(),
+            value: Dollarydoos::new(100_546),
+            hashlock: [75; 32],
+            receiver_public_key: compressed_key(76),
+            refund_public_key: compressed_key(77),
+            refund_locktime: 100,
+        };
+
+        assert!(
+            coordinator
+                .install_shakescape_hns_htlc_watch_set(&[descriptor], now)
+                .unwrap()
+        );
+        let mut installed = coordinator.backend().light_watch_set().unwrap();
+        assert_eq!(installed.scripts.len(), 5);
+        assert!(installed.scripts.contains(&WalletAddressKey {
+            version: 0,
+            hash: descriptor.script_hash().unwrap().to_vec(),
+        }));
+        assert!(
+            coordinator
+                .extend_wallet_restore_watch_set(now + 1)
+                .unwrap()
+        );
+        installed = coordinator.backend().light_watch_set().unwrap();
+        assert!(installed.scripts.contains(&WalletAddressKey {
+            version: 0,
+            hash: descriptor.script_hash().unwrap().to_vec(),
+        }));
+        assert!(
+            !coordinator
+                .install_shakescape_hns_htlc_watch_set(&[descriptor], now + 2)
+                .unwrap()
+        );
+
+        let wrong_network = HnsHtlc {
+            network: crate::shakedex_network_binding(HnsNetwork::Mainnet).unwrap(),
+            ..descriptor
+        };
+        assert!(
+            coordinator
+                .install_shakescape_hns_htlc_watch_set(&[wrong_network], now + 3)
+                .is_err()
+        );
+        assert_eq!(coordinator.backend().light_watch_set().unwrap(), installed);
     }
 
     #[test]
@@ -5722,6 +5896,19 @@ mod tests {
         address = NetAddress::from_socket_addr("127.0.0.1:32123".parse().unwrap(), now, services);
         assert!(!shakescape_net_address_allowed(&address, now, false));
         assert!(shakescape_net_address_allowed(&address, now, true));
+    }
+
+    #[test]
+    fn accepted_inbound_sources_may_arrive_from_private_overlays() {
+        assert!(inbound_source_address_allowed(
+            "100.88.243.100:43117".parse().unwrap()
+        ));
+        assert!(inbound_source_address_allowed(
+            "192.168.8.242:43117".parse().unwrap()
+        ));
+        assert!(!inbound_source_address_allowed(
+            "192.168.8.242:0".parse().unwrap()
+        ));
     }
 
     #[test]
