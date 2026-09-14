@@ -22,7 +22,8 @@ use hns_wallet_market::{
     list_local_shakescape_direct_offers, list_local_shakescape_direct_takes,
     list_pending_local_shakescape_direct_takes, list_shakescape_executions,
     load_shakescape_direct_offer, load_shakescape_direct_offers, load_shakescape_direct_swap,
-    open_shakescape_execution, shakescape_execution_workflow_id,
+    load_shakescape_direct_swaps, load_shakescape_execution, open_shakescape_execution,
+    shakescape_execution_workflow_id,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::{TransactionHash, WalletId};
@@ -1024,6 +1025,22 @@ impl MobileShakescapeSessionController {
         let policy = self.policy;
         self.store
             .try_with_store_mut(|store| {
+                // Older clients admitted the countersigned hello but did not
+                // open the maker's execution workflow. Once the maker retires
+                // the consumed public offer, a stateless rendezvous cannot
+                // reconstruct that route to redeliver the hello. Recover the
+                // workflow directly from the already-authenticated durable
+                // record before applying ordinary timeout and listing cleanup.
+                let mut recovered = 0usize;
+                for record in load_shakescape_direct_swaps(store, &policy)? {
+                    let session_id = hns_wallet_types::SessionId::new(record.take.swap_session_id);
+                    if record.hello.is_some()
+                        && load_shakescape_execution(store, &policy, session_id)?.is_none()
+                    {
+                        open_shakescape_execution(store, &policy, session_id, now_unix)?;
+                        recovered = recovered.saturating_add(1);
+                    }
+                }
                 let mut expired = Vec::new();
                 for execution in list_shakescape_executions(store, &policy)? {
                     if !matches!(
@@ -1088,7 +1105,9 @@ impl MobileShakescapeSessionController {
                     }
                 }
                 Ok::<_, hns_wallet_market::MarketError>(
-                    expired.len().saturating_add(retired_offers),
+                    recovered
+                        .saturating_add(expired.len())
+                        .saturating_add(retired_offers),
                 )
             })
             .map_err(MobileWalletError::from)
