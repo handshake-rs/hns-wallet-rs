@@ -2608,9 +2608,11 @@ impl MobileShakescapeSessionController {
         // A take stops being "pending" as soon as the taker has durably
         // countersigned the maker proposal.  Delivery is not thereby proven:
         // the peer or rendezvous route can disappear between the local commit
-        // and the one-shot send.  Replay the exact retained hello, followed by
-        // the exact retained watch acknowledgement when present.  Both are
-        // canonical signed messages and their admission is idempotent.
+        // and the one-shot send.  Replay the exact retained take first so a
+        // stateless rendezvous can reconstruct its authenticated session
+        // route, then replay the exact retained hello and watch
+        // acknowledgement.  All are canonical signed messages and their
+        // admission is idempotent.
         for envelope in self.direct_swap_handshake_reconciliation_envelopes(now_unix)? {
             peer.send_cross_chain_envelope(&envelope)?;
         }
@@ -2644,6 +2646,11 @@ impl MobileShakescapeSessionController {
                     let request_id = record
                         .proposal_request_id
                         .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                    // Relays key the volatile maker/taker route from the
+                    // signed take.  A replacement transport peer therefore
+                    // cannot route an orphan hello until this envelope has
+                    // been replayed.
+                    envelopes.push(take.envelope);
                     envelopes.push(
                         CrossChainMessage::SwapSessionHello(hello)
                             .encode_envelope(request_id)
@@ -3345,10 +3352,15 @@ mod tests {
         let replay = controller
             .direct_swap_handshake_reconciliation_envelopes(START + 32)
             .expect("reconciliation envelopes");
-        assert_eq!(replay, vec![accepted.envelope, ready_envelope]);
-        admit_shakescape_direct_swap_hello(&mut maker, &policy, &replay[0], START + 32)
+        assert_eq!(
+            replay,
+            vec![take.envelope.clone(), accepted.envelope, ready_envelope]
+        );
+        admit_shakescape_direct_offer_take(&mut maker, &policy, &replay[0], START + 32)
+            .expect("replayed take is idempotent");
+        admit_shakescape_direct_swap_hello(&mut maker, &policy, &replay[1], START + 32)
             .expect("replayed hello reaches maker");
-        admit_shakescape_direct_swap_watch_ready(&mut maker, &policy, &replay[1], START + 32)
+        admit_shakescape_direct_swap_watch_ready(&mut maker, &policy, &replay[2], START + 32)
             .expect("replayed watch acknowledgement reaches maker");
         let record = load_shakescape_direct_swap(&maker, &policy, offer.offer.session_id)
             .expect("load maker session")
