@@ -702,8 +702,11 @@ impl From<hns_wallet_hns::HnsWalletError> for ShakedexError {
             HnsWalletError::ApprovalRequired => Self::ApprovalRequired,
             HnsWalletError::FeeQuoteInputUnavailable
             | HnsWalletError::InvalidFeeQuoteTransaction
-            | HnsWalletError::InvalidFeeQuote
-            | HnsWalletError::FeeLimit => Self::InvalidFeeEvidence,
+            | HnsWalletError::InvalidFeeQuote => Self::InvalidFeeEvidence,
+            // A caller-selected cap that is below the canonical policy fee is
+            // actionable and is not malformed fee evidence. Preserve the
+            // closed error text so native clients can distinguish it.
+            HnsWalletError::FeeLimit => Self::HnsIntegration(error.to_string()),
             HnsWalletError::StaleNodeSnapshot
             | HnsWalletError::StaleAccountRead
             | HnsWalletError::StaleAddressReservation => Self::StaleRevision,
@@ -821,6 +824,11 @@ mod tests {
             ShakedexError::from(hns_wallet_hns::HnsWalletError::InvalidPreparedArtifact),
             ShakedexError::HnsIntegration(ref detail)
                 if detail == "prepared transaction artifact is invalid"
+        ));
+        assert!(matches!(
+            ShakedexError::from(hns_wallet_hns::HnsWalletError::FeeLimit),
+            ShakedexError::HnsIntegration(ref detail)
+                if detail == "fee exceeds the approved maximum"
         ));
     }
 
