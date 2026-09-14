@@ -68,7 +68,9 @@ fn listing_fixture() -> (FixedPriceListing, Coin, SigningKey) {
     };
     let locking_coin = Coin {
         outpoint: proof.locking_outpoint,
-        value: Dollarydoos::new(900_000),
+        // Zero-value owner outputs are consensus-valid for free Handshake
+        // names and must survive the restart-safe Shakedex evidence boundary.
+        value: Dollarydoos::new(0),
         height: Height::new(123),
         coinbase: false,
         address: Address::new(0, lock_script_hash(&seller_public_key).to_vec())

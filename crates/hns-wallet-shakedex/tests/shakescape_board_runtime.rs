@@ -2198,7 +2198,7 @@ fn board_conflicts_spends_stale_mempool_and_unrelated_stores_fail_closed() {
         .store(true, Ordering::SeqCst);
     assert!(matches!(
         board.admit_offer(&update, update_hash),
-        Err(ShakedexError::InvalidEvidence)
+        Err(ShakedexError::StaleRevision)
     ));
     control
         .restart_mempool_on_fence
@@ -2861,7 +2861,7 @@ fn single_offer_response_plan_fails_on_spend_stale_mempool_board_replacement_and
     control.restart_chain_on_fence.store(true, Ordering::SeqCst);
     assert!(matches!(
         prepare_shakescape_board_offer_response(&request, &board),
-        Err(ShakedexError::InvalidEvidence)
+        Err(ShakedexError::StaleRevision)
     ));
     control
         .restart_chain_on_fence
@@ -2878,7 +2878,7 @@ fn single_offer_response_plan_fails_on_spend_stale_mempool_board_replacement_and
         .store(true, Ordering::SeqCst);
     assert!(matches!(
         prepare_shakescape_board_offer_response(&request, &board),
-        Err(ShakedexError::InvalidEvidence)
+        Err(ShakedexError::StaleRevision)
     ));
     control
         .restart_mempool_on_fence

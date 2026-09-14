@@ -846,7 +846,7 @@ impl ShakedexValueWorkflow {
             source_coin: CoinEvidence::from_coin(source_coin)?,
             funding_input_coins: funding_input_coins
                 .iter()
-                .map(CoinEvidence::from_coin)
+                .map(CoinEvidence::from_funding_coin)
                 .collect::<Result<_, _>>()?,
             recipient: AddressEvidence::from_address(recipient)?,
             value_base_units,
@@ -955,7 +955,7 @@ impl ShakedexValueWorkflow {
     pub(crate) fn funding_input_coins(&self) -> Result<Vec<Coin>, ShakedexError> {
         self.funding_input_coins
             .iter()
-            .map(CoinEvidence::to_coin)
+            .map(CoinEvidence::to_funding_coin)
             .collect()
     }
 

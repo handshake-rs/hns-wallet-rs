@@ -77,7 +77,12 @@ pub(crate) struct CoinEvidence {
 
 impl CoinEvidence {
     pub(crate) fn from_coin(coin: &Coin) -> Result<Self, ShakedexError> {
-        if coin.outpoint.is_null() || coin.value.get() == 0 {
+        // A consensus-valid Handshake name owner can carry zero value.  In
+        // particular, a Shakedex FINALIZE lock for a freely registered name
+        // is still an authenticated, spendable covenant coin.  Value must be
+        // constrained by the role that consumes the evidence rather than by
+        // this lossless coin encoding.
+        if coin.outpoint.is_null() {
             return Err(ShakedexError::InvalidEvidence);
         }
         let covenant = coin
@@ -95,10 +100,14 @@ impl CoinEvidence {
         })
     }
 
-    pub(crate) fn to_coin(&self) -> Result<Coin, ShakedexError> {
-        if self.value_base_units == 0 {
+    pub(crate) fn from_funding_coin(coin: &Coin) -> Result<Self, ShakedexError> {
+        if coin.value.get() == 0 {
             return Err(ShakedexError::InvalidEvidence);
         }
+        Self::from_coin(coin)
+    }
+
+    pub(crate) fn to_coin(&self) -> Result<Coin, ShakedexError> {
         let covenant =
             Covenant::decode(&self.covenant).map_err(|_| ShakedexError::InvalidEvidence)?;
         if covenant
@@ -120,6 +129,14 @@ impl CoinEvidence {
             covenant,
         };
         if coin.outpoint.is_null() {
+            return Err(ShakedexError::InvalidEvidence);
+        }
+        Ok(coin)
+    }
+
+    pub(crate) fn to_funding_coin(&self) -> Result<Coin, ShakedexError> {
+        let coin = self.to_coin()?;
+        if coin.value.get() == 0 {
             return Err(ShakedexError::InvalidEvidence);
         }
         Ok(coin)
@@ -219,7 +236,7 @@ impl SellerLockPlan {
             recipient: AddressEvidence::from_address(recovery.recipient())?,
             funding_input_coins: funding_input_coins
                 .iter()
-                .map(CoinEvidence::from_coin)
+                .map(CoinEvidence::from_funding_coin)
                 .collect::<Result<_, _>>()?,
             transaction: recovery.transaction(),
             transaction_bytes: recovery.transaction_bytes().to_vec(),
@@ -471,7 +488,7 @@ impl BuyerLockPlan {
             recipient: AddressEvidence::from_address(fulfillment.recipient())?,
             funding_input_coins: funding_input_coins
                 .iter()
-                .map(CoinEvidence::from_coin)
+                .map(CoinEvidence::from_funding_coin)
                 .collect::<Result<_, _>>()?,
             transaction: fulfillment.transaction(),
             transaction_bytes: fulfillment.transaction_bytes().to_vec(),
@@ -868,5 +885,41 @@ fn decode_coins(encoded: &[CoinEvidence]) -> Result<Vec<Coin>, ShakedexError> {
     if encoded.is_empty() || encoded.len() > crate::MAX_SHAKEDEX_FUNDING_INPUTS {
         return Err(ShakedexError::InvalidEvidence);
     }
-    encoded.iter().map(CoinEvidence::to_coin).collect()
+    encoded.iter().map(CoinEvidence::to_funding_coin).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use hns_covenants::Covenant;
+
+    use super::*;
+
+    #[test]
+    fn zero_value_coin_is_lossless_evidence_but_not_funding() {
+        let coin = Coin {
+            outpoint: Outpoint {
+                transaction_hash: CanonicalTransactionHash::new([0x51; 32]),
+                index: 7,
+            },
+            value: Dollarydoos::new(0),
+            height: Height::new(123),
+            coinbase: false,
+            address: Address::new(0, vec![0x22; 32]).expect("covenant address"),
+            covenant: Covenant::default(),
+        };
+
+        let evidence = CoinEvidence::from_coin(&coin).expect("zero-value covenant coin evidence");
+        assert_eq!(
+            evidence.to_coin().expect("zero-value coin round trip"),
+            coin
+        );
+        assert!(matches!(
+            CoinEvidence::from_funding_coin(&coin),
+            Err(ShakedexError::InvalidEvidence)
+        ));
+        assert!(matches!(
+            evidence.to_funding_coin(),
+            Err(ShakedexError::InvalidEvidence)
+        ));
+    }
 }

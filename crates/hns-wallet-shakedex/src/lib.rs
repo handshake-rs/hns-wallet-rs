@@ -711,6 +711,11 @@ impl From<hns_wallet_hns::HnsWalletError> for ShakedexError {
             HnsWalletError::RuntimeIntegrationUnavailable | HnsWalletError::MainnetDisabled => {
                 Self::ValueRuntimeUnavailable
             }
+            // Preserve the protocol-level evidence classification relied on
+            // by board admission and current-lock callers.  It is distinct
+            // from operational preparation failures that benefit from the
+            // more specific closed HNS error text below.
+            HnsWalletError::InvalidEvidence => Self::InvalidEvidence,
             HnsWalletError::StoreAuthorityMismatch => Self::StoreAuthorityMismatch,
             HnsWalletError::Backend(message) => Self::HnsBackend(message),
             // Every remaining display string comes from the closed
