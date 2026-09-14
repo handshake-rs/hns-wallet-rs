@@ -2519,9 +2519,26 @@ impl MobileShakescapeSessionController {
                     admit_shakescape_direct_swap_proposal(store, &self.policy, envelope, now_unix)
                         .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
                 }
-                CrossChainMessage::SwapSessionHello(_) => {
-                    admit_shakescape_direct_swap_hello(store, &self.policy, envelope, now_unix)
-                        .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
+                CrossChainMessage::SwapSessionHello(hello) => {
+                    let admission = admit_shakescape_direct_swap_hello(
+                        store,
+                        &self.policy,
+                        envelope,
+                        now_unix,
+                    )?;
+                    // A countersigned hello is the bilateral execution
+                    // commitment. The taker opens its workflow while creating
+                    // that hello, but the maker only receives it through this
+                    // admission path. Open the same idempotent workflow here
+                    // so both wallets can independently recover and advance
+                    // the first-funding gate after a disconnect or restart.
+                    open_shakescape_execution(
+                        store,
+                        &self.policy,
+                        hns_wallet_types::SessionId::new(hello.swap_session_id),
+                        now_unix,
+                    )?;
+                    Ok(Some(MobileShakescapeDirectAdmission::Swap(admission)))
                 }
                 CrossChainMessage::SwapFundingStatus(_)
                 | CrossChainMessage::SwapRedeemStatus(_)
@@ -3356,17 +3373,33 @@ mod tests {
             replay,
             vec![take.envelope.clone(), accepted.envelope, ready_envelope]
         );
-        admit_shakescape_direct_offer_take(&mut maker, &policy, &replay[0], START + 32)
+        let maker_shared = SharedWalletStore::new(maker);
+        let maker_controller =
+            MobileShakescapeSessionController::new(maker_shared.clone(), policy, maker_id);
+        maker_controller
+            .admit_direct_envelope(&replay[0], START + 32)
             .expect("replayed take is idempotent");
-        admit_shakescape_direct_swap_hello(&mut maker, &policy, &replay[1], START + 32)
+        maker_controller
+            .admit_direct_envelope(&replay[1], START + 32)
             .expect("replayed hello reaches maker");
-        admit_shakescape_direct_swap_watch_ready(&mut maker, &policy, &replay[2], START + 32)
+        maker_controller
+            .admit_direct_envelope(&replay[2], START + 32)
             .expect("replayed watch acknowledgement reaches maker");
-        let record = load_shakescape_direct_swap(&maker, &policy, offer.offer.session_id)
-            .expect("load maker session")
-            .expect("maker session exists");
-        assert!(record.hello.is_some());
-        assert!(record.first_chain_watch_ready.is_some());
+        maker_shared
+            .try_with_store(|maker| {
+                let record = load_shakescape_direct_swap(maker, &policy, offer.offer.session_id)?
+                    .expect("maker session exists");
+                assert!(record.hello.is_some());
+                assert!(record.first_chain_watch_ready.is_some());
+                Ok::<_, hns_wallet_market::MarketError>(())
+            })
+            .expect("load maker session");
+        let maker_execution = maker_controller
+            .durable_executions()
+            .expect("maker execution opened by countersigned hello");
+        assert_eq!(maker_execution.len(), 1);
+        assert_eq!(maker_execution[0].local_role, "maker");
+        assert_eq!(maker_execution[0].state, SwapState::TermsFrozen);
         assert!(
             controller
                 .direct_swap_handshake_reconciliation_envelopes(START + 621)
