@@ -608,9 +608,11 @@ impl HnsDirectShakescapeListener {
     }
 
     /// Accept at most one pending connection and route it after the ordinary
-    /// Handshake version/verack exchange. This method must be polled only
-    /// while [`HnsDirectPeerCoordinator::minimal_network_service_ready`] is
-    /// true, because its local version truthfully advertises `NETWORK`.
+    /// Handshake version/verack exchange. The listener implements the minimal
+    /// standard `NETWORK` profile, but callers must retain an ordinary network
+    /// peer only while [`HnsDirectPeerCoordinator::minimal_network_service_ready`]
+    /// is true. An extension-negotiated ShakeScape peer can remain available
+    /// during an outbound header-peer refresh.
     pub fn accept_next_mobile(
         &self,
         local_height: u32,

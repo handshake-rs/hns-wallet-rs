@@ -5499,12 +5499,16 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .config
             .clone();
         let workflow_id = settlement_workflow_id(&config, session_id, HnsSettlementAction::Lock);
-        let stored = self
+        let Some(stored) = self
             .store_lock()
             .map_err(map_chain_error)?
             .load_workflow::<HnsPreparedSettlement>(workflow_id)
             .map_err(map_chain_error)?
-            .ok_or(ChainError::InvalidEvidence)?;
+        else {
+            // No locally prepared/broadcast lock is the normal pre-funding
+            // condition. It is absence of evidence, not invalid evidence.
+            return Ok(None);
+        };
         let HnsSettlementTerms::Lock { request } = &stored.state.terms else {
             return Err(ChainError::InvalidEvidence);
         };

@@ -1621,9 +1621,10 @@ impl MobileShakescapeSessionController {
         &self,
     ) -> Result<Vec<MobileShakescapeHnsVerificationPermit>, MobileWalletError> {
         let policy = self.policy;
+        let wallet_id = self.wallet_id;
         self.store
             .try_with_store(|store| {
-                list_shakescape_executions(store, &policy)?
+                let permits = list_shakescape_executions(store, &policy)?
                     .into_iter()
                     .filter(|session| {
                         (session.state == SwapState::FirstFundingPending
@@ -1668,16 +1669,42 @@ impl MobileShakescapeSessionController {
                                         .map(|status| {
                                             TransactionHash::new(status.status.transaction_id)
                                         });
-                                    MobileShakescapeHnsVerificationPermit {
+                                    let local_maker =
+                                        hns_wallet_market::is_local_shakescape_direct_maker(
+                                            store, &policy, wallet_id, session.id,
+                                        )?;
+                                    let local_taker =
+                                        hns_wallet_market::is_local_shakescape_direct_taker(
+                                            store, wallet_id, session.id,
+                                        )?;
+                                    if local_maker == local_taker {
+                                        return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+                                    }
+                                    let local_hns_funder = (local_maker
+                                        && hello.offered_asset == AssetId::HNS)
+                                        || (local_taker && hello.received_asset == AssetId::HNS);
+                                    // A remote HNS lock has no trustworthy lookup
+                                    // key until its funder supplies an authenticated
+                                    // locator. Falling back to this wallet's local
+                                    // persisted-workflow lookup before that point is
+                                    // both pointless and noisy: no such local
+                                    // workflow should exist. A local HNS funder may
+                                    // still use the locator-free path to recover an
+                                    // already-broadcast workflow after restart.
+                                    if !local_hns_funder && funding_transaction.is_none() {
+                                        return Ok(None);
+                                    }
+                                    Ok(Some(MobileShakescapeHnsVerificationPermit {
                                         hello,
                                         side,
                                         funding_transaction,
-                                    }
+                                    }))
                                 })
                             })
-                            .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)
+                            .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
                     })
-                    .collect::<Result<Vec<_>, _>>()
+                    .collect::<Result<Vec<_>, hns_wallet_market::MarketError>>()?;
+                Ok::<_, hns_wallet_market::MarketError>(permits.into_iter().flatten().collect())
             })
             .map_err(MobileWalletError::from)
     }
@@ -4376,6 +4403,18 @@ mod tests {
                 .expect("taker independently verifies funding"),
             SwapState::FirstFunded
         );
+        assert!(
+            controller
+                .pending_second_hns_funding_verifications()
+                .expect("maker HNS verification candidates")
+                .is_empty(),
+            "the BTC maker must wait for the remote HNS transaction locator"
+        );
+        let local_hns_recovery = taker_controller
+            .pending_second_hns_funding_verifications()
+            .expect("local HNS recovery candidate");
+        assert_eq!(local_hns_recovery.len(), 1);
+        assert_eq!(local_hns_recovery[0].funding_transaction(), None);
         let hns_permit = taker_controller
             .authorize_local_hns_second_funding(offer.offer.session_id, START + 51)
             .expect("ordered HNS funding permit");
@@ -4459,6 +4498,14 @@ mod tests {
                 .admit_direct_envelope(&hns_funding_envelope, START + 59)
                 .expect("maker admits HNS funding locator"),
             None
+        );
+        let remote_hns_verification = controller
+            .pending_second_hns_funding_verifications()
+            .expect("maker remote HNS verification candidate");
+        assert_eq!(remote_hns_verification.len(), 1);
+        assert_eq!(
+            remote_hns_verification[0].funding_transaction(),
+            Some(hns_wallet_types::TransactionHash::new([0x71; 32]))
         );
         assert_eq!(
             controller
