@@ -3089,7 +3089,12 @@ impl MobileShakescapeSessionController {
                             second_refund_after_seconds: 2 * 60 * 60,
                             refund_safety_margin_seconds: 60 * 60,
                             bitcoin_minimum_confirmations: 1,
-                            hns_minimum_confirmations: 1,
+                            // Match the native HNS wallet's default local
+                            // settlement floor. The verifier independently
+                            // raises legacy lower terms to its configured
+                            // policy, but new peers should agree on the
+                            // stronger threshold before either funds.
+                            hns_minimum_confirmations: 2,
                         },
                     )
                 });

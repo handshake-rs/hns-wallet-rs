@@ -5439,6 +5439,15 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         ensure_settlement_ready(&cache)?;
         let binding = cache.binding.ok_or(ChainError::NotSynchronized)?;
         let mempool = cache.mempool_binding.ok_or(ChainError::NotSynchronized)?;
+        // A peer's signed minimum is a floor, not authority to weaken this
+        // wallet's local settlement policy. Legacy mobile terms advertised
+        // one confirmation while the native wallet default required two;
+        // rejecting those locks forever was unnecessary once the locally
+        // authenticated chain had reached the stronger threshold. Elevate
+        // verification to the stronger of both policies and return `None`
+        // normally until that threshold is reached.
+        let required_confirmations =
+            minimum_confirmations.max(cache.account.config.minimum_confirmations);
         drop(cache);
         let evidence = self
             .backend
@@ -5448,7 +5457,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         {
             return Err(ChainError::InvalidEvidence);
         }
-        if evidence.status.confirmation_count < minimum_confirmations {
+        if evidence.status.confirmation_count < required_confirmations {
             return Ok(None);
         }
         let raw = evidence.raw.ok_or(ChainError::InvalidEvidence)?;
@@ -5463,7 +5472,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     receiver: hex::encode(descriptor.receiver_public_key),
                     refund_target: hex::encode(descriptor.refund_public_key),
                     absolute_timelock: u64::from(descriptor.refund_locktime),
-                    minimum_confirmations,
+                    minimum_confirmations: required_confirmations,
                 },
                 transaction_or_receipt: raw,
                 confirmation_count: evidence.status.confirmation_count,
