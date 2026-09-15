@@ -84,6 +84,7 @@ pub enum EntityKind {
     SwapSession,
     RefundTransaction,
     HnsRecoveryState,
+    HnsShakescapeWatch,
     HnsVerifiedSettlement,
     PendingApproval,
     InputReservation,
@@ -122,6 +123,7 @@ impl EntityKind {
             Self::SwapSession => "swap_session",
             Self::RefundTransaction => "refund_transaction",
             Self::HnsRecoveryState => "hns_recovery_state",
+            Self::HnsShakescapeWatch => "hns_shakescape_watch",
             Self::HnsVerifiedSettlement => "hns_verified_settlement",
             Self::PendingApproval => "pending_approval",
             Self::InputReservation => "input_reservation",
@@ -1546,6 +1548,13 @@ impl WalletStore {
             hns_recovery_states,
             delete_hns_recovery_state,
             HnsRecoveryState
+        ),
+        (
+            save_hns_shakescape_watch,
+            hns_shakescape_watch,
+            hns_shakescape_watches,
+            delete_hns_shakescape_watch,
+            HnsShakescapeWatch
         ),
         (
             save_hns_verified_settlement,
