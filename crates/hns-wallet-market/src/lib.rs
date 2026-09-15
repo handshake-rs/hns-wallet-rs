@@ -156,7 +156,7 @@ pub struct SwapSession {
     /// execution opened from the Shakescape board. Generic non-Shakescape sessions keep
     /// this empty; a Shakescape execution never relies on a board record surviving
     /// independently of its durable recovery journal.
-    #[serde(default)]
+    #[serde(default, alias = "accepted_denuo_terms")]
     pub accepted_shakescape_terms: Option<Vec<u8>>,
     pub timeouts: TimeoutPlan,
     pub first_funding: Option<ObjectHash>,
@@ -338,7 +338,11 @@ pub fn shakescape_execution_workflow_id(session_id: SessionId) -> WorkflowId {
 ///
 /// The returned session is at `TermsFrozen`, so the next permitted action is
 /// local refund preparation. A restart can call this function again: the
-/// exact existing journal is returned, while any mismatch fails closed.
+/// exact existing journal is returned, while any mismatch fails closed. If a
+/// crash left the authenticated direct record without its derived execution
+/// row, recovery is also permitted after the funding window: construction is
+/// evaluated at the original admission instant and every actual funding path
+/// must still pass `verify_new_funding_at` against the current time.
 pub fn open_shakescape_execution(
     store: &mut WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
@@ -377,10 +381,16 @@ pub fn open_shakescape_execution(
         }
         return Ok(existing.state);
     }
-    // A new execution must still be inside the signed new-funding window.
-    // Existing execution journals deliberately remain recoverable afterwards.
-    let mut expected = swap_session_from_accepted_hello(hello, now_unix)?;
+    // The countersigned direct record is the durable authority and was
+    // admitted only after time-bound verification. Reconstruct its missing
+    // derivative at that original instant. Using `now_unix` here used to make
+    // a crash between the direct-record write and execution-journal write
+    // permanently unrecoverable once the funding window elapsed. This does
+    // not reopen funding: all mobile funding permits independently call
+    // `verify_new_funding_at(policy.network(), now_unix)` before progressing.
+    let mut expected = swap_session_from_accepted_hello(hello, expected_accepted_at)?;
     expected.accepted_shakescape_terms = Some(encoded_terms);
+    expected.last_verified_at_unix = now_unix;
     let saved_revision = store.save_workflow(
         workflow_id,
         WorkflowKind::AtomicSwap,
@@ -418,22 +428,31 @@ pub fn list_shakescape_executions(
     store: &WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
 ) -> Result<Vec<SwapSession>, MarketError> {
-    store
-        .list_workflows_complete::<SwapSession>(
-            WorkflowKind::AtomicSwap,
-            MAX_SHAKESCAPE_DIRECT_SWAPS,
-        )?
-        .into_iter()
-        .map(|stored| {
-            let session_id = stored.state.id;
-            validate_shakescape_execution(
-                policy,
-                session_id,
-                shakescape_execution_workflow_id(session_id),
-                stored,
-            )
-        })
-        .collect()
+    // `WorkflowKind::AtomicSwap` is intentionally shared by more than one
+    // authenticated wallet protocol, including the older HNS name-swap
+    // workflow. Its encrypted JSON rows therefore do not share one Rust
+    // schema and must never be bulk-deserialized as `SwapSession` merely
+    // because their broad workflow kind matches.
+    //
+    // The direct ShakeScape record namespace is the exact durable registry
+    // for this protocol. Enumerate those authenticated records first, then
+    // derive and load only the corresponding execution workflow IDs. This is
+    // both an authority boundary and a schema boundary: an unrelated valid
+    // atomic workflow can no longer suppress HNS synchronization or swap
+    // recovery with a misleading persistence failure.
+    let records = load_shakescape_direct_swaps(store, policy)?;
+    let mut executions = Vec::with_capacity(records.len());
+    for record in records {
+        if record.hello.is_none() {
+            continue;
+        }
+        let session_id = SessionId::new(record.take.swap_session_id);
+        let execution = load_shakescape_execution(store, policy, session_id)?
+            .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
+        executions.push(execution);
+    }
+    executions.sort_by(|left, right| left.id.as_bytes().cmp(right.id.as_bytes()));
+    Ok(executions)
 }
 
 /// A funding lock independently verified by one wallet's chain authority.
@@ -1208,6 +1227,8 @@ pub enum MarketError {
     ShakescapeDirectSwapCapacity,
     #[error("persisted direct HNS/BTC swap is corrupt or noncanonical")]
     CorruptShakescapeDirectSwap,
+    #[error("persisted direct HNS/BTC swap failed canonical invariant: {0}")]
+    CorruptShakescapeDirectSwapDetail(&'static str),
     #[error("invalid, unexpected, or resource-exhausting Shakescape peer message")]
     InvalidShakescapePeerMessage,
     #[error("unsupported or inconsistent asset pair")]
@@ -1226,6 +1247,13 @@ pub enum MarketError {
     StaleRevision,
     #[error("wallet persistence failed")]
     Persistence,
+    /// Closed local persistence diagnostic retained for native recovery logs.
+    /// `StoreError` descriptions contain no decrypted wallet values, keys, or
+    /// caller-controlled record contents. Keeping the category here prevents
+    /// an actionable schema/capacity/lock failure from being flattened into
+    /// the same message as an unrelated signing-adapter failure.
+    #[error("wallet store failed: {0}")]
+    StoreFailure(String),
 }
 
 impl From<StoreError> for MarketError {
@@ -1233,7 +1261,7 @@ impl From<StoreError> for MarketError {
         if matches!(error, StoreError::StaleRevision { .. }) {
             Self::StaleRevision
         } else {
-            Self::Persistence
+            Self::StoreFailure(error.to_string())
         }
     }
 }
@@ -1426,5 +1454,25 @@ mod tests {
             shakescape_execution_workflow_id(btc_first.id),
             "workflow identity is session-bound, not chain-order-bound"
         );
+    }
+
+    #[test]
+    fn expired_authenticated_terms_can_reconstruct_a_missing_execution_baseline() {
+        let terms = accepted_terms(ChainId::HANDSHAKE);
+        let accepted_at = 100;
+        let recovered_at = terms.header.expires_at + 1;
+
+        // `open_shakescape_execution` first authenticates the persisted hello
+        // at its original admission and then reconstructs the missing
+        // derivative using that same instant. Its durable update timestamp is
+        // the recovery time so the workflow-store invariant remains exact.
+        let mut recovered = swap_session_from_accepted_hello(&terms, accepted_at)
+            .expect("originally admitted terms remain reconstructible");
+        recovered.last_verified_at_unix = recovered_at;
+
+        assert_eq!(recovered.state, SwapState::TermsFrozen);
+        assert_eq!(recovered.revision, 1);
+        assert_eq!(recovered.last_verified_at_unix, recovered_at);
+        assert!(swap_session_from_accepted_hello(&terms, recovered_at).is_err());
     }
 }

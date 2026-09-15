@@ -593,7 +593,7 @@ fn decode_stored_swap(
     stored: StoredEntity<PersistedShakescapeDirectSwap>,
 ) -> Result<ShakescapeDirectSwapRecord, MarketError> {
     let value = stored.value;
-    if value.schema_version != SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION
+    let malformed_envelope = value.schema_version != SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION
         || value.policy_fingerprint != policy.fingerprint()
         || value.take_request_id == 0
         || value.proposal_request_id == Some(0)
@@ -604,33 +604,58 @@ fn decode_stored_swap(
         || value.hello_hex.is_some() && value.proposal_hex.is_none()
         || value.watch_ready_accepted_at_unix.is_some()
             != value.first_chain_watch_ready_hex.is_some()
-        || value.first_chain_watch_ready_hex.is_some() && value.hello_hex.is_none()
-    {
-        return Err(MarketError::CorruptShakescapeDirectSwap);
+        || value.first_chain_watch_ready_hex.is_some() && value.hello_hex.is_none();
+    if malformed_envelope {
+        return Err(MarketError::CorruptShakescapeDirectSwapDetail(
+            "record envelope",
+        ));
     }
-    let offer = decode_hex::<DirectOffer>(&value.offer_hex)?;
-    let take = decode_hex::<DirectOfferTake>(&value.take_hex)?;
+    let offer = decode_hex::<DirectOffer>(&value.offer_hex)
+        .map_err(|_| MarketError::CorruptShakescapeDirectSwapDetail("canonical offer encoding"))?;
+    let take = decode_hex::<DirectOfferTake>(&value.take_hex)
+        .map_err(|_| MarketError::CorruptShakescapeDirectSwapDetail("canonical take encoding"))?;
     if SessionId::new(take.swap_session_id) != value.session_id
         || take
             .verify_for_offer(&offer, policy.network(), value.take_accepted_at_unix)
             .is_err()
     {
-        return Err(MarketError::CorruptShakescapeDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwapDetail(
+            "take authentication",
+        ));
     }
-    let proposal = value.proposal_hex.as_deref().map(decode_hex).transpose()?;
-    let hello = value.hello_hex.as_deref().map(decode_hex).transpose()?;
+    let proposal = value
+        .proposal_hex
+        .as_deref()
+        .map(decode_hex)
+        .transpose()
+        .map_err(|_| {
+            MarketError::CorruptShakescapeDirectSwapDetail("canonical proposal encoding")
+        })?;
+    let hello = value
+        .hello_hex
+        .as_deref()
+        .map(decode_hex)
+        .transpose()
+        .map_err(|_| MarketError::CorruptShakescapeDirectSwapDetail("canonical hello encoding"))?;
     let first_chain_watch_ready = value
         .first_chain_watch_ready_hex
         .as_deref()
         .map(decode_hex)
-        .transpose()?;
+        .transpose()
+        .map_err(|_| {
+            MarketError::CorruptShakescapeDirectSwapDetail("canonical watch-ready encoding")
+        })?;
     let peer_funding_statuses = value
         .peer_funding_statuses
         .into_iter()
         .map(|status| {
             Ok(ShakescapePeerFundingStatusRecord {
                 accepted_at_unix: status.accepted_at_unix,
-                status: decode_hex(&status.status_hex)?,
+                status: decode_hex(&status.status_hex).map_err(|_| {
+                    MarketError::CorruptShakescapeDirectSwapDetail(
+                        "canonical peer-funding encoding",
+                    )
+                })?,
             })
         })
         .collect::<Result<Vec<_>, MarketError>>()?;
@@ -652,20 +677,27 @@ fn decode_stored_swap(
     if let (Some(proposal), Some(at)) = (&record.proposal, record.proposal_accepted_at_unix) {
         proposal
             .verify_for_direct_offer(&record.offer, &record.take, policy.network(), at)
-            .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
+            .map_err(|_| {
+                MarketError::CorruptShakescapeDirectSwapDetail("proposal authentication")
+            })?;
     }
     if let (Some(hello), Some(at)) = (&record.hello, record.hello_accepted_at_unix) {
         hello
             .verify_for_direct_offer(&record.offer, &record.take, policy.network(), at)
-            .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
-        let proposal = record
-            .proposal
-            .as_ref()
-            .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
+            .map_err(|_| MarketError::CorruptShakescapeDirectSwapDetail("hello authentication"))?;
+        let proposal =
+            record
+                .proposal
+                .as_ref()
+                .ok_or(MarketError::CorruptShakescapeDirectSwapDetail(
+                    "hello without proposal",
+                ))?;
         let mut maker_terms = hello.clone();
         maker_terms.taker_signature = [0; 64];
         if proposal.terms() != &maker_terms {
-            return Err(MarketError::CorruptShakescapeDirectSwap);
+            return Err(MarketError::CorruptShakescapeDirectSwapDetail(
+                "proposal/hello term mismatch",
+            ));
         }
     }
     if let (Some(ready), Some(at), Some(hello)) = (
@@ -677,7 +709,9 @@ fn decode_stored_swap(
             .verify_for_session(hello, policy.network(), at)
             .is_err())
     {
-        return Err(MarketError::CorruptShakescapeDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwapDetail(
+            "watch-ready authentication",
+        ));
     }
     if record.peer_funding_statuses.len() > 2
         || record
@@ -693,12 +727,16 @@ fn decode_stored_swap(
             })
         })
     {
-        return Err(MarketError::CorruptShakescapeDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwapDetail(
+            "peer-funding authentication",
+        ));
     }
     if stored.updated_at_unix != record.snapshot().last_accepted_at_unix
         || !timestamps_monotonic(&record)
     {
-        return Err(MarketError::CorruptShakescapeDirectSwap);
+        return Err(MarketError::CorruptShakescapeDirectSwapDetail(
+            "record timestamps",
+        ));
     }
     Ok(record)
 }
