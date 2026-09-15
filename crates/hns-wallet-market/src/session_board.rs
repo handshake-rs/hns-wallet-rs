@@ -263,24 +263,22 @@ pub fn admit_shakescape_direct_offer_take(
     };
     let offer = load_shakescape_direct_offer(store, &policy.board_policy(), take.offer_id)?
         .ok_or(MarketError::UnknownShakescapeDirectOffer)?;
-    if !offer.is_active_at(accepted_at_unix) {
-        return Err(MarketError::InvalidShakescapeDirectSwap);
-    }
-    take.verify_for_offer(&offer.offer, policy.network(), accepted_at_unix)
-        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let session_id = SessionId::new(take.swap_session_id);
     if let Some(existing) = load_shakescape_direct_swap(store, policy, session_id)? {
-        // The transport correlation ID is deliberately outside the signed
-        // take. A reconnecting wallet may replay the same durable take on a
-        // new socket whose request-ID sequence is different. Treat the exact
-        // signed offer/take pair as idempotent and retain the first admitted
-        // request ID so an already-created proposal/hello exchange keeps its
-        // original correlation.
+        // An exact replay is recovery/routing material and remains idempotent
+        // after the public offer expires. Check it before the new-take time
+        // gate so reconnecting wallets can deliver the rest of an already
+        // frozen session.
         if existing.offer == offer.offer && existing.take == take {
             return Ok(ShakescapeDirectSwapAdmission::Existing(existing.snapshot()));
         }
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
+    if !offer.is_active_at(accepted_at_unix) {
+        return Err(MarketError::InvalidShakescapeDirectSwap);
+    }
+    take.verify_for_offer(&offer.offer, policy.network(), accepted_at_unix)
+        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     if load_shakescape_direct_swaps(store, policy)?.len() >= MAX_SHAKESCAPE_DIRECT_SWAPS {
         return Err(MarketError::ShakescapeDirectSwapCapacity);
     }
@@ -405,14 +403,6 @@ pub fn admit_shakescape_direct_swap_hello(
         }
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
-    hello
-        .verify_for_direct_offer(
-            &record.offer,
-            &record.take,
-            policy.network(),
-            accepted_at_unix,
-        )
-        .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let proposal = record
         .proposal
         .as_ref()
@@ -421,6 +411,30 @@ pub fn admit_shakescape_direct_swap_hello(
     maker_terms.taker_signature = [0; 64];
     if proposal.terms() != &maker_terms {
         return Err(MarketError::ShakescapeDirectSwapConflict);
+    }
+    // A fully countersigned hello is durable recovery material, not an
+    // instruction to begin new funding. It may arrive again after a mobile
+    // disconnect and after its original funding window. Verify it at receipt
+    // while live; for a late replay, verify the complete offer/take binding
+    // and both signatures at the hello's signed creation time. Every actual
+    // funding action still calls `verify_new_funding_at(now)`, so admitting a
+    // delayed agreement cannot authorize a new lock after the deadline.
+    match hello.verify_for_direct_offer(
+        &record.offer,
+        &record.take,
+        policy.network(),
+        accepted_at_unix,
+    ) {
+        Ok(()) => {}
+        Err(MarketplaceError::Expired { .. }) => hello
+            .verify_for_direct_offer(
+                &record.offer,
+                &record.take,
+                policy.network(),
+                hello.header.created_at,
+            )
+            .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?,
+        Err(_) => return Err(MarketError::InvalidShakescapeDirectSwap),
     }
     let mut persisted = encode_persisted(policy, &record)?;
     persisted.hello_accepted_at_unix = Some(accepted_at_unix);
@@ -461,14 +475,18 @@ pub fn admit_shakescape_direct_swap_watch_ready(
     if ready.chain != hello.first_funding_chain {
         return Err(MarketError::InvalidShakescapePeerMessage);
     }
-    ready
-        .verify_for_session(hello, policy.network(), accepted_at_unix)
-        .map_err(|_| MarketError::InvalidShakescapePeerMessage)?;
     if let Some(existing) = &record.first_chain_watch_ready {
         if existing == &ready {
             return Ok(ShakescapeDirectSwapAdmission::Existing(record.snapshot()));
         }
         return Err(MarketError::ShakescapeDirectSwapConflict);
+    }
+    match ready.verify_for_session(hello, policy.network(), accepted_at_unix) {
+        Ok(()) => {}
+        Err(MarketplaceError::Expired { .. }) => ready
+            .verify_for_session(hello, policy.network(), ready.header.created_at)
+            .map_err(|_| MarketError::InvalidShakescapePeerMessage)?,
+        Err(_) => return Err(MarketError::InvalidShakescapePeerMessage),
     }
     let mut persisted = encode_persisted(policy, &record)?;
     persisted.watch_ready_accepted_at_unix = Some(accepted_at_unix);

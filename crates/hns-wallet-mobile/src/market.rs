@@ -3145,14 +3145,12 @@ impl MobileShakescapeSessionController {
         for take in pending_takes {
             peer.send_cross_chain_envelope(&take.envelope)?;
         }
-        // A take stops being "pending" as soon as the taker has durably
-        // countersigned the maker proposal.  Delivery is not thereby proven:
-        // the peer or rendezvous route can disappear between the local commit
-        // and the one-shot send.  Replay the exact retained take first so a
-        // stateless rendezvous can reconstruct its authenticated session
-        // route, then replay the exact retained hello and watch
-        // acknowledgement.  All are canonical signed messages and their
-        // admission is idempotent.
+        // A take stops being "pending" as soon as the proposal is jointly
+        // signed, but delivery is not thereby proven. Either participant may
+        // reconnect after the one-shot exchange, so replay the complete
+        // canonical handshake retained by every wallet-owned session. This
+        // lets either endpoint repair the other's durable state without a
+        // stateful rendezvous or out-of-band coordination.
         let session_envelopes = self.direct_swap_handshake_reconciliation_envelopes(now_unix)?;
         let session_envelope_count = session_envelopes.len();
         for envelope in session_envelopes {
@@ -3176,28 +3174,73 @@ impl MobileShakescapeSessionController {
         self.store
             .try_with_store(|store| {
                 let mut envelopes = Vec::new();
-                for take in list_local_shakescape_direct_takes(store, &self.policy, self.wallet_id)?
-                {
-                    let Some(record) =
-                        load_shakescape_direct_swap(store, &self.policy, take.session_id)?
-                    else {
+                for record in load_shakescape_direct_swaps(store, &self.policy)? {
+                    let session_id = hns_wallet_types::SessionId::new(record.take.swap_session_id);
+                    let local_maker = is_local_shakescape_direct_maker(
+                        store,
+                        &self.policy,
+                        self.wallet_id,
+                        session_id,
+                    )?;
+                    let local_taker =
+                        is_local_shakescape_direct_taker(store, self.wallet_id, session_id)?;
+                    if local_maker == local_taker {
                         continue;
-                    };
+                    }
                     let Some(hello) = record.hello else { continue };
-                    // Once this deadline passes no new funding may begin.  Do
-                    // not turn an expired, unfunded agreement into perpetual
-                    // network noise or invite the maker to fund stale terms.
-                    if now_unix > hello.header.expires_at {
+                    let execution = load_shakescape_execution(store, &self.policy, session_id)?;
+                    // The funding deadline prevents new funding; it must not
+                    // prevent recovery of a lock which was already authorized
+                    // or observed. An untouched agreement is omitted after
+                    // expiry so it cannot become perpetual network noise.
+                    let recovery_in_progress = execution.as_ref().is_some_and(|execution| {
+                        (execution.state == SwapState::FirstFundingPending && local_maker)
+                            || matches!(
+                                execution.state,
+                                SwapState::FirstFunded
+                                    | SwapState::SecondFundingPending
+                                    | SwapState::BothFunded
+                                    | SwapState::FirstRedeemed
+                                    | SwapState::SecretObserved
+                                    | SwapState::SecondRedeemed
+                                    | SwapState::RefundEligible
+                                    | SwapState::RefundBroadcast
+                            )
+                            || (execution.state == SwapState::Failed
+                                && (execution.first_funding.is_some()
+                                    || execution.second_funding.is_some()))
+                    });
+                    if now_unix > hello.header.expires_at && !recovery_in_progress {
                         continue;
                     }
                     let request_id = record
                         .proposal_request_id
                         .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
-                    // Relays key the volatile maker/taker route from the
-                    // signed take.  A replacement transport peer therefore
-                    // cannot route an orphan hello until this envelope has
-                    // been replayed.
-                    envelopes.push(take.envelope);
+                    // The take re-establishes the volatile maker/taker route.
+                    envelopes.push(
+                        CrossChainMessage::TakeDirectOffer(record.take.clone())
+                            .encode_envelope(record.take_request_id)
+                            .map_err(|_| {
+                                hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
+                            })?,
+                    );
+                    // Only the maker replays its proposal. A taker replaying a
+                    // maker-authored proposal back to the maker is redundant,
+                    // while maker -> taker repairs the precise missing step
+                    // needed to re-admit the jointly signed hello.
+                    if local_maker {
+                        let proposal = record
+                            .proposal
+                            .clone()
+                            .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                        envelopes.push(
+                            CrossChainMessage::SwapSessionProposal(proposal)
+                                .encode_envelope(record.take_request_id)
+                                .map_err(|_| {
+                                    hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
+                                })?,
+                        );
+                    }
                     envelopes.push(
                         CrossChainMessage::SwapSessionHello(hello)
                             .encode_envelope(request_id)
@@ -3952,7 +3995,11 @@ mod tests {
             .expect("reconciliation envelopes");
         assert_eq!(
             replay,
-            vec![take.envelope.clone(), accepted.envelope, ready_envelope]
+            vec![
+                take.envelope.clone(),
+                accepted.envelope.clone(),
+                ready_envelope.clone(),
+            ]
         );
         let maker_shared = SharedWalletStore::new(maker);
         let maker_controller =
@@ -3981,6 +4028,18 @@ mod tests {
         assert_eq!(maker_execution.len(), 1);
         assert_eq!(maker_execution[0].local_role, "maker");
         assert_eq!(maker_execution[0].state, SwapState::TermsFrozen);
+        let maker_replay = maker_controller
+            .direct_swap_handshake_reconciliation_envelopes(START + 33)
+            .expect("maker reconciliation envelopes");
+        assert_eq!(
+            maker_replay,
+            vec![
+                take.envelope.clone(),
+                proposal.envelope.clone(),
+                accepted.envelope,
+                ready_envelope,
+            ]
+        );
         assert!(
             controller
                 .direct_swap_handshake_reconciliation_envelopes(START + 621)
