@@ -397,11 +397,40 @@ pub enum MobileShakescapeDirectAdmission {
     Swap(ShakescapeDirectSwapAdmission),
 }
 
+/// Protocol identity of one serviced cross-chain envelope. This intentionally
+/// exposes no offer, wallet, transaction, or session identifier; embeddings
+/// can use it to diagnose bounded transport progress without logging private
+/// market material.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MobileShakescapeDirectMessageKind {
+    OfferInventory,
+    GetOffer,
+    Offer,
+    OfferCancellation,
+    TakeOffer,
+    SessionProposal,
+    SessionHello,
+    FundingStatus,
+    RedeemStatus,
+    RefundStatus,
+    WatchReady,
+}
+
+/// Bounded material emitted during one periodic direct-board reconciliation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MobileShakescapeDirectInventoryReport {
+    pub active_offers: usize,
+    pub cancellations: usize,
+    pub pending_takes: usize,
+    pub session_envelopes: usize,
+}
+
 /// Bounded effects of one direct HNS/BTC Shakescape transport event. Discovery
 /// traffic has no settlement authority; `admission` is populated only after a
 /// signed offer or session message passes the durable local checks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MobileShakescapeDirectTransportReport {
+    pub message_kind: MobileShakescapeDirectMessageKind,
     pub messages_received: usize,
     pub messages_sent: usize,
     pub admission: Option<MobileShakescapeDirectAdmission>,
@@ -2869,7 +2898,7 @@ impl MobileShakescapeSessionController {
         &self,
         peer: &mut HnsDirectShakescapePeer,
         now_unix: u64,
-    ) -> Result<(), MobileWalletError> {
+    ) -> Result<MobileShakescapeDirectInventoryReport, MobileWalletError> {
         let local_offers = self
             .store
             .try_with_store(|store| {
@@ -2881,10 +2910,11 @@ impl MobileShakescapeSessionController {
                 )
             })
             .map_err(MobileWalletError::from)?;
-        let inventory = local_offers
+        let inventory: Vec<_> = local_offers
             .into_iter()
             .map(|offer| offer.offer.offer_id.into_bytes())
             .collect();
+        let active_offers = inventory.len();
         peer.send_cross_chain_message(&CrossChainMessage::DirectOfferInventory(inventory))?;
         // Active offer IDs alone cannot tell a peer that a previously learned
         // offer was cancelled. Replay every still-retained signed tombstone
@@ -2900,10 +2930,12 @@ impl MobileShakescapeSessionController {
                 )
             })
             .map_err(MobileWalletError::from)?;
-        for cancellation in cancellations
+        let cancellations: Vec<_> = cancellations
             .into_iter()
             .filter(|cancellation| cancellation.header.expires_at > now_unix)
-        {
+            .collect();
+        let cancellation_count = cancellations.len();
+        for cancellation in cancellations {
             peer.send_cross_chain_message(&CrossChainMessage::CancelDirectOffer(cancellation))?;
         }
         let pending_takes = self
@@ -2917,6 +2949,7 @@ impl MobileShakescapeSessionController {
                 )
             })
             .map_err(MobileWalletError::from)?;
+        let pending_take_count = pending_takes.len();
         for take in pending_takes {
             peer.send_cross_chain_envelope(&take.envelope)?;
         }
@@ -2928,10 +2961,17 @@ impl MobileShakescapeSessionController {
         // route, then replay the exact retained hello and watch
         // acknowledgement.  All are canonical signed messages and their
         // admission is idempotent.
-        for envelope in self.direct_swap_handshake_reconciliation_envelopes(now_unix)? {
+        let session_envelopes = self.direct_swap_handshake_reconciliation_envelopes(now_unix)?;
+        let session_envelope_count = session_envelopes.len();
+        for envelope in session_envelopes {
             peer.send_cross_chain_envelope(&envelope)?;
         }
-        Ok(())
+        Ok(MobileShakescapeDirectInventoryReport {
+            active_offers,
+            cancellations: cancellation_count,
+            pending_takes: pending_take_count,
+            session_envelopes: session_envelope_count,
+        })
     }
 
     fn direct_swap_handshake_reconciliation_envelopes(
@@ -3024,7 +3064,35 @@ impl MobileShakescapeSessionController {
         if canonical != envelope {
             return Err(MobileWalletError::InvalidShakescapeSessionMessage);
         }
+        let message_kind = match &message {
+            CrossChainMessage::DirectOfferInventory(_) => {
+                MobileShakescapeDirectMessageKind::OfferInventory
+            }
+            CrossChainMessage::GetDirectOffer(_) => MobileShakescapeDirectMessageKind::GetOffer,
+            CrossChainMessage::DirectOffer(_) => MobileShakescapeDirectMessageKind::Offer,
+            CrossChainMessage::CancelDirectOffer(_) => {
+                MobileShakescapeDirectMessageKind::OfferCancellation
+            }
+            CrossChainMessage::TakeDirectOffer(_) => MobileShakescapeDirectMessageKind::TakeOffer,
+            CrossChainMessage::SwapSessionProposal(_) => {
+                MobileShakescapeDirectMessageKind::SessionProposal
+            }
+            CrossChainMessage::SwapSessionHello(_) => {
+                MobileShakescapeDirectMessageKind::SessionHello
+            }
+            CrossChainMessage::SwapFundingStatus(_) => {
+                MobileShakescapeDirectMessageKind::FundingStatus
+            }
+            CrossChainMessage::SwapRedeemStatus(_) => {
+                MobileShakescapeDirectMessageKind::RedeemStatus
+            }
+            CrossChainMessage::SwapRefundStatus(_) => {
+                MobileShakescapeDirectMessageKind::RefundStatus
+            }
+            CrossChainMessage::SwapWatchReady(_) => MobileShakescapeDirectMessageKind::WatchReady,
+        };
         let mut report = MobileShakescapeDirectTransportReport {
+            message_kind,
             messages_received: 1,
             messages_sent: 0,
             admission: None,
