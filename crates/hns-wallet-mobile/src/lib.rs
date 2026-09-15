@@ -3764,6 +3764,24 @@ pub enum MobileWalletError {
     Abi(#[from] AbiError),
 }
 
+impl MobileWalletError {
+    /// Whether a failed direct ShakeScape envelope proves that the underlying
+    /// authenticated peer can no longer be serviced safely.
+    ///
+    /// Durable board/session admission is deliberately independent from the
+    /// transport lifetime. A stale, duplicate, conflicting, or locally
+    /// unserviceable signed object can be rejected while later inventory and
+    /// offer messages on the same ordered connection remain useful. Only an
+    /// actual peer I/O failure or a non-canonical cross-chain envelope makes
+    /// the connection itself unusable.
+    pub const fn invalidates_direct_shakescape_transport(&self) -> bool {
+        matches!(
+            self,
+            Self::DirectHns(_) | Self::InvalidShakescapeSessionMessage
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3804,6 +3822,17 @@ mod tests {
         ] {
             assert!(!hns_send_pre_broadcast_retry_required(&error));
         }
+    }
+
+    #[test]
+    fn durable_swap_rejection_does_not_invalidate_authenticated_transport() {
+        let conflict = MobileWalletError::Market(
+            hns_wallet_market::MarketError::ShakescapeDirectSwapConflict,
+        );
+        assert!(!conflict.invalidates_direct_shakescape_transport());
+
+        let invalid_envelope = MobileWalletError::InvalidShakescapeSessionMessage;
+        assert!(invalid_envelope.invalidates_direct_shakescape_transport());
     }
 
     fn shakescape_acceptance_policy_json() -> Vec<u8> {
