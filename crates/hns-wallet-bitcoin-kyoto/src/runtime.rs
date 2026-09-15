@@ -2156,7 +2156,11 @@ impl KyotoSupervisor {
     /// Persist and activate one exact HTLC compact-filter watch before either
     /// party can fund it. Registration is bound to this wallet's current
     /// locally validated checkpoint and immediately joins the existing Kyoto
-    /// filter stream.
+    /// filter stream. A freshly started supervisor may accept the watch before
+    /// its first update is polled: at that point the wallet, scanned, and last
+    /// consistent checkpoints must still agree, and the script is inserted
+    /// into the already-created update stream before any synchronization can
+    /// take exclusive ownership of this controller.
     pub fn register_htlc_watch(
         &mut self,
         wallet: &EncryptedPersistedBitcoinWallet,
@@ -2164,7 +2168,7 @@ impl KyotoSupervisor {
         now_unix: u64,
     ) -> Result<BitcoinHtlcWatchAdmission, BitcoinWalletError> {
         if self.poisoned
-            || !matches!(self.durable.state.phase, KyotoSyncPhase::Ready)
+            || !phase_accepts_htlc_watch_registration(&self.durable.state.phase)
             || wallet.network() != self.durable.state.network
             || wallet.account_id() != self.durable.account_id.as_slice()
             || !wallet.shared_store().is_same_authority(&self.store)
@@ -3301,6 +3305,17 @@ fn restart_requires_recovery(state: &KyotoWalletState, wallet: &Wallet) -> bool 
     tip_mismatch_requires_recovery(&state.phase, state.last_consistent_checkpoint, wallet_tip)
 }
 
+/// Watch registration is safe before the supervisor's first update begins as
+/// well as between completed updates. `synchronize_once` takes exclusive
+/// ownership before changing `Starting` to `Synchronizing`, so no concurrent
+/// chain mutation can cross this gate.
+fn phase_accepts_htlc_watch_registration(phase: &KyotoSyncPhase) -> bool {
+    matches!(
+        phase,
+        KyotoSyncPhase::Ready | KyotoSyncPhase::Starting { .. }
+    )
+}
+
 fn tip_mismatch_requires_recovery(
     phase: &KyotoSyncPhase,
     last_consistent_checkpoint: BitcoinCheckpoint,
@@ -3824,6 +3839,37 @@ mod restart_tests {
         bytes[..4].copy_from_slice(&height.to_be_bytes());
         bytes[4..8].copy_from_slice(&height.wrapping_mul(2_654_435_761).to_be_bytes());
         BlockHash::from_byte_array(bytes)
+    }
+
+    #[test]
+    fn htlc_watch_admission_is_open_only_before_or_between_updates() {
+        assert!(phase_accepts_htlc_watch_registration(
+            &KyotoSyncPhase::Ready
+        ));
+        assert!(phase_accepts_htlc_watch_registration(
+            &KyotoSyncPhase::Starting {
+                sequence: 7,
+                recovery_scan: true,
+            }
+        ));
+        assert!(!phase_accepts_htlc_watch_registration(
+            &KyotoSyncPhase::Synchronizing {
+                sequence: 7,
+                from: checkpoint(10, 1),
+            }
+        ));
+        assert!(!phase_accepts_htlc_watch_registration(
+            &KyotoSyncPhase::Reconciling {
+                sequence: 7,
+                wallet_tip: checkpoint(11, 2),
+                common_ancestor: Some(checkpoint(10, 1)),
+            }
+        ));
+        assert!(!phase_accepts_htlc_watch_registration(
+            &KyotoSyncPhase::RecoveryRequired {
+                reason: KyotoRecoveryReason::InterruptedSynchronization,
+            }
+        ));
     }
 
     #[test]
