@@ -99,6 +99,11 @@ unsafe_code = "forbid"
 all = "warn"
 
 [patch.crates-io]
+# Keep the reviewed transport local so approved broadcasts are announced to
+# every active peer instead of one randomly selected connection, and so all
+# queued package members are flushed directly after BIP339 inventory while
+# remaining retrievable by either wtxid or txid for normal getdata handling.
+bip157 = { path = "vendor/bip157" }
 # The adjacent engine exposes inbound standard serving requests instead of
 # discarding their locators. Mobile NETWORK service depends on that reviewed
 # wire/session implementation while retaining the exact published version.

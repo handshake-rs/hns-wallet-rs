@@ -21,8 +21,9 @@ use hns_wallet_bitcoin_kyoto::{
     DEFAULT_RECOVERY_GAP_LIMIT, EncryptedPersistedBitcoinWallet, HtlcSpendBranch,
     KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor, KyotoSyncProgressHandle,
     KyotoSyncReceipt, KyotoSyncStage, KyotoTipDiscovery, KyotoWalletState,
-    PreparedBitcoinHtlcFunding, StoredKyotoWalletState, VerifiedBitcoinLock, authorize_native_send,
-    bitcoin_activity_page, bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit,
+    PreparedBitcoinHtlcFunding, StoredKyotoWalletState, VerifiedBitcoinLock,
+    approved_bitcoin_broadcast_has_output, authorize_native_send, bitcoin_activity_page,
+    bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit,
     build_shakescape_bitcoin_htlc, create_persisted_descriptor_wallet_from_seed,
     initialize_pristine_wallet_at_creation_tip, initialize_pristine_wallet_at_recovery_checkpoint,
     load_bitcoin_htlc_watch, load_cached_bitcoin_peers, load_persisted_descriptor_wallet_from_seed,
@@ -40,8 +41,9 @@ use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 use zeroize::Zeroizing;
 
 use crate::{
-    MobileShakescapeBitcoinFundingPermit, MobileShakescapeBitcoinSettlementPermit,
-    MobileShakescapeBitcoinWatchPermit, MobileShakescapeSettlementAction, MobileWalletError,
+    MobileShakescapeBitcoinAbsencePermit, MobileShakescapeBitcoinFundingPermit,
+    MobileShakescapeBitcoinSettlementPermit, MobileShakescapeBitcoinWatchPermit,
+    MobileShakescapeSettlementAction, MobileWalletError,
 };
 
 const BITCOIN_RECOVERY_GAP_LIMIT: u32 = DEFAULT_RECOVERY_GAP_LIMIT;
@@ -349,6 +351,15 @@ pub struct MobileBitcoinHtlcSettlementReceipt {
     pub txid: String,
     pub attempt_count: u16,
     pub submitted_at_unix: Option<u64>,
+}
+
+/// Checkpoint-bound proof that this wallet neither observed nor durably
+/// approved the exact Bitcoin HTLC funding output for a swap session.
+/// Fields remain crate-private so platform bindings cannot manufacture it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MobileShakescapeUnfundedBitcoinProof {
+    pub(crate) session_id: SessionId,
+    pub(crate) terms_commitment: hns_wallet_types::ObjectHash,
 }
 
 /// Wallet-owned Kyoto state for the installed HNS/Bitcoin product. It opens
@@ -1478,6 +1489,79 @@ impl MobileBitcoinValueController {
             .try_with_store(|store| {
                 load_bitcoin_htlc_watch(store, wallet.network(), wallet.account_id(), session_id)
                     .map(|watch| watch.and_then(|watch| watch.verified_lock_at(checkpoint)))
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    /// Prove that an exact registered swap lock is absent from the current
+    /// verified compact-filter view and from every durable approved broadcast.
+    /// An in-memory prepared funding action also prevents abandonment.
+    pub fn prove_shakescape_htlc_unfunded(
+        &self,
+        permit: &MobileShakescapeBitcoinAbsencePermit,
+    ) -> Result<Option<MobileShakescapeUnfundedBitcoinProof>, MobileWalletError> {
+        let hello = permit.hello();
+        let side = permit.side();
+        let session_id = SessionId::new(hello.swap_session_id);
+        let binding = build_shakescape_bitcoin_htlc(hello, side)?;
+        let minimum_confirmations = match side {
+            hns_marketplace_protocol::SwapAssetSide::Offered => hello.offered_minimum_confirmations,
+            hns_marketplace_protocol::SwapAssetSide::Received => {
+                hello.received_minimum_confirmations
+            }
+        };
+        let terms_commitment = BitcoinHtlcWatchRequest {
+            session_id,
+            htlc: binding.htlc.clone(),
+            expected_value_sats: binding.value_sats,
+            minimum_confirmations,
+        }
+        .terms_commitment()?;
+        if self
+            .pending_htlc_funding
+            .as_ref()
+            .is_some_and(|pending| pending.session_id == session_id)
+        {
+            return Ok(None);
+        }
+        let wallet = self
+            .wallet
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let checkpoint = supervisor.state().scanned_checkpoint;
+        self.store
+            .try_with_store(|store| {
+                let watch = load_bitcoin_htlc_watch(
+                    store,
+                    wallet.network(),
+                    wallet.account_id(),
+                    session_id,
+                )?;
+                if let Some(watch) = watch.as_ref() {
+                    let snapshot = watch.snapshot();
+                    if snapshot.terms_commitment != terms_commitment
+                        || snapshot.scanned_checkpoint != checkpoint
+                        || snapshot.funding_txid.is_some()
+                    {
+                        return Ok::<_, BitcoinWalletError>(None);
+                    }
+                }
+                if approved_bitcoin_broadcast_has_output(
+                    store,
+                    wallet.network(),
+                    binding.htlc.script_pubkey().as_script(),
+                    binding.value_sats,
+                )? {
+                    return Ok::<_, BitcoinWalletError>(None);
+                }
+                Ok::<_, BitcoinWalletError>(Some(MobileShakescapeUnfundedBitcoinProof {
+                    session_id,
+                    terms_commitment,
+                }))
             })
             .map_err(MobileWalletError::from)
     }

@@ -2901,6 +2901,46 @@ pub fn unobserved_approved_broadcast_inputs(
     )
 }
 
+/// Return whether any durably approved Bitcoin transaction pays the exact
+/// script and value. This includes both observed and not-yet-observed
+/// broadcasts: callers use it to close the crash window between persisting a
+/// signed HTLC funding transaction and announcing its locator to the swap
+/// journal.
+pub fn approved_bitcoin_broadcast_has_output(
+    store: &WalletStore,
+    network: Network,
+    script_pubkey: &bdk_wallet::bitcoin::Script,
+    value_sats: u64,
+) -> Result<bool, BitcoinWalletError> {
+    let records = store
+        .bitcoin_transactions::<BitcoinTransactionRecord>(MAX_TRACKED_BITCOIN_TRANSACTIONS + 1)?;
+    if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
+        return Err(BitcoinWalletError::BitcoinTransactionCapacity);
+    }
+    for stored in records {
+        let record = stored.value;
+        record.validate()?;
+        let Some(intent) = record.broadcast.as_ref() else {
+            continue;
+        };
+        if intent.network != network {
+            return Err(BitcoinWalletError::NetworkMismatch);
+        }
+        let raw = record
+            .raw_transaction
+            .as_ref()
+            .ok_or(BitcoinWalletError::CorruptRuntimeState)?;
+        let transaction: Transaction =
+            deserialize(raw).map_err(|_| BitcoinWalletError::CorruptRuntimeState)?;
+        if transaction.output.iter().any(|output| {
+            output.value.to_sat() == value_sats && output.script_pubkey.as_script() == script_pubkey
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn collect_unobserved_approved_broadcast_inputs(
     records: Vec<StoredEntity<BitcoinTransactionRecord>>,
     network: Network,

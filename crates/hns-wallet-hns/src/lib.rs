@@ -927,7 +927,8 @@ pub enum HnsFeeRateSource {
     /// Canonical HSD normal wallet fee floor for the selected network.
     NetworkDefault,
     Mempool,
-    /// Lower-median relay floor advertised by connected untrusted peers.
+    /// Legacy serialized source retained for compatibility. Untrusted peer
+    /// relay filters are no longer used as wallet fee estimates.
     PeerRelay,
 }
 

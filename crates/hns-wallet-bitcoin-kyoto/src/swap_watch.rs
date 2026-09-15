@@ -128,6 +128,10 @@ impl BitcoinHtlcWatch {
         &self.persisted.htlc
     }
 
+    pub const fn expected_value_sats(&self) -> u64 {
+        self.persisted.expected_value_sats
+    }
+
     pub fn funding_raw_transaction(&self) -> Option<&[u8]> {
         self.persisted
             .funding

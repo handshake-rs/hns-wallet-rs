@@ -2098,19 +2098,14 @@ fn embedded_block_hash(state: &EmbeddedState, height: u32) -> Result<[u8; 32], H
 }
 
 fn wallet_fee_rate(state: &EmbeddedState) -> (u64, usize) {
-    let mut rates = state.peer_fee_rates.values().copied().collect::<Vec<_>>();
     let network_default = normal_wallet_fee_rate(state.authority.consensus_network());
-    if rates.is_empty() {
-        return (network_default, 0);
-    }
-    rates.sort_unstable();
-    let lower_median = rates[(rates.len() - 1) / 2];
-    (
-        lower_median
-            .max(MINIMUM_RELAY_FEE_RATE)
-            .max(network_default),
-        rates.len(),
-    )
+    // FEEFILTER is an untrusted peer's current receive policy, not a fee
+    // estimate. It cannot tell the wallet what miners require, and feeding it
+    // into construction lets a peer force excessive fees or strand a bounded
+    // HTLC. Keep observed filters for relay-path diagnostics, but construct
+    // with HSD's canonical per-network normal wallet rate until an
+    // authenticated fee-estimation source exists.
+    (network_default.max(MINIMUM_RELAY_FEE_RATE), 0)
 }
 
 const fn normal_wallet_fee_rate(network: hns_header_consensus::Network) -> u64 {
@@ -3036,8 +3031,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(quote.rate_atomic_units_per_1000_policy_vbytes, 20_000);
-        assert_eq!(quote.rate_sample_count, 2);
-        assert_eq!(quote.rate_source, HnsFeeRateSource::PeerRelay);
+        assert_eq!(quote.rate_sample_count, 0);
+        assert_eq!(quote.rate_source, HnsFeeRateSource::NetworkDefault);
         assert_eq!(quote.actual_fee, BaseUnits::new(2_000));
 
         backend.remove_header_peer(peer_two).unwrap();

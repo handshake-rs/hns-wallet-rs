@@ -13,7 +13,7 @@ pub use bitcoin::{
     MobileBitcoinHtlcFundingReceipt, MobileBitcoinHtlcSettlementApproval,
     MobileBitcoinHtlcSettlementReceipt, MobileBitcoinSendApproval, MobileBitcoinShutdownHandle,
     MobileBitcoinSnapshot, MobileBitcoinSyncProgress, MobileBitcoinSyncProgressHandle,
-    MobileBitcoinValueController,
+    MobileBitcoinValueController, MobileShakescapeUnfundedBitcoinProof,
 };
 pub use hns_wallet_bitcoin_kyoto::{
     BitcoinBroadcastRecoverySummary, VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock,
@@ -21,14 +21,14 @@ pub use hns_wallet_bitcoin_kyoto::{
 pub use market::{
     MINIMUM_BITCOIN_FEE_RESERVE_SATS, MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary,
     MobileDirectOfferSummary, MobileDirectOfferTakeApproval, MobileDirectOfferTakeSummary,
-    MobileHnsForBtcOfferApproval, MobileShakescapeBitcoinFundingPermit,
-    MobileShakescapeBitcoinSettlementPermit, MobileShakescapeBitcoinWatchPermit,
-    MobileShakescapeDirectAdmission, MobileShakescapeDirectInventoryReport,
-    MobileShakescapeDirectMessageKind, MobileShakescapeDirectTransportReport,
-    MobileShakescapeExecutionSummary, MobileShakescapeHnsFundingPermit,
-    MobileShakescapeHnsSettlementPermit, MobileShakescapeHnsVerificationPermit,
-    MobileShakescapeHnsWatchPermit, MobileShakescapeSessionController,
-    MobileShakescapeSettlementAction,
+    MobileHnsForBtcOfferApproval, MobileShakescapeBitcoinAbsencePermit,
+    MobileShakescapeBitcoinFundingPermit, MobileShakescapeBitcoinSettlementPermit,
+    MobileShakescapeBitcoinWatchPermit, MobileShakescapeDirectAdmission,
+    MobileShakescapeDirectInventoryReport, MobileShakescapeDirectMessageKind,
+    MobileShakescapeDirectTransportReport, MobileShakescapeExecutionSummary,
+    MobileShakescapeHnsFundingPermit, MobileShakescapeHnsSettlementPermit,
+    MobileShakescapeHnsVerificationPermit, MobileShakescapeHnsWatchPermit,
+    MobileShakescapeSessionController, MobileShakescapeSettlementAction,
 };
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
@@ -2302,16 +2302,24 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             return Err(MobileWalletError::InvalidValueAction);
         }
         let session_id = hns_wallet_types::SessionId::new(hello.swap_session_id);
-        let lock = self
-            .session
-            .service
-            .verify_trusted_native_persisted_hns_htlc_lock(
+        let lock = match permit.funding_transaction() {
+            Some(transaction) => self.session.service.verify_trusted_native_hns_htlc_lock(
                 session_id,
-                binding.descriptor,
+                binding.descriptor.clone(),
+                transaction,
                 confirmations,
-            )
-            .map_err(mobile_service_failure)?
-            .ok_or(MobileWalletError::InvalidValueAction)?;
+            ),
+            None => self
+                .session
+                .service
+                .verify_trusted_native_persisted_hns_htlc_lock(
+                    session_id,
+                    binding.descriptor.clone(),
+                    confirmations,
+                ),
+        }
+        .map_err(mobile_service_failure)?
+        .ok_or(MobileWalletError::InvalidValueAction)?;
         let maximum_fee = BaseUnits::new(u128::from(maximum_fee_dollarydoos));
         let action = permit.action();
         let prepared = match action {
@@ -3827,9 +3835,8 @@ mod tests {
 
     #[test]
     fn durable_swap_rejection_does_not_invalidate_authenticated_transport() {
-        let conflict = MobileWalletError::Market(
-            hns_wallet_market::MarketError::ShakescapeDirectSwapConflict,
-        );
+        let conflict =
+            MobileWalletError::Market(hns_wallet_market::MarketError::ShakescapeDirectSwapConflict);
         assert!(!conflict.invalidates_direct_shakescape_transport());
 
         let invalid_envelope = MobileWalletError::InvalidShakescapeSessionMessage;

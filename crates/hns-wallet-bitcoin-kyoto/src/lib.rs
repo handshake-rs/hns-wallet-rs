@@ -2104,6 +2104,25 @@ mod tests {
         )
         .expect("durable first approval");
 
+        assert!(
+            approved_bitcoin_broadcast_has_output(
+                &store,
+                Network::Regtest,
+                first.htlc.script_pubkey().as_script(),
+                first.value_sats,
+            )
+            .expect("find exact approved HTLC output")
+        );
+        assert!(
+            !approved_bitcoin_broadcast_has_output(
+                &store,
+                Network::Regtest,
+                first.htlc.script_pubkey().as_script(),
+                first.value_sats + 1,
+            )
+            .expect("reject a different HTLC value")
+        );
+
         let committed = unobserved_approved_broadcast_inputs(&store, Network::Regtest)
             .expect("committed inputs");
         let recovery = bitcoin_broadcast_recovery_summary(&store, Network::Regtest)
