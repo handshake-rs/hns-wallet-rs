@@ -10,10 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bdk_wallet::KeychainKind;
 use bdk_wallet::bitcoin::Network as BitcoinNetwork;
-use bdk_wallet::bitcoin::Transaction;
 use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
 use bdk_wallet::bitcoin::consensus::deserialize;
 use bdk_wallet::bitcoin::hashes::Hash;
+use bdk_wallet::bitcoin::{Transaction, Txid, Wtxid};
 use hns_wallet_bitcoin_kyoto::{
     BIP39_SEED_BYTES, BitcoinActivityStatus, BitcoinBirthdaySource, BitcoinBroadcastReceipt,
     BitcoinBroadcastRecoverySummary, BitcoinCheckpoint, BitcoinHtlcWatchRequest,
@@ -1076,7 +1076,7 @@ impl MobileBitcoinValueController {
         let approval = MobileBitcoinHtlcFundingApproval {
             action_token: lowercase_hex(&action_token),
             session_id: lowercase_hex(session_id.as_bytes()),
-            txid: lowercase_hex(prepared.txid.as_bytes()),
+            txid: bitcoin_txid_hex(prepared.txid.as_bytes()),
             amount_sats: prepared.value_sats,
             fee_sats: prepared.fee_sats,
             maximum_fee_sats,
@@ -1227,7 +1227,7 @@ impl MobileBitcoinValueController {
         ))?;
         Ok(MobileBitcoinHtlcFundingReceipt {
             session_id: lowercase_hex(pending.session_id.as_bytes()),
-            txid: lowercase_hex(&receipt.txid),
+            txid: bitcoin_txid_hex(&receipt.txid),
             output_index: verified.output_index,
             attempt_count: receipt.attempt_count,
             submitted_at_unix: receipt.submitted_at_unix,
@@ -1365,7 +1365,7 @@ impl MobileBitcoinValueController {
             action_token: lowercase_hex(&action_token),
             session_id: lowercase_hex(session_id.as_bytes()),
             action: permit.action(),
-            txid: lowercase_hex(verified.txid.as_bytes()),
+            txid: bitcoin_txid_hex(verified.txid.as_bytes()),
             input_amount_sats: lock.value_sats,
             output_amount_sats,
             fee_sats: verified.fee_sats,
@@ -1450,7 +1450,7 @@ impl MobileBitcoinValueController {
         Ok(MobileBitcoinHtlcSettlementReceipt {
             session_id: lowercase_hex(pending.session_id.as_bytes()),
             action: pending.action,
-            txid: lowercase_hex(&receipt.txid),
+            txid: bitcoin_txid_hex(&receipt.txid),
             attempt_count: receipt.attempt_count,
             submitted_at_unix: receipt.submitted_at_unix,
         })
@@ -1882,6 +1882,18 @@ fn lowercase_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+/// Render Bitcoin transaction hashes in the conventional RPC/explorer byte
+/// order. The wallet stores consensus hash bytes so equality and outpoint
+/// lookups remain allocation-free; directly hex-encoding that internal array
+/// would display the reverse of Bitcoin Core's `txid`/`wtxid` notation.
+fn bitcoin_txid_hex(bytes: &[u8; 32]) -> String {
+    Txid::from_byte_array(*bytes).to_string()
+}
+
+fn bitcoin_wtxid_hex(bytes: &[u8; 32]) -> String {
+    Wtxid::from_byte_array(*bytes).to_string()
+}
+
 fn mobile_bitcoin_activity(
     activity: Vec<BitcoinRecentActivity>,
     synchronized_height: u32,
@@ -1916,7 +1928,7 @@ fn mobile_bitcoin_activity(
                     .then_some(item.fee_sats)
                     .flatten();
             MobileBitcoinActivity {
-                txid: lowercase_hex(&item.txid),
+                txid: bitcoin_txid_hex(&item.txid),
                 direction,
                 amount_sats,
                 fee_sats: reported_fee_sats,
@@ -1953,8 +1965,8 @@ fn action_token_matches(expected: &[u8; MOBILE_ACTION_TOKEN_BYTES], candidate: &
 
 fn mobile_broadcast_receipt(receipt: BitcoinBroadcastReceipt) -> MobileBitcoinBroadcastReceipt {
     MobileBitcoinBroadcastReceipt {
-        txid: lowercase_hex(&receipt.txid),
-        wtxid: lowercase_hex(&receipt.wtxid),
+        txid: bitcoin_txid_hex(&receipt.txid),
+        wtxid: bitcoin_wtxid_hex(&receipt.wtxid),
         attempt_count: receipt.attempt_count,
         submitted_at_unix: receipt.submitted_at_unix,
     }
@@ -2023,6 +2035,23 @@ mod tests {
         assert_eq!(
             MobileBitcoinDirectConfig::for_hns_wallet(HnsNetwork::Simnet, path).network,
             BitcoinNetwork::Regtest
+        );
+    }
+
+    #[test]
+    fn bitcoin_hashes_use_conventional_rpc_display_order() {
+        let internal = [
+            0xe4, 0x1d, 0x97, 0x45, 0x56, 0x21, 0xcd, 0x9b, 0x81, 0x53, 0x3d, 0x0e, 0xd8, 0x36,
+            0x62, 0xa3, 0x6d, 0xd4, 0xc0, 0xd0, 0x13, 0xfd, 0x42, 0xa0, 0x9c, 0x21, 0xb1, 0xc4,
+            0x8e, 0x3f, 0xa8, 0x6a,
+        ];
+        assert_eq!(
+            bitcoin_txid_hex(&internal),
+            "6aa83f8ec4b1219ca042fd13d0c0d46da36236d80e3d53819bcd215645971de4",
+        );
+        assert_eq!(
+            bitcoin_wtxid_hex(&internal),
+            "6aa83f8ec4b1219ca042fd13d0c0d46da36236d80e3d53819bcd215645971de4",
         );
     }
 }
