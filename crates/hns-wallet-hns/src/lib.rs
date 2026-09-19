@@ -4111,11 +4111,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             return Err(HnsWalletError::InvalidWorkflow);
         }
         stored.state.stage = HnsSettlementStage::Cancelled;
-        let deletes = if stored.state.action == HnsSettlementAction::Lock {
-            reservation_deletes(&store, &config, stored.id)?
-        } else {
-            Vec::new()
-        };
+        let deletes = reservation_deletes(&store, &config, stored.id)?;
         store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
             stored.id,
             kind,
@@ -4222,11 +4218,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             if now >= stored.state.expires_at_unix {
                 if stored.state.stage == HnsSettlementStage::Prepared {
                     stored.state.stage = HnsSettlementStage::Expired;
-                    let deletes = if stored.state.action == HnsSettlementAction::Lock {
-                        reservation_deletes(&store, &config, stored.id)?
-                    } else {
-                        Vec::new()
-                    };
+                    let deletes = reservation_deletes(&store, &config, stored.id)?;
                     store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
                         stored.id,
                         kind,
@@ -4283,8 +4275,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             if current.revision != stored.revision || current.state != stored.state {
                 return Err(HnsWalletError::InvalidWorkflow);
             }
-            let activate = current.state.action == HnsSettlementAction::Lock
-                && current.state.stage == HnsSettlementStage::Prepared;
+            let activate = current.state.stage == HnsSettlementStage::Prepared;
             let activation_saves = if activate {
                 reservation_activation_saves(&store, &config, current.id, submission_started_at)?
             } else {
@@ -4516,9 +4507,103 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             }
         }
         let account = cache.account.clone();
+        let account_revision = cache.account_revision;
+        let coins = cache.coins.clone();
         drop(cache);
         let config = account.config.clone();
-        let store = self.store_lock().map_err(map_chain_error)?;
+        let terms = match action {
+            HnsSettlementAction::Redeem => HnsSettlementTerms::Redeem { lock: lock.clone() },
+            HnsSettlementAction::Refund => HnsSettlementTerms::Refund { lock: lock.clone() },
+            HnsSettlementAction::Lock => {
+                return Err(ChainError::InvalidRequest(
+                    "invalid settlement spend action",
+                ));
+            }
+        };
+        let workflow_id = settlement_workflow_id(&config, session_id, action);
+        let mut store = self.store_lock().map_err(map_chain_error)?;
+        if let Some(stored) = store
+            .load_workflow::<HnsPreparedSettlement>(workflow_id)
+            .map_err(map_chain_error)?
+        {
+            if stored.kind != settlement_workflow_kind(action)
+                || stored.state.wallet_id != config.wallet_id
+                || stored.state.account_id != config.account_id
+                || stored.state.workflow_id != workflow_id
+                || stored.state.session_id != session_id
+                || stored.state.action != action
+                || stored.state.stage != HnsSettlementStage::Prepared
+                || stored.state.terms != terms
+                || stored.state.maximum_fee != maximum_fee
+                || stored.state.fee > maximum_fee
+                || stored.state.expires_at_unix <= now
+            {
+                return Err(ChainError::InvalidRequest(
+                    "persisted Handshake settlement spend does not match retry",
+                ));
+            }
+            let quote = stored
+                .state
+                .fee_quote
+                .as_ref()
+                .ok_or(ChainError::InvalidEvidence)?;
+            let input_coins =
+                canonical_evidence_coins(&stored.state.input_coins).map_err(map_chain_error)?;
+            validate_final_fee_quote(
+                &stored.state.signed_transaction,
+                &input_coins,
+                quote,
+                quote.binding,
+                quote.mempool,
+                stored.state.fee,
+                stored.state.maximum_fee,
+            )
+            .map_err(map_chain_error)?;
+            let transaction = Transaction::decode(&stored.state.signed_transaction)
+                .map_err(|_| ChainError::InvalidEvidence)?;
+            if transaction.inputs.is_empty() || transaction.inputs.len() != input_coins.len() {
+                return Err(ChainError::InvalidEvidence);
+            }
+            let sponsor_outpoints = transaction
+                .inputs
+                .iter()
+                .skip(1)
+                .map(|input| HnsOutpoint {
+                    transaction: TransactionHash::new(
+                        input.previous_output.transaction_hash.into_bytes(),
+                    ),
+                    output_index: input.previous_output.index,
+                })
+                .collect::<Vec<_>>();
+            if sponsor_outpoints.is_empty() {
+                if account_input_reservations(&store, &config)
+                    .map_err(map_chain_error)?
+                    .into_iter()
+                    .any(|reservation| reservation.value.workflow_id == workflow_id)
+                {
+                    return Err(ChainError::InvalidEvidence);
+                }
+            } else {
+                validate_prepared_reservations(
+                    &store,
+                    &config,
+                    workflow_id,
+                    &sponsor_outpoints,
+                    stored.state.expires_at_unix,
+                )
+                .map_err(map_chain_error)?;
+            }
+            let artifact =
+                Self::prepared_settlement_artifact(&stored.state).map_err(map_chain_error)?;
+            let committed_account = store
+                .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))
+                .map_err(map_chain_error)?
+                .ok_or(ChainError::InvalidEvidence)?;
+            drop(store);
+            self.install_loaded_account(committed_account)
+                .map_err(map_chain_error)?;
+            return Ok(artifact);
+        }
         let record = store
             .hns_verified_settlement::<HnsVerifiedSettlementRecord>(&settlement_entity_id(
                 &config, session_id,
@@ -4547,17 +4632,17 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 "settlement target is not controlled by this wallet",
             ));
         }
-        let receive_derivation = DerivationReference {
+        let change_derivation = DerivationReference {
             role: KeyRole::HnsCoin,
             account: account_number(&account),
-            change: 0,
-            index: account.next_receive_index,
+            change: 1,
+            index: account.next_change_index,
         };
-        let receive_public = derive_hns_public_key(&store, config.wallet_id, receive_derivation)
+        let change_public = derive_hns_public_key(&store, config.wallet_id, change_derivation)
             .map_err(map_chain_error)?;
         let destination = Address::new(
             0,
-            public_key_hash(&receive_public)
+            public_key_hash(&change_public)
                 .map_err(map_chain_error)?
                 .to_vec(),
         )
@@ -4579,54 +4664,84 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         {
             return Err(ChainError::InvalidEvidence);
         }
-        let input_coins = vec![canonical_funding_coin];
         let sequence = if refund { u32::MAX - 1 } else { u32::MAX };
         let locktime = if refund {
             u32::try_from(lock.absolute_timelock).map_err(|_| ChainError::InvalidEvidence)?
         } else {
             0
         };
-        let mut transaction = Transaction {
-            version: 0,
-            inputs: vec![Input {
-                previous_output: Outpoint {
-                    transaction_hash: CanonicalTransactionHash::new(lock.funding_id.into_bytes()),
-                    index: record.output_index,
-                },
-                sequence,
-                witness: Witness {
-                    items: if refund {
-                        vec![vec![0; 65], Vec::new(), record.script.clone()]
-                    } else {
-                        vec![
-                            vec![0; 65],
-                            vec![0; Preimage::LENGTH],
-                            vec![1],
-                            record.script.clone(),
-                        ]
-                    },
-                },
-            }],
-            outputs: vec![Output {
-                value: Dollarydoos::new(previous_value),
-                address: destination,
-                covenant: Covenant::default(),
-            }],
-            locktime,
-        };
+        let mut sponsor_candidates =
+            available_unreserved_coins(&mut store, &config, coins, now).map_err(map_chain_error)?;
+        sponsor_candidates.retain(|coin| {
+            is_confirmed_ordinary_hns_spend_candidate(coin)
+                && coin.coin.outpoint != funding_coin.outpoint
+        });
+        sponsor_candidates.sort_by(|left, right| {
+            right
+                .coin
+                .value
+                .cmp(&left.coin.value)
+                .then_with(|| left.coin.outpoint.cmp(&right.coin.outpoint))
+        });
         let fee_rate = self.backend.estimate_fee_rate(6).map_err(map_chain_error)?;
-        let fee = canonical_policy_minimum_fee(&transaction, &input_coins, fee_rate)
+        let mut sponsors = Vec::new();
+        let (transaction, input_coins, fee) = loop {
+            let transaction = unsigned_sponsored_htlc_spend(
+                &lock,
+                record.output_index,
+                &record.script,
+                previous_value,
+                &sponsors,
+                destination.clone(),
+                sequence,
+                locktime,
+                refund,
+            )
             .map_err(map_chain_error)?;
-        if fee > maximum_fee
-            || fee.get() >= u128::from(previous_value)
-            || u128::from(previous_value) - fee.get() < config.dust_threshold.get()
-        {
-            return Err(ChainError::FeeLimit);
-        }
-        transaction.outputs[0].value = Dollarydoos::new(
-            previous_value - u64::try_from(fee.get()).map_err(|_| ChainError::Overflow)?,
-        );
+            let mut input_coins = Vec::with_capacity(1 + sponsors.len());
+            input_coins.push(canonical_funding_coin.clone());
+            if !sponsors.is_empty() {
+                input_coins.extend(canonical_input_coins(&sponsors).map_err(map_chain_error)?);
+            }
+            let fee = canonical_policy_minimum_fee(&transaction, &input_coins, fee_rate)
+                .map_err(map_chain_error)?;
+            if fee > maximum_fee {
+                return Err(ChainError::FeeLimit);
+            }
+            let input_total = input_coins.iter().try_fold(0_u128, |total, coin| {
+                total
+                    .checked_add(u128::from(coin.value.get()))
+                    .ok_or(ChainError::Overflow)
+            })?;
+            if input_total >= fee.get() && input_total - fee.get() >= config.dust_threshold.get() {
+                let output_value =
+                    u64::try_from(input_total - fee.get()).map_err(|_| ChainError::Overflow)?;
+                let mut transaction = transaction;
+                transaction.outputs[0].value = Dollarydoos::new(output_value);
+                break (transaction, input_coins, fee);
+            }
+            let next = sponsor_candidates
+                .get(sponsors.len())
+                .cloned()
+                .ok_or_else(|| map_chain_error(HnsWalletError::InsufficientFunds))?;
+            sponsors.push(next);
+        };
         let unsigned_transaction = transaction.clone();
+        let transaction = if sponsors.is_empty() {
+            transaction
+        } else {
+            let expected_roles = vec![KeyRole::HnsCoin; sponsors.len()];
+            let signed = sign_ordered_p2pkh_inputs_from(
+                &store,
+                &account,
+                transaction,
+                1,
+                &sponsors,
+                &expected_roles,
+            )
+            .map_err(map_chain_error)?;
+            Transaction::decode(&signed).map_err(|_| ChainError::InvalidEvidence)?
+        };
         let signed = match external_signer {
             Some(signer) => sign_htlc_spend_with_settlement_signer(
                 transaction,
@@ -4648,34 +4763,41 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             ),
         }
         .map_err(map_chain_error)?;
-        validate_witness_only_change(&unsigned_transaction, &signed).map_err(map_chain_error)?;
+        let signed_transaction = validate_witness_only_change(&unsigned_transaction, &signed)
+            .map_err(map_chain_error)?;
+        validate_standard_input_authorizations(&signed_transaction, &input_coins)
+            .map_err(map_chain_error)?;
+        let expires_at_unix = now
+            .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
+            .ok_or(ChainError::Overflow)?;
+        let reservation_saves =
+            reservation_saves(&config, workflow_id, &sponsors, expires_at_unix, now)
+                .map_err(map_chain_error)?;
+        let mut policy_input_evidence = vec![funding_coin];
+        policy_input_evidence.extend(input_coin_evidence(&sponsors).map_err(map_chain_error)?);
         drop(store);
         let quote = self
             .quote_final_transaction(&signed, &input_coins, fee, maximum_fee)
             .map_err(map_chain_error)?;
-        if self.cache_read().map_err(map_chain_error)?.account != account {
+        let cache = self.cache_read().map_err(map_chain_error)?;
+        if cache.account != account || cache.account_revision != account_revision {
             return Err(ChainError::InvalidEvidence);
         }
-        let terms = match action {
-            HnsSettlementAction::Redeem => HnsSettlementTerms::Redeem { lock },
-            HnsSettlementAction::Refund => HnsSettlementTerms::Refund { lock },
-            HnsSettlementAction::Lock => {
-                return Err(ChainError::InvalidRequest(
-                    "invalid settlement spend action",
-                ));
-            }
-        };
+        drop(cache);
+        let account_save =
+            Self::change_account_save(&account, account_revision, change_derivation.index, now)
+                .map_err(map_chain_error)?;
         self.persist_prepared_settlement(
             session_id,
             action,
             signed,
-            vec![funding_coin],
+            policy_input_evidence,
             fee,
             maximum_fee,
             quote,
             terms,
-            &[],
-            None,
+            &reservation_saves,
+            Some(&account_save),
             now,
         )
         .map_err(map_chain_error)
@@ -6191,23 +6313,21 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 } else {
                     previous_stage
                 };
-                let terminal_lock = stored.state.action == HnsSettlementAction::Lock
-                    && matches!(
-                        next_stage,
-                        HnsSettlementStage::Confirmed
-                            | HnsSettlementStage::Conflicted
-                            | HnsSettlementStage::Expired
-                            | HnsSettlementStage::Cancelled
-                    );
+                let terminal_settlement = matches!(
+                    next_stage,
+                    HnsSettlementStage::Confirmed
+                        | HnsSettlementStage::Conflicted
+                        | HnsSettlementStage::Expired
+                        | HnsSettlementStage::Cancelled
+                );
                 if next_stage != previous_stage {
                     stored.state.stage = next_stage;
-                    let deletes = if terminal_lock {
+                    let deletes = if terminal_settlement {
                         reservation_deletes(store, &config, stored.id)?
                     } else {
                         Vec::new()
                     };
-                    let saves = if stored.state.action == HnsSettlementAction::Lock
-                        && previous_stage == HnsSettlementStage::Prepared
+                    let saves = if previous_stage == HnsSettlementStage::Prepared
                         && next_stage == HnsSettlementStage::Mempool
                     {
                         reservation_activation_saves(store, &config, stored.id, now_unix)?
@@ -6230,7 +6350,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                         &saves,
                         &deletes,
                     )?;
-                } else if terminal_lock {
+                } else if terminal_settlement {
                     release_reservations(store, &config, stored.id)?;
                 }
             }
@@ -11188,6 +11308,65 @@ fn settlement_entity_id(config: &HnsRuntimeConfig, session_id: SessionId) -> [u8
     id
 }
 
+#[allow(clippy::too_many_arguments)]
+fn unsigned_sponsored_htlc_spend(
+    lock: &VerifiedLock,
+    funding_output_index: u32,
+    script: &[u8],
+    previous_value: u64,
+    sponsors: &[TrackedHnsCoin],
+    destination: Address,
+    htlc_sequence: u32,
+    locktime: u32,
+    refund: bool,
+) -> Result<Transaction, HnsWalletError> {
+    if sponsors.len() >= MAX_TRANSACTION_INPUTS {
+        return Err(HnsWalletError::InvalidAmount);
+    }
+    let mut inputs = Vec::with_capacity(1 + sponsors.len());
+    inputs.push(Input {
+        previous_output: Outpoint {
+            transaction_hash: CanonicalTransactionHash::new(lock.funding_id.into_bytes()),
+            index: funding_output_index,
+        },
+        sequence: htlc_sequence,
+        witness: Witness {
+            items: if refund {
+                vec![vec![0; 65], Vec::new(), script.to_vec()]
+            } else {
+                vec![
+                    vec![0; 65],
+                    vec![0; Preimage::LENGTH],
+                    vec![1],
+                    script.to_vec(),
+                ]
+            },
+        },
+    });
+    inputs.extend(sponsors.iter().map(|coin| Input {
+        previous_output: Outpoint {
+            transaction_hash: CanonicalTransactionHash::new(
+                coin.coin.outpoint.transaction.into_bytes(),
+            ),
+            index: coin.coin.outpoint.output_index,
+        },
+        sequence: u32::MAX,
+        witness: Witness {
+            items: vec![vec![0; 65], vec![0; 33]],
+        },
+    }));
+    Ok(Transaction {
+        version: 0,
+        inputs,
+        outputs: vec![Output {
+            value: Dollarydoos::new(previous_value),
+            address: destination,
+            covenant: Covenant::default(),
+        }],
+        locktime,
+    })
+}
+
 // All parameters contribute directly to the signed HTLC witness and remain
 // explicit so callers cannot accidentally reuse a partially bound context.
 #[allow(clippy::too_many_arguments)]
@@ -14393,6 +14572,160 @@ mod tests {
             ),
             Err(HnsWalletError::InvalidPreparedArtifact)
         ));
+    }
+
+    #[test]
+    fn tiny_htlc_redeem_can_be_fee_sponsored_and_all_inputs_verify() {
+        let mut store = WalletStore::create(":memory:", "passphrase").expect("store");
+        let account = HnsAccountRecord {
+            config: test_runtime_config(),
+            next_receive_index: 0,
+            next_change_index: 0,
+            next_name_index: 0,
+            next_shakedex_index: 0,
+            external_scan_end: 99,
+            internal_scan_end: 99,
+            name_scan_end: 99,
+            shakedex_scan_end: 99,
+            shakedex_scan_complete: true,
+            shakedex_scan_in_progress: false,
+            last_used_external: None,
+            last_used_internal: None,
+            last_used_name: None,
+            last_used_shakedex: None,
+        };
+        store
+            .put_secret(
+                account.config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[91; 64],
+                1,
+            )
+            .expect("seed");
+        let session_id = SessionId::new([92; 32]);
+        let receiver =
+            derive_settlement_public_key(&store, &account, session_id, false).expect("receiver");
+        let refund = SigningKey::from_slice(&[93; 32])
+            .expect("refund key")
+            .verifying_key()
+            .to_encoded_point(true);
+        let refund: [u8; 33] = refund.as_bytes().try_into().expect("compressed refund key");
+        let preimage = Preimage::new([94; 32]);
+        let hashlock = ObjectHash::new(Sha256::digest(preimage.expose_for_settlement()).into());
+        let script = hns_htlc_script(hashlock, &receiver, &refund, 600).expect("HTLC script");
+        let funding_id = TransactionHash::new([95; 32]);
+        let lock = VerifiedLock {
+            module: ModuleId::Handshake,
+            session_id,
+            funding_id,
+            amount: Amount::new(WalletAsset::Hns, 546),
+            hashlock,
+            absolute_timelock: 600,
+            confirmation_count: 2,
+            evidence_hash: ObjectHash::new([96; 32]),
+        };
+        let sponsor_derivation = DerivationReference {
+            role: KeyRole::HnsCoin,
+            account: account_number(&account),
+            change: 0,
+            index: 4,
+        };
+        let sponsor_public =
+            derive_hns_public_key(&store, account.config.wallet_id, sponsor_derivation)
+                .expect("sponsor public key");
+        let sponsor = TrackedHnsCoin {
+            coin: WalletCoin {
+                outpoint: HnsOutpoint {
+                    transaction: TransactionHash::new([97; 32]),
+                    output_index: 1,
+                },
+                value: BaseUnits::new(100_000),
+                confirmation_count: 3,
+                confirmed_height: Some(500),
+                coinbase: false,
+                covenant: Covenant::default().encode().expect("covenant"),
+                name_locked: false,
+            },
+            derivation: sponsor_derivation,
+            address_program: public_key_hash(&sponsor_public)
+                .expect("sponsor program")
+                .to_vec(),
+        };
+        let destination = Address::new(0, vec![98; 20]).expect("destination");
+        let unsponsored = unsigned_sponsored_htlc_spend(
+            &lock,
+            0,
+            &script,
+            546,
+            &[],
+            destination.clone(),
+            u32::MAX,
+            0,
+            false,
+        )
+        .expect("unsponsored template");
+        let funding_coin = Coin {
+            outpoint: unsponsored.inputs[0].previous_output,
+            value: Dollarydoos::new(546),
+            height: Height::new(500),
+            coinbase: false,
+            address: Address::new(0, Sha3_256::digest(&script).to_vec()).expect("HTLC address"),
+            covenant: Covenant::default(),
+        };
+        let rate = BaseUnits::new(1_000);
+        let unsponsored_fee =
+            canonical_policy_minimum_fee(&unsponsored, std::slice::from_ref(&funding_coin), rate)
+                .expect("unsponsored fee");
+        assert!(
+            u128::from(funding_coin.value.get()) - unsponsored_fee.get()
+                < account.config.dust_threshold.get()
+        );
+
+        let mut transaction = unsigned_sponsored_htlc_spend(
+            &lock,
+            0,
+            &script,
+            546,
+            std::slice::from_ref(&sponsor),
+            destination,
+            u32::MAX,
+            0,
+            false,
+        )
+        .expect("sponsored template");
+        let sponsor_coin = sponsor.to_canonical_coin().expect("sponsor coin");
+        let input_coins = vec![funding_coin, sponsor_coin];
+        let fee =
+            canonical_policy_minimum_fee(&transaction, &input_coins, rate).expect("sponsored fee");
+        let total = 100_546_u64;
+        transaction.outputs[0].value =
+            Dollarydoos::new(total - u64::try_from(fee.get()).expect("bounded sponsored fee"));
+        let signed_sponsor = sign_ordered_p2pkh_inputs_from(
+            &store,
+            &account,
+            transaction,
+            1,
+            std::slice::from_ref(&sponsor),
+            &[KeyRole::HnsCoin],
+        )
+        .expect("sponsor signature");
+        let signed = sign_htlc_spend(
+            &store,
+            &account,
+            Transaction::decode(&signed_sponsor).expect("sponsor transaction"),
+            session_id,
+            &script,
+            546,
+            Some(&preimage),
+            false,
+        )
+        .expect("HTLC signature");
+        let signed = Transaction::decode(&signed).expect("signed transaction");
+        validate_standard_input_authorizations(&signed, &input_coins)
+            .expect("all mixed input authorizations");
+        assert_eq!(signed.inputs[0].witness.items.len(), 4);
+        assert_eq!(signed.inputs[1].witness.items.len(), 2);
+        assert!(u128::from(signed.outputs[0].value.get()) >= account.config.dust_threshold.get());
     }
 
     #[test]
