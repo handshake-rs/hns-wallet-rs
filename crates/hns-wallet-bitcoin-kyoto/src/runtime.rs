@@ -46,10 +46,12 @@ pub const MIN_REBROADCAST_INTERVAL_SECONDS: u64 = 60;
 pub const MAX_PERSISTED_BROADCAST_TRANSACTION_BYTES: usize = 200_000;
 pub const MAX_RECONCILIATION_BATCH_SAVES: usize = 512;
 pub const MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS: usize = 4;
-/// The canonical recent-block window probed while an exact wallet-approved
-/// broadcast remains unobserved. This is bounded by Kyoto's ten-header sync
-/// update and is only activated for durable recovery records.
-pub const MAX_APPROVED_BROADCAST_PROBE_BLOCKS: usize = 10;
+/// Maximum canonical history searched newest-first while an exact
+/// wallet-approved broadcast remains unobserved. Kyoto exposes ten recent
+/// headers with each sync event; older headers are read from its locally
+/// validated header database. The search stops as soon as every exact txid is
+/// found, so the normal case downloads only the few blocks since submission.
+pub const MAX_APPROVED_BROADCAST_PROBE_BLOCKS: u32 = 144;
 pub const PEER_INFO_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 pub const BITCOIN_PEER_CACHE_RECORD_VERSION: u16 = 1;
 pub const MAX_CACHED_BITCOIN_PEERS: usize = 32;
@@ -1222,17 +1224,12 @@ impl KyotoWalletSwapSubscriber {
                 }
                 Event::ChainUpdate(changes) => self.apply_chain_event(&changes),
                 Event::FiltersSynced(update) => {
-                    let unobserved_broadcast_txids = self.store.try_with_store(|store| {
+                    let mut unobserved_broadcast_txids = self.store.try_with_store(|store| {
                         unobserved_approved_broadcast_txids(store, self.network)
                     })?;
                     let mut approved_broadcast_probe_blocks = BTreeSet::new();
                     if !unobserved_broadcast_txids.is_empty() {
-                        for header in update
-                            .recent_history()
-                            .values()
-                            .rev()
-                            .take(MAX_APPROVED_BROADCAST_PROBE_BLOCKS)
-                        {
+                        for header in update.recent_history().values().rev() {
                             let hash = header.block_hash();
                             approved_broadcast_probe_blocks.insert(hash);
                             self.queued_blocks.entry(hash).or_insert(false);
@@ -1278,7 +1275,7 @@ impl KyotoWalletSwapSubscriber {
                                 &mut self.graph,
                                 &indexed.block,
                                 indexed.height,
-                                &unobserved_broadcast_txids,
+                                &mut unobserved_broadcast_txids,
                             );
                         if swap_match || approved_broadcast_match {
                             swap_blocks.insert(
@@ -1288,6 +1285,72 @@ impl KyotoWalletSwapSubscriber {
                                     block: indexed.block,
                                 },
                             );
+                        }
+                    }
+                    if !unobserved_broadcast_txids.is_empty() {
+                        let tip_height = update.tip().height;
+                        let end = tip_height
+                            .checked_add(1)
+                            .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
+                        let start = end.saturating_sub(MAX_APPROVED_BROADCAST_PROBE_BLOCKS);
+                        let mut historical = Vec::new();
+                        for height in (start..end).rev() {
+                            let header = self
+                                .requester
+                                .get_header(height)
+                                .await
+                                .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?
+                                .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
+                            if header.height != height {
+                                return Err(BitcoinWalletError::InvalidCheckpoint);
+                            }
+                            let hash = header.block_hash();
+                            if !approved_broadcast_probe_blocks.contains(&hash) {
+                                historical.push((height, hash));
+                            }
+                        }
+                        let mut remaining = historical.into_iter();
+                        let mut pending =
+                            VecDeque::with_capacity(MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS);
+                        while !unobserved_broadcast_txids.is_empty() {
+                            while pending.len() < MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS {
+                                let Some((height, hash)) = remaining.next() else {
+                                    break;
+                                };
+                                let receiver = self
+                                    .requester
+                                    .request_block(hash)
+                                    .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
+                                pending.push_back((height, receiver));
+                            }
+                            let Some((height, receiver)) = pending.pop_front() else {
+                                break;
+                            };
+                            let indexed = receiver
+                                .await
+                                .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?
+                                .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
+                            if indexed.height != height {
+                                return Err(BitcoinWalletError::InvalidEvidence);
+                            }
+                            self.progress.record_downloaded_block();
+                            let _ = self
+                                .graph
+                                .apply_block_relevant(&indexed.block, indexed.height);
+                            if insert_exact_approved_broadcasts(
+                                &mut self.graph,
+                                &indexed.block,
+                                indexed.height,
+                                &mut unobserved_broadcast_txids,
+                            ) {
+                                swap_blocks.insert(
+                                    indexed.block.block_hash(),
+                                    MatchedBitcoinBlock {
+                                        height: indexed.height,
+                                        block: indexed.block,
+                                    },
+                                );
+                            }
                         }
                     }
                     if let Some(gap_limit) = self.recovery_gap_limit {
@@ -1358,13 +1421,13 @@ fn insert_exact_approved_broadcasts(
     graph: &mut IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
     block: &Block,
     height: u32,
-    approved_txids: &BTreeSet<[u8; 32]>,
+    approved_txids: &mut BTreeSet<[u8; 32]>,
 ) -> bool {
     let block_id = BlockId {
         height,
         hash: block.block_hash(),
     };
-    let mut matched = false;
+    let mut matched_txids = Vec::new();
     for transaction in &block.txdata {
         let txid = transaction.compute_txid();
         if !approved_txids.contains(&txid.to_byte_array()) {
@@ -1378,9 +1441,12 @@ fn insert_exact_approved_broadcasts(
                 confirmation_time: u64::from(block.header.time),
             },
         );
-        matched = true;
+        matched_txids.push(txid.to_byte_array());
     }
-    matched
+    for txid in &matched_txids {
+        approved_txids.remove(txid);
+    }
+    !matched_txids.is_empty()
 }
 
 pub struct KyotoSupervisor {
@@ -4029,8 +4095,13 @@ mod restart_tests {
         let mut graph = IndexedTxGraph::new(KeychainTxOutIndex::<KeychainKind>::new(10, true));
 
         assert!(insert_exact_approved_broadcasts(
-            &mut graph, &block, 17, &approved,
+            &mut graph,
+            &block,
+            17,
+            &mut approved,
         ));
+        assert!(!approved.contains(&txid.to_byte_array()));
+        assert!(approved.contains(&[42; 32]));
         assert_eq!(
             graph.graph().get_tx(txid).as_deref(),
             Some(&block.txdata[0])
@@ -4056,7 +4127,7 @@ mod restart_tests {
             &mut unrelated_graph,
             &block,
             17,
-            &unrelated,
+            &mut unrelated,
         ));
         assert!(unrelated_graph.graph().get_tx(txid).is_none());
     }
