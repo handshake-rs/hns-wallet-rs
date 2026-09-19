@@ -19,6 +19,22 @@ const DIRECT_OFFER_BOARD_SCHEMA_VERSION: u16 = 1;
 const DIRECT_OFFER_BOARD_POLICY_DOMAIN: &[u8] = b"hns-wallet-direct-offer-board-policy-v1\0";
 const DIRECT_OFFER_BOARD_RECORD_PREFIX: &[u8] = b"shakescape-v2-direct-offer\0";
 
+/// Mobile clocks are normally network-synchronized, but two correctly
+/// synchronized devices can still differ by a few seconds.  Accepting a
+/// signed object strictly at the receiver's local second makes a fast direct
+/// connection reject an otherwise valid object as `NotYetValid`.  Keep the
+/// tolerance bounded so a peer cannot move wallet state arbitrarily far into
+/// the future.
+pub(crate) const MAX_SHAKESCAPE_PEER_CLOCK_SKEW_SECONDS: u64 = 10 * 60;
+
+pub(crate) fn peer_object_validation_time(
+    created_at_unix: u64,
+    received_at_unix: u64,
+) -> Option<u64> {
+    (created_at_unix <= received_at_unix.saturating_add(MAX_SHAKESCAPE_PEER_CLOCK_SKEW_SECONDS))
+        .then_some(received_at_unix.max(created_at_unix))
+}
+
 /// A full board fits into the protocol inventory bound. The wallet fails
 /// closed rather than silently dropping live offers.
 pub const MAX_SHAKESCAPE_DIRECT_OFFERS: usize = hns_marketplace_protocol::MAX_INVENTORY_ENTRIES;
@@ -280,8 +296,10 @@ pub fn admit_shakescape_direct_offer(
     let CrossChainMessage::DirectOffer(offer) = message else {
         return Err(MarketError::InvalidShakescapeDirectOffer);
     };
+    let validation_time = peer_object_validation_time(offer.header.created_at, accepted_at_unix)
+        .ok_or(MarketError::InvalidShakescapeDirectOffer)?;
     offer
-        .verify_at(policy.network(), accepted_at_unix)
+        .verify_at(policy.network(), validation_time)
         .map_err(|_| MarketError::InvalidShakescapeDirectOffer)?;
     let offer_id = offer.offer_id;
     if let Some(existing) = load_shakescape_direct_offer(store, policy, offer_id)? {
@@ -333,10 +351,13 @@ pub fn admit_shakescape_direct_offer_cancellation(
     let CrossChainMessage::CancelDirectOffer(cancellation) = message else {
         return Err(MarketError::InvalidShakescapeDirectOffer);
     };
+    let validation_time =
+        peer_object_validation_time(cancellation.header.created_at, accepted_at_unix)
+            .ok_or(MarketError::InvalidShakescapeDirectOffer)?;
     let mut record = load_shakescape_direct_offer(store, policy, cancellation.offer_id)?
         .ok_or(MarketError::UnknownShakescapeDirectOffer)?;
     cancellation
-        .verify_for_offer(&record.offer, policy.network(), accepted_at_unix)
+        .verify_for_offer(&record.offer, policy.network(), validation_time)
         .map_err(|_| MarketError::InvalidShakescapeDirectOffer)?;
     if let Some(existing) = &record.cancellation {
         if existing == &cancellation {
@@ -423,9 +444,8 @@ fn decode_stored_offer(
     let offer = DirectOffer::decode(&offer_bytes)
         .map_err(|_| MarketError::CorruptShakescapeDirectOfferBoard)?;
     if offer.offer_id != value.offer_id.into_bytes()
-        || offer
-            .verify_at(policy.network(), value.accepted_at_unix)
-            .is_err()
+        || peer_object_validation_time(offer.header.created_at, value.accepted_at_unix)
+            .is_none_or(|at| offer.verify_at(policy.network(), at).is_err())
         || offer.encode().ok().as_deref() != Some(offer_bytes.as_slice())
     {
         return Err(MarketError::CorruptShakescapeDirectOfferBoard);
@@ -442,9 +462,12 @@ fn decode_stored_offer(
                 .cancelled_at_unix
                 .ok_or(MarketError::CorruptShakescapeDirectOfferBoard)?;
             if cancelled_at < value.accepted_at_unix
-                || cancellation
-                    .verify_for_offer(&offer, policy.network(), cancelled_at)
-                    .is_err()
+                || peer_object_validation_time(cancellation.header.created_at, cancelled_at)
+                    .is_none_or(|at| {
+                        cancellation
+                            .verify_for_offer(&offer, policy.network(), at)
+                            .is_err()
+                    })
                 || cancellation.encode().ok().as_deref() != Some(bytes.as_slice())
             {
                 return Err(MarketError::CorruptShakescapeDirectOfferBoard);

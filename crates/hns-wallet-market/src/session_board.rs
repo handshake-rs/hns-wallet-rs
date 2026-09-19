@@ -10,7 +10,7 @@ use hns_wallet_types::{ObjectHash, SessionId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::direct_board::decode_canonical_envelope;
+use crate::direct_board::{decode_canonical_envelope, peer_object_validation_time};
 use crate::{MarketError, ShakescapeDirectOfferBoardPolicy, load_shakescape_direct_offer};
 
 const SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION: u16 = 1;
@@ -261,6 +261,8 @@ pub fn admit_shakescape_direct_offer_take(
     let CrossChainMessage::TakeDirectOffer(take) = message else {
         return Err(MarketError::InvalidShakescapeDirectSwap);
     };
+    let validation_time = peer_object_validation_time(take.header.created_at, accepted_at_unix)
+        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
     let offer = load_shakescape_direct_offer(store, &policy.board_policy(), take.offer_id)?
         .ok_or(MarketError::UnknownShakescapeDirectOffer)?;
     let session_id = SessionId::new(take.swap_session_id);
@@ -277,7 +279,7 @@ pub fn admit_shakescape_direct_offer_take(
     if !offer.is_active_at(accepted_at_unix) {
         return Err(MarketError::InvalidShakescapeDirectSwap);
     }
-    take.verify_for_offer(&offer.offer, policy.network(), accepted_at_unix)
+    take.verify_for_offer(&offer.offer, policy.network(), validation_time)
         .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     if load_shakescape_direct_swaps(store, policy)?.len() >= MAX_SHAKESCAPE_DIRECT_SWAPS {
         return Err(MarketError::ShakescapeDirectSwapCapacity);
@@ -334,6 +336,9 @@ pub fn admit_shakescape_direct_swap_proposal(
     let CrossChainMessage::SwapSessionProposal(proposal) = message else {
         return Err(MarketError::InvalidShakescapeDirectSwap);
     };
+    let validation_time =
+        peer_object_validation_time(proposal.terms().header.created_at, accepted_at_unix)
+            .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
     let session_id = SessionId::new(proposal.terms().swap_session_id);
     let mut record = load_shakescape_direct_swap(store, policy, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
@@ -360,7 +365,7 @@ pub fn admit_shakescape_direct_swap_proposal(
             &record.offer,
             &record.take,
             policy.network(),
-            accepted_at_unix,
+            validation_time,
         )
         .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let mut persisted = encode_persisted(policy, &record)?;
@@ -391,6 +396,8 @@ pub fn admit_shakescape_direct_swap_hello(
     let CrossChainMessage::SwapSessionHello(hello) = message else {
         return Err(MarketError::InvalidShakescapeDirectSwap);
     };
+    let validation_time = peer_object_validation_time(hello.header.created_at, accepted_at_unix)
+        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
     let session_id = SessionId::new(hello.swap_session_id);
     let mut record = load_shakescape_direct_swap(store, policy, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
@@ -423,7 +430,7 @@ pub fn admit_shakescape_direct_swap_hello(
         &record.offer,
         &record.take,
         policy.network(),
-        accepted_at_unix,
+        validation_time,
     ) {
         Ok(()) => {}
         Err(MarketplaceError::Expired { .. }) => hello
@@ -465,6 +472,8 @@ pub fn admit_shakescape_direct_swap_watch_ready(
     let CrossChainMessage::SwapWatchReady(ready) = message else {
         return Err(MarketError::InvalidShakescapePeerMessage);
     };
+    let validation_time = peer_object_validation_time(ready.header.created_at, accepted_at_unix)
+        .ok_or(MarketError::InvalidShakescapePeerMessage)?;
     let session_id = SessionId::new(ready.swap_session_id);
     let mut record = load_shakescape_direct_swap(store, policy, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
@@ -481,7 +490,7 @@ pub fn admit_shakescape_direct_swap_watch_ready(
         }
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
-    match ready.verify_for_session(hello, policy.network(), accepted_at_unix) {
+    match ready.verify_for_session(hello, policy.network(), validation_time) {
         Ok(()) => {}
         Err(MarketplaceError::Expired { .. }) => ready
             .verify_for_session(hello, policy.network(), ready.header.created_at)
@@ -526,6 +535,14 @@ pub fn validate_shakescape_direct_swap_peer_status(
         }
         _ => return Err(MarketError::InvalidShakescapePeerMessage),
     };
+    let created_at_unix = match &status {
+        ShakescapeDirectSwapPeerStatus::Funding(status) => status.header.created_at,
+        ShakescapeDirectSwapPeerStatus::Redeem(status) => status.header.created_at,
+        ShakescapeDirectSwapPeerStatus::Refund(status) => status.header.created_at,
+        ShakescapeDirectSwapPeerStatus::WatchReady(status) => status.header.created_at,
+    };
+    let now_unix = peer_object_validation_time(created_at_unix, now_unix)
+        .ok_or(MarketError::InvalidShakescapePeerMessage)?;
     let record = load_shakescape_direct_swap(store, policy, status.session_id())?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     let hello = record
@@ -633,9 +650,8 @@ fn decode_stored_swap(
     let take = decode_hex::<DirectOfferTake>(&value.take_hex)
         .map_err(|_| MarketError::CorruptShakescapeDirectSwapDetail("canonical take encoding"))?;
     if SessionId::new(take.swap_session_id) != value.session_id
-        || take
-            .verify_for_offer(&offer, policy.network(), value.take_accepted_at_unix)
-            .is_err()
+        || peer_object_validation_time(take.header.created_at, value.take_accepted_at_unix)
+            .is_none_or(|at| take.verify_for_offer(&offer, policy.network(), at).is_err())
     {
         return Err(MarketError::CorruptShakescapeDirectSwapDetail(
             "take authentication",
@@ -693,16 +709,50 @@ fn decode_stored_swap(
         peer_funding_statuses,
     };
     if let (Some(proposal), Some(at)) = (&record.proposal, record.proposal_accepted_at_unix) {
-        proposal
-            .verify_for_direct_offer(&record.offer, &record.take, policy.network(), at)
-            .map_err(|_| {
-                MarketError::CorruptShakescapeDirectSwapDetail("proposal authentication")
-            })?;
+        let at = peer_object_validation_time(proposal.terms().header.created_at, at).ok_or(
+            MarketError::CorruptShakescapeDirectSwapDetail("proposal authentication"),
+        )?;
+        match proposal.verify_for_direct_offer(&record.offer, &record.take, policy.network(), at) {
+            Ok(()) => {}
+            Err(MarketplaceError::Expired { .. }) => proposal
+                .verify_for_direct_offer(
+                    &record.offer,
+                    &record.take,
+                    policy.network(),
+                    proposal.terms().header.created_at,
+                )
+                .map_err(|_| {
+                    MarketError::CorruptShakescapeDirectSwapDetail("proposal authentication")
+                })?,
+            Err(_) => {
+                return Err(MarketError::CorruptShakescapeDirectSwapDetail(
+                    "proposal authentication",
+                ));
+            }
+        }
     }
     if let (Some(hello), Some(at)) = (&record.hello, record.hello_accepted_at_unix) {
-        hello
-            .verify_for_direct_offer(&record.offer, &record.take, policy.network(), at)
-            .map_err(|_| MarketError::CorruptShakescapeDirectSwapDetail("hello authentication"))?;
+        let at = peer_object_validation_time(hello.header.created_at, at).ok_or(
+            MarketError::CorruptShakescapeDirectSwapDetail("hello authentication"),
+        )?;
+        match hello.verify_for_direct_offer(&record.offer, &record.take, policy.network(), at) {
+            Ok(()) => {}
+            Err(MarketplaceError::Expired { .. }) => hello
+                .verify_for_direct_offer(
+                    &record.offer,
+                    &record.take,
+                    policy.network(),
+                    hello.header.created_at,
+                )
+                .map_err(|_| {
+                    MarketError::CorruptShakescapeDirectSwapDetail("hello authentication")
+                })?,
+            Err(_) => {
+                return Err(MarketError::CorruptShakescapeDirectSwapDetail(
+                    "hello authentication",
+                ));
+            }
+        }
         let proposal =
             record
                 .proposal
@@ -722,14 +772,22 @@ fn decode_stored_swap(
         &record.first_chain_watch_ready,
         record.watch_ready_accepted_at_unix,
         &record.hello,
-    ) && (ready.chain != hello.first_funding_chain
-        || ready
-            .verify_for_session(hello, policy.network(), at)
-            .is_err())
-    {
-        return Err(MarketError::CorruptShakescapeDirectSwapDetail(
-            "watch-ready authentication",
-        ));
+    ) {
+        let at = peer_object_validation_time(ready.header.created_at, at).ok_or(
+            MarketError::CorruptShakescapeDirectSwapDetail("watch-ready authentication"),
+        )?;
+        let verified = match ready.verify_for_session(hello, policy.network(), at) {
+            Ok(()) => true,
+            Err(MarketplaceError::Expired { .. }) => ready
+                .verify_for_session(hello, policy.network(), ready.header.created_at)
+                .is_ok(),
+            Err(_) => false,
+        };
+        if ready.chain != hello.first_funding_chain || !verified {
+            return Err(MarketError::CorruptShakescapeDirectSwapDetail(
+                "watch-ready authentication",
+            ));
+        }
     }
     if record.peer_funding_statuses.len() > 2
         || record
@@ -738,10 +796,16 @@ fn decode_stored_swap(
             .any(|window| window[0].status.chain >= window[1].status.chain)
         || record.peer_funding_statuses.iter().any(|funding| {
             record.hello.as_ref().is_none_or(|hello| {
-                funding
-                    .status
-                    .verify_for_session(hello, policy.network(), funding.accepted_at_unix)
-                    .is_err()
+                peer_object_validation_time(
+                    funding.status.header.created_at,
+                    funding.accepted_at_unix,
+                )
+                .is_none_or(|at| {
+                    funding
+                        .status
+                        .verify_for_session(hello, policy.network(), at)
+                        .is_err()
+                })
             })
         })
     {

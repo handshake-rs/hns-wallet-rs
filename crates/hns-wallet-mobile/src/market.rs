@@ -4396,7 +4396,11 @@ mod tests {
                 pair: permit.hello().header.pair,
                 signer_public_key: [0; 33],
                 sequence: permit.hello().header.sequence + 2,
-                created_at: START + 49,
+                // The sender is one second ahead of the receiver. Mobile
+                // devices with network-synchronized clocks can legitimately
+                // have this small offset, and direct delivery can be faster
+                // than the skew.
+                created_at: START + 50,
                 expires_at: permit.hello().header.expires_at,
             },
             swap_session_id: permit.hello().swap_session_id,
@@ -4410,7 +4414,7 @@ mod tests {
             signature: [0; 64],
         };
         maker_key
-            .sign_funding_status(&mut funding_status, permit.hello(), START + 49)
+            .sign_funding_status(&mut funding_status, permit.hello(), START + 50)
             .expect("sign funding locator");
         let funding_envelope = CrossChainMessage::SwapFundingStatus(funding_status)
             .encode_envelope(0)
