@@ -1118,12 +1118,44 @@ pub fn sign_bitcoin_htlc_spend(
 /// digest crosses the signer boundary; the scalar remains wallet-owned.
 pub fn sign_bitcoin_htlc_spend_with_settlement_signer(
     lock: &VerifiedBitcoinLock,
-    _permit: &BitcoinValueRuntimePermit,
+    permit: &BitcoinValueRuntimePermit,
     request: BitcoinHtlcSpendRequest,
     signer: &dyn SettlementSigner,
 ) -> Result<Vec<u8>, BitcoinWalletError> {
+    sign_bitcoin_htlc_spend_template_with_settlement_signer(
+        lock,
+        permit,
+        request.destination,
+        request.fee_sats,
+        request.branch,
+        request.preimage.as_ref(),
+        Some(request.chain_context),
+        signer,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact HTLC signing boundary keeps all policy inputs explicit"
+)]
+fn sign_bitcoin_htlc_spend_template_with_settlement_signer(
+    lock: &VerifiedBitcoinLock,
+    _permit: &BitcoinValueRuntimePermit,
+    destination: ScriptBuf,
+    fee_sats: u64,
+    branch: HtlcSpendBranch,
+    preimage: Option<&[u8; 32]>,
+    chain_context: Option<BitcoinChainLockContext>,
+    signer: &dyn SettlementSigner,
+) -> Result<Vec<u8>, BitcoinWalletError> {
     lock.htlc.validate()?;
-    let expected_public_key = match request.branch {
+    if branch == HtlcSpendBranch::Refund && chain_context.is_none() {
+        return Err(BitcoinWalletError::InvalidChainLockContext);
+    }
+    if let Some(context) = chain_context {
+        context.validate()?;
+    }
+    let expected_public_key = match branch {
         HtlcSpendBranch::Redeem => &lock.htlc.receiver_public_key,
         HtlcSpendBranch::Refund => &lock.htlc.refund_public_key,
     };
@@ -1132,14 +1164,8 @@ pub fn sign_bitcoin_htlc_spend_with_settlement_signer(
     if public_key.to_bytes().as_slice() != expected_public_key {
         return Err(BitcoinWalletError::InvalidSwapKeyReference);
     }
-    let transaction = prepare_htlc_spend(
-        lock,
-        request.destination,
-        request.fee_sats,
-        request.branch,
-        request.preimage.as_ref(),
-        request.chain_context,
-    )?;
+    let transaction =
+        prepare_htlc_spend_template(lock, destination, fee_sats, branch, preimage, chain_context)?;
     let sighash = SighashCache::new(&transaction)
         .p2wsh_signature_hash(
             0,
@@ -1152,7 +1178,7 @@ pub fn sign_bitcoin_htlc_spend_with_settlement_signer(
     let signature = signer
         .sign_digest(sighash)
         .map_err(|_| BitcoinWalletError::SigningIncomplete)?;
-    finalize_signed_htlc_spend(transaction, request.branch, sighash, signature, &public_key)
+    finalize_signed_htlc_spend(transaction, branch, sighash, signature, &public_key)
 }
 
 /// Sign an HTLC spend at the wallet's validated minimum relay fee while
@@ -1174,21 +1200,77 @@ pub fn sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer(
     maximum_fee_sats: u64,
     signer: &dyn SettlementSigner,
 ) -> Result<Vec<u8>, BitcoinWalletError> {
+    sign_bitcoin_htlc_spend_at_fee_rate_template_with_settlement_signer(
+        lock,
+        permit,
+        destination,
+        branch,
+        preimage.as_ref(),
+        Some(chain_context),
+        fee_rate_sat_vb,
+        maximum_fee_sats,
+        signer,
+    )
+}
+
+/// Sign the secret-bearing HTLC redeem branch without consulting chain
+/// height or median-time-past. Redeem transactions use zero locktime and a
+/// final sequence, so requiring Kyoto's recent-header checkpoint here would
+/// couple a valid spend to consensus state that cannot affect its validity.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the redeem boundary keeps the verified lock, destination, secret, fee policy, and signer explicit"
+)]
+pub fn sign_bitcoin_htlc_redeem_at_fee_rate_with_settlement_signer(
+    lock: &VerifiedBitcoinLock,
+    permit: &BitcoinValueRuntimePermit,
+    destination: ScriptBuf,
+    preimage: [u8; 32],
+    fee_rate_sat_vb: u64,
+    maximum_fee_sats: u64,
+    signer: &dyn SettlementSigner,
+) -> Result<Vec<u8>, BitcoinWalletError> {
+    sign_bitcoin_htlc_spend_at_fee_rate_template_with_settlement_signer(
+        lock,
+        permit,
+        destination,
+        HtlcSpendBranch::Redeem,
+        Some(&preimage),
+        None,
+        fee_rate_sat_vb,
+        maximum_fee_sats,
+        signer,
+    )
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact fee-refinement boundary keeps all policy inputs explicit"
+)]
+fn sign_bitcoin_htlc_spend_at_fee_rate_template_with_settlement_signer(
+    lock: &VerifiedBitcoinLock,
+    permit: &BitcoinValueRuntimePermit,
+    destination: ScriptBuf,
+    branch: HtlcSpendBranch,
+    preimage: Option<&[u8; 32]>,
+    chain_context: Option<BitcoinChainLockContext>,
+    fee_rate_sat_vb: u64,
+    maximum_fee_sats: u64,
+    signer: &dyn SettlementSigner,
+) -> Result<Vec<u8>, BitcoinWalletError> {
     if fee_rate_sat_vb == 0 || maximum_fee_sats == 0 {
         return Err(BitcoinWalletError::InvalidFee);
     }
     let mut fee_sats = 1_u64;
     for _ in 0..8 {
-        let raw = sign_bitcoin_htlc_spend_with_settlement_signer(
+        let raw = sign_bitcoin_htlc_spend_template_with_settlement_signer(
             lock,
             permit,
-            BitcoinHtlcSpendRequest {
-                destination: destination.clone(),
-                fee_sats,
-                branch,
-                preimage,
-                chain_context,
-            },
+            destination.clone(),
+            fee_sats,
+            branch,
+            preimage,
+            chain_context,
             signer,
         )?;
         let transaction: Transaction =
@@ -2527,6 +2609,38 @@ mod tests {
                 .expect("verified fee-rate settlement spend");
         assert!(verified.fee_sats >= u64::try_from(transaction.vsize()).unwrap() * 2);
         assert!(verified.fee_sats <= 1_000);
+
+        let checkpoint_independent_raw =
+            sign_bitcoin_htlc_redeem_at_fee_rate_with_settlement_signer(
+                &lock,
+                &BitcoinValueRuntimePermit(()),
+                ScriptBuf::new_p2wpkh(&key(8).wpubkey_hash().expect("compressed destination")),
+                preimage,
+                2,
+                1_000,
+                &signer,
+            )
+            .expect("checkpoint-independent redeem");
+        let checkpoint_independent = verify_signed_bitcoin_htlc_spend(
+            &checkpoint_independent_raw,
+            &lock,
+            HtlcSpendBranch::Redeem,
+        )
+        .expect("verified checkpoint-independent redeem");
+        assert!(checkpoint_independent.fee_sats <= 1_000);
+        assert!(matches!(
+            sign_bitcoin_htlc_spend_template_with_settlement_signer(
+                &lock,
+                &BitcoinValueRuntimePermit(()),
+                ScriptBuf::new_p2wpkh(&key(8).wpubkey_hash().expect("compressed destination"),),
+                500,
+                HtlcSpendBranch::Refund,
+                None,
+                None,
+                &signer,
+            ),
+            Err(BitcoinWalletError::InvalidChainLockContext)
+        ));
         assert!(matches!(
             sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer(
                 &lock,

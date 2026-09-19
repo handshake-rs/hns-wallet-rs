@@ -30,6 +30,7 @@ use hns_wallet_bitcoin_kyoto::{
     monitor_kyoto_sync_progress, persist_prepared_bitcoin_broadcast,
     persist_prepared_bitcoin_htlc_spend_broadcast, prepare_bitcoin_htlc_funding_excluding,
     prepare_native_send_excluding, recommended_initialization_checkpoint,
+    sign_bitcoin_htlc_redeem_at_fee_rate_with_settlement_signer,
     sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
     unobserved_approved_broadcast_inputs, verify_htlc_funding, verify_signed_bitcoin_htlc_spend,
 };
@@ -1299,7 +1300,12 @@ impl MobileBitcoinValueController {
             .as_ref()
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
         let fee_rate_sat_vb = runtime.block_on(supervisor.minimum_broadcast_fee_rate_sat_vb())?;
-        let chain_context = runtime.block_on(supervisor.validated_chain_lock_context())?;
+        let chain_context = match branch {
+            HtlcSpendBranch::Redeem => None,
+            HtlcSpendBranch::Refund => {
+                Some(runtime.block_on(supervisor.validated_chain_lock_context())?)
+            }
+        };
         let destination = {
             let wallet = self.wallet_mut()?;
             let destination = wallet
@@ -1312,17 +1318,31 @@ impl MobileBitcoinValueController {
         let preimage = permit
             .take_preimage()
             .map(|preimage| *preimage.expose_for_settlement());
-        let raw_transaction = sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer(
-            &lock,
-            &bitcoin_value_runtime_permit()?,
-            destination,
-            branch,
-            preimage,
-            chain_context,
-            fee_rate_sat_vb,
-            maximum_fee_sats,
-            permit.settlement_key(),
-        )?;
+        let raw_transaction = match branch {
+            HtlcSpendBranch::Redeem => {
+                let preimage = preimage.ok_or(MobileWalletError::InvalidBitcoinAction)?;
+                sign_bitcoin_htlc_redeem_at_fee_rate_with_settlement_signer(
+                    &lock,
+                    &bitcoin_value_runtime_permit()?,
+                    destination,
+                    preimage,
+                    fee_rate_sat_vb,
+                    maximum_fee_sats,
+                    permit.settlement_key(),
+                )?
+            }
+            HtlcSpendBranch::Refund => sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer(
+                &lock,
+                &bitcoin_value_runtime_permit()?,
+                destination,
+                branch,
+                preimage,
+                chain_context.ok_or(MobileWalletError::InvalidBitcoinAction)?,
+                fee_rate_sat_vb,
+                maximum_fee_sats,
+                permit.settlement_key(),
+            )?,
+        };
         let verified = verify_signed_bitcoin_htlc_spend(&raw_transaction, &lock, branch)?;
         let output_amount_sats = lock
             .value_sats
