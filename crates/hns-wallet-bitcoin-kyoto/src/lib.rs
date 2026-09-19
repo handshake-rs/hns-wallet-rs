@@ -1998,6 +1998,14 @@ pub enum BitcoinWalletError {
     TimelockNotReached,
     #[error("chain evidence is missing or inconsistent")]
     InvalidEvidence,
+    #[error("a recovered Bitcoin transaction anchor is absent from the authenticated chain")]
+    InvalidRecoveredTransactionAnchor,
+    #[error("a compact-filter-matched swap block is absent from the authenticated chain")]
+    InvalidSwapBlockEvidence,
+    #[error(
+        "a canonical Bitcoin transaction spending the watched HTLC failed exact branch verification"
+    )]
+    InvalidSwapSpendEvidence,
     #[error("chain evidence contains multiple possible matches")]
     AmbiguousEvidence,
     #[error("Bitcoin checkpoint is invalid")]

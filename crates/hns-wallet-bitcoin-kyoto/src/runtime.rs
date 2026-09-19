@@ -3682,7 +3682,7 @@ fn sparse_wallet_chain_update(
         let canonical = canonical_chain
             .get(anchor.block_id.height)
             .filter(|checkpoint| checkpoint.hash() == anchor.block_id.hash)
-            .ok_or(BitcoinWalletError::InvalidEvidence)?;
+            .ok_or(BitcoinWalletError::InvalidRecoveredTransactionAnchor)?;
         retained.insert(canonical.height(), canonical.hash());
     }
 
@@ -4373,7 +4373,7 @@ mod restart_tests {
                 &transaction_update,
                 recovery_checkpoint,
             ),
-            Err(BitcoinWalletError::InvalidEvidence)
+            Err(BitcoinWalletError::InvalidRecoveredTransactionAnchor)
         ));
 
         let with_recovered = without_recovered.insert(recovered);

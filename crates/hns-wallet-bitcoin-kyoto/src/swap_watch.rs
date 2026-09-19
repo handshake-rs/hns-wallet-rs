@@ -359,33 +359,28 @@ pub(crate) fn reconcile_bitcoin_htlc_watches(
         return Err(BitcoinWalletError::InvalidCheckpoint);
     }
     for matched in matched_blocks {
-        validate_matched_block(matched)?;
+        validate_matched_block(matched)
+            .map_err(|_| BitcoinWalletError::InvalidSwapBlockEvidence)?;
         if canonical_chain
             .get(matched.height)
             .is_none_or(|checkpoint| checkpoint.hash() != matched.block.block_hash())
         {
-            return Err(BitcoinWalletError::InvalidEvidence);
+            return Err(BitcoinWalletError::InvalidSwapBlockEvidence);
         }
     }
     let binding = account_binding(network, account_id)?;
     let watches = load_bitcoin_htlc_watches(store, network, account_id)?;
     for mut watch in watches {
         let mut changed = false;
-        if watch
-            .persisted
-            .funding
-            .as_ref()
-            .is_some_and(|observation| !observation_is_canonical(canonical_chain, observation))
-        {
+        if watch.persisted.funding.as_ref().is_some_and(|observation| {
+            observation_conflicts_with_chain(canonical_chain, observation)
+        }) {
             watch.persisted.funding = None;
             watch.persisted.spend = None;
             changed = true;
-        } else if watch
-            .persisted
-            .spend
-            .as_ref()
-            .is_some_and(|observation| !observation_is_canonical(canonical_chain, observation))
-        {
+        } else if watch.persisted.spend.as_ref().is_some_and(|observation| {
+            observation_conflicts_with_chain(canonical_chain, observation)
+        }) {
             watch.persisted.spend = None;
             changed = true;
         }
@@ -532,7 +527,8 @@ fn spend_candidates(
             let verified = verify_observed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Redeem)
                 .or_else(|_| {
                     verify_observed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Refund)
-                })?;
+                })
+                .map_err(|_| BitcoinWalletError::InvalidSwapSpendEvidence)?;
             let confirmations = confirmation_count(tip.height, matched.height)?;
             candidates.push(PersistedBitcoinSwapObservation {
                 txid: verified.txid.into_bytes(),
@@ -675,13 +671,17 @@ fn validate_matched_block(block: &MatchedBitcoinBlock) -> Result<(), BitcoinWall
     Ok(())
 }
 
-fn observation_is_canonical(
+/// A sparse local chain proves an observation stale only when it carries a
+/// different hash at the same height. Absence is not evidence of a reorg: old
+/// swap anchors intentionally fall out of the bounded header/checkpoint set.
+/// Deep-reorganization detection remains the supervisor's responsibility.
+fn observation_conflicts_with_chain(
     chain: &CheckPoint,
     observation: &PersistedBitcoinSwapObservation,
 ) -> bool {
     chain
         .get(observation.block_height)
-        .is_some_and(|checkpoint| checkpoint.hash().to_byte_array() == observation.block_hash)
+        .is_some_and(|checkpoint| checkpoint.hash().to_byte_array() != observation.block_hash)
 }
 
 fn confirmation_count(tip_height: u32, block_height: u32) -> Result<u32, BitcoinWalletError> {
@@ -1094,6 +1094,22 @@ mod tests {
         assert_eq!(observed_spend.spend.branch, HtlcSpendBranch::Redeem);
         assert_eq!(observed_spend.spend.revealed_preimage, Some(PREIMAGE));
         assert_eq!(observed_spend.confirmation_count, 1);
+        let sparse_later_chain = chain([BlockId {
+            height: 200,
+            hash: BlockHash::from_byte_array([200; 32]),
+        }]);
+        assert!(!observation_conflicts_with_chain(
+            &sparse_later_chain,
+            watch
+                .persisted
+                .funding
+                .as_ref()
+                .expect("funding observation"),
+        ));
+        assert!(!observation_conflicts_with_chain(
+            &sparse_later_chain,
+            watch.persisted.spend.as_ref().expect("spend observation"),
+        ));
         assert!(
             watch
                 .verified_lock_at(BitcoinCheckpoint {
