@@ -1739,12 +1739,12 @@ pub fn verify_observed_bitcoin_htlc_spend(
     }
     lock.htlc.validate()?;
     let transaction: Transaction =
-        deserialize(raw_transaction).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+        deserialize(raw_transaction).map_err(|_| BitcoinWalletError::InvalidObservedSpendShape)?;
     if serialize(&transaction) != raw_transaction
         || transaction.input.is_empty()
         || transaction.output.is_empty()
     {
-        return Err(BitcoinWalletError::InvalidEvidence);
+        return Err(BitcoinWalletError::InvalidObservedSpendShape);
     }
     let expected_outpoint = OutPoint {
         txid: bdk_wallet::bitcoin::Txid::from_byte_array(lock.funding_txid.into_bytes()),
@@ -1755,9 +1755,11 @@ pub fn verify_observed_bitcoin_htlc_spend(
         .iter()
         .enumerate()
         .filter(|(_, input)| input.previous_output == expected_outpoint);
-    let (htlc_index, htlc_input) = matching.next().ok_or(BitcoinWalletError::InvalidEvidence)?;
+    let (htlc_index, htlc_input) = matching
+        .next()
+        .ok_or(BitcoinWalletError::InvalidObservedSpendOutpoint)?;
     if matching.next().is_some() {
-        return Err(BitcoinWalletError::InvalidEvidence);
+        return Err(BitcoinWalletError::InvalidObservedSpendOutpoint);
     }
     let witness = htlc_input
         .witness
@@ -1770,7 +1772,7 @@ pub fn verify_observed_bitcoin_htlc_spend(
                 || witness[2].as_slice() != [1]
                 || witness[3] != lock.htlc.witness_script
             {
-                return Err(BitcoinWalletError::InvalidEvidence);
+                return Err(BitcoinWalletError::InvalidObservedSpendBranch);
             }
             let preimage = <[u8; 32]>::try_from(witness[1].as_slice())
                 .map_err(|_| BitcoinWalletError::InvalidPreimage)?;
@@ -1792,7 +1794,7 @@ pub fn verify_observed_bitcoin_htlc_spend(
                 || !witness[1].is_empty()
                 || witness[2] != lock.htlc.witness_script
             {
-                return Err(BitcoinWalletError::InvalidEvidence);
+                return Err(BitcoinWalletError::InvalidObservedSpendBranch);
             }
             (None, &lock.htlc.refund_public_key)
         }
@@ -1800,22 +1802,22 @@ pub fn verify_observed_bitcoin_htlc_spend(
     let signature_bytes = witness
         .first()
         .filter(|signature| signature.len() > 1)
-        .ok_or(BitcoinWalletError::InvalidEvidence)?;
+        .ok_or(BitcoinWalletError::InvalidObservedSpendSignatureEncoding)?;
     let sighash_type = EcdsaSighashType::from_standard(u32::from(
         *signature_bytes
             .last()
-            .ok_or(BitcoinWalletError::InvalidEvidence)?,
+            .ok_or(BitcoinWalletError::InvalidObservedSpendSignatureEncoding)?,
     ))
-    .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    .map_err(|_| BitcoinWalletError::InvalidObservedSpendSignatureEncoding)?;
     let signature = Signature::from_der(&signature_bytes[..signature_bytes.len() - 1])
-        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+        .map_err(|_| BitcoinWalletError::InvalidObservedSpendSignatureEncoding)?;
     let mut normalized = signature;
     normalized.normalize_s();
     if normalized != signature {
-        return Err(BitcoinWalletError::InvalidEvidence);
+        return Err(BitcoinWalletError::InvalidObservedSpendSignatureEncoding);
     }
     let public_key = PublicKey::from_slice(expected_public_key)
-        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+        .map_err(|_| BitcoinWalletError::InvalidObservedSpendSignatureEncoding)?;
     let sighash = SighashCache::new(&transaction)
         .p2wsh_signature_hash(
             htlc_index,
@@ -1823,14 +1825,14 @@ pub fn verify_observed_bitcoin_htlc_spend(
             BitcoinAmount::from_sat(lock.value_sats),
             sighash_type,
         )
-        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+        .map_err(|_| BitcoinWalletError::InvalidObservedSpendSignatureEncoding)?;
     Secp256k1::verification_only()
         .verify_ecdsa(
             &Message::from_digest(sighash.to_byte_array()),
             &signature,
             &public_key.inner,
         )
-        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+        .map_err(|_| BitcoinWalletError::InvalidObservedSpendSignature)?;
     Ok(VerifiedBitcoinHtlcChainSpend {
         txid: TransactionHash::new(transaction.compute_txid().to_byte_array()),
         wtxid: transaction.compute_wtxid().to_byte_array(),
@@ -2007,6 +2009,16 @@ pub enum BitcoinWalletError {
     TimelockNotReached,
     #[error("chain evidence is missing or inconsistent")]
     InvalidEvidence,
+    #[error("observed Bitcoin HTLC spend transaction shape is invalid")]
+    InvalidObservedSpendShape,
+    #[error("observed Bitcoin HTLC spend does not contain exactly one expected funding outpoint")]
+    InvalidObservedSpendOutpoint,
+    #[error("observed Bitcoin HTLC spend does not satisfy the expected witness branch")]
+    InvalidObservedSpendBranch,
+    #[error("observed Bitcoin HTLC spend signature encoding or sighash mode is invalid")]
+    InvalidObservedSpendSignatureEncoding,
+    #[error("observed Bitcoin HTLC spend signature does not authenticate the expected role key")]
+    InvalidObservedSpendSignature,
     #[error("a recovered Bitcoin transaction anchor is absent from the authenticated chain")]
     InvalidRecoveredTransactionAnchor,
     #[error("a compact-filter-matched swap block is absent from the authenticated chain")]
@@ -3205,7 +3217,7 @@ mod tests {
                 &lock,
                 HtlcSpendBranch::Redeem,
             ),
-            Err(BitcoinWalletError::InvalidEvidence)
+            Err(BitcoinWalletError::InvalidObservedSpendSignature)
         ));
         assert!(
             transaction
