@@ -648,17 +648,17 @@ impl MobileBitcoinValueController {
         &mut self,
     ) -> Result<(KyotoSyncReceipt, MobileBitcoinSnapshot), MobileWalletError> {
         let first_attempt = self.synchronize_once_inner();
-        if !matches!(
-            &first_attempt,
-            Err(MobileWalletError::Bitcoin(
-                BitcoinWalletError::CorruptRuntimeState
-            ))
-        ) {
+        let requires_reconstruction = first_attempt
+            .as_ref()
+            .err()
+            .is_some_and(bitcoin_sync_requires_supervisor_reconstruction);
+        if !requires_reconstruction {
             return first_attempt;
         }
 
-        // A process death can occur after BDK has durably applied an update
-        // but before the active supervisor has completed its scan journal.
+        // A process death can occur after BDK has durably applied an update but
+        // before the active supervisor has completed its scan journal. Kyoto
+        // may also exhaust a transient peer pool and close its event channel.
         // Retire every process-local runtime object and reconstruct from the
         // authenticated wallet and journal before retrying once. This retains
         // the descriptor wallet, approved broadcast bytes, and store records;
@@ -1835,6 +1835,17 @@ impl MobileBitcoinValueController {
     }
 }
 
+fn bitcoin_sync_requires_supervisor_reconstruction(error: &MobileWalletError) -> bool {
+    matches!(
+        error,
+        MobileWalletError::Bitcoin(
+            BitcoinWalletError::CorruptRuntimeState
+                | BitcoinWalletError::KyotoNodeStopped
+                | BitcoinWalletError::SupervisorPoisoned
+        )
+    )
+}
+
 impl Drop for MobileBitcoinValueController {
     fn drop(&mut self) {
         let _ = self.deactivate();
@@ -1993,6 +2004,25 @@ mod tests {
             runtime.handle().runtime_flavor(),
             tokio::runtime::RuntimeFlavor::CurrentThread,
         );
+    }
+
+    #[test]
+    fn dead_or_poisoned_bitcoin_supervisors_are_reconstructed_once() {
+        for error in [
+            BitcoinWalletError::CorruptRuntimeState,
+            BitcoinWalletError::KyotoNodeStopped,
+            BitcoinWalletError::SupervisorPoisoned,
+        ] {
+            assert!(bitcoin_sync_requires_supervisor_reconstruction(
+                &MobileWalletError::Bitcoin(error)
+            ));
+        }
+        assert!(!bitcoin_sync_requires_supervisor_reconstruction(
+            &MobileWalletError::Bitcoin(BitcoinWalletError::InvalidEvidence)
+        ));
+        assert!(!bitcoin_sync_requires_supervisor_reconstruction(
+            &MobileWalletError::InvalidBitcoinAction
+        ));
     }
 
     #[test]

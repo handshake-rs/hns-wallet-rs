@@ -46,12 +46,10 @@ pub const MIN_REBROADCAST_INTERVAL_SECONDS: u64 = 60;
 pub const MAX_PERSISTED_BROADCAST_TRANSACTION_BYTES: usize = 200_000;
 pub const MAX_RECONCILIATION_BATCH_SAVES: usize = 512;
 pub const MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS: usize = 4;
-/// Maximum canonical history searched newest-first while an exact
-/// wallet-approved broadcast remains unobserved. Kyoto exposes ten recent
-/// headers with each sync event; older headers are read from its locally
-/// validated header database. The search stops as soon as every exact txid is
-/// found, so the normal case downloads only the few blocks since submission.
-pub const MAX_APPROVED_BROADCAST_PROBE_BLOCKS: u32 = 144;
+/// Maximum canonical history whose compact filters are rescanned while an
+/// exact wallet-approved broadcast remains unobserved. Only filter matches
+/// fetch full blocks; recovery never downloads this entire window.
+pub const MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS: u32 = 144;
 pub const PEER_INFO_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 pub const BITCOIN_PEER_CACHE_RECORD_VERSION: u16 = 1;
 pub const MAX_CACHED_BITCOIN_PEERS: usize = 32;
@@ -1209,6 +1207,7 @@ impl KyotoWalletSwapSubscriber {
 
     async fn update(&mut self) -> Result<KyotoWalletSwapUpdate, BitcoinWalletError> {
         let mut swap_blocks = BTreeMap::new();
+        let mut recovery_rescanned_txids = BTreeSet::new();
         while let Some(event) = self.receiver.recv().await {
             match event {
                 Event::IndexedFilter(filter) => {
@@ -1227,14 +1226,6 @@ impl KyotoWalletSwapSubscriber {
                     let mut unobserved_broadcast_txids = self.store.try_with_store(|store| {
                         unobserved_approved_broadcast_txids(store, self.network)
                     })?;
-                    let mut approved_broadcast_probe_blocks = BTreeSet::new();
-                    if !unobserved_broadcast_txids.is_empty() {
-                        for header in update.recent_history().values().rev() {
-                            let hash = header.block_hash();
-                            approved_broadcast_probe_blocks.insert(hash);
-                            self.queued_blocks.entry(hash).or_insert(false);
-                        }
-                    }
                     if !self.queued_blocks.is_empty() {
                         self.progress.set_stage(KyotoSyncStage::FetchingBlocks);
                     }
@@ -1251,15 +1242,9 @@ impl KyotoWalletSwapSubscriber {
                                 .requester
                                 .request_block(hash)
                                 .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
-                            pending.push_back((
-                                swap_match,
-                                approved_broadcast_probe_blocks.contains(&hash),
-                                receiver,
-                            ));
+                            pending.push_back((swap_match, receiver));
                         }
-                        let Some((swap_match, approved_broadcast_probe, receiver)) =
-                            pending.pop_front()
-                        else {
+                        let Some((swap_match, receiver)) = pending.pop_front() else {
                             break;
                         };
                         let indexed = receiver
@@ -1270,13 +1255,12 @@ impl KyotoWalletSwapSubscriber {
                         let _ = self
                             .graph
                             .apply_block_relevant(&indexed.block, indexed.height);
-                        let approved_broadcast_match = approved_broadcast_probe
-                            && insert_exact_approved_broadcasts(
-                                &mut self.graph,
-                                &indexed.block,
-                                indexed.height,
-                                &mut unobserved_broadcast_txids,
-                            );
+                        let approved_broadcast_match = insert_exact_approved_broadcasts(
+                            &mut self.graph,
+                            &indexed.block,
+                            indexed.height,
+                            &mut unobserved_broadcast_txids,
+                        );
                         if swap_match || approved_broadcast_match {
                             swap_blocks.insert(
                                 indexed.block.block_hash(),
@@ -1287,71 +1271,18 @@ impl KyotoWalletSwapSubscriber {
                             );
                         }
                     }
-                    if !unobserved_broadcast_txids.is_empty() {
-                        let tip_height = update.tip().height;
-                        let end = tip_height
-                            .checked_add(1)
-                            .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
-                        let start = end.saturating_sub(MAX_APPROVED_BROADCAST_PROBE_BLOCKS);
-                        let mut historical = Vec::new();
-                        for height in (start..end).rev() {
-                            let header = self
-                                .requester
-                                .get_header(height)
-                                .await
-                                .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?
-                                .ok_or(BitcoinWalletError::InvalidCheckpoint)?;
-                            if header.height != height {
-                                return Err(BitcoinWalletError::InvalidCheckpoint);
-                            }
-                            let hash = header.block_hash();
-                            if !approved_broadcast_probe_blocks.contains(&hash) {
-                                historical.push((height, hash));
-                            }
-                        }
-                        let mut remaining = historical.into_iter();
-                        let mut pending =
-                            VecDeque::with_capacity(MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS);
-                        while !unobserved_broadcast_txids.is_empty() {
-                            while pending.len() < MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS {
-                                let Some((height, hash)) = remaining.next() else {
-                                    break;
-                                };
-                                let receiver = self
-                                    .requester
-                                    .request_block(hash)
-                                    .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
-                                pending.push_back((height, receiver));
-                            }
-                            let Some((height, receiver)) = pending.pop_front() else {
-                                break;
-                            };
-                            let indexed = receiver
-                                .await
-                                .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?
-                                .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
-                            if indexed.height != height {
-                                return Err(BitcoinWalletError::InvalidEvidence);
-                            }
-                            self.progress.record_downloaded_block();
-                            let _ = self
-                                .graph
-                                .apply_block_relevant(&indexed.block, indexed.height);
-                            if insert_exact_approved_broadcasts(
-                                &mut self.graph,
-                                &indexed.block,
-                                indexed.height,
-                                &mut unobserved_broadcast_txids,
-                            ) {
-                                swap_blocks.insert(
-                                    indexed.block.block_hash(),
-                                    MatchedBitcoinBlock {
-                                        height: indexed.height,
-                                        block: indexed.block,
-                                    },
-                                );
-                            }
-                        }
+                    let needs_recovery_rescan = unobserved_broadcast_txids
+                        .iter()
+                        .any(|txid| !recovery_rescanned_txids.contains(txid));
+                    if needs_recovery_rescan {
+                        recovery_rescanned_txids.extend(unobserved_broadcast_txids);
+                        let rescan_from =
+                            approved_broadcast_recovery_rescan_height(update.tip().height);
+                        self.requester
+                            .rescan_from(rescan_from)
+                            .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
+                        self.progress.set_stage(KyotoSyncStage::SyncingFilters);
+                        continue;
                     }
                     if let Some(gap_limit) = self.recovery_gap_limit {
                         let required_script_count = extended_recovery_script_count(
@@ -1411,6 +1342,10 @@ impl KyotoWalletSwapSubscriber {
             _ => {}
         }
     }
+}
+
+fn approved_broadcast_recovery_rescan_height(tip_height: u32) -> u32 {
+    tip_height.saturating_sub(MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS)
 }
 
 /// Insert only the exact wallet-approved transactions found in a canonical
@@ -4130,6 +4065,15 @@ mod restart_tests {
             &mut unrelated,
         ));
         assert!(unrelated_graph.graph().get_tx(txid).is_none());
+    }
+
+    #[test]
+    fn approved_broadcast_recovery_rescans_only_the_bounded_recent_window() {
+        assert_eq!(approved_broadcast_recovery_rescan_height(100), 0);
+        assert_eq!(
+            approved_broadcast_recovery_rescan_height(1_000),
+            1_000 - MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS
+        );
     }
 
     #[test]
