@@ -1078,11 +1078,12 @@ fn extended_recovery_script_count(
     Ok(current_script_count.max(required))
 }
 
-fn walk_back_wallet_checkpoint(checkpoint: CheckPoint) -> HashCheckpoint {
-    const REORG_SAFETY_DEPTH: usize = 7;
+const NORMAL_REORG_SAFETY_DEPTH: u32 = 7;
+
+fn walk_back_wallet_checkpoint(checkpoint: CheckPoint, depth: u32) -> HashCheckpoint {
     let mut start = HashCheckpoint::new(checkpoint.height(), checkpoint.hash());
     for (index, ancestor) in checkpoint.iter().enumerate() {
-        if index > REORG_SAFETY_DEPTH {
+        if u32::try_from(index).unwrap_or(u32::MAX) > depth {
             break;
         }
         start = HashCheckpoint::new(ancestor.height(), ancestor.hash());
@@ -1094,6 +1095,7 @@ fn build_wallet_swap_client(
     wallet: &Wallet,
     config: KyotoRuntimeConfig,
     scan_type: ScanType,
+    checkpoint_lookback: u32,
     swap_scripts: Vec<(SessionId, ScriptBuf)>,
     progress: KyotoSyncProgressHandle,
     store: SharedWalletStore,
@@ -1103,7 +1105,9 @@ fn build_wallet_swap_client(
         return Err(BitcoinWalletError::NetworkMismatch);
     }
     let start = match scan_type {
-        ScanType::Sync => walk_back_wallet_checkpoint(wallet.latest_checkpoint()),
+        ScanType::Sync => {
+            walk_back_wallet_checkpoint(wallet.latest_checkpoint(), checkpoint_lookback)
+        }
         ScanType::Recovery { checkpoint, .. } => checkpoint,
     };
     let mut builder = Builder::new(config.network)
@@ -1681,6 +1685,15 @@ impl KyotoSupervisor {
         let watches = store.try_with_store(|store| {
             load_bitcoin_htlc_watches(store, wallet.network(), wallet.account_id())
         })?;
+        let has_unobserved_approved_broadcast = store.try_with_store(|store| {
+            unobserved_approved_broadcast_txids(store, wallet.network())
+                .map(|txids| !txids.is_empty())
+        })?;
+        let checkpoint_lookback = if has_unobserved_approved_broadcast {
+            MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS
+        } else {
+            NORMAL_REORG_SAFETY_DEPTH
+        };
         config.trusted_peers.extend(load_cached_bitcoin_peers(
             &store,
             wallet.account_id(),
@@ -1691,6 +1704,7 @@ impl KyotoSupervisor {
             wallet,
             config,
             scan_type,
+            checkpoint_lookback,
             watched_scripts(&watches),
             progress.clone(),
             store.clone(),
@@ -4089,6 +4103,31 @@ mod restart_tests {
         assert_eq!(
             approved_broadcast_recovery_rescan_height(1_000),
             1_000 - MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS
+        );
+    }
+
+    #[test]
+    fn approved_broadcast_recovery_retains_the_requested_header_window() {
+        let mut checkpoint = CheckPoint::new(BlockId {
+            height: 0,
+            hash: block_hash(0),
+        });
+        for height in 1..=200 {
+            checkpoint = checkpoint
+                .push(BlockId {
+                    height,
+                    hash: block_hash(height),
+                })
+                .expect("strictly increasing checkpoint");
+        }
+
+        assert_eq!(
+            walk_back_wallet_checkpoint(checkpoint.clone(), NORMAL_REORG_SAFETY_DEPTH).height,
+            200 - NORMAL_REORG_SAFETY_DEPTH
+        );
+        assert_eq!(
+            walk_back_wallet_checkpoint(checkpoint, MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS,).height,
+            200 - MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS
         );
     }
 
