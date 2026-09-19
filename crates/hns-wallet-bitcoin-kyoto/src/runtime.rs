@@ -2570,13 +2570,7 @@ impl KyotoSupervisor {
                     if let Err(error) = record.validate() {
                         return Some(Err(error));
                     }
-                    (record.broadcast.is_some()
-                        && record.raw_transaction.is_some()
-                        && matches!(
-                            record.observation,
-                            BitcoinChainObservation::AbsentFromCanonicalWalletView
-                        ))
-                    .then_some(Ok(record.txid))
+                    broadcast_is_ready_to_resume(&record).then_some(Ok(record.txid))
                 })
                 .collect::<Result<Vec<_>, BitcoinWalletError>>()
         })?;
@@ -2615,6 +2609,27 @@ struct PendingBitcoinSubmission {
     transaction: Transaction,
     record: BitcoinTransactionRecord,
     started_revision: u64,
+}
+
+/// Return whether lifecycle recovery may make another network submission.
+///
+/// Exhausting the bounded retry budget does not invalidate the approved
+/// transaction. Its inputs must remain reserved and the exact transaction
+/// must remain tracked for later chain observation or swap refund handling.
+/// It is, however, no longer actionable by the automatic retry loop. Treating
+/// that durable terminal retry state as an error on every lifecycle tick both
+/// obscures real recovery failures and repeatedly performs work that cannot
+/// change the outcome.
+fn broadcast_is_ready_to_resume(record: &BitcoinTransactionRecord) -> bool {
+    record.raw_transaction.is_some()
+        && record
+            .broadcast
+            .as_ref()
+            .is_some_and(|intent| intent.attempt_count < MAX_BROADCAST_ATTEMPTS)
+        && matches!(
+            record.observation,
+            BitcoinChainObservation::AbsentFromCanonicalWalletView
+        )
 }
 
 fn begin_broadcast_submission(
@@ -2677,13 +2692,13 @@ fn begin_broadcast_submission(
             return Err(BitcoinWalletError::BroadcastRetryNotReady);
         }
     }
+    if intent.attempt_count >= MAX_BROADCAST_ATTEMPTS {
+        return Err(BitcoinWalletError::BroadcastAttemptLimit);
+    }
     intent.attempt_count = intent
         .attempt_count
         .checked_add(1)
         .ok_or(BitcoinWalletError::BroadcastAttemptLimit)?;
-    if intent.attempt_count > MAX_BROADCAST_ATTEMPTS {
-        return Err(BitcoinWalletError::BroadcastAttemptLimit);
-    }
     intent.phase = BitcoinBroadcastPhase::SubmissionStarted;
     intent.last_submission_started_at_unix = Some(now_unix);
     let started_revision =
@@ -4145,6 +4160,74 @@ mod restart_tests {
                 reason: KyotoRecoveryReason::InterruptedSynchronization,
             }
         ));
+    }
+
+    #[test]
+    fn lifecycle_recovery_skips_exhausted_and_observed_broadcasts() {
+        let transaction = genesis_block(Network::Regtest).txdata[0].clone();
+        let txid = transaction.compute_txid().to_byte_array();
+        let wtxid = transaction.compute_wtxid().to_byte_array();
+        let fee_sats = 1;
+        let maximum_fee_sats = 1;
+        let prepared_at_unix = 1;
+        let expires_at_unix = prepared_at_unix + MAX_BROADCAST_APPROVAL_LIFETIME_SECONDS;
+        let mut record = BitcoinTransactionRecord {
+            schema_version: BITCOIN_TRANSACTION_RECORD_VERSION,
+            txid,
+            wtxid,
+            input_count: u32::try_from(transaction.input.len()).expect("bounded test input count"),
+            output_count: u32::try_from(transaction.output.len())
+                .expect("bounded test output count"),
+            input_outpoint_commitment: input_outpoint_commitment(&transaction),
+            sent_sats: 0,
+            received_sats: 0,
+            fee_sats: Some(fee_sats),
+            observation: BitcoinChainObservation::AbsentFromCanonicalWalletView,
+            raw_transaction: Some(serialize(&transaction)),
+            broadcast: Some(BitcoinBroadcastIntent {
+                network: Network::Regtest,
+                approval_commitment: bitcoin_broadcast_approval_commitment(
+                    Network::Regtest,
+                    txid,
+                    wtxid,
+                    fee_sats,
+                    maximum_fee_sats,
+                    expires_at_unix,
+                ),
+                fee_sats,
+                maximum_fee_sats,
+                prepared_at_unix,
+                expires_at_unix,
+                phase: BitcoinBroadcastPhase::Submitted,
+                attempt_count: MAX_BROADCAST_ATTEMPTS - 1,
+                last_submission_started_at_unix: Some(2),
+                last_submitted_at_unix: Some(2),
+            }),
+            first_observed_at_unix: None,
+            last_changed_at_unix: 2,
+        };
+        record.validate().expect("retryable record is valid");
+        assert!(broadcast_is_ready_to_resume(&record));
+
+        record
+            .broadcast
+            .as_mut()
+            .expect("broadcast intent")
+            .attempt_count = MAX_BROADCAST_ATTEMPTS;
+        record.validate().expect("exhausted record remains valid");
+        assert!(!broadcast_is_ready_to_resume(&record));
+
+        record
+            .broadcast
+            .as_mut()
+            .expect("broadcast intent")
+            .attempt_count = MAX_BROADCAST_ATTEMPTS - 1;
+        record.observation = BitcoinChainObservation::Unconfirmed {
+            first_seen_at_unix: Some(3),
+            last_seen_at_unix: Some(3),
+        };
+        record.validate().expect("observed record is valid");
+        assert!(!broadcast_is_ready_to_resume(&record));
     }
 
     #[test]
