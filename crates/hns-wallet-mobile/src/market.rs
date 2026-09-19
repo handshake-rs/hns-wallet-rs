@@ -4683,10 +4683,9 @@ mod tests {
         );
 
         let bitcoin_redeem = hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcSpendObservation {
-            spend: hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcSpend {
+            spend: hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcChainSpend {
                 txid: hns_wallet_types::TransactionHash::new([0x91; 32]),
                 wtxid: [0x92; 32],
-                fee_sats: 400,
                 branch: hns_wallet_bitcoin_kyoto::HtlcSpendBranch::Redeem,
                 revealed_preimage: Some(known_preimage),
             },

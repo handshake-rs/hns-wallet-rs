@@ -497,7 +497,7 @@ impl LocallyVerifiedSwapSpend {
             Self::Hns(VerifiedNativeHtlcSpend::Redeem { preimage, .. }) => Ok(preimage.clone()),
             Self::Bitcoin(VerifiedBitcoinHtlcSpendObservation {
                 spend:
-                    hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcSpend {
+                    hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcChainSpend {
                         branch: HtlcSpendBranch::Redeem,
                         revealed_preimage: Some(preimage),
                         ..
@@ -513,7 +513,7 @@ impl LocallyVerifiedSwapSpend {
             self,
             Self::Hns(VerifiedNativeHtlcSpend::Refund { .. })
                 | Self::Bitcoin(VerifiedBitcoinHtlcSpendObservation {
-                    spend: hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcSpend {
+                    spend: hns_wallet_bitcoin_kyoto::VerifiedBitcoinHtlcChainSpend {
                         branch: HtlcSpendBranch::Refund,
                         ..
                     },

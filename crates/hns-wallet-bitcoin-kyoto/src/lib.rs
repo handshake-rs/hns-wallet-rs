@@ -921,6 +921,22 @@ pub struct VerifiedBitcoinHtlcSpend {
     pub revealed_preimage: Option<[u8; 32]>,
 }
 
+/// A canonical-chain HTLC spend authenticated from the exact funding
+/// outpoint, witness script, branch selector, preimage, and input signature.
+///
+/// Unlike [`VerifiedBitcoinHtlcSpend`], this evidence deliberately carries no
+/// fee. A compact-filter watch has the spent HTLC output but need not have the
+/// previous outputs for unrelated fee-sponsor inputs, so it cannot truthfully
+/// calculate the whole transaction fee. Broadcast authorization continues to
+/// use the stricter fee-bearing type above.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedBitcoinHtlcChainSpend {
+    pub txid: TransactionHash,
+    pub wtxid: [u8; 32],
+    pub branch: HtlcSpendBranch,
+    pub revealed_preimage: Option<[u8; 32]>,
+}
+
 /// Locally validated chain state used to decide whether an absolute Bitcoin
 /// refund lock can be mined in the next block. BIP113 evaluates time locks
 /// against the median time of the preceding eleven blocks, never wall time.
@@ -1704,6 +1720,113 @@ pub fn verify_signed_bitcoin_htlc_spend_with_wallet(
         fee_sats,
         branch,
         revealed_preimage: Some(preimage),
+    })
+}
+
+/// Authenticate an HTLC spend observed in a locally validated canonical
+/// block, including a redeem whose miner fee is sponsored by additional
+/// inputs. The signature commits to the complete transaction, while the
+/// witness checks bind the observation to the exact negotiated HTLC and
+/// branch. This does not infer a transaction fee because a compact-filter
+/// wallet may not know the previous outputs for every additional input.
+pub fn verify_observed_bitcoin_htlc_spend(
+    raw_transaction: &[u8],
+    lock: &VerifiedBitcoinLock,
+    branch: HtlcSpendBranch,
+) -> Result<VerifiedBitcoinHtlcChainSpend, BitcoinWalletError> {
+    if raw_transaction.is_empty() || raw_transaction.len() > MAX_BITCOIN_TRANSACTION_BYTES {
+        return Err(BitcoinWalletError::TransactionTooLarge);
+    }
+    lock.htlc.validate()?;
+    let transaction: Transaction =
+        deserialize(raw_transaction).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    if serialize(&transaction) != raw_transaction
+        || transaction.version != transaction::Version::TWO
+        || transaction.input.is_empty()
+        || transaction.output.is_empty()
+    {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    let expected_outpoint = OutPoint {
+        txid: bdk_wallet::bitcoin::Txid::from_byte_array(lock.funding_txid.into_bytes()),
+        vout: lock.output_index,
+    };
+    let mut matching = transaction
+        .input
+        .iter()
+        .enumerate()
+        .filter(|(_, input)| input.previous_output == expected_outpoint);
+    let (htlc_index, htlc_input) = matching.next().ok_or(BitcoinWalletError::InvalidEvidence)?;
+    if matching.next().is_some() {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    let witness = htlc_input
+        .witness
+        .iter()
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let (preimage, expected_public_key) = match branch {
+        HtlcSpendBranch::Redeem => {
+            if transaction.lock_time != absolute::LockTime::ZERO
+                || htlc_input.sequence != Sequence::MAX
+                || witness.len() != 4
+                || witness[2].as_slice() != [1]
+                || witness[3] != lock.htlc.witness_script
+            {
+                return Err(BitcoinWalletError::InvalidEvidence);
+            }
+            let preimage = <[u8; 32]>::try_from(witness[1].as_slice())
+                .map_err(|_| BitcoinWalletError::InvalidPreimage)?;
+            if Sha256::digest(preimage).as_slice() != lock.htlc.hashlock {
+                return Err(BitcoinWalletError::InvalidPreimage);
+            }
+            (Some(preimage), &lock.htlc.receiver_public_key)
+        }
+        HtlcSpendBranch::Refund => {
+            if transaction.lock_time.to_consensus_u32() != lock.htlc.refund_locktime
+                || htlc_input.sequence != Sequence::ZERO
+                || witness.len() != 3
+                || !witness[1].is_empty()
+                || witness[2] != lock.htlc.witness_script
+            {
+                return Err(BitcoinWalletError::InvalidEvidence);
+            }
+            (None, &lock.htlc.refund_public_key)
+        }
+    };
+    let signature_bytes = witness
+        .first()
+        .and_then(|signature| signature.strip_suffix(&[EcdsaSighashType::All.to_u32() as u8]))
+        .ok_or(BitcoinWalletError::InvalidEvidence)?;
+    let signature =
+        Signature::from_der(signature_bytes).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    let mut normalized = signature;
+    normalized.normalize_s();
+    if normalized != signature {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    let public_key = PublicKey::from_slice(expected_public_key)
+        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    let sighash = SighashCache::new(&transaction)
+        .p2wsh_signature_hash(
+            htlc_index,
+            &lock.htlc.witness_script(),
+            BitcoinAmount::from_sat(lock.value_sats),
+            EcdsaSighashType::All,
+        )
+        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    Secp256k1::verification_only()
+        .verify_ecdsa(
+            &Message::from_digest(sighash.to_byte_array()),
+            &signature,
+            &public_key.inner,
+        )
+        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    Ok(VerifiedBitcoinHtlcChainSpend {
+        txid: TransactionHash::new(transaction.compute_txid().to_byte_array()),
+        wtxid: transaction.compute_wtxid().to_byte_array(),
+        branch,
+        revealed_preimage: preimage,
     })
 }
 
@@ -2978,6 +3101,35 @@ mod tests {
         assert!(verified.fee_sats > 0);
         assert!(verified.fee_sats <= 1_000);
         assert_eq!(verified.revealed_preimage, Some(preimage));
+        let observed = verify_observed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Redeem)
+            .expect("canonical watcher accepts sponsored redeem");
+        assert_eq!(observed.txid, verified.txid);
+        assert_eq!(observed.wtxid, verified.wtxid);
+        assert_eq!(observed.revealed_preimage, Some(preimage));
+        let mut tampered: Transaction = deserialize(&raw).expect("sponsored transaction");
+        let htlc_index = tampered
+            .input
+            .iter()
+            .position(|input| {
+                input.previous_output.vout == lock.output_index
+                    && input.previous_output.txid.to_byte_array() == lock.funding_txid.into_bytes()
+            })
+            .expect("HTLC input");
+        let mut tampered_witness = tampered.input[htlc_index]
+            .witness
+            .iter()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        tampered_witness[0][5] ^= 1;
+        tampered.input[htlc_index].witness = Witness::from_slice(&tampered_witness);
+        assert!(matches!(
+            verify_observed_bitcoin_htlc_spend(
+                &serialize(&tampered),
+                &lock,
+                HtlcSpendBranch::Redeem,
+            ),
+            Err(BitcoinWalletError::InvalidEvidence)
+        ));
         assert!(
             transaction
                 .output

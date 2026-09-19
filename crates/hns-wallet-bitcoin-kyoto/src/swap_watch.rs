@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     BitcoinCheckpoint, BitcoinHtlc, BitcoinWalletError, HtlcSpendBranch, MIN_HTLC_DUST_SATS,
-    VerifiedBitcoinHtlcSpend, VerifiedBitcoinLock, htlc_commitment, verify_htlc_funding,
-    verify_signed_bitcoin_htlc_spend,
+    VerifiedBitcoinHtlcChainSpend, VerifiedBitcoinLock, htlc_commitment, verify_htlc_funding,
+    verify_observed_bitcoin_htlc_spend,
 };
 
 const BITCOIN_SWAP_WATCH_SCHEMA_VERSION: u16 = 1;
@@ -95,7 +95,7 @@ pub struct BitcoinHtlcWatchSnapshot {
 /// reorged watch data from advancing a recovery workflow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerifiedBitcoinHtlcSpendObservation {
-    pub spend: VerifiedBitcoinHtlcSpend,
+    pub spend: VerifiedBitcoinHtlcChainSpend,
     pub confirmation_count: u32,
 }
 
@@ -186,7 +186,7 @@ impl BitcoinHtlcWatch {
         let branch = spend.branch?;
         let lock = self.verified_lock_at(current_checkpoint)?;
         let verified =
-            verify_signed_bitcoin_htlc_spend(&spend.raw_transaction, &lock, branch).ok()?;
+            verify_observed_bitcoin_htlc_spend(&spend.raw_transaction, &lock, branch).ok()?;
         (verified.txid.into_bytes() == spend.txid
             && verified.wtxid == spend.wtxid
             && verified.revealed_preimage == spend.preimage
@@ -529,10 +529,10 @@ fn spend_candidates(
                 continue;
             }
             let raw = serialize(transaction);
-            let verified = verify_signed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Redeem)
+            let verified = verify_observed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Redeem)
                 .or_else(|_| {
-                verify_signed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Refund)
-            })?;
+                    verify_observed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Refund)
+                })?;
             let confirmations = confirmation_count(tip.height, matched.height)?;
             candidates.push(PersistedBitcoinSwapObservation {
                 txid: verified.txid.into_bytes(),
@@ -628,7 +628,7 @@ fn validate_persisted_watch(
             confirmation_count: funding.confirmation_count,
             htlc: watch.htlc.clone(),
         };
-        let verified = verify_signed_bitcoin_htlc_spend(&spend.raw_transaction, &lock, branch)?;
+        let verified = verify_observed_bitcoin_htlc_spend(&spend.raw_transaction, &lock, branch)?;
         if verified.txid.into_bytes() != spend.txid
             || verified.wtxid != spend.wtxid
             || verified.revealed_preimage != spend.preimage
