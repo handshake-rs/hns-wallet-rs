@@ -1413,6 +1413,18 @@ fn approved_broadcast_recovery_rescan_height(tip_height: u32) -> u32 {
     tip_height.saturating_sub(MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS)
 }
 
+/// Force an already-synchronized Kyoto node to publish a finite update for a
+/// caller-driven synchronization cycle. Kyoto otherwise waits in
+/// `FiltersSynced` until another block arrives, which can strand a manual
+/// mobile sync at the chain tip and prevent the subscriber from noticing a
+/// newly persisted broadcast-recovery request. Replaying the tip filter is
+/// enough to produce the cycle boundary; the subscriber expands that replay
+/// to the bounded recovery window when an approved broadcast is still
+/// unobserved.
+fn tip_cycle_rescan_height(tip_height: u32) -> u32 {
+    tip_height.saturating_sub(1)
+}
+
 /// Insert only the exact wallet-approved transactions found in a canonical
 /// recovery block. This avoids retaining every unrelated transaction in the
 /// block while still giving BDK an authenticated transaction and anchor.
@@ -1983,6 +1995,17 @@ impl KyotoSupervisor {
         self.durable.persist(now_unix)?;
 
         self.progress.set_stage(KyotoSyncStage::SyncingFilters);
+        if self.durable.state.completed_syncs != 0 {
+            // The long-lived Kyoto node remains in `FiltersSynced` after a
+            // completed cycle. Without an explicit replay request, polling
+            // `updates.update()` again at the same tip waits for the next
+            // block (up to the full recovery-scan timeout). Re-emit the one
+            // canonical tip filter so this user-scheduled cycle terminates
+            // promptly and can trigger any deeper approved-broadcast replay.
+            self.requester
+                .rescan_from(tip_cycle_rescan_height(previous_tip.height))
+                .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
+        }
         let network_started = Instant::now();
         let update_result = tokio::select! {
             biased;
@@ -4178,6 +4201,13 @@ mod restart_tests {
             approved_broadcast_recovery_rescan_height(1_000),
             1_000 - MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS
         );
+    }
+
+    #[test]
+    fn repeated_tip_sync_replays_exactly_one_filter() {
+        assert_eq!(tip_cycle_rescan_height(0), 0);
+        assert_eq!(tip_cycle_rescan_height(1), 0);
+        assert_eq!(tip_cycle_rescan_height(967_721), 967_720);
     }
 
     #[test]
