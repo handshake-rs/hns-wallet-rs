@@ -4509,45 +4509,72 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let kind = settlement_workflow_kind(action);
         let artifact = Self::prepared_settlement_artifact(&prepared)?;
         let mut store = self.store_lock()?;
-        match store.load_workflow::<HnsPreparedSettlement>(workflow_id)? {
-            Some(stored) if stored.state == prepared && stored.kind == kind => {}
-            Some(_) => return Err(HnsWalletError::InvalidWorkflow),
-            None => {
-                if let Some(account_save) = account_save {
-                    let (_, next_account_revision) = store
-                        .save_workflow_with_account_and_entity_batch(
-                            workflow_id,
-                            kind,
-                            0,
-                            &prepared,
-                            true,
-                            now_unix,
-                            account_save,
-                            EntityKind::InputReservation,
-                            reservation_saves,
-                            &[],
-                        )?;
-                    drop(store);
-                    self.install_committed_account(
-                        account_save.expected_revision,
-                        next_account_revision,
-                        account_save.value.clone(),
-                        now_unix,
-                    )?;
-                } else {
-                    store.save_workflow_with_entity_batch(
-                        workflow_id,
-                        kind,
-                        0,
-                        &prepared,
-                        true,
-                        now_unix,
-                        EntityKind::InputReservation,
-                        reservation_saves,
-                        &[],
-                    )?;
+        let expected_workflow_revision =
+            match store.load_workflow::<HnsPreparedSettlement>(workflow_id)? {
+                Some(stored) if stored.state == prepared && stored.kind == kind => {
+                    return Ok(artifact);
                 }
-            }
+                Some(stored)
+                    if stored.kind == kind
+                        && stored.state.wallet_id == prepared.wallet_id
+                        && stored.state.account_id == prepared.account_id
+                        && stored.state.workflow_id == prepared.workflow_id
+                        && stored.state.session_id == prepared.session_id
+                        && stored.state.action == prepared.action
+                        && settlement_terms_are_retry_compatible(
+                            &stored.state.terms,
+                            &prepared.terms,
+                        )
+                        && ((matches!(
+                            stored.state.stage,
+                            HnsSettlementStage::Expired | HnsSettlementStage::Cancelled
+                        ) && !stored.irreversible_broadcast_prepared)
+                            || (stored.state.stage == HnsSettlementStage::Prepared
+                                && stored.state.expires_at_unix <= now_unix)) =>
+                {
+                    if account_input_reservations(&store, &account.config)?
+                        .into_iter()
+                        .any(|reservation| reservation.value.workflow_id == workflow_id)
+                    {
+                        return Err(HnsWalletError::InvalidWorkflow);
+                    }
+                    stored.revision
+                }
+                Some(_) => return Err(HnsWalletError::InvalidWorkflow),
+                None => 0,
+            };
+        if let Some(account_save) = account_save {
+            let (_, next_account_revision) = store.save_workflow_with_account_and_entity_batch(
+                workflow_id,
+                kind,
+                expected_workflow_revision,
+                &prepared,
+                true,
+                now_unix,
+                account_save,
+                EntityKind::InputReservation,
+                reservation_saves,
+                &[],
+            )?;
+            drop(store);
+            self.install_committed_account(
+                account_save.expected_revision,
+                next_account_revision,
+                account_save.value.clone(),
+                now_unix,
+            )?;
+        } else {
+            store.save_workflow_with_entity_batch(
+                workflow_id,
+                kind,
+                expected_workflow_revision,
+                &prepared,
+                true,
+                now_unix,
+                EntityKind::InputReservation,
+                reservation_saves,
+                &[],
+            )?;
         }
         Ok(artifact)
     }
@@ -4611,7 +4638,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         };
         let workflow_id = settlement_workflow_id(&config, session_id, action);
         let mut store = self.store_lock().map_err(map_chain_error)?;
-        if let Some(stored) = store
+        if let Some(mut stored) = store
             .load_workflow::<HnsPreparedSettlement>(workflow_id)
             .map_err(map_chain_error)?
         {
@@ -4621,77 +4648,115 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 || stored.state.workflow_id != workflow_id
                 || stored.state.session_id != session_id
                 || stored.state.action != action
-                || stored.state.stage != HnsSettlementStage::Prepared
-                || stored.state.terms != terms
-                || stored.state.maximum_fee != maximum_fee
-                || stored.state.fee > maximum_fee
-                || stored.state.expires_at_unix <= now
+                || !settlement_terms_are_retry_compatible(&stored.state.terms, &terms)
             {
                 return Err(ChainError::InvalidRequest(
                     "persisted Handshake settlement spend does not match retry",
                 ));
             }
-            let quote = stored
-                .state
-                .fee_quote
-                .as_ref()
-                .ok_or(ChainError::InvalidEvidence)?;
-            let input_coins =
-                canonical_evidence_coins(&stored.state.input_coins).map_err(map_chain_error)?;
-            validate_final_fee_quote(
-                &stored.state.signed_transaction,
-                &input_coins,
-                quote,
-                quote.binding,
-                quote.mempool,
-                stored.state.fee,
-                stored.state.maximum_fee,
-            )
-            .map_err(map_chain_error)?;
-            let transaction = Transaction::decode(&stored.state.signed_transaction)
-                .map_err(|_| ChainError::InvalidEvidence)?;
-            if transaction.inputs.is_empty() || transaction.inputs.len() != input_coins.len() {
-                return Err(ChainError::InvalidEvidence);
-            }
-            let sponsor_outpoints = transaction
-                .inputs
-                .iter()
-                .skip(1)
-                .map(|input| HnsOutpoint {
-                    transaction: TransactionHash::new(
-                        input.previous_output.transaction_hash.into_bytes(),
-                    ),
-                    output_index: input.previous_output.index,
-                })
-                .collect::<Vec<_>>();
-            if sponsor_outpoints.is_empty() {
-                if account_input_reservations(&store, &config)
-                    .map_err(map_chain_error)?
-                    .into_iter()
-                    .any(|reservation| reservation.value.workflow_id == workflow_id)
-                {
-                    return Err(ChainError::InvalidEvidence);
+            let active_retry = stored.state.stage == HnsSettlementStage::Prepared
+                && stored.state.expires_at_unix > now;
+            if !active_retry {
+                let replaceable = (stored.state.stage == HnsSettlementStage::Prepared
+                    && stored.state.expires_at_unix <= now)
+                    || (matches!(
+                        stored.state.stage,
+                        HnsSettlementStage::Expired | HnsSettlementStage::Cancelled
+                    ) && !stored.irreversible_broadcast_prepared);
+                if !replaceable {
+                    return Err(ChainError::InvalidRequest(
+                        "persisted Handshake settlement spend does not match retry",
+                    ));
+                }
+                if stored.state.stage == HnsSettlementStage::Prepared {
+                    stored.state.stage = HnsSettlementStage::Expired;
+                    let deletes = reservation_deletes(&store, &config, workflow_id)
+                        .map_err(map_chain_error)?;
+                    store
+                        .save_workflow_with_entity_batch::<_, HnsInputReservation>(
+                            workflow_id,
+                            stored.kind,
+                            stored.revision,
+                            &stored.state,
+                            false,
+                            now,
+                            EntityKind::InputReservation,
+                            &[],
+                            &deletes,
+                        )
+                        .map_err(map_chain_error)?;
+                } else {
+                    release_reservations(&mut store, &config, workflow_id)
+                        .map_err(map_chain_error)?;
                 }
             } else {
-                validate_prepared_reservations(
-                    &store,
-                    &config,
-                    workflow_id,
-                    &sponsor_outpoints,
-                    stored.state.expires_at_unix,
+                if stored.state.maximum_fee != maximum_fee || stored.state.fee > maximum_fee {
+                    return Err(ChainError::InvalidRequest(
+                        "persisted Handshake settlement spend does not match retry",
+                    ));
+                }
+                let quote = stored
+                    .state
+                    .fee_quote
+                    .as_ref()
+                    .ok_or(ChainError::InvalidEvidence)?;
+                let input_coins =
+                    canonical_evidence_coins(&stored.state.input_coins).map_err(map_chain_error)?;
+                validate_final_fee_quote(
+                    &stored.state.signed_transaction,
+                    &input_coins,
+                    quote,
+                    quote.binding,
+                    quote.mempool,
+                    stored.state.fee,
+                    stored.state.maximum_fee,
                 )
                 .map_err(map_chain_error)?;
+                let transaction = Transaction::decode(&stored.state.signed_transaction)
+                    .map_err(|_| ChainError::InvalidEvidence)?;
+                if transaction.inputs.is_empty() || transaction.inputs.len() != input_coins.len() {
+                    return Err(ChainError::InvalidEvidence);
+                }
+                let sponsor_outpoints = transaction
+                    .inputs
+                    .iter()
+                    .skip(1)
+                    .map(|input| HnsOutpoint {
+                        transaction: TransactionHash::new(
+                            input.previous_output.transaction_hash.into_bytes(),
+                        ),
+                        output_index: input.previous_output.index,
+                    })
+                    .collect::<Vec<_>>();
+                if sponsor_outpoints.is_empty() {
+                    if account_input_reservations(&store, &config)
+                        .map_err(map_chain_error)?
+                        .into_iter()
+                        .any(|reservation| reservation.value.workflow_id == workflow_id)
+                    {
+                        return Err(ChainError::InvalidEvidence);
+                    }
+                } else {
+                    validate_prepared_reservations(
+                        &store,
+                        &config,
+                        workflow_id,
+                        &sponsor_outpoints,
+                        stored.state.expires_at_unix,
+                    )
+                    .map_err(map_chain_error)?;
+                }
+                let artifact =
+                    Self::prepared_settlement_artifact(&stored.state).map_err(map_chain_error)?;
+                let committed_account = store
+                    .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))
+                    .map_err(map_chain_error)?
+                    .ok_or(ChainError::InvalidEvidence)?;
+                drop(store);
+                self.install_loaded_account(committed_account)
+                    .map_err(map_chain_error)?;
+                return Ok(artifact);
             }
-            let artifact =
-                Self::prepared_settlement_artifact(&stored.state).map_err(map_chain_error)?;
-            let committed_account = store
-                .wallet_account::<HnsAccountRecord>(&account_entity_id(&config))
-                .map_err(map_chain_error)?
-                .ok_or(ChainError::InvalidEvidence)?;
-            drop(store);
-            self.install_loaded_account(committed_account)
-                .map_err(map_chain_error)?;
-            return Ok(artifact);
         }
         let record = store
             .hns_verified_settlement::<HnsVerifiedSettlementRecord>(&settlement_entity_id(
@@ -11373,6 +11438,44 @@ fn same_prepared_settlement(
         && stored.terms == artifact.terms
 }
 
+fn settlement_terms_are_retry_compatible(
+    stored: &HnsSettlementTerms,
+    candidate: &HnsSettlementTerms,
+) -> bool {
+    match (stored, candidate) {
+        (
+            HnsSettlementTerms::Lock { request: stored },
+            HnsSettlementTerms::Lock { request: candidate },
+        ) => {
+            stored.session_id == candidate.session_id
+                && stored.module == candidate.module
+                && stored.amount == candidate.amount
+                && stored.hashlock == candidate.hashlock
+                && stored.receiver == candidate.receiver
+                && stored.refund_target == candidate.refund_target
+                && stored.absolute_timelock == candidate.absolute_timelock
+        }
+        (
+            HnsSettlementTerms::Redeem { lock: stored },
+            HnsSettlementTerms::Redeem { lock: candidate },
+        )
+        | (
+            HnsSettlementTerms::Refund { lock: stored },
+            HnsSettlementTerms::Refund { lock: candidate },
+        ) => {
+            stored.module == candidate.module
+                && stored.session_id == candidate.session_id
+                && stored.funding_id == candidate.funding_id
+                && stored.amount == candidate.amount
+                && stored.hashlock == candidate.hashlock
+                && stored.absolute_timelock == candidate.absolute_timelock
+                && stored.evidence_hash == candidate.evidence_hash
+                && candidate.confirmation_count >= stored.confirmation_count
+        }
+        _ => false,
+    }
+}
+
 fn same_verified_settlement_binding(
     stored: &HnsVerifiedSettlementRecord,
     candidate: &HnsVerifiedSettlementRecord,
@@ -14815,6 +14918,49 @@ mod tests {
         assert_eq!(signed.inputs[0].witness.items.len(), 4);
         assert_eq!(signed.inputs[1].witness.items.len(), 2);
         assert!(u128::from(signed.outputs[0].value.get()) >= account.config.dust_threshold.get());
+    }
+
+    #[test]
+    fn settlement_retry_terms_accept_only_monotonic_confirmation_refreshes() {
+        let stored_lock = VerifiedLock {
+            module: ModuleId::Handshake,
+            session_id: SessionId::new([101; 32]),
+            funding_id: TransactionHash::new([102; 32]),
+            amount: Amount::new(WalletAsset::Hns, 546),
+            hashlock: ObjectHash::new([103; 32]),
+            absolute_timelock: 700,
+            confirmation_count: 2,
+            evidence_hash: ObjectHash::new([104; 32]),
+        };
+        let mut refreshed_lock = stored_lock.clone();
+        refreshed_lock.confirmation_count = 5;
+        assert!(settlement_terms_are_retry_compatible(
+            &HnsSettlementTerms::Redeem {
+                lock: stored_lock.clone(),
+            },
+            &HnsSettlementTerms::Redeem {
+                lock: refreshed_lock.clone(),
+            },
+        ));
+
+        let mut regressed_lock = stored_lock.clone();
+        regressed_lock.confirmation_count = 1;
+        assert!(!settlement_terms_are_retry_compatible(
+            &HnsSettlementTerms::Redeem {
+                lock: stored_lock.clone(),
+            },
+            &HnsSettlementTerms::Redeem {
+                lock: regressed_lock,
+            },
+        ));
+
+        refreshed_lock.evidence_hash = ObjectHash::new([105; 32]);
+        assert!(!settlement_terms_are_retry_compatible(
+            &HnsSettlementTerms::Redeem { lock: stored_lock },
+            &HnsSettlementTerms::Redeem {
+                lock: refreshed_lock,
+            },
+        ));
     }
 
     #[test]
