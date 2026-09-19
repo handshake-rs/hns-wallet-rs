@@ -1768,11 +1768,14 @@ pub fn verify_observed_bitcoin_htlc_spend(
         .collect::<Vec<_>>();
     let (preimage, expected_public_key) = match branch {
         HtlcSpendBranch::Redeem => {
-            if witness.len() != 4
-                || witness[2].as_slice() != [1]
-                || witness[3] != lock.htlc.witness_script
-            {
-                return Err(BitcoinWalletError::InvalidObservedSpendBranch);
+            if witness.len() != 4 {
+                return Err(BitcoinWalletError::InvalidObservedSpendWitnessShape);
+            }
+            if witness[2].as_slice() != [1] {
+                return Err(BitcoinWalletError::InvalidObservedSpendBranchSelector);
+            }
+            if witness[3] != lock.htlc.witness_script {
+                return Err(BitcoinWalletError::InvalidObservedSpendWitnessScript);
             }
             let preimage = <[u8; 32]>::try_from(witness[1].as_slice())
                 .map_err(|_| BitcoinWalletError::InvalidPreimage)?;
@@ -1790,11 +1793,17 @@ pub fn verify_observed_bitcoin_htlc_spend(
                 || u64::from(transaction.lock_time.to_consensus_u32())
                     < BITCOIN_TIMESTAMP_LOCKTIME_THRESHOLD
                 || htlc_input.sequence == Sequence::MAX
-                || witness.len() != 3
-                || !witness[1].is_empty()
-                || witness[2] != lock.htlc.witness_script
             {
-                return Err(BitcoinWalletError::InvalidObservedSpendBranch);
+                return Err(BitcoinWalletError::InvalidObservedSpendRefundLocktime);
+            }
+            if witness.len() != 3 {
+                return Err(BitcoinWalletError::InvalidObservedSpendWitnessShape);
+            }
+            if !witness[1].is_empty() {
+                return Err(BitcoinWalletError::InvalidObservedSpendBranchSelector);
+            }
+            if witness[2] != lock.htlc.witness_script {
+                return Err(BitcoinWalletError::InvalidObservedSpendWitnessScript);
             }
             (None, &lock.htlc.refund_public_key)
         }
@@ -2013,8 +2022,14 @@ pub enum BitcoinWalletError {
     InvalidObservedSpendShape,
     #[error("observed Bitcoin HTLC spend does not contain exactly one expected funding outpoint")]
     InvalidObservedSpendOutpoint,
-    #[error("observed Bitcoin HTLC spend does not satisfy the expected witness branch")]
-    InvalidObservedSpendBranch,
+    #[error("observed Bitcoin HTLC spend has the wrong witness item count for the expected branch")]
+    InvalidObservedSpendWitnessShape,
+    #[error("observed Bitcoin HTLC spend has the wrong redeem/refund branch selector")]
+    InvalidObservedSpendBranchSelector,
+    #[error("observed Bitcoin HTLC spend witness script differs from the watched funding script")]
+    InvalidObservedSpendWitnessScript,
+    #[error("observed Bitcoin HTLC refund does not satisfy its locktime and sequence")]
+    InvalidObservedSpendRefundLocktime,
     #[error("observed Bitcoin HTLC spend signature encoding or sighash mode is invalid")]
     InvalidObservedSpendSignatureEncoding,
     #[error("observed Bitcoin HTLC spend signature does not authenticate the expected role key")]
