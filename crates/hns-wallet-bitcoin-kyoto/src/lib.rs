@@ -1741,7 +1741,6 @@ pub fn verify_observed_bitcoin_htlc_spend(
     let transaction: Transaction =
         deserialize(raw_transaction).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
     if serialize(&transaction) != raw_transaction
-        || transaction.version != transaction::Version::TWO
         || transaction.input.is_empty()
         || transaction.output.is_empty()
     {
@@ -1767,9 +1766,7 @@ pub fn verify_observed_bitcoin_htlc_spend(
         .collect::<Vec<_>>();
     let (preimage, expected_public_key) = match branch {
         HtlcSpendBranch::Redeem => {
-            if transaction.lock_time != absolute::LockTime::ZERO
-                || htlc_input.sequence != Sequence::MAX
-                || witness.len() != 4
+            if witness.len() != 4
                 || witness[2].as_slice() != [1]
                 || witness[3] != lock.htlc.witness_script
             {
@@ -1783,8 +1780,14 @@ pub fn verify_observed_bitcoin_htlc_spend(
             (Some(preimage), &lock.htlc.receiver_public_key)
         }
         HtlcSpendBranch::Refund => {
-            if transaction.lock_time.to_consensus_u32() != lock.htlc.refund_locktime
-                || htlc_input.sequence != Sequence::ZERO
+            // OP_CHECKLOCKTIMEVERIFY accepts any same-kind transaction
+            // locktime greater than or equal to the script operand, provided
+            // this input is non-final. Exact equality and Sequence::ZERO are
+            // properties of our builder, not Bitcoin consensus requirements.
+            if transaction.lock_time.to_consensus_u32() < lock.htlc.refund_locktime
+                || u64::from(transaction.lock_time.to_consensus_u32())
+                    < BITCOIN_TIMESTAMP_LOCKTIME_THRESHOLD
+                || htlc_input.sequence == Sequence::MAX
                 || witness.len() != 3
                 || !witness[1].is_empty()
                 || witness[2] != lock.htlc.witness_script
@@ -3030,6 +3033,57 @@ mod tests {
             ),
             Err(BitcoinWalletError::FeeLimit)
         ));
+    }
+
+    #[test]
+    fn canonical_observer_accepts_consensus_valid_redeem_transaction_fields() {
+        let signer = TestSettlementSigner(SecretKey::from_slice(&[3; 32]).expect("signer key"));
+        let receiver =
+            PublicKey::from_slice(&signer.compressed_public_key()).expect("receiver public key");
+        let preimage = [9_u8; 32];
+        let deadline = 1_800_000_000;
+        let htlc = BitcoinHtlc::new(Sha256::digest(preimage).into(), receiver, key(4), deadline)
+            .expect("timestamp HTLC");
+        let lock = verify_htlc_funding(&serialize(&funding(&htlc, 50_000)), &htlc, 50_000, 1, 1)
+            .expect("funding lock");
+        let mut transaction = prepare_htlc_spend_template(
+            &lock,
+            ScriptBuf::new_p2wpkh(&key(8).wpubkey_hash().expect("compressed destination")),
+            500,
+            HtlcSpendBranch::Redeem,
+            Some(&preimage),
+            None,
+        )
+        .expect("redeem template");
+
+        // A counterparty is free to choose these transaction-level fields.
+        // They do not alter the selected redeem branch or weaken its script.
+        transaction.version = transaction::Version::ONE;
+        transaction.lock_time =
+            absolute::LockTime::from_time(deadline + 1).expect("timestamp locktime");
+        transaction.input[0].sequence = Sequence::ENABLE_LOCKTIME_NO_RBF;
+        let sighash = SighashCache::new(&transaction)
+            .p2wsh_signature_hash(
+                0,
+                &lock.htlc.witness_script(),
+                BitcoinAmount::from_sat(lock.value_sats),
+                EcdsaSighashType::All,
+            )
+            .expect("redeem sighash")
+            .to_byte_array();
+        let signature = signer.sign_digest(sighash).expect("redeem signature");
+        let raw = finalize_signed_htlc_spend(
+            transaction,
+            HtlcSpendBranch::Redeem,
+            sighash,
+            signature,
+            &receiver,
+        )
+        .expect("signed counterparty redeem");
+
+        let observed = verify_observed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Redeem)
+            .expect("canonical observer accepts consensus-valid fields");
+        assert_eq!(observed.revealed_preimage, Some(preimage));
     }
 
     #[test]
