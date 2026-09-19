@@ -29,7 +29,7 @@ use bdk_wallet::bitcoin::secp256k1::{Message, Secp256k1, SecretKey, ecdsa::Signa
 use bdk_wallet::bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bdk_wallet::bitcoin::{
     Address, Amount as BitcoinAmount, BlockHash, Network, OutPoint, PublicKey, ScriptBuf, Sequence,
-    Transaction, TxIn, TxOut, Witness, bip32::Xpriv, psbt::Psbt, transaction,
+    Transaction, TxIn, TxOut, Weight, Witness, bip32::Xpriv, psbt, psbt::Psbt, transaction,
 };
 use bdk_wallet::template::Bip84;
 use bdk_wallet::{KeychainKind, SignOptions, Wallet};
@@ -1243,6 +1243,127 @@ pub fn sign_bitcoin_htlc_redeem_at_fee_rate_with_settlement_signer(
     )
 }
 
+/// Redeem a small HTLC while paying its relay fee from descriptor-wallet
+/// inputs. The complete HTLC value is delivered to a wallet-owned output;
+/// selected wallet coins pay only the approved transaction fee and return
+/// change to the same wallet.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the sponsored redeem boundary keeps lock, wallet, secret, fee policy, exclusions, and signer explicit"
+)]
+pub fn sign_bitcoin_htlc_redeem_with_wallet_fee_sponsor(
+    wallet: &mut Wallet,
+    permit: &BitcoinValueRuntimePermit,
+    lock: &VerifiedBitcoinLock,
+    destination: ScriptBuf,
+    preimage: [u8; 32],
+    fee_rate_sat_vb: u64,
+    maximum_fee_sats: u64,
+    unspendable: &[OutPoint],
+    signer: &dyn SettlementSigner,
+) -> Result<Vec<u8>, BitcoinWalletError> {
+    lock.htlc.validate()?;
+    if fee_rate_sat_vb == 0 || maximum_fee_sats == 0 {
+        return Err(BitcoinWalletError::InvalidFee);
+    }
+    if Sha256::digest(preimage).as_slice() != lock.htlc.hashlock {
+        return Err(BitcoinWalletError::InvalidPreimage);
+    }
+    let public_key = PublicKey::from_slice(&signer.compressed_public_key())
+        .map_err(|_| BitcoinWalletError::InvalidSwapKeyReference)?;
+    if public_key.to_bytes() != lock.htlc.receiver_public_key {
+        return Err(BitcoinWalletError::InvalidSwapKeyReference);
+    }
+    let outpoint = OutPoint {
+        txid: bdk_wallet::bitcoin::Txid::from_byte_array(lock.funding_txid.into_bytes()),
+        vout: lock.output_index,
+    };
+    let funding_output = TxOut {
+        value: BitcoinAmount::from_sat(lock.value_sats),
+        script_pubkey: lock.htlc.script_pubkey(),
+    };
+    wallet.insert_txout(outpoint, funding_output.clone());
+    let fee_rate = bdk_wallet::bitcoin::FeeRate::from_sat_per_vb(fee_rate_sat_vb)
+        .ok_or(BitcoinWalletError::InvalidFee)?;
+    let mut builder = wallet.build_tx();
+    builder
+        .add_recipient(destination, BitcoinAmount::from_sat(lock.value_sats))
+        .fee_rate(fee_rate)
+        .only_witness_utxo()
+        .add_foreign_utxo(
+            outpoint,
+            psbt::Input {
+                witness_utxo: Some(funding_output),
+                witness_script: Some(lock.htlc.witness_script()),
+                ..Default::default()
+            },
+            Weight::from_wu(400),
+        )
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
+    for excluded in unspendable {
+        builder.add_unspendable(*excluded);
+    }
+    let mut psbt = builder
+        .finish()
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
+    let htlc_index = psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .position(|input| input.previous_output == outpoint)
+        .ok_or(BitcoinWalletError::InvalidEvidence)?;
+    let _ = permit;
+    wallet
+        .sign(
+            &mut psbt,
+            SignOptions {
+                trust_witness_utxo: true,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
+    let sighash = SighashCache::new(&psbt.unsigned_tx)
+        .p2wsh_signature_hash(
+            htlc_index,
+            &lock.htlc.witness_script(),
+            BitcoinAmount::from_sat(lock.value_sats),
+            EcdsaSighashType::All,
+        )
+        .map_err(|_| BitcoinWalletError::InvalidEvidence)?
+        .to_byte_array();
+    let signature = signer
+        .sign_digest(sighash)
+        .map_err(|_| BitcoinWalletError::SigningIncomplete)?;
+    let signature =
+        Signature::from_compact(&signature).map_err(|_| BitcoinWalletError::SigningIncomplete)?;
+    let mut signature_bytes = signature.serialize_der().to_vec();
+    signature_bytes.push(EcdsaSighashType::All.to_u32() as u8);
+    psbt.inputs[htlc_index].final_script_witness = Some(Witness::from_slice(&[
+        signature_bytes,
+        preimage.to_vec(),
+        vec![1],
+        lock.htlc.witness_script.clone(),
+    ]));
+    let transaction = psbt
+        .extract_tx()
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?;
+    let fee_sats = wallet
+        .calculate_fee(&transaction)
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?
+        .to_sat();
+    let required_fee = fee_rate_sat_vb
+        .checked_mul(
+            u64::try_from(transaction.vsize()).map_err(|_| BitcoinWalletError::InvalidFee)?,
+        )
+        .ok_or(BitcoinWalletError::InvalidFee)?;
+    if fee_sats < required_fee || fee_sats > maximum_fee_sats {
+        return Err(BitcoinWalletError::FeeLimit);
+    }
+    let raw = serialize(&transaction);
+    verify_signed_bitcoin_htlc_spend_with_wallet(wallet, &raw, lock, HtlcSpendBranch::Redeem)?;
+    Ok(raw)
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "the exact fee-refinement boundary keeps all policy inputs explicit"
@@ -1460,6 +1581,124 @@ pub fn verify_signed_bitcoin_htlc_spend(
         fee_sats,
         branch,
         revealed_preimage: preimage,
+    })
+}
+
+/// Verify the fee-sponsored redeem form: exactly one expected HTLC input plus
+/// wallet-owned fee inputs, with every output returning to this wallet.
+pub fn verify_signed_bitcoin_htlc_spend_with_wallet(
+    wallet: &Wallet,
+    raw_transaction: &[u8],
+    lock: &VerifiedBitcoinLock,
+    branch: HtlcSpendBranch,
+) -> Result<VerifiedBitcoinHtlcSpend, BitcoinWalletError> {
+    if let Ok(verified) = verify_signed_bitcoin_htlc_spend(raw_transaction, lock, branch) {
+        return Ok(verified);
+    }
+    if branch != HtlcSpendBranch::Redeem
+        || raw_transaction.is_empty()
+        || raw_transaction.len() > MAX_BITCOIN_TRANSACTION_BYTES
+    {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    lock.htlc.validate()?;
+    let transaction: Transaction =
+        deserialize(raw_transaction).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    if serialize(&transaction) != raw_transaction
+        || transaction.version != transaction::Version::TWO
+        || transaction.lock_time != absolute::LockTime::ZERO
+        || transaction.input.len() < 2
+        || transaction.output.is_empty()
+    {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    let expected_outpoint = OutPoint {
+        txid: bdk_wallet::bitcoin::Txid::from_byte_array(lock.funding_txid.into_bytes()),
+        vout: lock.output_index,
+    };
+    let mut matching = transaction
+        .input
+        .iter()
+        .enumerate()
+        .filter(|(_, input)| input.previous_output == expected_outpoint);
+    let (htlc_index, htlc_input) = matching.next().ok_or(BitcoinWalletError::InvalidEvidence)?;
+    if matching.next().is_some() || htlc_input.sequence != Sequence::MAX {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    for (index, input) in transaction.input.iter().enumerate() {
+        if index != htlc_index
+            && (wallet.get_utxo(input.previous_output).is_none() || input.witness.is_empty())
+        {
+            return Err(BitcoinWalletError::InvalidEvidence);
+        }
+    }
+    if transaction
+        .output
+        .iter()
+        .any(|output| !wallet.is_mine(output.script_pubkey.clone()))
+        || transaction
+            .output
+            .iter()
+            .filter(|output| output.value.to_sat() == lock.value_sats)
+            .count()
+            != 1
+    {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    let witness = htlc_input
+        .witness
+        .iter()
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    if witness.len() != 4 || witness[2].as_slice() != [1] || witness[3] != lock.htlc.witness_script
+    {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    let preimage = <[u8; 32]>::try_from(witness[1].as_slice())
+        .map_err(|_| BitcoinWalletError::InvalidPreimage)?;
+    if Sha256::digest(preimage).as_slice() != lock.htlc.hashlock {
+        return Err(BitcoinWalletError::InvalidPreimage);
+    }
+    let signature_bytes = witness[0]
+        .strip_suffix(&[EcdsaSighashType::All.to_u32() as u8])
+        .ok_or(BitcoinWalletError::InvalidEvidence)?;
+    let signature =
+        Signature::from_der(signature_bytes).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    let mut normalized = signature;
+    normalized.normalize_s();
+    if normalized != signature {
+        return Err(BitcoinWalletError::InvalidEvidence);
+    }
+    let public_key = PublicKey::from_slice(&lock.htlc.receiver_public_key)
+        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    let sighash = SighashCache::new(&transaction)
+        .p2wsh_signature_hash(
+            htlc_index,
+            &lock.htlc.witness_script(),
+            BitcoinAmount::from_sat(lock.value_sats),
+            EcdsaSighashType::All,
+        )
+        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    Secp256k1::verification_only()
+        .verify_ecdsa(
+            &Message::from_digest(sighash.to_byte_array()),
+            &signature,
+            &public_key.inner,
+        )
+        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    let fee_sats = wallet
+        .calculate_fee(&transaction)
+        .map_err(|error| BitcoinWalletError::Wallet(error.to_string()))?
+        .to_sat();
+    if fee_sats == 0 {
+        return Err(BitcoinWalletError::InvalidFee);
+    }
+    Ok(VerifiedBitcoinHtlcSpend {
+        txid: TransactionHash::new(transaction.compute_txid().to_byte_array()),
+        wtxid: transaction.compute_wtxid().to_byte_array(),
+        fee_sats,
+        branch,
+        revealed_preimage: Some(preimage),
     })
 }
 

@@ -30,7 +30,7 @@ use crate::{
     BitcoinHtlcWatchRequest, BitcoinWalletError, EncryptedPersistedBitcoinWallet, HtlcSpendBranch,
     KyotoRuntimeConfig, MAX_RECOVERY_SCRIPT_INDEX, MatchedBitcoinBlock, VerifiedBitcoinLock,
     load_bitcoin_htlc_watches, reconcile_bitcoin_htlc_watches, register_bitcoin_htlc_watch,
-    verify_signed_bitcoin_htlc_spend, watched_scripts,
+    verify_signed_bitcoin_htlc_spend_with_wallet, watched_scripts,
 };
 
 pub const KYOTO_WALLET_STATE_VERSION: u16 = 1;
@@ -3112,7 +3112,8 @@ pub fn derive_bitcoin_htlc_spend_broadcast_approval(
     if maximum_fee_sats == 0 || expires_at_unix == 0 {
         return Err(BitcoinWalletError::InvalidBroadcastApproval);
     }
-    let verified = verify_signed_bitcoin_htlc_spend(raw_transaction, lock, branch)?;
+    let verified =
+        verify_signed_bitcoin_htlc_spend_with_wallet(wallet, raw_transaction, lock, branch)?;
     if verified.fee_sats > maximum_fee_sats {
         return Err(BitcoinWalletError::FeeLimit);
     }

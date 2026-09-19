@@ -30,9 +30,10 @@ use hns_wallet_bitcoin_kyoto::{
     monitor_kyoto_sync_progress, persist_prepared_bitcoin_broadcast,
     persist_prepared_bitcoin_htlc_spend_broadcast, prepare_bitcoin_htlc_funding_excluding,
     prepare_native_send_excluding, recommended_initialization_checkpoint,
-    sign_bitcoin_htlc_redeem_at_fee_rate_with_settlement_signer,
+    sign_bitcoin_htlc_redeem_with_wallet_fee_sponsor,
     sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
-    unobserved_approved_broadcast_inputs, verify_htlc_funding, verify_signed_bitcoin_htlc_spend,
+    unobserved_approved_broadcast_inputs, verify_htlc_funding,
+    verify_signed_bitcoin_htlc_spend_with_wallet,
 };
 use hns_wallet_hns::{HnsNetwork, HnsRuntimeConfig};
 use hns_wallet_store::{SecretKind, SharedWalletStore, WalletStore};
@@ -1306,14 +1307,13 @@ impl MobileBitcoinValueController {
                 Some(runtime.block_on(supervisor.validated_chain_lock_context())?)
             }
         };
+        let committed_inputs = self.unobserved_approved_inputs()?;
         let destination = {
             let wallet = self.wallet_mut()?;
-            let destination = wallet
+            wallet
                 .reveal_next_address(KeychainKind::Internal)
                 .address
-                .script_pubkey();
-            wallet.persist(now_unix)?;
-            destination
+                .script_pubkey()
         };
         let preimage = permit
             .take_preimage()
@@ -1321,15 +1321,19 @@ impl MobileBitcoinValueController {
         let raw_transaction = match branch {
             HtlcSpendBranch::Redeem => {
                 let preimage = preimage.ok_or(MobileWalletError::InvalidBitcoinAction)?;
-                sign_bitcoin_htlc_redeem_at_fee_rate_with_settlement_signer(
-                    &lock,
+                let raw = sign_bitcoin_htlc_redeem_with_wallet_fee_sponsor(
+                    self.wallet_mut()?,
                     &bitcoin_value_runtime_permit()?,
+                    &lock,
                     destination,
                     preimage,
                     fee_rate_sat_vb,
                     maximum_fee_sats,
+                    &committed_inputs,
                     permit.settlement_key(),
-                )?
+                )?;
+                self.wallet_mut()?.persist(now_unix)?;
+                raw
             }
             HtlcSpendBranch::Refund => sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer(
                 &lock,
@@ -1343,11 +1347,19 @@ impl MobileBitcoinValueController {
                 permit.settlement_key(),
             )?,
         };
-        let verified = verify_signed_bitcoin_htlc_spend(&raw_transaction, &lock, branch)?;
-        let output_amount_sats = lock
-            .value_sats
-            .checked_sub(verified.fee_sats)
-            .ok_or(MobileWalletError::InvalidBitcoinAction)?;
+        let wallet = self
+            .wallet
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let verified =
+            verify_signed_bitcoin_htlc_spend_with_wallet(wallet, &raw_transaction, &lock, branch)?;
+        let output_amount_sats = match branch {
+            HtlcSpendBranch::Redeem => lock.value_sats,
+            HtlcSpendBranch::Refund => lock
+                .value_sats
+                .checked_sub(verified.fee_sats)
+                .ok_or(MobileWalletError::InvalidBitcoinAction)?,
+        };
         let action_token = random_nonzero_bytes()?;
         let approval = MobileBitcoinHtlcSettlementApproval {
             action_token: lowercase_hex(&action_token),
