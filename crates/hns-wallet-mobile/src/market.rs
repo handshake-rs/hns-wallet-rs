@@ -1942,8 +1942,10 @@ impl MobileShakescapeSessionController {
                 let mut execution =
                     hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
                         .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
-                if execution.state != SwapState::FirstFunded
-                    || execution.first_module != hns_wallet_types::ModuleId::Handshake
+                if !matches!(
+                    execution.state,
+                    SwapState::FirstFunded | SwapState::SecondFundingPending
+                ) || execution.first_module != hns_wallet_types::ModuleId::Handshake
                     || execution.second_module != hns_wallet_types::ModuleId::Bitcoin
                 {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
@@ -1970,12 +1972,18 @@ impl MobileShakescapeSessionController {
                 {
                     return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
-                let mut journal = WalletStoreJournal {
-                    store,
-                    workflow_id: shakescape_execution_workflow_id(session_id),
-                    updated_at_unix: now_unix,
-                };
-                execution.apply(VerifiedEvidence::SecondFundingReady, now_unix, &mut journal)?;
+                if execution.state == SwapState::FirstFunded {
+                    let mut journal = WalletStoreJournal {
+                        store,
+                        workflow_id: shakescape_execution_workflow_id(session_id),
+                        updated_at_unix: now_unix,
+                    };
+                    execution.apply(
+                        VerifiedEvidence::SecondFundingReady,
+                        now_unix,
+                        &mut journal,
+                    )?;
+                }
                 Ok(MobileShakescapeBitcoinFundingPermit {
                     hello,
                     side: SwapAssetSide::Received,
@@ -2501,8 +2509,10 @@ impl MobileShakescapeSessionController {
                 let execution =
                     hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
                         .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
-                if execution.state != SwapState::FirstFunded
-                    || execution.first_module != hns_wallet_types::ModuleId::Bitcoin
+                if !matches!(
+                    execution.state,
+                    SwapState::FirstFunded | SwapState::SecondFundingPending
+                ) || execution.first_module != hns_wallet_types::ModuleId::Bitcoin
                     || execution.second_module != hns_wallet_types::ModuleId::Handshake
                 {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
@@ -2531,14 +2541,20 @@ impl MobileShakescapeSessionController {
                 {
                     return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
-                let workflow_id = shakescape_execution_workflow_id(session_id);
-                let mut execution = execution;
-                let mut journal = WalletStoreJournal {
-                    store,
-                    workflow_id,
-                    updated_at_unix: now_unix,
-                };
-                execution.apply(VerifiedEvidence::SecondFundingReady, now_unix, &mut journal)?;
+                if execution.state == SwapState::FirstFunded {
+                    let workflow_id = shakescape_execution_workflow_id(session_id);
+                    let mut execution = execution;
+                    let mut journal = WalletStoreJournal {
+                        store,
+                        workflow_id,
+                        updated_at_unix: now_unix,
+                    };
+                    execution.apply(
+                        VerifiedEvidence::SecondFundingReady,
+                        now_unix,
+                        &mut journal,
+                    )?;
+                }
                 Ok(MobileShakescapeHnsFundingPermit {
                     hello,
                     side: SwapAssetSide::Received,
@@ -4538,6 +4554,24 @@ mod tests {
             taker_controller
                 .durable_executions()
                 .expect("taker execution")[0]
+                .state,
+            SwapState::SecondFundingPending
+        );
+        let retried_hns_permit = taker_controller
+            .authorize_local_hns_second_funding(offer.offer.session_id, START + 52)
+            .expect("second-chain HNS funding permit is restart-safe");
+        assert_eq!(
+            retried_hns_permit.hello().swap_session_id,
+            hns_permit.hello().swap_session_id
+        );
+        assert_eq!(
+            retried_hns_permit.hns_fee_reserve_dollarydoos(),
+            hns_permit.hns_fee_reserve_dollarydoos()
+        );
+        assert_eq!(
+            taker_controller
+                .durable_executions()
+                .expect("retried taker execution")[0]
                 .state,
             SwapState::SecondFundingPending
         );
