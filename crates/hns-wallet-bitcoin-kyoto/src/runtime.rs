@@ -1152,13 +1152,19 @@ struct KyotoWalletSwapUpdate {
     swap_blocks: Vec<MatchedBitcoinBlock>,
 }
 
+#[derive(Clone, Copy)]
+struct QueuedBitcoinBlock {
+    height: u32,
+    swap_match: bool,
+}
+
 /// One compact-filter consumer for both the descriptor wallet and every
 /// active native HTLC. Keeping the script sets in one subscriber avoids a
 /// second node, a second peer pool, or counterparty-provided chain authority.
 struct KyotoWalletSwapSubscriber {
     requester: Requester,
     receiver: bip157::tokio::sync::mpsc::UnboundedReceiver<Event>,
-    queued_blocks: BTreeMap<BlockHash, bool>,
+    queued_blocks: BTreeMap<BlockHash, QueuedBitcoinBlock>,
     wallet_scripts: HashSet<ScriptBuf>,
     swap_scripts: BTreeMap<SessionId, ScriptBuf>,
     chain: CheckPoint,
@@ -1219,10 +1225,17 @@ impl KyotoWalletSwapSubscriber {
                     let swap_match = filter.contains_any(self.swap_scripts.values());
                     self.progress.record_filter(wallet_match || swap_match);
                     if wallet_match || swap_match {
-                        self.queued_blocks
-                            .entry(filter.block_hash())
-                            .and_modify(|queued_for_swap| *queued_for_swap |= swap_match)
-                            .or_insert(swap_match);
+                        let hash = filter.block_hash();
+                        let height = filter.height();
+                        if let Some(queued) = self.queued_blocks.get_mut(&hash) {
+                            if queued.height != height {
+                                return Err(BitcoinWalletError::InvalidEvidence);
+                            }
+                            queued.swap_match |= swap_match;
+                        } else {
+                            self.queued_blocks
+                                .insert(hash, QueuedBitcoinBlock { height, swap_match });
+                        }
                     }
                 }
                 Event::ChainUpdate(changes) => self.apply_chain_event(&changes),
@@ -1239,22 +1252,36 @@ impl KyotoWalletSwapSubscriber {
                         VecDeque::with_capacity(MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS);
                     loop {
                         while pending.len() < MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS {
-                            let Some((hash, swap_match)) = remaining.next() else {
+                            let Some((hash, queued)) = remaining.next() else {
                                 break;
                             };
                             let receiver = self
                                 .requester
                                 .request_block(hash)
                                 .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
-                            pending.push_back((swap_match, receiver));
+                            pending.push_back((hash, queued, receiver));
                         }
-                        let Some((swap_match, receiver)) = pending.pop_front() else {
+                        let Some((requested_hash, queued, receiver)) = pending.pop_front() else {
                             break;
                         };
                         let indexed = receiver
                             .await
                             .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?
                             .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
+                        let block_hash = indexed.block.block_hash();
+                        if indexed.height != queued.height || block_hash != requested_hash {
+                            return Err(BitcoinWalletError::InvalidEvidence);
+                        }
+                        // The filter that selected this block was authenticated
+                        // against Kyoto's canonical header/filter-header chain.
+                        // Retain that exact historical checkpoint in the BDK
+                        // chain handed to sparse publication so an approved
+                        // transaction recovered below the ordinary reorg window
+                        // can carry a verifiable confirmation anchor.
+                        self.chain = self.chain.clone().insert(BlockId {
+                            height: indexed.height,
+                            hash: block_hash,
+                        });
                         self.progress.record_downloaded_block();
                         let _ = self
                             .graph
@@ -1265,9 +1292,9 @@ impl KyotoWalletSwapSubscriber {
                             indexed.height,
                             &mut unobserved_broadcast_txids,
                         );
-                        if swap_match || approved_broadcast_match {
+                        if queued.swap_match || approved_broadcast_match {
                             swap_blocks.insert(
-                                indexed.block.block_hash(),
+                                block_hash,
                                 MatchedBitcoinBlock {
                                     height: indexed.height,
                                     block: indexed.block,
@@ -4296,6 +4323,72 @@ mod restart_tests {
                 .get(replaced.height)
                 .map(|checkpoint| checkpoint.hash()),
             Some(canonical_at_replaced_height.hash)
+        );
+    }
+
+    #[test]
+    fn recovered_historical_block_connects_its_transaction_anchor() {
+        let mut wallet = crate::create_descriptor_wallet_from_seed(
+            &[12_u8; crate::BIP39_SEED_BYTES],
+            Network::Regtest,
+        )
+        .expect("descriptor wallet");
+        let genesis = wallet.latest_checkpoint().block_id();
+        let tip = BlockId {
+            height: 1_000,
+            hash: block_hash(1_000),
+        };
+        wallet
+            .apply_update(Update {
+                chain: Some(
+                    CheckPoint::from_block_ids([genesis, tip]).expect("sparse wallet chain"),
+                ),
+                ..Update::default()
+            })
+            .expect("install sparse chain");
+
+        let recovered = BlockId {
+            height: 900,
+            hash: block_hash(900),
+        };
+        let anchor = ConfirmationBlockTime {
+            block_id: recovered,
+            confirmation_time: 1_700_000_000,
+        };
+        let mut transaction_update = TxUpdate::default();
+        transaction_update.anchors.insert((
+            anchor,
+            bdk_wallet::bitcoin::Txid::from_byte_array([0x88; 32]),
+        ));
+        let recovery_checkpoint = BitcoinCheckpoint {
+            height: genesis.height,
+            block_hash: genesis.hash.to_byte_array(),
+        };
+
+        let without_recovered = wallet.latest_checkpoint();
+        assert!(matches!(
+            sparse_wallet_chain_update(
+                &wallet,
+                &without_recovered,
+                &transaction_update,
+                recovery_checkpoint,
+            ),
+            Err(BitcoinWalletError::InvalidEvidence)
+        ));
+
+        let with_recovered = without_recovered.insert(recovered);
+        let sparse = sparse_wallet_chain_update(
+            &wallet,
+            &with_recovered,
+            &transaction_update,
+            recovery_checkpoint,
+        )
+        .expect("historical anchor is connected by its authenticated checkpoint");
+        assert_eq!(
+            sparse
+                .get(recovered.height)
+                .map(|checkpoint| checkpoint.hash()),
+            Some(recovered.hash)
         );
     }
 
