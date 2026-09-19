@@ -524,11 +524,26 @@ fn spend_candidates(
                 continue;
             }
             let raw = serialize(transaction);
-            let verified = verify_observed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Redeem)
-                .or_else(|_| {
-                    verify_observed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Refund)
-                })
-                .map_err(|_| BitcoinWalletError::InvalidSwapSpendEvidence)?;
+            let verified =
+                match verify_observed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Redeem) {
+                    Ok(verified) => verified,
+                    Err(redeem_error) => {
+                        match verify_observed_bitcoin_htlc_spend(
+                            &raw,
+                            &lock,
+                            HtlcSpendBranch::Refund,
+                        ) {
+                            Ok(verified) => verified,
+                            Err(refund_error) => {
+                                return Err(BitcoinWalletError::InvalidSwapSpendEvidence {
+                                    txid: transaction.compute_txid().to_string(),
+                                    redeem_error: redeem_error.to_string(),
+                                    refund_error: refund_error.to_string(),
+                                });
+                            }
+                        }
+                    }
+                };
             let confirmations = confirmation_count(tip.height, matched.height)?;
             candidates.push(PersistedBitcoinSwapObservation {
                 txid: verified.txid.into_bytes(),

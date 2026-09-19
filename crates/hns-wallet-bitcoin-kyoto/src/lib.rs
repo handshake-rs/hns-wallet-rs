@@ -1799,10 +1799,16 @@ pub fn verify_observed_bitcoin_htlc_spend(
     };
     let signature_bytes = witness
         .first()
-        .and_then(|signature| signature.strip_suffix(&[EcdsaSighashType::All.to_u32() as u8]))
+        .filter(|signature| signature.len() > 1)
         .ok_or(BitcoinWalletError::InvalidEvidence)?;
-    let signature =
-        Signature::from_der(signature_bytes).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    let sighash_type = EcdsaSighashType::from_standard(u32::from(
+        *signature_bytes
+            .last()
+            .ok_or(BitcoinWalletError::InvalidEvidence)?,
+    ))
+    .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+    let signature = Signature::from_der(&signature_bytes[..signature_bytes.len() - 1])
+        .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
     let mut normalized = signature;
     normalized.normalize_s();
     if normalized != signature {
@@ -1815,7 +1821,7 @@ pub fn verify_observed_bitcoin_htlc_spend(
             htlc_index,
             &lock.htlc.witness_script(),
             BitcoinAmount::from_sat(lock.value_sats),
-            EcdsaSighashType::All,
+            sighash_type,
         )
         .map_err(|_| BitcoinWalletError::InvalidEvidence)?;
     Secp256k1::verification_only()
@@ -2006,9 +2012,13 @@ pub enum BitcoinWalletError {
     #[error("a compact-filter-matched swap block is absent from the authenticated chain")]
     InvalidSwapBlockEvidence,
     #[error(
-        "a canonical Bitcoin transaction spending the watched HTLC failed exact branch verification"
+        "canonical Bitcoin transaction {txid} spending the watched HTLC failed branch verification (redeem: {redeem_error}; refund: {refund_error})"
     )]
-    InvalidSwapSpendEvidence,
+    InvalidSwapSpendEvidence {
+        txid: String,
+        redeem_error: String,
+        refund_error: String,
+    },
     #[error("chain evidence contains multiple possible matches")]
     AmbiguousEvidence,
     #[error("Bitcoin checkpoint is invalid")]
@@ -3036,7 +3046,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_observer_accepts_consensus_valid_redeem_transaction_fields() {
+    fn canonical_observer_accepts_consensus_valid_redeem_fields_and_sighash() {
         let signer = TestSettlementSigner(SecretKey::from_slice(&[3; 32]).expect("signer key"));
         let receiver =
             PublicKey::from_slice(&signer.compressed_public_key()).expect("receiver public key");
@@ -3062,24 +3072,29 @@ mod tests {
         transaction.lock_time =
             absolute::LockTime::from_time(deadline + 1).expect("timestamp locktime");
         transaction.input[0].sequence = Sequence::ENABLE_LOCKTIME_NO_RBF;
+        let sighash_type = EcdsaSighashType::AllPlusAnyoneCanPay;
         let sighash = SighashCache::new(&transaction)
             .p2wsh_signature_hash(
                 0,
                 &lock.htlc.witness_script(),
                 BitcoinAmount::from_sat(lock.value_sats),
-                EcdsaSighashType::All,
+                sighash_type,
             )
             .expect("redeem sighash")
             .to_byte_array();
-        let signature = signer.sign_digest(sighash).expect("redeem signature");
-        let raw = finalize_signed_htlc_spend(
-            transaction,
-            HtlcSpendBranch::Redeem,
-            sighash,
-            signature,
-            &receiver,
-        )
-        .expect("signed counterparty redeem");
+        let signature =
+            Signature::from_compact(&signer.sign_digest(sighash).expect("redeem signature"))
+                .expect("compact signature");
+        let mut signature_bytes = signature.serialize_der().to_vec();
+        signature_bytes.push(sighash_type.to_u32() as u8);
+        let mut witness = transaction.input[0]
+            .witness
+            .iter()
+            .map(<[u8]>::to_vec)
+            .collect::<Vec<_>>();
+        witness[0] = signature_bytes;
+        transaction.input[0].witness = Witness::from_slice(&witness);
+        let raw = serialize(&transaction);
 
         let observed = verify_observed_bitcoin_htlc_spend(&raw, &lock, HtlcSpendBranch::Redeem)
             .expect("canonical observer accepts consensus-valid fields");
