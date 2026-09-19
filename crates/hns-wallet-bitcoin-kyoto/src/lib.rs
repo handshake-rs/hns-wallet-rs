@@ -1287,6 +1287,11 @@ pub fn sign_bitcoin_htlc_redeem_with_wallet_fee_sponsor(
         .ok_or(BitcoinWalletError::InvalidFee)?;
     let mut builder = wallet.build_tx();
     builder
+        // A redeem branch has no chain-height condition. Pinning nLockTime to
+        // zero also prevents BDK's anti-fee-sniping default from making the
+        // signed transaction disagree with the exact redeem verifier below.
+        .nlocktime(absolute::LockTime::ZERO)
+        .version(2)
         .add_recipient(destination, BitcoinAmount::from_sat(lock.value_sats))
         .fee_rate(fee_rate)
         .only_witness_utxo()
@@ -2894,6 +2899,97 @@ mod tests {
             ),
             Err(BitcoinWalletError::FeeLimit)
         ));
+    }
+
+    #[test]
+    fn descriptor_wallet_can_sponsor_a_dust_sized_htlc_redeem_fee() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let mnemonic = parse_recovery_phrase(phrase).expect("mnemonic");
+        let mut wallet = create_descriptor_wallet(&mnemonic, Network::Regtest).expect("wallet");
+        let sponsor_address = wallet.reveal_next_address(KeychainKind::External).address;
+        let sponsor_transaction = Transaction {
+            version: transaction::Version::TWO,
+            lock_time: absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: bdk_wallet::bitcoin::Txid::from_byte_array([44; 32]),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: BitcoinAmount::from_sat(600),
+                script_pubkey: sponsor_address.script_pubkey(),
+            }],
+        };
+        wallet.apply_unconfirmed_txs([(sponsor_transaction, 1)]);
+
+        let signer = TestSettlementSigner(SecretKey::from_slice(&[3; 32]).expect("signer key"));
+        let signer_public_key =
+            PublicKey::from_slice(&signer.compressed_public_key()).expect("signer public key");
+        let preimage = [9_u8; 32];
+        let htlc = BitcoinHtlc::new(
+            Sha256::digest(preimage).into(),
+            signer_public_key,
+            key(4),
+            500,
+        )
+        .expect("HTLC");
+        let lock = verify_htlc_funding(&serialize(&funding(&htlc, 330)), &htlc, 330, 1, 1)
+            .expect("dust-sized funded lock");
+        let destination = wallet
+            .reveal_next_address(KeychainKind::Internal)
+            .address
+            .script_pubkey();
+        let raw = sign_bitcoin_htlc_redeem_with_wallet_fee_sponsor(
+            &mut wallet,
+            &BitcoinValueRuntimePermit(()),
+            &lock,
+            destination,
+            preimage,
+            1,
+            1_000,
+            &[],
+            &signer,
+        )
+        .expect("wallet-sponsored redeem");
+        let transaction: Transaction = deserialize(&raw).expect("signed transaction");
+        assert_eq!(transaction.lock_time, absolute::LockTime::ZERO);
+        assert_eq!(transaction.version, transaction::Version::TWO);
+        assert_eq!(transaction.input.len(), 2);
+        assert!(
+            transaction
+                .input
+                .iter()
+                .any(|input| input.previous_output.vout == lock.output_index
+                    && input.previous_output.txid.to_byte_array()
+                        == lock.funding_txid.into_bytes()
+                    && input.sequence == Sequence::MAX)
+        );
+        let verified = verify_signed_bitcoin_htlc_spend_with_wallet(
+            &wallet,
+            &raw,
+            &lock,
+            HtlcSpendBranch::Redeem,
+        )
+        .expect("strictly verified wallet-sponsored redeem");
+        assert!(verified.fee_sats > 0);
+        assert!(verified.fee_sats <= 1_000);
+        assert_eq!(verified.revealed_preimage, Some(preimage));
+        assert!(
+            transaction
+                .output
+                .iter()
+                .any(|output| output.value.to_sat() == lock.value_sats)
+        );
+        assert!(
+            transaction
+                .output
+                .iter()
+                .all(|output| wallet.is_mine(output.script_pubkey.clone()))
+        );
     }
 
     #[test]
