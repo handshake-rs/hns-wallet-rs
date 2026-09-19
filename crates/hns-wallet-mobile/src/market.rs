@@ -1251,8 +1251,7 @@ impl MobileShakescapeSessionController {
                     };
                     execution.apply(
                         VerifiedEvidence::TerminalFailure {
-                            reason: "funding deadline expired before first-chain authorization"
-                                .to_owned(),
+                            reason: hns_wallet_market::PREFUNDING_DEADLINE_FAILURE.to_owned(),
                         },
                         now_unix,
                         &mut journal,
@@ -1391,8 +1390,7 @@ impl MobileShakescapeSessionController {
                 };
                 execution.apply(
                     VerifiedEvidence::TerminalFailure {
-                        reason: "funding deadline expired with verified absence of a Bitcoin lock"
-                            .to_owned(),
+                        reason: hns_wallet_market::PREFUNDING_BITCOIN_ABSENCE_FAILURE.to_owned(),
                     },
                     now_unix,
                     &mut journal,
@@ -1453,20 +1451,38 @@ impl MobileShakescapeSessionController {
         &self,
     ) -> Result<Vec<hns_wallet_types::SessionId>, MobileWalletError> {
         self.store
-            .try_with_store(|store| list_shakescape_executions(store, &self.policy))
-            .map_err(MobileWalletError::from)
-            .map(|sessions| {
-                sessions
-                    .into_iter()
-                    .filter(|session| {
-                        (session.state == SwapState::FirstFundingPending
-                            && session.first_module == hns_wallet_types::ModuleId::Bitcoin)
-                            || (session.state == SwapState::SecondFundingPending
-                                && session.second_module == hns_wallet_types::ModuleId::Bitcoin)
-                    })
-                    .map(|session| session.id)
-                    .collect()
+            .try_with_store(|store| {
+                let mut pending = Vec::new();
+                for session in list_shakescape_executions(store, &self.policy)? {
+                    let ordinary_pending = (session.state == SwapState::FirstFundingPending
+                        && session.first_module == hns_wallet_types::ModuleId::Bitcoin)
+                        || (session.state == SwapState::SecondFundingPending
+                            && session.second_module == hns_wallet_types::ModuleId::Bitcoin);
+                    let recoverable_timeout = session.state == SwapState::Failed
+                        && session.first_module == hns_wallet_types::ModuleId::Bitcoin
+                        && session.first_funding.is_none()
+                        && session.second_funding.is_none()
+                        && matches!(
+                            session.failure_reason.as_deref(),
+                            Some(
+                                hns_wallet_market::PREFUNDING_DEADLINE_FAILURE
+                                    | hns_wallet_market::PREFUNDING_BITCOIN_ABSENCE_FAILURE
+                            )
+                        )
+                        && load_shakescape_direct_swap(store, &self.policy, session.id)?
+                            .is_some_and(|record| {
+                                record.peer_funding_statuses.iter().any(|retained| {
+                                    retained.status.chain
+                                        == hns_marketplace_protocol::ChainId::BITCOIN
+                                })
+                            });
+                    if ordinary_pending || recoverable_timeout {
+                        pending.push(session.id);
+                    }
+                }
+                Ok::<_, hns_wallet_market::MarketError>(pending)
             })
+            .map_err(MobileWalletError::from)
     }
 
     /// Return one accepted local-taker session whose first-chain Bitcoin watch

@@ -68,6 +68,21 @@ pub use settlement_key::{
     derive_cross_chain_swap_key_from_store, load_cross_chain_swap_key_allocation,
 };
 
+/// Terminal reason used when a countersigned session reaches its funding
+/// deadline before either participant has supplied locally verified chain
+/// evidence. A later exact-chain observation is allowed to recover only this
+/// narrowly identified pre-funding timeout (and the independently proven
+/// Bitcoin-absence variant below); arbitrary failed sessions stay terminal.
+pub const PREFUNDING_DEADLINE_FAILURE: &str =
+    "funding deadline expired before first-chain authorization";
+
+/// Terminal reason used after the local Bitcoin backend independently proves
+/// that an expired first-chain lock is absent. Chain evidence can still race
+/// that snapshot, so a later verified exact lock must supersede the absence
+/// result and restore the funded recovery path.
+pub const PREFUNDING_BITCOIN_ABSENCE_FAILURE: &str =
+    "funding deadline expired with verified absence of a Bitcoin lock";
+
 pub const MAX_CONCURRENT_SWAP_SESSIONS: usize = 16;
 
 const SHAKESCAPE_EXECUTION_WORKFLOW_DOMAIN: &[u8] =
@@ -251,6 +266,23 @@ impl SwapSession {
                 VerifiedEvidence::FirstFundingConfirmed { evidence },
             ) => {
                 self.first_funding = Some(evidence);
+                SwapState::FirstFunded
+            }
+            (SwapState::Failed, VerifiedEvidence::FirstFundingConfirmed { evidence })
+                if self.first_funding.is_none()
+                    && self.second_funding.is_none()
+                    && matches!(
+                        self.failure_reason.as_deref(),
+                        Some(PREFUNDING_DEADLINE_FAILURE | PREFUNDING_BITCOIN_ABSENCE_FAILURE)
+                    ) =>
+            {
+                // A timeout is evidence that the coordinator had not yet
+                // observed a lock, not evidence that no lock can exist. Once
+                // the local chain verifier proves the exact terms-bound HTLC,
+                // restoring FirstFunded is the only safe state: settlement or
+                // refund recovery must remain available for locked funds.
+                self.first_funding = Some(evidence);
+                self.failure_reason = None;
                 SwapState::FirstFunded
             }
             (SwapState::FirstFunded, VerifiedEvidence::SecondFundingReady) => {
@@ -581,6 +613,19 @@ pub fn apply_locally_verified_shakescape_funding(
     }
     let evidence = match stored.state.state {
         SwapState::FirstFundingPending if funding.module() == stored.state.first_module => {
+            vec![VerifiedEvidence::FirstFundingConfirmed {
+                evidence: funding_evidence,
+            }]
+        }
+        SwapState::Failed
+            if funding.module() == stored.state.first_module
+                && stored.state.first_funding.is_none()
+                && stored.state.second_funding.is_none()
+                && matches!(
+                    stored.state.failure_reason.as_deref(),
+                    Some(PREFUNDING_DEADLINE_FAILURE | PREFUNDING_BITCOIN_ABSENCE_FAILURE)
+                ) =>
+        {
             vec![VerifiedEvidence::FirstFundingConfirmed {
                 evidence: funding_evidence,
             }]
@@ -1383,6 +1428,62 @@ mod tests {
                 .expect("transition");
         }
         assert_eq!(session.state, SwapState::Refunded);
+    }
+
+    #[test]
+    fn verified_first_funding_recovers_only_a_prefunding_timeout_failure() {
+        let mut timed_out = SwapSession::new(
+            SessionId::new([0x41; 32]),
+            ModuleId::Bitcoin,
+            ModuleId::Handshake,
+            quote(),
+            ObjectHash::new([0x42; 32]),
+            TimeoutPlan {
+                first_chain_refund_at: 500,
+                second_chain_refund_at: 300,
+                minimum_safety_margin: 100,
+            },
+            10,
+        )
+        .expect("session");
+        timed_out.state = SwapState::FirstFundingPending;
+        let mut journal = MemoryJournal::default();
+        timed_out
+            .apply(
+                VerifiedEvidence::TerminalFailure {
+                    reason: PREFUNDING_DEADLINE_FAILURE.to_owned(),
+                },
+                20,
+                &mut journal,
+            )
+            .expect("record timeout");
+        timed_out
+            .apply(
+                VerifiedEvidence::FirstFundingConfirmed {
+                    evidence: ObjectHash::new([0x43; 32]),
+                },
+                21,
+                &mut journal,
+            )
+            .expect("verified lock supersedes timeout");
+        assert_eq!(timed_out.state, SwapState::FirstFunded);
+        assert_eq!(timed_out.first_funding, Some(ObjectHash::new([0x43; 32])));
+        assert_eq!(timed_out.failure_reason, None);
+
+        let mut unrelated_failure = timed_out.clone();
+        unrelated_failure.state = SwapState::Failed;
+        unrelated_failure.first_funding = None;
+        unrelated_failure.failure_reason = Some("corrupt settlement terms".to_owned());
+        assert_eq!(
+            unrelated_failure.apply(
+                VerifiedEvidence::FirstFundingConfirmed {
+                    evidence: ObjectHash::new([0x44; 32]),
+                },
+                22,
+                &mut journal,
+            ),
+            Err(MarketError::InvalidTransition)
+        );
     }
 
     fn accepted_terms(first_funding_chain: ChainId) -> SwapSessionHello {
