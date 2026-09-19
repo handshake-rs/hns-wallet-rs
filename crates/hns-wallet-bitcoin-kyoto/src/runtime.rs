@@ -3440,15 +3440,31 @@ fn persist_approved_bitcoin_broadcast(
 }
 
 fn restart_requires_recovery(state: &KyotoWalletState, wallet: &Wallet) -> bool {
-    if state.completed_syncs == 0
-        || matches!(
-            &state.phase,
-            KyotoSyncPhase::RecoveryRequired { .. } | KyotoSyncPhase::Initialized
-        )
-    {
+    let wallet_tip = BitcoinCheckpoint::from_wallet(wallet);
+    restart_state_requires_recovery(state, wallet_tip)
+}
+
+fn restart_state_requires_recovery(
+    state: &KyotoWalletState,
+    wallet_tip: BitcoinCheckpoint,
+) -> bool {
+    if state.completed_syncs == 0 {
         return true;
     }
-    let wallet_tip = BitcoinCheckpoint::from_wallet(wallet);
+    match &state.phase {
+        KyotoSyncPhase::Initialized => return true,
+        KyotoSyncPhase::RecoveryRequired {
+            reason: KyotoRecoveryReason::InterruptedSynchronization,
+        } if wallet_tip == state.last_consistent_checkpoint => {
+            // The update failed before BDK received or persisted a wallet
+            // update. The encrypted wallet and the last durable checkpoint
+            // still agree, so reconstructing the peer/filter machinery as an
+            // ordinary incremental sync is sufficient. Replaying the wallet's
+            // complete birthday range cannot add safety in this exact state.
+        }
+        KyotoSyncPhase::RecoveryRequired { .. } => return true,
+        _ => {}
+    }
     tip_mismatch_requires_recovery(&state.phase, state.last_consistent_checkpoint, wallet_tip)
 }
 
@@ -4279,6 +4295,27 @@ mod restart_tests {
             committed,
             committed,
         ));
+    }
+
+    #[test]
+    fn interrupted_preapply_sync_restarts_incrementally_when_wallet_tip_is_unchanged() {
+        let consistent = checkpoint(100, 1);
+        let mut state =
+            KyotoWalletState::restored_wallet(Network::Regtest, Some(consistent), 20, 1)
+                .expect("restored wallet state");
+        state.completed_syncs = 1;
+        state.last_consistent_checkpoint = consistent;
+        state.phase = KyotoSyncPhase::RecoveryRequired {
+            reason: KyotoRecoveryReason::InterruptedSynchronization,
+        };
+
+        assert!(!restart_state_requires_recovery(&state, consistent));
+        assert!(restart_state_requires_recovery(&state, checkpoint(101, 2)));
+
+        state.phase = KyotoSyncPhase::RecoveryRequired {
+            reason: KyotoRecoveryReason::CheckpointMismatch,
+        };
+        assert!(restart_state_requires_recovery(&state, consistent));
     }
 
     #[test]
