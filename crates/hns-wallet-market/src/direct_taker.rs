@@ -423,14 +423,29 @@ pub fn reserved_local_shakescape_taker_amount(
         let execution = store.load_workflow::<SwapSession>(
             crate::shakescape_execution_workflow_id(take.session_id),
         )?;
-        let reserve = match execution.map(|stored| stored.state.state) {
+        let reserve = match execution.as_ref().map(|stored| stored.state.state) {
             Some(
                 crate::SwapState::TermsFrozen
                 | crate::SwapState::RefundsPrepared
                 | crate::SwapState::FirstFundingPending
-                | crate::SwapState::FirstFunded
                 | crate::SwapState::SecondFundingPending,
             ) => true,
+            Some(crate::SwapState::FirstFunded) => {
+                // The taker has not authorized its second-chain transaction
+                // yet. Once the jointly signed funding window closes, no new
+                // second lock can validly be created, so retaining this
+                // reservation would strand spendable funds until the remote
+                // maker eventually refunds its already-confirmed first lock.
+                // A SecondFundingPending execution remains reserved above:
+                // that state proves authorization happened while the window
+                // was open and its exact transaction may still be recovering.
+                let record = crate::load_shakescape_direct_swap(store, policy, take.session_id)?
+                    .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
+                now_unix < hello.header.expires_at
+            }
             Some(_) => false,
             None => !local_take_is_released(store, policy, wallet_id, &take, now_unix)?,
         };
@@ -857,6 +872,57 @@ mod tests {
         .expect("idempotent acceptance");
         assert_eq!(retried.envelope, accepted.envelope);
         assert_eq!(retried.execution, accepted.execution);
+
+        let mut taker_execution = open_shakescape_execution(
+            &mut taker_store,
+            &policy,
+            offer.offer.session_id,
+            START + 31,
+        )
+        .expect("taker execution");
+        let workflow_id = crate::shakescape_execution_workflow_id(offer.offer.session_id);
+        for (evidence, now_unix) in [
+            (crate::VerifiedEvidence::RefundsValidated, START + 32),
+            (crate::VerifiedEvidence::FundingReady, START + 33),
+            (
+                crate::VerifiedEvidence::FirstFundingConfirmed {
+                    evidence: ObjectHash::new([0x91; 32]),
+                },
+                START + 34,
+            ),
+        ] {
+            let mut journal = crate::WalletStoreJournal {
+                store: &mut taker_store,
+                workflow_id,
+                updated_at_unix: now_unix,
+            };
+            taker_execution
+                .apply(evidence, now_unix, &mut journal)
+                .expect("advance independently verified first funding");
+        }
+        assert_eq!(taker_execution.state, crate::SwapState::FirstFunded);
+        assert_eq!(
+            reserved_local_shakescape_taker_amount(
+                &taker_store,
+                &policy,
+                taker_id,
+                AssetId::HNS,
+                START + 619,
+            )
+            .expect("live second-funding reservation"),
+            2_000_000,
+        );
+        assert_eq!(
+            reserved_local_shakescape_taker_amount(
+                &taker_store,
+                &policy,
+                taker_id,
+                AssetId::HNS,
+                START + 620,
+            )
+            .expect("expired second-funding reservation"),
+            0,
+        );
     }
 
     #[test]

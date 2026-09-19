@@ -253,11 +253,13 @@ impl MobileShakescapeBitcoinAbsencePermit {
 }
 
 const DIRECT_OFFER_APPROVAL_LIFETIME_SECONDS: u64 = 300;
-/// The maker commits this much time to first-chain funding after receiving a
-/// take. A take is unusable unless the listing remains valid for this complete
-/// interval. Two windows make a newly published offer useful for up to one
-/// hour of ordinary board propagation and user review.
-const DIRECT_SWAP_FUNDING_WINDOW_SECONDS: u64 = 60 * 60;
+/// The maker commits this much time to complete first-chain funding and let a
+/// one-confirmation Bitcoin lock become locally verified before the taker may
+/// fund the second chain. A one-hour deadline races Bitcoin's normal block
+/// variance and mobile scheduling, so new mobile sessions use a bounded
+/// six-hour window. Two windows leave equal headroom before the second-chain
+/// refund, and the first-chain refund follows one more window later.
+const DIRECT_SWAP_FUNDING_WINDOW_SECONDS: u64 = 6 * 60 * 60;
 const MIN_DIRECT_OFFER_LIFETIME_SECONDS: u64 = 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS;
 const MAX_DIRECT_OFFER_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Product floor for Bitcoin funding/refund headroom committed by a mobile
@@ -405,6 +407,10 @@ pub struct MobileShakescapeExecutionSummary {
     /// clients use it to expose funding actions only to the chain owner that
     /// can actually authorize them.
     pub local_role: String,
+    /// Last signed instant at which a participant may authorize a new chain
+    /// lock. Recovery of a transaction authorized before this instant remains
+    /// valid after it; this deadline only gates creation of new funding.
+    pub funding_deadline_unix: u64,
     pub first_refund_at_unix: u64,
     pub second_refund_at_unix: u64,
     pub first_funding_confirmed: bool,
@@ -1047,9 +1053,17 @@ impl MobileShakescapeSessionController {
                                 hns_wallet_market::MarketError::CorruptShakescapeDirectSwap,
                             );
                         };
-                        execution_summary(session, local_role).map_err(|_| {
-                            hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
-                        })
+                        let record = load_shakescape_direct_swap(store, &self.policy, session.id)?
+                            .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                        let funding_deadline_unix = record
+                            .hello
+                            .as_ref()
+                            .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
+                            .header
+                            .expires_at;
+                        execution_summary(session, local_role, funding_deadline_unix).map_err(
+                            |_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap,
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -1940,7 +1954,7 @@ impl MobileShakescapeSessionController {
                     .hello
                     .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 hello
-                    .verify_agreement(policy.network())
+                    .verify_new_funding_at(policy.network(), now_unix)
                     .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 if hello.offered_asset != AssetId::HNS || hello.received_asset != AssetId::BTC {
                     return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
@@ -2499,7 +2513,7 @@ impl MobileShakescapeSessionController {
                     .hello
                     .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 hello
-                    .verify_agreement(policy.network())
+                    .verify_new_funding_at(policy.network(), now_unix)
                     .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
                 let (settlement_key, hns_fee_reserve_dollarydoos) =
                     hns_wallet_market::derive_local_hns_for_btc_taker_key(
@@ -3407,8 +3421,8 @@ impl MobileShakescapeSessionController {
                             // first funding gate. Keep this bounded but do not
                             // make ordinary mobile scheduling race ten minutes.
                             funding_window_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
-                            second_refund_after_seconds: 2 * 60 * 60,
-                            refund_safety_margin_seconds: 60 * 60,
+                            second_refund_after_seconds: 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                            refund_safety_margin_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
                             bitcoin_minimum_confirmations: 1,
                             // Match the native HNS wallet's default local
                             // settlement floor. The verifier independently
@@ -3600,6 +3614,7 @@ fn asset_name(asset: AssetId) -> &'static str {
 fn execution_summary(
     session: hns_wallet_market::SwapSession,
     local_role: &str,
+    funding_deadline_unix: u64,
 ) -> Result<MobileShakescapeExecutionSummary, MobileWalletError> {
     let chain = |module| -> Result<String, MobileWalletError> {
         match module {
@@ -3630,6 +3645,7 @@ fn execution_summary(
         received_asset: asset(session.received.asset)?,
         received_amount: session.received.base_units.get(),
         local_role: local_role.to_owned(),
+        funding_deadline_unix,
         first_refund_at_unix: session.timeouts.first_chain_refund_at,
         second_refund_at_unix: session.timeouts.second_chain_refund_at,
         first_funding_confirmed: session.first_funding.is_some(),
@@ -4497,6 +4513,19 @@ mod tests {
             .expect("local HNS recovery candidate");
         assert_eq!(local_hns_recovery.len(), 1);
         assert_eq!(local_hns_recovery[0].funding_transaction(), None);
+        let hns_permit = taker_controller
+            .authorize_local_hns_second_funding(offer.offer.session_id, START + 621);
+        assert!(
+            hns_permit.is_err(),
+            "a confirmed first lock must not authorize new second funding after the signed window"
+        );
+        assert_eq!(
+            taker_controller
+                .durable_executions()
+                .expect("expired attempt leaves execution unchanged")[0]
+                .state,
+            SwapState::FirstFunded
+        );
         let hns_permit = taker_controller
             .authorize_local_hns_second_funding(offer.offer.session_id, START + 51)
             .expect("ordered HNS funding permit");
