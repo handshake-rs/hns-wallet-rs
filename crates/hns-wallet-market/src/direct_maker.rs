@@ -728,7 +728,9 @@ pub fn list_local_shakescape_direct_offer_cancellations(
     Ok(cancellations)
 }
 
-/// Sum Bitcoin still committed by local maker offers. Once a countersigned
+/// Sum Bitcoin still committed by local maker offers. The offered amount is
+/// the entire future HTLC value and already includes its settlement-fee cap.
+/// Once a countersigned
 /// execution exists, its durable state—not board expiry—controls reservation:
 /// funds remain reserved through pending first funding and are released only
 /// after locally verified first-chain funding has consumed them (or the
@@ -776,7 +778,6 @@ pub fn reserved_local_shakescape_btc_maker_sats(
                 .map_err(|_| MarketError::InvalidShakescapeDirectOffer)?;
             total = total
                 .checked_add(amount)
-                .and_then(|value| value.checked_add(local.bitcoin_fee_reserve_sats))
                 .ok_or(MarketError::InvalidShakescapeDirectOffer)?;
         }
     }
@@ -784,6 +785,8 @@ pub fn reserved_local_shakescape_btc_maker_sats(
 }
 
 /// Sum HNS committed by active local HNS-for-BTC maker offers and sessions.
+/// The offered amount is the entire future HTLC value and already includes
+/// its settlement-fee cap.
 pub fn reserved_local_shakescape_hns_maker_dollarydoos(
     store: &WalletStore,
     policy: &crate::ShakescapeDirectSwapPolicy,
@@ -827,7 +830,6 @@ pub fn reserved_local_shakescape_hns_maker_dollarydoos(
                 .map_err(|_| MarketError::InvalidShakescapeDirectOffer)?;
             total = total
                 .checked_add(amount)
-                .and_then(|value| value.checked_add(local.bitcoin_fee_reserve_sats))
                 .ok_or(MarketError::InvalidShakescapeDirectOffer)?;
         }
     }
@@ -1099,6 +1101,54 @@ mod tests {
             list_local_shakescape_direct_offers(&store, &policy(), wallet_id, 1_000)
                 .expect("expired list")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn maker_reservations_are_the_exact_locked_amounts() {
+        let wallet_id = WalletId::new([0x19; 16]);
+        let mut store = seeded_store(wallet_id);
+        let board_policy = policy();
+        let swap_policy =
+            crate::ShakescapeDirectSwapPolicy::new(board_policy).expect("swap policy");
+        create_shakescape_btc_for_hns_offer(
+            &mut store,
+            &swap_policy.board_policy(),
+            ShakescapeBtcForHnsOfferRequest {
+                wallet_id,
+                btc_amount_sats: 1_330,
+                hns_amount_dollarydoos: 100_546,
+                bitcoin_fee_reserve_sats: 1_000,
+                created_at_unix: 100,
+                expires_at_unix: 1_000,
+                nonce: [0x29; 32],
+            },
+        )
+        .expect("BTC offer");
+        create_shakescape_hns_for_btc_offer(
+            &mut store,
+            &swap_policy.board_policy(),
+            ShakescapeHnsForBtcOfferRequest {
+                wallet_id,
+                hns_amount_dollarydoos: 100_546,
+                btc_amount_sats: 1_330,
+                hns_fee_reserve_dollarydoos: 100_000,
+                created_at_unix: 100,
+                expires_at_unix: 1_000,
+                nonce: [0x39; 32],
+            },
+        )
+        .expect("HNS offer");
+
+        assert_eq!(
+            reserved_local_shakescape_btc_maker_sats(&store, &swap_policy, wallet_id, 101,)
+                .expect("BTC reservation"),
+            1_330,
+        );
+        assert_eq!(
+            reserved_local_shakescape_hns_maker_dollarydoos(&store, &swap_policy, wallet_id, 101,)
+                .expect("HNS reservation"),
+            100_546,
         );
     }
 

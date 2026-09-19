@@ -511,9 +511,11 @@ impl MobileShakescapeSessionController {
         {
             return Err(MobileWalletError::InvalidDirectOfferAction);
         }
-        let requested = btc_amount_sats
-            .checked_add(bitcoin_fee_reserve_sats)
-            .ok_or(MobileWalletError::InvalidDirectOfferAction)?;
+        // The advertised amount is the complete HTLC value. The settlement
+        // fee reserve is a cap carved out of that value, not additional
+        // wallet principal (the validation above guarantees a non-dust
+        // receiver output remains after spending the whole reserve).
+        let requested = btc_amount_sats;
         let already_reserved = self.reserved_bitcoin_sats(now_unix)?;
         if already_reserved
             .checked_add(requested)
@@ -647,9 +649,9 @@ impl MobileShakescapeSessionController {
         {
             return Err(MobileWalletError::InvalidDirectOfferAction);
         }
-        let requested = hns_amount_dollarydoos
-            .checked_add(hns_fee_reserve_dollarydoos)
-            .ok_or(MobileWalletError::InvalidDirectOfferAction)?;
+        // As on Bitcoin, the fee reserve is included in the advertised HTLC
+        // value and must not be counted as a second balance commitment.
+        let requested = hns_amount_dollarydoos;
         let already_reserved = self.reserved_hns_dollarydoos(now_unix)?;
         if already_reserved
             .checked_add(requested)
@@ -848,9 +850,9 @@ impl MobileShakescapeSessionController {
         ) {
             return Err(MobileWalletError::InvalidDirectOfferAction);
         }
-        let total = received_amount
-            .checked_add(received_fee_reserve)
-            .ok_or(MobileWalletError::InvalidDirectOfferAction)?;
+        // The received-side amount is the exact value this taker will lock.
+        // Its fee reserve is paid from that lock during settlement.
+        let total = received_amount;
         let confirmed = match record.offer.received_asset {
             AssetId::BTC => confirmed_btc_sats,
             AssetId::HNS => confirmed_hns_dollarydoos,
@@ -3759,33 +3761,34 @@ mod tests {
             Err(MobileWalletError::InvalidDirectOfferAction)
         ));
 
+        let bitcoin_lock = MIN_HTLC_DUST_SATS + MINIMUM_BITCOIN_FEE_RESERVE_SATS;
         let mut exact_bitcoin_fee_reserve = make_controller();
-        assert!(
-            exact_bitcoin_fee_reserve
-                .prepare_btc_for_hns_offer(
-                    100_000,
-                    MIN_HTLC_DUST_SATS + MINIMUM_BITCOIN_FEE_RESERVE_SATS,
-                    1_000_000,
-                    MINIMUM_BITCOIN_FEE_RESERVE_SATS,
-                    MIN_DIRECT_OFFER_LIFETIME_SECONDS,
-                    START,
-                )
-                .is_ok()
-        );
+        let bitcoin_approval = exact_bitcoin_fee_reserve
+            .prepare_btc_for_hns_offer(
+                bitcoin_lock,
+                bitcoin_lock,
+                1_000_000,
+                MINIMUM_BITCOIN_FEE_RESERVE_SATS,
+                MIN_DIRECT_OFFER_LIFETIME_SECONDS,
+                START,
+            )
+            .expect("the exact locked amount covers its included Bitcoin reserve");
+        assert_eq!(bitcoin_approval.total_bitcoin_commitment_sats, bitcoin_lock);
 
+        let hns_lock = u64::try_from(DEFAULT_DUST_THRESHOLD).expect("HNS dust fits u64")
+            + MINIMUM_HNS_FEE_RESERVE_DOLLARYDOOS;
         let mut exact_boundaries = make_controller();
-        assert!(
-            exact_boundaries
-                .prepare_hns_for_btc_offer(
-                    2_000_000,
-                    u64::try_from(DEFAULT_DUST_THRESHOLD).expect("HNS dust fits u64") + 100_000,
-                    MIN_HTLC_DUST_SATS,
-                    100_000,
-                    MIN_DIRECT_OFFER_LIFETIME_SECONDS,
-                    START,
-                )
-                .is_ok()
-        );
+        let hns_approval = exact_boundaries
+            .prepare_hns_for_btc_offer(
+                hns_lock,
+                hns_lock,
+                MIN_HTLC_DUST_SATS,
+                MINIMUM_HNS_FEE_RESERVE_DOLLARYDOOS,
+                MIN_DIRECT_OFFER_LIFETIME_SECONDS,
+                START,
+            )
+            .expect("the exact locked amount covers its included HNS reserve");
+        assert_eq!(hns_approval.total_hns_commitment_dollarydoos, hns_lock);
     }
 
     #[test]
@@ -3839,17 +3842,17 @@ mod tests {
             ),
             Err(MobileWalletError::InvalidDirectOfferAction)
         ));
-        assert!(
-            taker
-                .prepare_direct_offer_take(
-                    &offer_id,
-                    100_000,
-                    0,
-                    MINIMUM_BITCOIN_FEE_RESERVE_SATS,
-                    START + 1,
-                )
-                .is_ok()
-        );
+        let bitcoin_lock = MIN_HTLC_DUST_SATS + MINIMUM_BITCOIN_FEE_RESERVE_SATS;
+        let approval = taker
+            .prepare_direct_offer_take(
+                &offer_id,
+                bitcoin_lock,
+                0,
+                MINIMUM_BITCOIN_FEE_RESERVE_SATS,
+                START + 1,
+            )
+            .expect("exact received lock covers its included reserve");
+        assert_eq!(approval.total_received_asset_commitment, bitcoin_lock);
     }
 
     #[test]
@@ -4365,7 +4368,7 @@ mod tests {
             controller
                 .reserved_bitcoin_sats(START + 10_001)
                 .expect("reservation survives listing expiry"),
-            10_000
+            9_000
         );
         controller
             .authorize_local_btc_first_funding(offer.offer.session_id, START + 41)

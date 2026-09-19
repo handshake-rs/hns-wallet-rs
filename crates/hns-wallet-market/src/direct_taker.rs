@@ -403,6 +403,8 @@ pub fn abandon_pending_local_shakescape_direct_take(
 /// Sum funds still committed by this wallet's accepted takes for one asset.
 /// A taker funds the offer's received asset on the second chain, so the
 /// reservation remains live until that funding is independently confirmed.
+/// `received_amount` is the complete HTLC value and already includes the
+/// settlement-fee cap.
 pub fn reserved_local_shakescape_taker_amount(
     store: &WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
@@ -435,7 +437,6 @@ pub fn reserved_local_shakescape_taker_amount(
         if reserve {
             total = total
                 .checked_add(take.received_amount)
-                .and_then(|value| value.checked_add(take.received_fee_reserve))
                 .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
         }
     }
@@ -1036,7 +1037,7 @@ mod tests {
                 START + 11,
             )
             .expect("reservation"),
-            1_050_000,
+            1_000_000,
         );
         assert_eq!(
             list_pending_local_shakescape_direct_takes(
