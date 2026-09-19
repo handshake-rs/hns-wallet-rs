@@ -703,6 +703,10 @@ impl KyotoTipDiscovery {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| BitcoinWalletError::RuntimeUnavailable)?;
         let mut builder = Builder::new(network)
+            // Swap recovery depends on the witness branch and preimage. A
+            // legacy MSG_BLOCK response has the same txids but deliberately
+            // strips that consensus data.
+            .fetch_witness_data()
             .data_dir(data_dir)
             .required_peers(required_peers)
             .response_timeout(response_timeout)
@@ -1111,6 +1115,9 @@ fn build_wallet_swap_client(
         ScanType::Recovery { checkpoint, .. } => checkpoint,
     };
     let mut builder = Builder::new(config.network)
+        // BDK needs witnesses for its own SegWit transactions, and the swap
+        // observer additionally extracts the HTLC redeem preimage from them.
+        .fetch_witness_data()
         .data_dir(config.data_dir)
         .required_peers(config.required_peers)
         .response_timeout(config.response_timeout)

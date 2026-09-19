@@ -110,3 +110,28 @@ pub(in crate::network) fn make_version(port: Option<u16>, network: &Network) -> 
         relay: true,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bitcoin::hashes::Hash;
+
+    use super::*;
+
+    #[test]
+    fn witness_block_mode_encodes_msg_witness_block_inventory() {
+        let hash = BlockHash::from_byte_array([42; 32]);
+        let mut generator = MessageGenerator {
+            network: Network::Bitcoin,
+            transport: Transport::V1,
+            block_type: BlockType::Witness,
+        };
+
+        let actual = generator.block(hash);
+        let expected = serialize(&RawNetworkMessage::new(
+            Network::Bitcoin.magic(),
+            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+        ));
+
+        assert_eq!(actual, expected);
+    }
+}

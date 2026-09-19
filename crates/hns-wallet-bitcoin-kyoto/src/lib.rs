@@ -186,6 +186,10 @@ pub fn build_kyoto_client(
         return Err(BitcoinWalletError::NetworkMismatch);
     }
     let mut builder = Builder::new(config.network)
+        // Always ask peers for BIP144 witness blocks. A legacy block preserves
+        // txids while omitting the witness data required to update a SegWit
+        // wallet and to validate/recover atomic-swap HTLC branches.
+        .fetch_witness_data()
         .data_dir(config.data_dir)
         .required_peers(config.required_peers)
         .response_timeout(config.response_timeout);

@@ -239,6 +239,20 @@ impl Peer {
                 if self.message_state.version_handshake.is_complete() {
                     return Err(PeerError::DisconnectCommand);
                 }
+                // MSG_WITNESS_BLOCK is only meaningful for peers that
+                // advertise NODE_WITNESS. Reject an incapable connection
+                // before the node can randomly assign it a block request and
+                // leave a matched-filter scan waiting for data it cannot
+                // provide.
+                if matches!(self.block_type, BlockType::Witness)
+                    && !version.services.has(ServiceFlags::WITNESS)
+                {
+                    crate::debug!(format!(
+                        "Peer {} does not advertise witness block service",
+                        self.nonce
+                    ));
+                    return Err(PeerError::DisconnectCommand);
+                }
                 self.main_thread_sender
                     .send(PeerThreadMessage {
                         nonce: self.nonce,
