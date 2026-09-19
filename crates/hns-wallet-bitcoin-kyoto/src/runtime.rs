@@ -5,14 +5,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use bdk_kyoto::bip157::chain::{BlockHeaderChanges, IndexedHeader};
-use bdk_kyoto::bip157::{self, ChainState, Client, Event, SyncUpdate};
+use bdk_kyoto::bip157::{self, ChainState, Client, Event};
 use bdk_kyoto::builder::Builder;
 use bdk_kyoto::{HashCheckpoint, Info, LoggingSubscribers, Requester, ScanType, Warning};
 use bdk_wallet::bitcoin::consensus::{deserialize, serialize};
 use bdk_wallet::bitcoin::hashes::Hash;
 use bdk_wallet::bitcoin::p2p::ServiceFlags;
 use bdk_wallet::bitcoin::p2p::address::AddrV2;
-use bdk_wallet::bitcoin::{BlockHash, Network, OutPoint, ScriptBuf, Transaction};
+use bdk_wallet::bitcoin::{Block, BlockHash, Network, OutPoint, ScriptBuf, Transaction};
 use bdk_wallet::chain::keychain_txout::KeychainTxOutIndex;
 use bdk_wallet::chain::{
     BlockId, ChainPosition, CheckPoint, ConfirmationBlockTime, IndexedTxGraph, TxUpdate,
@@ -46,6 +46,10 @@ pub const MIN_REBROADCAST_INTERVAL_SECONDS: u64 = 60;
 pub const MAX_PERSISTED_BROADCAST_TRANSACTION_BYTES: usize = 200_000;
 pub const MAX_RECONCILIATION_BATCH_SAVES: usize = 512;
 pub const MAX_CONCURRENT_MATCHED_BLOCK_REQUESTS: usize = 4;
+/// The canonical recent-block window probed while an exact wallet-approved
+/// broadcast remains unobserved. This is bounded by Kyoto's ten-header sync
+/// update and is only activated for durable recovery records.
+pub const MAX_APPROVED_BROADCAST_PROBE_BLOCKS: usize = 10;
 pub const PEER_INFO_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 pub const BITCOIN_PEER_CACHE_RECORD_VERSION: u16 = 1;
 pub const MAX_CACHED_BITCOIN_PEERS: usize = 32;
@@ -1092,6 +1096,7 @@ fn build_wallet_swap_client(
     scan_type: ScanType,
     swap_scripts: Vec<(SessionId, ScriptBuf)>,
     progress: KyotoSyncProgressHandle,
+    store: SharedWalletStore,
 ) -> Result<(Requester, LoggingSubscribers, KyotoWalletSwapSubscriber), BitcoinWalletError> {
     config.validate()?;
     if wallet.network() != config.network {
@@ -1123,6 +1128,8 @@ fn build_wallet_swap_client(
         scan_type,
         swap_scripts,
         progress,
+        store,
+        config.network,
     );
     bip157::tokio::task::spawn(async move { node.run().await });
     Ok((
@@ -1155,6 +1162,8 @@ struct KyotoWalletSwapSubscriber {
     recovery_gap_limit: Option<u32>,
     recovery_script_count: u32,
     progress: KyotoSyncProgressHandle,
+    store: SharedWalletStore,
+    network: Network,
 }
 
 impl KyotoWalletSwapSubscriber {
@@ -1165,6 +1174,8 @@ impl KyotoWalletSwapSubscriber {
         scan_type: ScanType,
         swap_scripts: Vec<(SessionId, ScriptBuf)>,
         progress: KyotoSyncProgressHandle,
+        store: SharedWalletStore,
+        network: Network,
     ) -> Self {
         let graph = IndexedTxGraph::new(wallet.spk_index().clone());
         let wallet_scripts = wallet_scripts_for_scan(&graph.index, scan_type);
@@ -1185,6 +1196,8 @@ impl KyotoWalletSwapSubscriber {
             recovery_gap_limit,
             recovery_script_count: recovery_gap_limit.unwrap_or(0),
             progress,
+            store,
+            network,
         }
     }
 
@@ -1208,7 +1221,23 @@ impl KyotoWalletSwapSubscriber {
                     }
                 }
                 Event::ChainUpdate(changes) => self.apply_chain_event(&changes),
-                Event::FiltersSynced(SyncUpdate { .. }) => {
+                Event::FiltersSynced(update) => {
+                    let unobserved_broadcast_txids = self.store.try_with_store(|store| {
+                        unobserved_approved_broadcast_txids(store, self.network)
+                    })?;
+                    let mut approved_broadcast_probe_blocks = BTreeSet::new();
+                    if !unobserved_broadcast_txids.is_empty() {
+                        for header in update
+                            .recent_history()
+                            .values()
+                            .rev()
+                            .take(MAX_APPROVED_BROADCAST_PROBE_BLOCKS)
+                        {
+                            let hash = header.block_hash();
+                            approved_broadcast_probe_blocks.insert(hash);
+                            self.queued_blocks.entry(hash).or_insert(false);
+                        }
+                    }
                     if !self.queued_blocks.is_empty() {
                         self.progress.set_stage(KyotoSyncStage::FetchingBlocks);
                     }
@@ -1225,9 +1254,15 @@ impl KyotoWalletSwapSubscriber {
                                 .requester
                                 .request_block(hash)
                                 .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
-                            pending.push_back((swap_match, receiver));
+                            pending.push_back((
+                                swap_match,
+                                approved_broadcast_probe_blocks.contains(&hash),
+                                receiver,
+                            ));
                         }
-                        let Some((swap_match, receiver)) = pending.pop_front() else {
+                        let Some((swap_match, approved_broadcast_probe, receiver)) =
+                            pending.pop_front()
+                        else {
                             break;
                         };
                         let indexed = receiver
@@ -1238,7 +1273,14 @@ impl KyotoWalletSwapSubscriber {
                         let _ = self
                             .graph
                             .apply_block_relevant(&indexed.block, indexed.height);
-                        if swap_match {
+                        let approved_broadcast_match = approved_broadcast_probe
+                            && insert_exact_approved_broadcasts(
+                                &mut self.graph,
+                                &indexed.block,
+                                indexed.height,
+                                &unobserved_broadcast_txids,
+                            );
+                        if swap_match || approved_broadcast_match {
                             swap_blocks.insert(
                                 indexed.block.block_hash(),
                                 MatchedBitcoinBlock {
@@ -1306,6 +1348,39 @@ impl KyotoWalletSwapSubscriber {
             _ => {}
         }
     }
+}
+
+/// Insert only the exact wallet-approved transactions found in a canonical
+/// recovery block. This avoids retaining every unrelated transaction in the
+/// block while still giving BDK an authenticated transaction and anchor.
+/// The same block is subsequently passed to the HTLC watch reconciler.
+fn insert_exact_approved_broadcasts(
+    graph: &mut IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
+    block: &Block,
+    height: u32,
+    approved_txids: &BTreeSet<[u8; 32]>,
+) -> bool {
+    let block_id = BlockId {
+        height,
+        hash: block.block_hash(),
+    };
+    let mut matched = false;
+    for transaction in &block.txdata {
+        let txid = transaction.compute_txid();
+        if !approved_txids.contains(&txid.to_byte_array()) {
+            continue;
+        }
+        let _ = graph.insert_tx(transaction.clone());
+        let _ = graph.insert_anchor(
+            txid,
+            ConfirmationBlockTime {
+                block_id,
+                confirmation_time: u64::from(block.header.time),
+            },
+        );
+        matched = true;
+    }
+    matched
 }
 
 pub struct KyotoSupervisor {
@@ -1617,6 +1692,7 @@ impl KyotoSupervisor {
             scan_type,
             watched_scripts(&watches),
             progress.clone(),
+            store.clone(),
         )?;
         let cancellation = Arc::new(KyotoCancellation::default());
         Ok((
@@ -2901,6 +2977,35 @@ pub fn unobserved_approved_broadcast_inputs(
     )
 }
 
+fn unobserved_approved_broadcast_txids(
+    store: &WalletStore,
+    network: Network,
+) -> Result<BTreeSet<[u8; 32]>, BitcoinWalletError> {
+    let records = store
+        .bitcoin_transactions::<BitcoinTransactionRecord>(MAX_TRACKED_BITCOIN_TRANSACTIONS + 1)?;
+    if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
+        return Err(BitcoinWalletError::BitcoinTransactionCapacity);
+    }
+    let mut txids = BTreeSet::new();
+    for stored in records {
+        let record = stored.value;
+        record.validate()?;
+        let Some(intent) = record.broadcast.as_ref() else {
+            continue;
+        };
+        if intent.network != network {
+            return Err(BitcoinWalletError::NetworkMismatch);
+        }
+        if matches!(
+            record.observation,
+            BitcoinChainObservation::AbsentFromCanonicalWalletView
+        ) {
+            txids.insert(record.txid);
+        }
+    }
+    Ok(txids)
+}
+
 /// Return whether any durably approved Bitcoin transaction pays the exact
 /// script and value. This includes both observed and not-yet-observed
 /// broadcasts: callers use it to close the crash window between persisting a
@@ -3865,6 +3970,7 @@ fn bitcoin_outpoint_id(txid: [u8; 32], output_index: u32) -> Vec<u8> {
 #[cfg(test)]
 mod restart_tests {
     use super::*;
+    use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
 
     const TEST_STORE_PASSPHRASE: &str = "correct horse battery staple";
 
@@ -3911,6 +4017,48 @@ mod restart_tests {
                 reason: KyotoRecoveryReason::InterruptedSynchronization,
             }
         ));
+    }
+
+    #[test]
+    fn exact_approved_broadcast_probe_inserts_only_matching_transaction_and_anchor() {
+        let block = genesis_block(Network::Regtest);
+        let txid = block.txdata[0].compute_txid();
+        let mut approved = BTreeSet::new();
+        approved.insert(txid.to_byte_array());
+        approved.insert([42; 32]);
+        let mut graph = IndexedTxGraph::new(KeychainTxOutIndex::<KeychainKind>::new(10, true));
+
+        assert!(insert_exact_approved_broadcasts(
+            &mut graph, &block, 17, &approved,
+        ));
+        assert_eq!(
+            graph.graph().get_tx(txid).as_deref(),
+            Some(&block.txdata[0])
+        );
+        let anchors = graph
+            .graph()
+            .all_anchors()
+            .get(&txid)
+            .expect("approved transaction anchor");
+        assert!(anchors.contains(&ConfirmationBlockTime {
+            block_id: BlockId {
+                height: 17,
+                hash: block.block_hash(),
+            },
+            confirmation_time: u64::from(block.header.time),
+        }));
+
+        let mut unrelated = BTreeSet::new();
+        unrelated.insert([7; 32]);
+        let mut unrelated_graph =
+            IndexedTxGraph::new(KeychainTxOutIndex::<KeychainKind>::new(10, true));
+        assert!(!insert_exact_approved_broadcasts(
+            &mut unrelated_graph,
+            &block,
+            17,
+            &unrelated,
+        ));
+        assert!(unrelated_graph.graph().get_tx(txid).is_none());
     }
 
     #[test]
