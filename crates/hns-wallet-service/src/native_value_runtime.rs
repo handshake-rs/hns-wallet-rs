@@ -22,9 +22,10 @@ use hns_wallet_ffi::{
 };
 use hns_wallet_hns::{
     HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED, HNS_VALUE_RUNTIME_RELEASE_QUALIFIED, HnsBackend,
-    HnsClock, HnsDirectShakescapePeer, HnsNameAction, HnsNetwork, HnsRuntimeConfig, HnsWalletError,
-    HnsWalletRuntime, KnownName, NameOperation, NameOperationState, NameOwnershipStatus,
-    PrepareNameFinalize, PrepareNameTransfer, PrepareNameUpdate,
+    HnsClock, HnsDirectShakescapePeer, HnsNameAction, HnsNetwork,
+    HnsPreparedSettlementValueSummary, HnsRuntimeConfig, HnsWalletError, HnsWalletRuntime,
+    KnownName, NameOperation, NameOperationState, NameOwnershipStatus, PrepareNameFinalize,
+    PrepareNameTransfer, PrepareNameUpdate,
 };
 use hns_wallet_provider::{
     APPROVAL_LIFETIME_SECONDS, ApprovedCall, PendingApproval, ProviderMethod, SelectedNamespace,
@@ -1837,6 +1838,16 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         self.runtime
             .runtime
             .prepared_settlement_transaction_id(artifact)
+            .map_err(hns_runtime_failure)
+    }
+
+    pub fn trusted_native_hns_settlement_value_summary(
+        &self,
+        artifact: &PreparedArtifact,
+    ) -> Result<HnsPreparedSettlementValueSummary, ServiceFailure> {
+        self.runtime
+            .runtime
+            .prepared_settlement_value_summary(artifact)
             .map_err(hns_runtime_failure)
     }
 

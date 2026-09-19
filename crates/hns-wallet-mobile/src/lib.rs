@@ -2355,13 +2355,33 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .service
             .trusted_native_hns_settlement_transaction_id(&prepared)
             .map_err(mobile_service_failure)?;
-        let input_amount_dollarydoos =
-            u64::try_from(amount.get()).map_err(|_| MobileWalletError::InvalidValueAction)?;
+        let value_summary = self
+            .session
+            .service
+            .trusted_native_hns_settlement_value_summary(&prepared)
+            .map_err(mobile_service_failure)?;
+        if value_summary.settlement_input != BaseUnits::new(amount.get())
+            || value_summary
+                .settlement_input
+                .checked_add(value_summary.wallet_sponsor_input)
+                .map_err(|_| MobileWalletError::InvalidValueAction)?
+                != value_summary.total_input
+        {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
+        let input_amount_dollarydoos = u64::try_from(value_summary.total_input.get())
+            .map_err(|_| MobileWalletError::InvalidValueAction)?;
         let fee_dollarydoos =
             u64::try_from(prepared.fee.get()).map_err(|_| MobileWalletError::InvalidValueAction)?;
-        let output_amount_dollarydoos = input_amount_dollarydoos
+        let output_amount_dollarydoos = u64::try_from(value_summary.total_output.get())
+            .map_err(|_| MobileWalletError::InvalidValueAction)?;
+        if input_amount_dollarydoos
             .checked_sub(fee_dollarydoos)
-            .ok_or(MobileWalletError::InvalidValueAction)?;
+            .ok_or(MobileWalletError::InvalidValueAction)?
+            != output_amount_dollarydoos
+        {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
         let action_token = random_nonzero_bytes()?;
         let approval = MobileShakescapeHnsSettlementApproval {
             action_token: lowercase_hex(&action_token),

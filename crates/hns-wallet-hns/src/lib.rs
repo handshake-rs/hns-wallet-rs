@@ -3151,6 +3151,20 @@ struct HnsPreparedSettlement {
     terms: HnsSettlementTerms,
 }
 
+/// Exact value accounting for a prepared HNS settlement transaction.
+///
+/// A small HTLC can require confirmed ordinary wallet inputs to sponsor its
+/// network fee. Callers must therefore review the transaction's complete
+/// input and output totals rather than assuming `HTLC amount - fee` describes
+/// the final transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HnsPreparedSettlementValueSummary {
+    pub total_input: BaseUnits,
+    pub total_output: BaseUnits,
+    pub settlement_input: BaseUnits,
+    pub wallet_sponsor_input: BaseUnits,
+}
+
 impl fmt::Debug for HnsPreparedSettlement {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -4145,6 +4159,81 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             return Err(HnsWalletError::InvalidPreparedArtifact);
         }
         Ok(prepared.transaction)
+    }
+
+    /// Return authenticated complete input/output accounting for native
+    /// settlement review. This intentionally does not expose transaction
+    /// bytes, scripts, outpoints, or derivations across the service boundary.
+    pub fn prepared_settlement_value_summary(
+        &self,
+        artifact: &PreparedArtifact,
+    ) -> Result<HnsPreparedSettlementValueSummary, HnsWalletError> {
+        if artifact.module != ModuleId::Handshake {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let prepared: HnsPreparedSettlement = serde_json::from_slice(artifact.commitment_bytes())?;
+        if prepared.stage != HnsSettlementStage::Prepared
+            || prepared.session_id != artifact.session_id
+            || prepared.fee != artifact.fee
+            || prepared.expires_at_unix != artifact.expires_at_unix
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let authenticated = Self::prepared_settlement_artifact(&prepared)?;
+        if authenticated.module != artifact.module
+            || authenticated.session_id != artifact.session_id
+            || authenticated.fee != artifact.fee
+            || authenticated.expires_at_unix != artifact.expires_at_unix
+            || authenticated.commitment_bytes() != artifact.commitment_bytes()
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let transaction = Transaction::decode(&prepared.signed_transaction)
+            .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+        let input_coins = canonical_evidence_coins(&prepared.input_coins)?;
+        if transaction.inputs.len() != input_coins.len() || input_coins.is_empty() {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let total_input = input_coins.iter().try_fold(0_u128, |total, coin| {
+            total
+                .checked_add(u128::from(coin.value.get()))
+                .ok_or(HnsWalletError::Arithmetic)
+        })?;
+        let total_output = transaction
+            .outputs
+            .iter()
+            .try_fold(0_u128, |total, output| {
+                total
+                    .checked_add(u128::from(output.value.get()))
+                    .ok_or(HnsWalletError::Arithmetic)
+            })?;
+        if total_input < total_output || total_input - total_output != prepared.fee.get() {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        let settlement_input = match &prepared.terms {
+            HnsSettlementTerms::Redeem { lock } | HnsSettlementTerms::Refund { lock } => {
+                if lock.amount.asset != WalletAsset::Hns {
+                    return Err(HnsWalletError::InvalidPreparedArtifact);
+                }
+                lock.amount.base_units
+            }
+            HnsSettlementTerms::Lock { .. } => {
+                return Err(HnsWalletError::InvalidPreparedArtifact);
+            }
+        };
+        if input_coins[0].value.get()
+            != u64::try_from(settlement_input.get())
+                .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?
+            || total_input < settlement_input.get()
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        Ok(HnsPreparedSettlementValueSummary {
+            total_input: BaseUnits::new(total_input),
+            total_output: BaseUnits::new(total_output),
+            settlement_input,
+            wallet_sponsor_input: BaseUnits::new(total_input - settlement_input.get()),
+        })
     }
 
     pub fn settlement_key_target(
