@@ -1095,11 +1095,32 @@ fn walk_back_wallet_checkpoint(checkpoint: CheckPoint, depth: u32) -> HashCheckp
     start
 }
 
+fn select_earlier_scan_checkpoint(
+    ordinary_start: HashCheckpoint,
+    active_swap_start: Option<HashCheckpoint>,
+) -> Result<HashCheckpoint, BitcoinWalletError> {
+    let Some(active_swap_start) = active_swap_start else {
+        return Ok(ordinary_start);
+    };
+    if active_swap_start.height == ordinary_start.height {
+        if active_swap_start.hash != ordinary_start.hash {
+            return Err(BitcoinWalletError::InvalidCheckpoint);
+        }
+        return Ok(ordinary_start);
+    }
+    Ok(if active_swap_start.height < ordinary_start.height {
+        active_swap_start
+    } else {
+        ordinary_start
+    })
+}
+
 fn build_wallet_swap_client(
     wallet: &Wallet,
     config: KyotoRuntimeConfig,
     scan_type: ScanType,
     checkpoint_lookback: u32,
+    active_swap_rescan_checkpoint: Option<HashCheckpoint>,
     swap_scripts: Vec<(SessionId, ScriptBuf)>,
     progress: KyotoSyncProgressHandle,
     store: SharedWalletStore,
@@ -1108,12 +1129,18 @@ fn build_wallet_swap_client(
     if wallet.network() != config.network {
         return Err(BitcoinWalletError::NetworkMismatch);
     }
-    let start = match scan_type {
+    let ordinary_start = match scan_type {
         ScanType::Sync => {
             walk_back_wallet_checkpoint(wallet.latest_checkpoint(), checkpoint_lookback)
         }
         ScanType::Recovery { checkpoint, .. } => checkpoint,
     };
+    // An active watch with no durable spend must remain recoverable even when
+    // its funding/redemption block has fallen outside BDK's ordinary reorg
+    // window. Compact filters make replay from the exact registration anchor
+    // cheap; only matching blocks are downloaded. Once the spend is retained,
+    // the watch no longer contributes this floor.
+    let start = select_earlier_scan_checkpoint(ordinary_start, active_swap_rescan_checkpoint)?;
     let mut builder = Builder::new(config.network)
         // BDK needs witnesses for its own SegWit transactions, and the swap
         // observer additionally extracts the HTLC redeem preimage from them.
@@ -1719,6 +1746,18 @@ impl KyotoSupervisor {
         let watches = store.try_with_store(|store| {
             load_bitcoin_htlc_watches(store, wallet.network(), wallet.account_id())
         })?;
+        let active_swap_rescan_checkpoint = watches
+            .iter()
+            .filter_map(|watch| {
+                let snapshot = watch.snapshot();
+                snapshot
+                    .spending_txid
+                    .is_none()
+                    .then_some(snapshot.registered_checkpoint)
+            })
+            .min_by_key(|checkpoint| checkpoint.height)
+            .map(|checkpoint| checkpoint.to_kyoto(wallet.network()))
+            .transpose()?;
         let has_unobserved_approved_broadcast = store.try_with_store(|store| {
             unobserved_approved_broadcast_txids(store, wallet.network())
                 .map(|txids| !txids.is_empty())
@@ -1739,6 +1778,7 @@ impl KyotoSupervisor {
             config,
             scan_type,
             checkpoint_lookback,
+            active_swap_rescan_checkpoint,
             watched_scripts(&watches),
             progress.clone(),
             store.clone(),
@@ -4163,6 +4203,33 @@ mod restart_tests {
             walk_back_wallet_checkpoint(checkpoint, MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS,).height,
             200 - MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS
         );
+    }
+
+    #[test]
+    fn active_unspent_swap_checkpoint_extends_the_filter_replay_window() {
+        let ordinary = HashCheckpoint::new(967_703, block_hash(967_703));
+        let active_swap = HashCheckpoint::new(967_660, block_hash(967_660));
+
+        assert_eq!(
+            select_earlier_scan_checkpoint(ordinary, Some(active_swap))
+                .expect("canonical active swap anchor"),
+            active_swap
+        );
+        assert_eq!(
+            select_earlier_scan_checkpoint(ordinary, None).expect("ordinary replay window"),
+            ordinary
+        );
+    }
+
+    #[test]
+    fn equal_height_swap_and_wallet_forks_fail_closed() {
+        let ordinary = HashCheckpoint::new(967_660, block_hash(1));
+        let conflicting_swap = HashCheckpoint::new(967_660, block_hash(2));
+
+        assert!(matches!(
+            select_earlier_scan_checkpoint(ordinary, Some(conflicting_swap)),
+            Err(BitcoinWalletError::InvalidCheckpoint)
+        ));
     }
 
     #[test]
