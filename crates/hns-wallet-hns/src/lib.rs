@@ -10923,9 +10923,7 @@ where
         HnsWalletError::Randomness => {
             ChainError::Backend("operating-system randomness is unavailable".to_owned())
         }
-        HnsWalletError::WrongKeyRole
-        | HnsWalletError::KeyDerivation
-        | HnsWalletError::Address => {
+        HnsWalletError::WrongKeyRole | HnsWalletError::KeyDerivation | HnsWalletError::Address => {
             ChainError::Backend("Handshake wallet key derivation failed".to_owned())
         }
         HnsWalletError::StoreAuthorityMismatch
