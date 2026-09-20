@@ -2899,6 +2899,23 @@ fn input_coin_evidence(
         .collect()
 }
 
+/// Preserve the HTLC funding coin first and append optional ordinary-wallet
+/// fee sponsors. The generic wallet-input encoder intentionally rejects an
+/// empty selection, but an HNS settlement that can pay its fee from the HTLC
+/// value itself has no sponsor inputs and is still a complete one-input
+/// transaction.
+fn settlement_input_evidence(
+    funding_coin: HnsInputCoinEvidence,
+    sponsors: &[TrackedHnsCoin],
+) -> Result<Vec<HnsInputCoinEvidence>, HnsWalletError> {
+    let mut evidence = Vec::with_capacity(1 + sponsors.len());
+    evidence.push(funding_coin);
+    if !sponsors.is_empty() {
+        evidence.extend(input_coin_evidence(sponsors)?);
+    }
+    Ok(evidence)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HnsTransactionRecord {
     pub summary: TransactionSummary,
@@ -4993,13 +5010,13 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     )
                 },
             )?;
-        let mut policy_input_evidence = vec![funding_coin];
-        policy_input_evidence.extend(input_coin_evidence(&sponsors).map_err(|error| {
-            evidence_error_context(
-                map_chain_error(error),
-                "HNS settlement input evidence encoding",
-            )
-        })?);
+        let policy_input_evidence =
+            settlement_input_evidence(funding_coin, &sponsors).map_err(|error| {
+                evidence_error_context(
+                    map_chain_error(error),
+                    "HNS settlement input evidence encoding",
+                )
+            })?;
         drop(store);
         let quote = self
             .quote_final_transaction(&signed, &input_coins, fee, maximum_fee)
@@ -15126,6 +15143,25 @@ mod tests {
         let signed = Transaction::decode(&signed).expect("signed transaction");
         validate_standard_input_authorizations(&signed, &input_coins)
             .expect("all mixed input authorizations");
+        let funding_evidence =
+            HnsInputCoinEvidence::from_canonical_coin(&input_coins[0]).expect("funding evidence");
+        let unsponsored_evidence = settlement_input_evidence(funding_evidence.clone(), &[])
+            .expect("unsponsored settlement evidence");
+        assert_eq!(unsponsored_evidence, vec![funding_evidence.clone()]);
+        assert_eq!(
+            canonical_evidence_coins(&unsponsored_evidence)
+                .expect("canonical unsponsored settlement evidence"),
+            vec![input_coins[0].clone()]
+        );
+        let sponsored_evidence =
+            settlement_input_evidence(funding_evidence, std::slice::from_ref(&sponsor))
+                .expect("sponsored settlement evidence");
+        assert_eq!(sponsored_evidence.len(), 2);
+        assert_eq!(
+            canonical_evidence_coins(&sponsored_evidence)
+                .expect("canonical sponsored settlement evidence"),
+            input_coins
+        );
         assert_eq!(signed.inputs[0].witness.items.len(), 4);
         assert_eq!(signed.inputs[1].witness.items.len(), 2);
         assert!(u128::from(signed.outputs[0].value.get()) >= account.config.dust_threshold.get());
