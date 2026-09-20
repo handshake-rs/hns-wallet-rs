@@ -3213,9 +3213,11 @@ impl MobileShakescapeSessionController {
         // A take stops being "pending" as soon as the proposal is jointly
         // signed, but delivery is not thereby proven. Either participant may
         // reconnect after the one-shot exchange, so replay the complete
-        // canonical handshake retained by every wallet-owned session. This
-        // lets either endpoint repair the other's durable state without a
-        // stateful rendezvous or out-of-band coordination.
+        // canonical, locally authored handshake packets retained by every
+        // wallet-owned session. Together the two endpoints repair each
+        // other's durable state and a relay's volatile route without either
+        // endpoint impersonating the other or requiring out-of-band
+        // coordination.
         let session_envelopes = self.direct_swap_handshake_reconciliation_envelopes(now_unix)?;
         let session_envelope_count = session_envelopes.len();
         for envelope in session_envelopes {
@@ -3253,6 +3255,25 @@ impl MobileShakescapeSessionController {
                         continue;
                     }
                     let Some(hello) = record.hello else { continue };
+                    let local_settlement_public_key = if local_maker {
+                        hns_wallet_market::derive_local_direct_maker_key(
+                            store,
+                            &self.policy,
+                            self.wallet_id,
+                            session_id,
+                        )?
+                        .0
+                        .public_key()
+                    } else {
+                        hns_wallet_market::derive_local_direct_taker_key(
+                            store,
+                            &self.policy,
+                            self.wallet_id,
+                            session_id,
+                        )?
+                        .0
+                        .public_key()
+                    };
                     let execution = load_shakescape_execution(store, &self.policy, session_id)?;
                     // The funding deadline prevents new funding; it must not
                     // prevent recovery of a lock which was already authorized
@@ -3281,18 +3302,23 @@ impl MobileShakescapeSessionController {
                     let request_id = record
                         .proposal_request_id
                         .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
-                    // The take re-establishes the volatile maker/taker route.
-                    envelopes.push(
-                        CrossChainMessage::TakeDirectOffer(record.take.clone())
-                            .encode_envelope(record.take_request_id)
-                            .map_err(|_| {
-                                hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
-                            })?,
-                    );
-                    // Only the maker replays its proposal. A taker replaying a
-                    // maker-authored proposal back to the maker is redundant,
-                    // while maker -> taker repairs the precise missing step
-                    // needed to re-admit the jointly signed hello.
+                    // Reconciliation preserves transport provenance, not only
+                    // signatures. A relay binds the maker and taker routes to
+                    // their current peer connections and correctly rejects a
+                    // maker which replays the taker's signed Take or Hello (or
+                    // vice versa). Replay only packets authored by this wallet;
+                    // together, the two endpoints rebuild the volatile route
+                    // after a relay restart without either impersonating its
+                    // counterparty.
+                    if local_taker {
+                        envelopes.push(
+                            CrossChainMessage::TakeDirectOffer(record.take.clone())
+                                .encode_envelope(record.take_request_id)
+                                .map_err(|_| {
+                                    hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
+                                })?,
+                        );
+                    }
                     if local_maker {
                         let proposal = record
                             .proposal
@@ -3306,14 +3332,18 @@ impl MobileShakescapeSessionController {
                                 })?,
                         );
                     }
-                    envelopes.push(
-                        CrossChainMessage::SwapSessionHello(hello)
-                            .encode_envelope(request_id)
-                            .map_err(|_| {
-                                hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
-                            })?,
-                    );
-                    if let Some(ready) = record.first_chain_watch_ready {
+                    if local_taker {
+                        envelopes.push(
+                            CrossChainMessage::SwapSessionHello(hello.clone())
+                                .encode_envelope(request_id)
+                                .map_err(|_| {
+                                    hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
+                                })?,
+                        );
+                    }
+                    if let Some(ready) = record.first_chain_watch_ready
+                        && ready.header.signer_public_key == local_settlement_public_key
+                    {
                         envelopes.push(
                             CrossChainMessage::SwapWatchReady(ready)
                                 .encode_envelope(0)
@@ -3322,15 +3352,17 @@ impl MobileShakescapeSessionController {
                                 })?,
                         );
                     }
-                }
-                // Funding locators are settlement recovery records, not
-                // public listings. Replay every still-valid signed locator
-                // even after the original offer/hello listing window closed.
-                // Recipients independently retrieve and verify the exact HTLC
-                // before advancing any durable execution state.
-                for record in load_shakescape_direct_swaps(store, &self.policy)? {
+                    // Funding locators are settlement recovery records, not
+                    // public listings. Replay every still-valid locator signed
+                    // by this wallet even after the original listing window
+                    // closed. Replaying a counterparty-authored locator would
+                    // send it back to its signer through a routed relay and can
+                    // never repair the other endpoint's state.
                     for funding in record.peer_funding_statuses {
-                        if funding.status.header.expires_at > now_unix {
+                        if funding.status.header.expires_at > now_unix
+                            && funding.status.header.signer_public_key
+                                == local_settlement_public_key
+                        {
                             envelopes.push(
                                 CrossChainMessage::SwapFundingStatus(funding.status)
                                     .encode_envelope(0)
@@ -3344,6 +3376,15 @@ impl MobileShakescapeSessionController {
                 Ok::<_, hns_wallet_market::MarketError>(envelopes)
             })
             .map_err(MobileWalletError::from)
+    }
+
+    /// Whether an authenticated session still has wallet-authored recovery
+    /// packets which should be replayed on a short reconnect cadence. The
+    /// returned value is derived only from durable state; it does not mark a
+    /// packet delivered or otherwise mutate the swap journal.
+    pub fn has_direct_swap_reconciliation(&self, now_unix: u64) -> Result<bool, MobileWalletError> {
+        self.direct_swap_handshake_reconciliation_envelopes(now_unix)
+            .map(|envelopes| !envelopes.is_empty())
     }
 
     /// Service one already-received canonical cross-chain envelope. Direct
@@ -4110,14 +4151,16 @@ mod tests {
         let maker_replay = maker_controller
             .direct_swap_handshake_reconciliation_envelopes(START + 33)
             .expect("maker reconciliation envelopes");
-        assert_eq!(
-            maker_replay,
-            vec![
-                take.envelope.clone(),
-                proposal.envelope.clone(),
-                accepted.envelope,
-                ready_envelope,
-            ]
+        assert_eq!(maker_replay, vec![proposal.envelope.clone()]);
+        assert!(
+            controller
+                .has_direct_swap_reconciliation(START + 33)
+                .unwrap()
+        );
+        assert!(
+            maker_controller
+                .has_direct_swap_reconciliation(START + 33)
+                .unwrap()
         );
         assert!(
             controller
@@ -4705,6 +4748,36 @@ mod tests {
                 .expect("taker verifies HNS funding"),
             SwapState::BothFunded
         );
+        let maker_replay = controller
+            .direct_swap_handshake_reconciliation_envelopes(START + 61)
+            .expect("maker recovery packets");
+        let taker_replay = taker_controller
+            .direct_swap_handshake_reconciliation_envelopes(START + 61)
+            .expect("taker recovery packets");
+        let maker_funding_chains = maker_replay
+            .iter()
+            .filter_map(|envelope| {
+                CrossChainMessage::decode_envelope(envelope)
+                    .ok()
+                    .and_then(|(_, message)| match message {
+                        CrossChainMessage::SwapFundingStatus(status) => Some(status.chain),
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        let taker_funding_chains = taker_replay
+            .iter()
+            .filter_map(|envelope| {
+                CrossChainMessage::decode_envelope(envelope)
+                    .ok()
+                    .and_then(|(_, message)| match message {
+                        CrossChainMessage::SwapFundingStatus(status) => Some(status.chain),
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(maker_funding_chains, vec![ChainId::BITCOIN]);
+        assert_eq!(taker_funding_chains, vec![ChainId::HANDSHAKE]);
 
         let maker_hns_redeem = controller
             .authorize_local_hns_redeem(offer.offer.session_id)
