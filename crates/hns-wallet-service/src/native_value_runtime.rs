@@ -2728,8 +2728,22 @@ fn chain_failure(error: ChainError) -> ServiceFailure {
             ServiceErrorCode::UnsupportedCapability,
             "HNS value operations are unavailable",
         ),
-        ChainError::NotSynchronized | ChainError::Overflow | ChainError::Backend(_) => {
-            (ServiceErrorCode::RuntimeFailure, "HNS value runtime failed")
+        ChainError::NotSynchronized => (
+            ServiceErrorCode::RuntimeFailure,
+            "HNS wallet synchronization is not current",
+        ),
+        ChainError::Overflow => (
+            ServiceErrorCode::RuntimeFailure,
+            "HNS value calculation overflowed",
+        ),
+        ChainError::Backend(message) => {
+            return ServiceFailure {
+                code: ServiceErrorCode::RuntimeFailure,
+                // The chain adapter supplies only bounded static categories;
+                // it never forwards backend strings, paths, peers, or secrets.
+                message,
+                unsupported_capability: None,
+            };
         }
     };
     ServiceFailure {
@@ -2759,6 +2773,17 @@ mod tests {
         assert_eq!(
             chain_failure(ChainError::InvalidRequest("unclassified request")).message,
             "HNS value request is invalid",
+        );
+        assert_eq!(
+            chain_failure(ChainError::NotSynchronized).message,
+            "HNS wallet synchronization is not current",
+        );
+        assert_eq!(
+            chain_failure(ChainError::Backend(
+                "Handshake transaction signing failed".to_owned(),
+            ))
+            .message,
+            "Handshake transaction signing failed",
         );
     }
 

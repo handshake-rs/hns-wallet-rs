@@ -10916,6 +10916,59 @@ where
         | HnsWalletError::InvalidFeeQuoteTransaction
         | HnsWalletError::InvalidFeeQuote => ChainError::InvalidEvidence,
         HnsWalletError::Store => ChainError::Backend("wallet store failed".to_owned()),
+        // Keep these descriptions deliberately static: callers need an
+        // actionable failure category, while backend strings, filesystem
+        // paths, peer addresses, and key material must not cross the wallet
+        // service boundary.
+        HnsWalletError::Randomness => {
+            ChainError::Backend("operating-system randomness is unavailable".to_owned())
+        }
+        HnsWalletError::WrongKeyRole
+        | HnsWalletError::KeyDerivation
+        | HnsWalletError::Address => {
+            ChainError::Backend("Handshake wallet key derivation failed".to_owned())
+        }
+        HnsWalletError::StoreAuthorityMismatch
+        | HnsWalletError::AccountConfigurationMismatch
+        | HnsWalletError::DuplicateAccountDerivation => {
+            ChainError::Backend("Handshake wallet account authority is inconsistent".to_owned())
+        }
+        HnsWalletError::StaleAccountRead | HnsWalletError::StaleAddressReservation => {
+            ChainError::Backend("Handshake wallet state changed during preparation".to_owned())
+        }
+        HnsWalletError::RuntimePoisoned => {
+            ChainError::Backend("Handshake wallet runtime lock is unavailable".to_owned())
+        }
+        HnsWalletError::Clock => {
+            ChainError::Backend("Handshake wallet clock is unavailable".to_owned())
+        }
+        HnsWalletError::InvalidLookahead | HnsWalletError::ScanCapacityExhausted => {
+            ChainError::Backend("Handshake wallet scan state is invalid".to_owned())
+        }
+        HnsWalletError::InvalidWorkflow => {
+            ChainError::Backend("Handshake wallet workflow state is invalid".to_owned())
+        }
+        HnsWalletError::Signing => {
+            ChainError::Backend("Handshake transaction signing failed".to_owned())
+        }
+        HnsWalletError::Encoding => {
+            ChainError::Backend("Handshake wallet state encoding failed".to_owned())
+        }
+        HnsWalletError::HistoryLimit => {
+            ChainError::Backend("Handshake wallet history exceeded its bound".to_owned())
+        }
+        HnsWalletError::NameExpired | HnsWalletError::NameFinalizeNotMature { .. } => {
+            ChainError::Backend("Handshake name state cannot fund this value action".to_owned())
+        }
+        HnsWalletError::HeaderRoundInsufficientResponses
+        | HnsWalletError::HeaderRoundInsufficientAgreement => {
+            ChainError::Backend("Handshake header verification is incomplete".to_owned())
+        }
+        HnsWalletError::Backend(_) => {
+            ChainError::Backend("Handshake backend request failed".to_owned())
+        }
+        // Variants classified above as protocol errors are exhaustive today;
+        // retain a non-sensitive fail-closed category if another one is added.
         _ => ChainError::Backend("Handshake wallet runtime failed".to_owned()),
     }
 }
