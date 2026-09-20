@@ -4623,7 +4623,6 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             }
         }
         let account = cache.account.clone();
-        let account_revision = cache.account_revision;
         let coins = cache.coins.clone();
         drop(cache);
         let config = account.config.clone();
@@ -4934,9 +4933,18 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .quote_final_transaction(&signed, &input_coins, fee, maximum_fee)
             .map_err(map_chain_error)?;
         let cache = self.cache_read().map_err(map_chain_error)?;
-        if cache.account != account || cache.account_revision != account_revision {
-            return Err(ChainError::InvalidEvidence);
-        }
+        // Fee quoting may perform one bounded reconciliation when the newly
+        // confirmed HTLC input was not present in the quote snapshot. That
+        // reconciliation is allowed to advance the durable account revision
+        // without changing the account itself. Rebase the change-address
+        // reservation onto that authoritative revision, just as the native
+        // HTLC lock path does, while still rejecting any actual account
+        // mutation that would make this prepared transaction stale.
+        let account_revision = authoritative_unchanged_account_revision(
+            &account,
+            &cache.account,
+            cache.account_revision,
+        )?;
         drop(cache);
         let account_save =
             Self::change_account_save(&account, account_revision, change_derivation.index, now)
@@ -10729,6 +10737,17 @@ fn ensure_ready(cache: &HnsRuntimeCache) -> Result<(), ChainError> {
     }
 }
 
+fn authoritative_unchanged_account_revision(
+    prepared_account: &HnsAccountRecord,
+    current_account: &HnsAccountRecord,
+    current_revision: u64,
+) -> Result<u64, ChainError> {
+    if prepared_account != current_account {
+        return Err(ChainError::InvalidEvidence);
+    }
+    Ok(current_revision)
+}
+
 fn map_chain_error<E>(error: E) -> ChainError
 where
     HnsWalletError: From<E>,
@@ -12105,6 +12124,24 @@ mod tests {
             value_operations_enabled: false,
             settlement_enabled: false,
         }
+    }
+
+    #[test]
+    fn settlement_preparation_rebases_an_unchanged_account_revision() {
+        let prepared =
+            HnsAccountRecord::initial_non_value(test_runtime_config()).expect("test account");
+        assert_eq!(
+            authoritative_unchanged_account_revision(&prepared, &prepared, 37)
+                .expect("an evidence-only reconciliation may advance the revision"),
+            37,
+        );
+
+        let mut changed = prepared.clone();
+        changed.next_change_index = changed.next_change_index.saturating_add(1);
+        assert_eq!(
+            authoritative_unchanged_account_revision(&prepared, &changed, 38),
+            Err(ChainError::InvalidEvidence),
+        );
     }
 
     fn twenty_four_word_phrase() -> String {
