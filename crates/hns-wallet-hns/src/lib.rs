@@ -4770,8 +4770,14 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let refund = action == HnsSettlementAction::Refund;
         let public = external_signer.map_or_else(
             || {
-                derive_settlement_public_key(&store, &account, session_id, refund)
-                    .map_err(map_chain_error)
+                derive_settlement_public_key(&store, &account, session_id, refund).map_err(
+                    |error| {
+                        evidence_error_context(
+                            map_chain_error(error),
+                            "HNS settlement public-key derivation",
+                        )
+                    },
+                )
             },
             |signer| Ok(signer.compressed_public_key()),
         )?;
@@ -4792,16 +4798,29 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             index: account.next_change_index,
         };
         let change_public = derive_hns_public_key(&store, config.wallet_id, change_derivation)
-            .map_err(map_chain_error)?;
+            .map_err(|error| {
+                evidence_error_context(
+                    map_chain_error(error),
+                    "HNS settlement change-key derivation",
+                )
+            })?;
         let destination = Address::new(
             0,
             public_key_hash(&change_public)
-                .map_err(map_chain_error)?
+                .map_err(|error| {
+                    evidence_error_context(
+                        map_chain_error(error),
+                        "HNS settlement change-address hashing",
+                    )
+                })?
                 .to_vec(),
         )
-        .map_err(|_| ChainError::InvalidEvidence)?;
-        let previous_value =
-            u64::try_from(lock.amount.base_units.get()).map_err(|_| ChainError::InvalidEvidence)?;
+        .map_err(|_| {
+            ChainError::InvalidEvidenceContext("HNS settlement change-address construction")
+        })?;
+        let previous_value = u64::try_from(lock.amount.base_units.get()).map_err(|_| {
+            ChainError::InvalidEvidenceContext("HNS settlement lock-value conversion")
+        })?;
         let funding_coin =
             record
                 .funding_coin
@@ -4830,8 +4849,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         } else {
             0
         };
-        let mut sponsor_candidates =
-            available_unreserved_coins(&mut store, &config, coins, now).map_err(map_chain_error)?;
+        let mut sponsor_candidates = available_unreserved_coins(&mut store, &config, coins, now)
+            .map_err(|error| {
+                evidence_error_context(map_chain_error(error), "HNS settlement sponsor selection")
+            })?;
         sponsor_candidates.retain(|coin| {
             is_confirmed_ordinary_hns_spend_candidate(coin)
                 && coin.coin.outpoint != funding_coin.outpoint
@@ -4857,14 +4878,30 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 locktime,
                 refund,
             )
-            .map_err(map_chain_error)?;
+            .map_err(|error| {
+                evidence_error_context(
+                    map_chain_error(error),
+                    "HNS settlement transaction construction",
+                )
+            })?;
             let mut input_coins = Vec::with_capacity(1 + sponsors.len());
             input_coins.push(canonical_funding_coin.clone());
             if !sponsors.is_empty() {
-                input_coins.extend(canonical_input_coins(&sponsors).map_err(map_chain_error)?);
+                input_coins.extend(canonical_input_coins(&sponsors).map_err(|error| {
+                    evidence_error_context(
+                        map_chain_error(error),
+                        "HNS settlement sponsor-coin encoding",
+                    )
+                })?);
             }
-            let fee = canonical_policy_minimum_fee(&transaction, &input_coins, fee_rate)
-                .map_err(map_chain_error)?;
+            let fee = canonical_policy_minimum_fee(&transaction, &input_coins, fee_rate).map_err(
+                |error| {
+                    evidence_error_context(
+                        map_chain_error(error),
+                        "HNS settlement local fee policy",
+                    )
+                },
+            )?;
             if fee > maximum_fee {
                 return Err(ChainError::FeeLimit);
             }
@@ -4899,8 +4936,15 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 &sponsors,
                 &expected_roles,
             )
-            .map_err(map_chain_error)?;
-            Transaction::decode(&signed).map_err(|_| ChainError::InvalidEvidence)?
+            .map_err(|error| {
+                evidence_error_context(
+                    map_chain_error(error),
+                    "HNS settlement sponsor authorization",
+                )
+            })?;
+            Transaction::decode(&signed).map_err(|_| {
+                ChainError::InvalidEvidenceContext("HNS settlement sponsor transaction decoding")
+            })?
         };
         let signed = match external_signer {
             Some(signer) => sign_htlc_spend_with_settlement_signer(
@@ -4922,19 +4966,40 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 refund,
             ),
         }
-        .map_err(map_chain_error)?;
+        .map_err(|error| {
+            evidence_error_context(map_chain_error(error), "HNS settlement HTLC authorization")
+        })?;
         let signed_transaction = validate_witness_only_change(&unsigned_transaction, &signed)
-            .map_err(map_chain_error)?;
-        validate_standard_input_authorizations(&signed_transaction, &input_coins)
-            .map_err(map_chain_error)?;
+            .map_err(|error| {
+                evidence_error_context(
+                    map_chain_error(error),
+                    "HNS settlement signed-transaction structure",
+                )
+            })?;
+        validate_standard_input_authorizations(&signed_transaction, &input_coins).map_err(
+            |error| {
+                evidence_error_context(map_chain_error(error), "HNS settlement input authorization")
+            },
+        )?;
         let expires_at_unix = now
             .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
             .ok_or(ChainError::Overflow)?;
         let reservation_saves =
-            reservation_saves(&config, workflow_id, &sponsors, expires_at_unix, now)
-                .map_err(map_chain_error)?;
+            reservation_saves(&config, workflow_id, &sponsors, expires_at_unix, now).map_err(
+                |error| {
+                    evidence_error_context(
+                        map_chain_error(error),
+                        "HNS settlement sponsor reservation",
+                    )
+                },
+            )?;
         let mut policy_input_evidence = vec![funding_coin];
-        policy_input_evidence.extend(input_coin_evidence(&sponsors).map_err(map_chain_error)?);
+        policy_input_evidence.extend(input_coin_evidence(&sponsors).map_err(|error| {
+            evidence_error_context(
+                map_chain_error(error),
+                "HNS settlement input evidence encoding",
+            )
+        })?);
         drop(store);
         let quote = self
             .quote_final_transaction(&signed, &input_coins, fee, maximum_fee)
@@ -4953,11 +5018,17 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             &account,
             &cache.account,
             cache.account_revision,
-        )?;
+        )
+        .map_err(|error| evidence_error_context(error, "HNS settlement account-revision rebase"))?;
         drop(cache);
         let account_save =
             Self::change_account_save(&account, account_revision, change_derivation.index, now)
-                .map_err(map_chain_error)?;
+                .map_err(|error| {
+                    evidence_error_context(
+                        map_chain_error(error),
+                        "HNS settlement change-index reservation",
+                    )
+                })?;
         self.persist_prepared_settlement(
             session_id,
             action,
@@ -5746,7 +5817,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let evidence = self
             .backend
             .get_transaction_evidence(funding_transaction, binding, Some(mempool))
-            .map_err(map_chain_error)?;
+            .map_err(|error| {
+                evidence_error_context(map_chain_error(error), "HNS lock evidence retrieval")
+            })?;
         if evidence.binding != binding || evidence.mempool != mempool || evidence.status.conflicted
         {
             return Err(ChainError::InvalidEvidenceContext(
