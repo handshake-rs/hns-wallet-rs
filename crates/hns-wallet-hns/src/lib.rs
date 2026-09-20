@@ -4626,6 +4626,18 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let coins = cache.coins.clone();
         drop(cache);
         let config = account.config.clone();
+        let workflow_id = settlement_workflow_id(&config, session_id, action);
+        let mut store = self.store_lock().map_err(map_chain_error)?;
+        let record = store
+            .hns_verified_settlement::<HnsVerifiedSettlementRecord>(&settlement_entity_id(
+                &config, session_id,
+            ))
+            .map_err(map_chain_error)?
+            .ok_or(ChainError::InvalidEvidenceContext(
+                "verified HNS lock lookup",
+            ))?
+            .value;
+        let lock = refreshed_verified_settlement_lock(&record.verified, &lock)?;
         let terms = match action {
             HnsSettlementAction::Redeem => HnsSettlementTerms::Redeem { lock: lock.clone() },
             HnsSettlementAction::Refund => HnsSettlementTerms::Refund { lock: lock.clone() },
@@ -4635,8 +4647,6 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 ));
             }
         };
-        let workflow_id = settlement_workflow_id(&config, session_id, action);
-        let mut store = self.store_lock().map_err(map_chain_error)?;
         if let Some(mut stored) = store
             .load_workflow::<HnsPreparedSettlement>(workflow_id)
             .map_err(map_chain_error)?
@@ -4757,16 +4767,6 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 return Ok(artifact);
             }
         }
-        let record = store
-            .hns_verified_settlement::<HnsVerifiedSettlementRecord>(&settlement_entity_id(
-                &config, session_id,
-            ))
-            .map_err(map_chain_error)?
-            .ok_or(ChainError::InvalidEvidence)?
-            .value;
-        if record.verified != lock {
-            return Err(ChainError::InvalidEvidence);
-        }
         let refund = action == HnsSettlementAction::Refund;
         let public = external_signer.map_or_else(
             || {
@@ -4802,11 +4802,16 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         .map_err(|_| ChainError::InvalidEvidence)?;
         let previous_value =
             u64::try_from(lock.amount.base_units.get()).map_err(|_| ChainError::InvalidEvidence)?;
-        let funding_coin = record
-            .funding_coin
-            .clone()
-            .ok_or(ChainError::InvalidEvidence)?;
-        let canonical_funding_coin = funding_coin.to_canonical_coin().map_err(map_chain_error)?;
+        let funding_coin =
+            record
+                .funding_coin
+                .clone()
+                .ok_or(ChainError::InvalidEvidenceContext(
+                    "verified HNS funding coin lookup",
+                ))?;
+        let canonical_funding_coin = funding_coin.to_canonical_coin().map_err(|error| {
+            evidence_error_context(map_chain_error(error), "verified HNS funding coin decoding")
+        })?;
         if canonical_funding_coin.outpoint.transaction_hash.as_bytes() != lock.funding_id.as_bytes()
             || canonical_funding_coin.outpoint.index != record.output_index
             || canonical_funding_coin.value.get() != previous_value
@@ -4815,7 +4820,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             || canonical_funding_coin.address.hash != Sha3_256::digest(&record.script).to_vec()
             || canonical_funding_coin.covenant != Covenant::default()
         {
-            return Err(ChainError::InvalidEvidence);
+            return Err(ChainError::InvalidEvidenceContext(
+                "verified HNS funding coin binding",
+            ));
         }
         let sequence = if refund { u32::MAX - 1 } else { u32::MAX };
         let locktime = if refund {
@@ -4931,7 +4938,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         drop(store);
         let quote = self
             .quote_final_transaction(&signed, &input_coins, fee, maximum_fee)
-            .map_err(map_chain_error)?;
+            .map_err(|error| {
+                evidence_error_context(map_chain_error(error), "HNS settlement fee quote")
+            })?;
         let cache = self.cache_read().map_err(map_chain_error)?;
         // Fee quoting may perform one bounded reconciliation when the newly
         // confirmed HTLC input was not present in the quote snapshot. That
@@ -5740,12 +5749,16 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .map_err(map_chain_error)?;
         if evidence.binding != binding || evidence.mempool != mempool || evidence.status.conflicted
         {
-            return Err(ChainError::InvalidEvidence);
+            return Err(ChainError::InvalidEvidenceContext(
+                "HNS lock snapshot binding",
+            ));
         }
         if evidence.status.confirmation_count < required_confirmations {
             return Ok(None);
         }
-        let raw = evidence.raw.ok_or(ChainError::InvalidEvidence)?;
+        let raw = evidence.raw.ok_or(ChainError::InvalidEvidenceContext(
+            "HNS lock transaction lookup",
+        ))?;
         let verified = <Self as AtomicSettlement>::verify_lock(
             self,
             VerifySettlementLockRequest {
@@ -5762,7 +5775,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 transaction_or_receipt: raw,
                 confirmation_count: evidence.status.confirmation_count,
             },
-        )?;
+        )
+        .map_err(|error| evidence_error_context(error, "HNS lock verification"))?;
         Ok(Some(verified.0))
     }
 
@@ -5868,9 +5882,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         signer: &dyn SettlementSigner,
     ) -> Result<PreparedSettlementRedeem, ChainError> {
         self.verify_native_htlc_network(&descriptor)?;
-        validate_native_htlc_lock(&descriptor, session_id, &lock)?;
+        validate_native_htlc_lock(&descriptor, session_id, &lock)
+            .map_err(|error| evidence_error_context(error, "HNS redeem descriptor binding"))?;
         if HnsHtlc::hash_preimage(preimage.expose_for_settlement()) != descriptor.hashlock {
-            return Err(ChainError::InvalidEvidence);
+            return Err(ChainError::InvalidEvidenceContext(
+                "HNS redeem preimage binding",
+            ));
         }
         self.prepare_settlement_spend(
             session_id,
@@ -10748,6 +10765,38 @@ fn authoritative_unchanged_account_revision(
     Ok(current_revision)
 }
 
+fn evidence_error_context(error: ChainError, context: &'static str) -> ChainError {
+    match error {
+        ChainError::InvalidEvidence => ChainError::InvalidEvidenceContext(context),
+        other => other,
+    }
+}
+
+fn refreshed_verified_settlement_lock(
+    stored: &VerifiedLock,
+    candidate: &VerifiedLock,
+) -> Result<VerifiedLock, ChainError> {
+    if stored.module != candidate.module
+        || stored.session_id != candidate.session_id
+        || stored.funding_id != candidate.funding_id
+        || stored.amount != candidate.amount
+        || stored.hashlock != candidate.hashlock
+        || stored.absolute_timelock != candidate.absolute_timelock
+        || stored.evidence_hash != candidate.evidence_hash
+    {
+        return Err(ChainError::InvalidEvidenceContext(
+            "verified HNS lock binding",
+        ));
+    }
+    Ok(
+        if stored.confirmation_count >= candidate.confirmation_count {
+            stored.clone()
+        } else {
+            candidate.clone()
+        },
+    )
+}
+
 fn map_chain_error<E>(error: E) -> ChainError
 where
     HnsWalletError: From<E>,
@@ -15023,6 +15072,11 @@ mod tests {
         };
         let mut refreshed_lock = stored_lock.clone();
         refreshed_lock.confirmation_count = 5;
+        assert_eq!(
+            refreshed_verified_settlement_lock(&refreshed_lock, &stored_lock)
+                .expect("the freshest equivalent verified lock wins"),
+            refreshed_lock,
+        );
         assert!(settlement_terms_are_retry_compatible(
             &HnsSettlementTerms::Redeem {
                 lock: stored_lock.clone(),
@@ -15044,6 +15098,12 @@ mod tests {
         ));
 
         refreshed_lock.evidence_hash = ObjectHash::new([105; 32]);
+        assert!(matches!(
+            refreshed_verified_settlement_lock(&refreshed_lock, &stored_lock),
+            Err(ChainError::InvalidEvidenceContext(
+                "verified HNS lock binding"
+            ))
+        ));
         assert!(!settlement_terms_are_retry_compatible(
             &HnsSettlementTerms::Redeem { lock: stored_lock },
             &HnsSettlementTerms::Redeem {

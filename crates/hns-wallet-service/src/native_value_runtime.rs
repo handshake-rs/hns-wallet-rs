@@ -2717,6 +2717,13 @@ fn chain_failure(error: ChainError) -> ServiceFailure {
             ServiceErrorCode::RuntimeFailure,
             "HNS transaction evidence failed authentication",
         ),
+        ChainError::InvalidEvidenceContext(context) => {
+            return ServiceFailure {
+                code: ServiceErrorCode::RuntimeFailure,
+                message: format!("HNS transaction evidence failed authentication during {context}"),
+                unsupported_capability: None,
+            };
+        }
         ChainError::Disabled | ChainError::Unsupported => (
             ServiceErrorCode::UnsupportedCapability,
             "HNS value operations are unavailable",
@@ -2752,6 +2759,18 @@ mod tests {
         assert_eq!(
             chain_failure(ChainError::InvalidRequest("unclassified request")).message,
             "HNS value request is invalid",
+        );
+    }
+
+    #[test]
+    fn settlement_evidence_context_is_preserved_without_private_values() {
+        let failure = chain_failure(ChainError::InvalidEvidenceContext(
+            "verified HNS lock binding",
+        ));
+        assert_eq!(failure.code, ServiceErrorCode::RuntimeFailure);
+        assert_eq!(
+            failure.message,
+            "HNS transaction evidence failed authentication during verified HNS lock binding",
         );
     }
 

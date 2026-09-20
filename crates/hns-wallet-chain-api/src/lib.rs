@@ -629,6 +629,8 @@ pub enum ChainError {
     Overflow,
     #[error("chain evidence is stale, missing, or contradictory")]
     InvalidEvidence,
+    #[error("chain evidence is stale, missing, or contradictory during {0}")]
+    InvalidEvidenceContext(&'static str),
     #[error("opaque transaction is empty or exceeds the bounded maximum")]
     InvalidTransactionSize,
     #[error("backend failed: {0}")]
