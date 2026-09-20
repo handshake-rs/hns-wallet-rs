@@ -1191,20 +1191,40 @@ impl MobileShakescapeSessionController {
                         return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
                     };
                     if record.first_chain_watch_ready.is_some() {
-                        candidates.push((execution.id, hello.offered_asset));
+                        let local_maker = is_local_shakescape_direct_maker(
+                            store,
+                            &self.policy,
+                            self.wallet_id,
+                            execution.id,
+                        )?;
+                        let local_taker =
+                            is_local_shakescape_direct_taker(store, self.wallet_id, execution.id)?;
+                        if local_maker == local_taker {
+                            return Err(
+                                hns_wallet_market::MarketError::CorruptShakescapeDirectSwap,
+                            );
+                        }
+                        candidates.push((execution.id, hello.offered_asset, local_maker));
                     }
                 }
                 Ok::<_, hns_wallet_market::MarketError>(candidates)
             })
             .map_err(MobileWalletError::from)?;
         let mut advanced = 0usize;
-        for (session_id, offered_asset) in candidates {
-            let authorized = match offered_asset {
-                AssetId::BTC => self
+        for (session_id, offered_asset, local_maker) in candidates {
+            let authorized = match (local_maker, offered_asset) {
+                (true, AssetId::BTC) => self
                     .authorize_local_btc_first_funding(session_id, now_unix)
                     .is_ok(),
-                AssetId::HNS => self
+                (true, AssetId::HNS) => self
                     .authorize_local_hns_first_funding(session_id, now_unix)
+                    .is_ok(),
+                // Older HNS-first clients durably signed and admitted their
+                // receiver watch without crossing the local pre-funding
+                // checkpoints. Recover that exact authenticated watch before
+                // attempting independent chain verification.
+                (false, AssetId::HNS) => self
+                    .advance_counterparty_hns_watch_readiness(session_id, now_unix)
                     .is_ok(),
                 _ => false,
             };
@@ -1628,6 +1648,20 @@ impl MobileShakescapeSessionController {
         peer: &mut HnsDirectShakescapePeer,
         now_unix: u64,
     ) -> Result<(), MobileWalletError> {
+        let message = self.confirm_counterparty_hns_watch(permit, now_unix)?;
+        peer.send_cross_chain_message(&message)?;
+        Ok(())
+    }
+
+    /// Persist the locally installed first-chain HNS watch and cross the same
+    /// restart-safe pre-funding checkpoints used by the Bitcoin watch path.
+    /// The returned acknowledgement is safe to replay until transport
+    /// delivery succeeds; it contains no private settlement material.
+    pub fn confirm_counterparty_hns_watch(
+        &mut self,
+        permit: MobileShakescapeHnsWatchPermit,
+        now_unix: u64,
+    ) -> Result<CrossChainMessage, MobileWalletError> {
         let hello = permit.hello;
         let mut ready = hns_marketplace_protocol::SwapWatchReady {
             header: hns_marketplace_protocol::SignedObjectHeader {
@@ -1657,13 +1691,69 @@ impl MobileShakescapeSessionController {
         let envelope = message
             .encode_envelope(0)
             .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
+        let policy = self.policy;
+        let session_id = hns_wallet_types::SessionId::new(hello.swap_session_id);
         self.store
             .try_with_store_mut(|store| {
-                admit_shakescape_direct_swap_watch_ready(store, &self.policy, &envelope, now_unix)
+                admit_shakescape_direct_swap_watch_ready(store, &policy, &envelope, now_unix)
             })
             .map_err(MobileWalletError::from)?;
-        peer.send_cross_chain_message(&message)?;
-        Ok(())
+        self.advance_counterparty_hns_watch_readiness(session_id, now_unix)?;
+        Ok(message)
+    }
+
+    fn advance_counterparty_hns_watch_readiness(
+        &mut self,
+        session_id: hns_wallet_types::SessionId,
+        now_unix: u64,
+    ) -> Result<(), MobileWalletError> {
+        let policy = self.policy;
+        let wallet_id = self.wallet_id;
+        self.store
+            .try_with_store_mut(|store| {
+                if !is_local_shakescape_direct_taker(store, wallet_id, session_id)? {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
+                let record = load_shakescape_direct_swap(store, &policy, session_id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+                if hello.offered_asset != AssetId::HNS
+                    || hello.first_funding_chain != hns_marketplace_protocol::ChainId::HANDSHAKE
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
+                let ready = record
+                    .first_chain_watch_ready
+                    .ok_or(hns_wallet_market::MarketError::InvalidTransition)?;
+                ready
+                    .verify_for_session(&hello, policy.network(), ready.header.created_at)
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+                let mut execution =
+                    open_shakescape_execution(store, &policy, session_id, now_unix)?;
+                if execution.state == SwapState::TermsFrozen {
+                    let mut journal = WalletStoreJournal {
+                        store,
+                        workflow_id: shakescape_execution_workflow_id(session_id),
+                        updated_at_unix: now_unix,
+                    };
+                    execution.apply(VerifiedEvidence::RefundsValidated, now_unix, &mut journal)?;
+                }
+                if execution.state == SwapState::RefundsPrepared {
+                    let mut journal = WalletStoreJournal {
+                        store,
+                        workflow_id: shakescape_execution_workflow_id(session_id),
+                        updated_at_unix: now_unix,
+                    };
+                    execution.apply(VerifiedEvidence::FundingReady, now_unix, &mut journal)?;
+                }
+                if execution.state != SwapState::FirstFundingPending {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
+                Ok(())
+            })
+            .map_err(MobileWalletError::from)
     }
 
     pub fn pending_second_hns_funding_verifications(
@@ -3768,16 +3858,17 @@ fn decode_offer_id(encoded: &str) -> Result<[u8; 32], MobileWalletError> {
 
 #[cfg(test)]
 mod tests {
-    use hns_marketplace_protocol::{ChainId, CrossChainMessage, NetworkBinding};
+    use hns_marketplace_protocol::{ChainId, CrossChainMessage, NetworkBinding, SwapWatchReady};
     use hns_primitives::BlockHash;
     use hns_wallet_market::{
         ShakescapeBtcForHnsMakerProposalRequest, ShakescapeBtcForHnsOfferRequest,
-        ShakescapeDirectOfferBoardPolicy, ShakescapeHnsForBtcOfferRequest,
-        ShakescapeHnsForBtcTakeRequest, VerifiedEvidence, WalletStoreJournal,
-        accept_shakescape_hns_for_btc_maker_proposal, admit_shakescape_direct_offer,
-        admit_shakescape_direct_offer_take, admit_shakescape_direct_swap_hello,
-        admit_shakescape_direct_swap_proposal, create_shakescape_btc_for_hns_maker_proposal,
-        create_shakescape_btc_for_hns_offer, create_shakescape_hns_for_btc_offer,
+        ShakescapeBtcForHnsTakeRequest, ShakescapeDirectOfferBoardPolicy,
+        ShakescapeHnsForBtcOfferRequest, ShakescapeHnsForBtcTakeRequest, VerifiedEvidence,
+        WalletStoreJournal, accept_shakescape_hns_for_btc_maker_proposal,
+        admit_shakescape_direct_offer, admit_shakescape_direct_offer_take,
+        admit_shakescape_direct_swap_hello, admit_shakescape_direct_swap_proposal,
+        create_shakescape_btc_for_hns_maker_proposal, create_shakescape_btc_for_hns_offer,
+        create_shakescape_btc_for_hns_take, create_shakescape_hns_for_btc_offer,
         create_shakescape_hns_for_btc_take, load_shakescape_direct_offer,
         open_shakescape_execution, shakescape_execution_workflow_id,
     };
@@ -4186,6 +4277,143 @@ mod tests {
                 .reserved_hns_dollarydoos(START + 621)
                 .expect("expired taker reservation released"),
             0
+        );
+    }
+
+    #[test]
+    fn persisted_hns_first_watch_recovers_verified_funding_gate() {
+        let policy = policy();
+        let maker_id = WalletId::new([0x5b; 16]);
+        let taker_id = WalletId::new([0x5c; 16]);
+        let mut maker = seeded_store(maker_id, 0x6b);
+        let mut taker = seeded_store(taker_id, 0x6c);
+        let offer = create_shakescape_hns_for_btc_offer(
+            &mut maker,
+            &policy.board_policy(),
+            ShakescapeHnsForBtcOfferRequest {
+                wallet_id: maker_id,
+                hns_amount_dollarydoos: 2_000_000,
+                btc_amount_sats: 9_000,
+                hns_fee_reserve_dollarydoos: 10_000,
+                created_at_unix: START,
+                expires_at_unix: START + 10_000,
+                nonce: [0x7b; 32],
+            },
+        )
+        .expect("HNS-first offer");
+        let signed_offer = load_shakescape_direct_offer(
+            &maker,
+            &policy.board_policy(),
+            offer.offer.offer_id.into_bytes(),
+        )
+        .expect("load offer")
+        .expect("offer exists")
+        .offer;
+        let offer_envelope = CrossChainMessage::DirectOffer(signed_offer)
+            .encode_envelope(1)
+            .expect("offer envelope");
+        admit_shakescape_direct_offer(&mut taker, &policy.board_policy(), &offer_envelope, START)
+            .expect("taker admits offer");
+        let take = create_shakescape_btc_for_hns_take(
+            &mut taker,
+            &policy,
+            ShakescapeBtcForHnsTakeRequest {
+                wallet_id: taker_id,
+                offer_id: offer.offer.offer_id,
+                bitcoin_fee_reserve_sats: 1_000,
+                created_at_unix: START + 10,
+                expires_at_unix: START + 10_000,
+                nonce: [0x7c; 32],
+            },
+        )
+        .expect("BTC-paying take");
+        admit_shakescape_direct_offer_take(&mut maker, &policy, &take.envelope, START + 10)
+            .expect("maker admits take");
+        let proposal = create_shakescape_btc_for_hns_maker_proposal(
+            &mut maker,
+            &policy,
+            ShakescapeBtcForHnsMakerProposalRequest {
+                wallet_id: maker_id,
+                session_id: offer.offer.session_id,
+                now_unix: START + 20,
+                funding_window_seconds: 600,
+                second_refund_after_seconds: 3_600,
+                refund_safety_margin_seconds: 3_600,
+                bitcoin_minimum_confirmations: 1,
+                hns_minimum_confirmations: 2,
+            },
+        )
+        .expect("maker proposal");
+        admit_shakescape_direct_swap_proposal(&mut taker, &policy, &proposal.envelope, START + 20)
+            .expect("taker admits proposal");
+        let accepted = accept_shakescape_hns_for_btc_maker_proposal(
+            &mut taker,
+            &policy,
+            taker_id,
+            offer.offer.session_id,
+            START + 30,
+        )
+        .expect("taker countersigns");
+        admit_shakescape_direct_swap_hello(&mut maker, &policy, &accepted.envelope, START + 30)
+            .expect("maker admits hello");
+
+        // Reproduce the durable state written by the previous mobile binary:
+        // the taker had signed and admitted the exact HNS watch, but its
+        // execution journal remained at TermsFrozen.
+        let (settlement_key, _) = hns_wallet_market::derive_local_direct_taker_key(
+            &taker,
+            &policy,
+            taker_id,
+            offer.offer.session_id,
+        )
+        .expect("taker settlement key");
+        let hello = accepted.hello;
+        let mut ready = SwapWatchReady {
+            header: SignedObjectHeader {
+                version: hello.header.version,
+                network: hello.header.network,
+                pair: hello.header.pair,
+                signer_public_key: [0; 33],
+                sequence: hello.header.sequence + 1,
+                created_at: START + 31,
+                expires_at: hello.header.expires_at,
+            },
+            swap_session_id: hello.swap_session_id,
+            chain: ChainId::HANDSHAKE,
+            lock_commitment: hello.offered_lock_commitment,
+            minimum_confirmations: hello.offered_minimum_confirmations,
+            signature: [0; 64],
+        };
+        settlement_key
+            .sign_watch_ready(&mut ready, &hello, START + 31)
+            .expect("sign HNS watch readiness");
+        let ready_envelope = CrossChainMessage::SwapWatchReady(ready)
+            .encode_envelope(0)
+            .expect("watch-ready envelope");
+        admit_shakescape_direct_swap_watch_ready(&mut taker, &policy, &ready_envelope, START + 31)
+            .expect("persist legacy HNS watch state");
+
+        let shared = SharedWalletStore::new(taker);
+        let mut controller = MobileShakescapeSessionController::new(shared, policy, taker_id);
+        assert_eq!(
+            controller.durable_executions().unwrap()[0].state,
+            SwapState::TermsFrozen
+        );
+        assert_eq!(
+            controller
+                .advance_local_first_funding_readiness(START + 32)
+                .expect("recover persisted HNS watch gate"),
+            1
+        );
+        assert_eq!(
+            controller.durable_executions().unwrap()[0].state,
+            SwapState::FirstFundingPending
+        );
+        assert!(
+            controller
+                .next_counterparty_hns_watch(START + 33)
+                .expect("watch already persisted")
+                .is_none()
         );
     }
 
