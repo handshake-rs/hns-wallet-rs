@@ -413,6 +413,10 @@ pub struct MobileShakescapeExecutionSummary {
     pub funding_deadline_unix: u64,
     pub first_refund_at_unix: u64,
     pub second_refund_at_unix: u64,
+    /// Latest signed status for the funding transaction owned by this wallet.
+    /// This is coordination metadata only; the confirmed booleans below still
+    /// require independent local chain verification.
+    pub local_funding_state: Option<String>,
     pub first_funding_confirmed: bool,
     pub second_funding_confirmed: bool,
     pub first_redemption_confirmed: bool,
@@ -1055,15 +1059,28 @@ impl MobileShakescapeSessionController {
                         };
                         let record = load_shakescape_direct_swap(store, &self.policy, session.id)?
                             .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
-                        let funding_deadline_unix = record
+                        let hello = record
                             .hello
                             .as_ref()
-                            .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
-                            .header
-                            .expires_at;
-                        execution_summary(session, local_role, funding_deadline_unix).map_err(
-                            |_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap,
+                            .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                        let funding_deadline_unix = hello.header.expires_at;
+                        let local_chain = if local_role == "maker" {
+                            hello.offered_asset.chain()
+                        } else {
+                            hello.received_asset.chain()
+                        };
+                        let local_funding_state = record
+                            .peer_funding_statuses
+                            .iter()
+                            .find(|retained| retained.status.chain == local_chain)
+                            .map(|retained| funding_state_name(retained.status.state).to_owned());
+                        execution_summary(
+                            session,
+                            local_role,
+                            funding_deadline_unix,
+                            local_funding_state,
                         )
+                        .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -3631,6 +3648,7 @@ fn execution_summary(
     session: hns_wallet_market::SwapSession,
     local_role: &str,
     funding_deadline_unix: u64,
+    local_funding_state: Option<String>,
 ) -> Result<MobileShakescapeExecutionSummary, MobileWalletError> {
     let chain = |module| -> Result<String, MobileWalletError> {
         match module {
@@ -3664,6 +3682,7 @@ fn execution_summary(
         funding_deadline_unix,
         first_refund_at_unix: session.timeouts.first_chain_refund_at,
         second_refund_at_unix: session.timeouts.second_chain_refund_at,
+        local_funding_state,
         first_funding_confirmed: session.first_funding.is_some(),
         second_funding_confirmed: session.second_funding.is_some(),
         first_redemption_confirmed: session.first_redemption.is_some(),
@@ -3672,6 +3691,15 @@ fn execution_summary(
         last_verified_at_unix: session.last_verified_at_unix,
         failure_reason: session.failure_reason,
     })
+}
+
+fn funding_state_name(state: FundingState) -> &'static str {
+    match state {
+        FundingState::Broadcast => "broadcast",
+        FundingState::Seen => "seen",
+        FundingState::Confirmed => "confirmed",
+        FundingState::Reorged => "reorged",
+    }
 }
 
 fn decode_offer_id(encoded: &str) -> Result<[u8; 32], MobileWalletError> {
@@ -4391,6 +4419,7 @@ mod tests {
             crate::lowercase_hex(offer.offer.session_id.as_bytes())
         );
         assert_eq!(resumed[0].first_chain, "bitcoin");
+        assert_eq!(resumed[0].local_funding_state, None);
         assert!(!resumed[0].first_funding_confirmed);
         let permit = controller
             .authorize_local_btc_first_funding(offer.offer.session_id, START + 40)
@@ -4500,6 +4529,14 @@ mod tests {
                 )
                 .expect("verified funding"),
             SwapState::FirstFunded
+        );
+        assert_eq!(
+            controller
+                .durable_executions()
+                .expect("confirmed local funding summary")[0]
+                .local_funding_state
+                .as_deref(),
+            Some("confirmed")
         );
         assert_eq!(
             taker_controller
