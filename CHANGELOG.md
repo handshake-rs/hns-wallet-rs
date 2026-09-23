@@ -3,6 +3,22 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## 0.2.5 - 2026-09-23
+
+<!-- hns-wallet-release-state: 0.2.5 release -->
+Breaking clean-break migration of the wallet and atomic-swap boundary:
+
+- Make newly generated HNS payment accounts compatible with the hsd/Bob
+  BIP-44 branch `m/44'/5353'/0'/change/index`, while persisting an immutable
+  derivation-scheme marker and defaulting missing existing records to the
+  original role-separated HKDF scheme. Phrase restore exposes an explicit
+  legacy path because BIP-39 words do not encode an application's derivation
+  path.
+- Treat confirmed, covenant-free ordinary HNS accidentally received on the
+  dedicated name branch as recoverable spendable value, signing it with its
+  actual role key. Name-locked, coinbase, Shakedex, and settlement outputs
+  remain excluded from ordinary selection.
+
 ## 0.2.4 - 2026-09-23
 
 <!-- hns-wallet-release-state: 0.2.4 release -->

@@ -749,6 +749,32 @@ impl MobileWalletController {
         recovery_phrase: MobileRecoveryPhrase,
     ) -> Result<Self, MobileWalletError> {
         let bootstrap = HnsWalletBootstrap::restore(recovery_phrase.expose_secret(), policy)?;
+        Self::restore_bootstrap(path, database_key, platform, bootstrap, recovery_phrase)
+    }
+
+    /// Restores the original pre-BIP-44 Shakescape HNS derivation. BIP-39
+    /// words do not encode an application's derivation path, so this explicit
+    /// path is required for old backups and must never be selected silently
+    /// for a newly generated standards-compatible wallet.
+    pub fn restore_legacy(
+        path: impl AsRef<Path>,
+        database_key: &MobileDatabaseKey,
+        platform: MobilePlatform,
+        policy: HnsBootstrapPolicy,
+        recovery_phrase: MobileRecoveryPhrase,
+    ) -> Result<Self, MobileWalletError> {
+        let bootstrap =
+            HnsWalletBootstrap::restore_legacy(recovery_phrase.expose_secret(), policy)?;
+        Self::restore_bootstrap(path, database_key, platform, bootstrap, recovery_phrase)
+    }
+
+    fn restore_bootstrap(
+        path: impl AsRef<Path>,
+        database_key: &MobileDatabaseKey,
+        platform: MobilePlatform,
+        bootstrap: HnsWalletBootstrap,
+        recovery_phrase: MobileRecoveryPhrase,
+    ) -> Result<Self, MobileWalletError> {
         drop(recovery_phrase);
         let account_config = bootstrap.account_record().config.clone();
         let host = WalletHost::new_system(platform.into(), RESTART_GENERATION)?;

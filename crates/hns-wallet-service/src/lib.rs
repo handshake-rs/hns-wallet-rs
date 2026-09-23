@@ -3773,6 +3773,7 @@ mod tests {
     fn production_hns_account(config: HnsRuntimeConfig) -> HnsAccountRecord {
         HnsAccountRecord {
             config,
+            derivation_scheme: Default::default(),
             next_receive_index: 0,
             next_change_index: 0,
             next_name_index: 0,

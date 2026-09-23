@@ -56,6 +56,23 @@ wrong-branch, wrong-index, or ambiguous name-target evidence fails the whole
 read. This read projection does not allocate a key or change any value,
 settlement, provider, or browser capability.
 
+New accounts derive the ordinary payment branch using hsd's network-specific
+Handshake coin type (5353 mainnet, 5354 testnet, 5355 regtest, or 5356 simnet)
+at the hsd/Bob-compatible mainnet BIP-44 path
+`m/44'/5353'/0'/change/index`. Dedicated name keys use the adjacent BIP-44
+account so name ownership remains purpose-separated. The derivation scheme is
+stored in the authenticated account record: records created before this change
+deserialize to `RoleHkdfV1` and never silently change addresses, while new
+records use `HsdBip44V1`. Since a BIP-39 phrase does not encode a derivation
+path, restore callers must explicitly choose the legacy path for an old
+Shakescape backup.
+
+Both public receive branches are version-0 P2PKH addresses controlled by the
+wallet. A name sent to the payment address remains discoverable name authority;
+ordinary covenant-free HNS sent to the name address is included in spendable
+balance and signed with the matching name-branch key. Name-locked, coinbase,
+Shakedex, and settlement outputs are never admitted as ordinary spend inputs.
+
 The ordinary non-value read runtime also exposes `import_name_exact_text` for
 a trusted native caller. It performs no trimming, lowercasing, IDNA, Unicode
 normalization, or dot handling. Valid text is checked before backend I/O, fresh

@@ -42,31 +42,30 @@ Normalized archive inspection materializes complete tar listings and selected
 files before comparison so a successful match cannot hide an upstream tar read
 failure or emit a benign broken-pipe warning.
 
-## 0.2.4 release source
+## 0.2.5 release source
 
-Version `0.2.4` is the current prepared `hns-wallet-rs` release source. The
+Version `0.2.5` is the current prepared `hns-wallet-rs` release source. The
 canonical feature inventory is in `CHANGELOG.md`; source packaging, publication,
 or test success does not enable provider, value, settlement, or marketplace
 product gates. Registry and tag state are external facts and must be checked at
 release time rather than embedded as a claim in the source snapshot.
 
-The selected `0.2.4` heading and package-local changelogs use one
-version-scoped canonical `release` declaration. It describes prepared source,
-not an existing crates.io package or tag; execution requires this exact dated
-state and rejects a stale, missing, malformed, mismatched, or candidate
-declaration.
+The selected `0.2.5` heading and package-local changelogs use one
+version-scoped canonical declaration. During development it is a candidate;
+publication requires the exact dated `release` declaration and rejects a stale,
+missing, malformed, mismatched, or candidate declaration.
 
 Root `CHANGELOG.md` release form:
 
 ```markdown
-<!-- hns-wallet-release-state: 0.2.4 release -->
+<!-- hns-wallet-release-state: 0.2.5 release -->
 Breaking clean-break migration of the wallet and atomic-swap boundary:
 ```
 
 `release/CRATE-CHANGELOG.md` release form:
 
 ```markdown
-<!-- hns-wallet-release-state: 0.2.4 release -->
+<!-- hns-wallet-release-state: 0.2.5 release -->
 This crate changelog describes the prepared `hns-wallet-rs` release source.
 ```
 
@@ -179,7 +178,7 @@ document and verify boundaries; they grant no runtime or deployment authority.
    confirmation must equal the workspace version:
 
    ```bash
-   ./scripts/publish.sh --execute --confirm-publish 0.2.4
+   ./scripts/publish.sh --execute --confirm-publish 0.2.5
    ```
 
 Execution mode first downloads all nineteen `hns-rs` `0.4.2` crates, all 20
@@ -213,7 +212,7 @@ limit:
 ```bash
 PUBLISH_NEW_INTERVAL_SECONDS=605 \
 PUBLISH_UPDATE_INTERVAL_SECONDS=65 \
-  ./scripts/publish.sh --execute --confirm-publish 0.2.4
+  ./scripts/publish.sh --execute --confirm-publish 0.2.5
 ```
 
 After each applicable cooldown, the script downloads the new archive and

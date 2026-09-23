@@ -14,7 +14,10 @@ state machines and fail-closed authority checks beneath those integrations.
 ## Implemented capabilities
 
 - Encrypted SQLite wallet state with one process-local lock and key authority.
-- BIP39 account creation and restoration with bounded derivation state.
+- BIP39 account creation and restoration with bounded derivation state. New
+  HNS payment accounts use the hsd/Bob-compatible BIP-44 path
+  `m/44'/5353'/0'/change/index`; existing role-HKDF wallets retain their
+  immutable legacy scheme and have an explicit legacy restore path.
 - Direct Handshake header, peer, coin, transaction, name-state, and proof
   synchronization.
 - HNS balance, payment receive, name receive, history, and tracked-name
@@ -120,9 +123,9 @@ The dependency-ordered public list is maintained in
 
 ## Version and dependency policy
 
-All fourteen wallet crates use one shared release version. The current source
-prepares the `0.2.4` cohort for the post-`0.2.3` mobile synchronization, name,
-swap, and recovery changes.
+All sixteen wallet crates use one shared release version. The current source
+prepares the `0.2.5` cohort for standards-compatible HNS derivation, legacy
+recovery, and cross-purpose receive safety.
 
 Protocol and light-client dependencies are exact-version, checksum-recorded
 crates.io cohorts. Repository-local path patches may be used while coordinating

@@ -1511,6 +1511,7 @@ mod tests {
     fn account() -> HnsAccountRecord {
         HnsAccountRecord {
             config: config(),
+            derivation_scheme: Default::default(),
             next_receive_index: 0,
             next_change_index: 0,
             next_name_index: 0,

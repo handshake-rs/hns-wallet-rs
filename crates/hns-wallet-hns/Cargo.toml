@@ -14,6 +14,7 @@ publish = ["crates-io"]
 
 [dependencies]
 bech32.workspace = true
+bip32.workspace = true
 blake2.workspace = true
 bip39.workspace = true
 getrandom.workspace = true

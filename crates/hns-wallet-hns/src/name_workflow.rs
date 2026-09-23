@@ -2452,7 +2452,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let (unsigned, tracked, _) = validate_name_plan_transaction(&plan, None)?;
             let mut roles = Vec::with_capacity(tracked.len());
             roles.push(plan.source.owner_derivation.role);
-            roles.resize(tracked.len(), KeyRole::HnsCoin);
+            roles.extend(
+                plan.funding_inputs
+                    .iter()
+                    .map(|input| input.derivation.role),
+            );
             let signed = sign_ordered_p2pkh_inputs(&store, &account, unsigned, &tracked, &roles)?;
             let (signed_transaction, _, canonical) =
                 validate_name_plan_transaction(&plan, Some(&signed))?;
@@ -2991,7 +2995,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let (coins, change) = {
             let mut store = self.store_lock()?;
             let coins = available_unreserved_coins(&mut store, &config, cached_coins, now_unix)?;
-            let public = derive_hns_public_key(&store, config.wallet_id, change_derivation)?;
+            let public = derive_hns_account_public_key(&store, &account, change_derivation)?;
             let change = Address::new(0, public_key_hash(&public)?.to_vec())
                 .map_err(|_| HnsWalletError::InvalidAddress)?;
             (coins, change)
@@ -4037,6 +4041,7 @@ mod tests {
             store,
             HnsAccountRecord {
                 config,
+                derivation_scheme: Default::default(),
                 next_receive_index: 0,
                 next_change_index: 0,
                 next_name_index: 1,
@@ -4073,8 +4078,7 @@ mod tests {
             change: 0,
             index,
         };
-        let public =
-            derive_hns_public_key(store, account.config.wallet_id, derivation).expect("public key");
+        let public = derive_hns_account_public_key(store, account, derivation).expect("public key");
         TrackedHnsCoin {
             coin: WalletCoin {
                 outpoint,
@@ -4110,8 +4114,8 @@ mod tests {
             change: 0,
             index: 0,
         };
-        let public = derive_hns_public_key(store, account.config.wallet_id, derivation)
-            .expect("name public key");
+        let public =
+            derive_hns_account_public_key(store, account, derivation).expect("name public key");
         let program = public_key_hash(&public).expect("name program").to_vec();
         let mut state = NameState {
             name_hash,

@@ -15,5 +15,5 @@ swap policy. Those responsibilities remain in `hns-wallet-bitcoin-kyoto` and
 the native wallet service.
 
 See the repository-level
-[`CHANGELOG.md`](https://github.com/handshake-rs/hns-wallet-rs/blob/v0.2.4/CHANGELOG.md)
+[`CHANGELOG.md`](https://github.com/handshake-rs/hns-wallet-rs/blob/v0.2.5/CHANGELOG.md)
 and [Bitcoin integration notes](../../docs/BITCOIN_KYOTO.md).

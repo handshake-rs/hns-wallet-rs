@@ -69,6 +69,7 @@ use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bech32::{Hrp, segwit};
+use bip32::{DerivationPath, XPrv};
 use bip39::{Language, Mnemonic};
 use blake2::Blake2bVar;
 use blake2::digest::VariableOutput;
@@ -369,6 +370,97 @@ pub fn derive_hns_public_key(
         .map_err(|_| HnsWalletError::KeyDerivation)
 }
 
+/// Derive an address key according to the immutable scheme stored with the
+/// account. Legacy records deserialize to `RoleHkdfV1`; newly generated
+/// mobile accounts use the hsd/Bob-compatible BIP-44 payment branch.
+pub fn derive_hns_account_public_key(
+    store: &WalletStore,
+    account: &HnsAccountRecord,
+    reference: DerivationReference,
+) -> Result<[u8; 33], HnsWalletError> {
+    if reference.account != account_number(account) {
+        return Err(HnsWalletError::AccountConfigurationMismatch);
+    }
+    let seed = store
+        .get_secret(
+            account.config.wallet_id.as_bytes(),
+            SecretKind::RecoverySeed,
+        )?
+        .ok_or(HnsWalletError::MissingSeed)?;
+    let secret = derive_account_secret(
+        &seed,
+        account.derivation_scheme,
+        account.config.network,
+        reference,
+    )?;
+    let signing =
+        SigningKey::from_slice(secret.as_slice()).map_err(|_| HnsWalletError::KeyDerivation)?;
+    signing
+        .verifying_key()
+        .to_encoded_point(true)
+        .as_bytes()
+        .try_into()
+        .map_err(|_| HnsWalletError::KeyDerivation)
+}
+
+fn derive_account_secret(
+    seed: &[u8],
+    scheme: HnsKeyDerivationScheme,
+    network: HnsNetwork,
+    reference: DerivationReference,
+) -> Result<Zeroizing<[u8; 32]>, HnsWalletError> {
+    match (scheme, reference.role) {
+        (HnsKeyDerivationScheme::HsdBip44V1, KeyRole::HnsCoin | KeyRole::HnsName) => {
+            derive_hsd_bip44_secret(seed, network, reference)
+        }
+        _ => derive_secret(seed, reference),
+    }
+}
+
+fn derive_hsd_bip44_secret(
+    seed: &[u8],
+    network: HnsNetwork,
+    reference: DerivationReference,
+) -> Result<Zeroizing<[u8; 32]>, HnsWalletError> {
+    if reference.change > 1 {
+        return Err(HnsWalletError::KeyDerivation);
+    }
+    let role_offset = match reference.role {
+        KeyRole::HnsCoin => 0,
+        KeyRole::HnsName => 1,
+        _ => return Err(HnsWalletError::WrongKeyRole),
+    };
+    // Account zero's payment branch is exactly m/44'/5353'/0'/change/index,
+    // matching hsd and Bob. Dedicated name keys occupy the next BIP-44
+    // account. Further Shakescape accounts use non-overlapping even/odd pairs.
+    let bip44_account = reference
+        .account
+        .checked_mul(2)
+        .and_then(|account| account.checked_add(role_offset))
+        .ok_or(HnsWalletError::KeyDerivation)?;
+    let path = format!(
+        "m/44'/{}'/{}'/{}/{}",
+        hsd_bip44_coin_type(network),
+        bip44_account,
+        reference.change,
+        reference.index
+    )
+    .parse::<DerivationPath>()
+    .map_err(|_| HnsWalletError::KeyDerivation)?;
+    let child = XPrv::derive_from_path(seed, &path).map_err(|_| HnsWalletError::KeyDerivation)?;
+    Ok(Zeroizing::new(child.private_key().to_bytes().into()))
+}
+
+const fn hsd_bip44_coin_type(network: HnsNetwork) -> u32 {
+    // hsd lib/protocol/networks.js `keyPrefix.coinType`.
+    match network {
+        HnsNetwork::Mainnet => 5353,
+        HnsNetwork::Testnet => 5354,
+        HnsNetwork::Regtest => 5355,
+        HnsNetwork::Simnet => 5356,
+    }
+}
+
 fn derive_secret(
     seed: &[u8],
     reference: DerivationReference,
@@ -428,7 +520,7 @@ fn local_hns_payment_receive_target(
         index: account.next_receive_index,
     };
     store.try_with_store(|store| {
-        let public_key = derive_hns_public_key(store, account.config.wallet_id, derivation)?;
+        let public_key = derive_hns_account_public_key(store, account, derivation)?;
         let target = ReceiveTarget {
             module: ModuleId::Handshake,
             account: account.config.account_id,
@@ -1784,9 +1876,27 @@ impl HnsRuntimeConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HnsKeyDerivationScheme {
+    /// Original Shakescape role-separated HKDF construction. This remains the
+    /// serde default so opening an existing account can never change keys.
+    #[default]
+    RoleHkdfV1,
+    /// Standard BIP-39 seed plus the hsd network's BIP-44 Handshake coin type.
+    /// Mainnet payment account zero matches hsd/Bob at
+    /// m/44'/5353'/0'/change/index; the name branch uses the adjacent BIP-44
+    /// account to retain purpose separation.
+    HsdBip44V1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HnsAccountRecord {
     pub config: HnsRuntimeConfig,
+    /// Immutable key-derivation contract. Missing legacy data defaults to the
+    /// historical scheme; it is never inferred from software version.
+    #[serde(default)]
+    pub derivation_scheme: HnsKeyDerivationScheme,
     pub next_receive_index: u32,
     pub next_change_index: u32,
     /// Next dedicated name-key derivation. This is restoration metadata only;
@@ -1826,6 +1936,13 @@ impl HnsAccountRecord {
     /// Constructs an empty account projection for a configuration whose value
     /// and settlement paths are both disabled. No backend or node is touched.
     pub fn initial_non_value(config: HnsRuntimeConfig) -> Result<Self, HnsWalletError> {
+        Self::initial_non_value_with_derivation(config, HnsKeyDerivationScheme::RoleHkdfV1)
+    }
+
+    pub fn initial_non_value_with_derivation(
+        config: HnsRuntimeConfig,
+        derivation_scheme: HnsKeyDerivationScheme,
+    ) -> Result<Self, HnsWalletError> {
         config.validate()?;
         if config.value_operations_enabled || config.settlement_enabled {
             return Err(HnsWalletError::RuntimeIntegrationUnavailable);
@@ -1836,6 +1953,7 @@ impl HnsAccountRecord {
             .ok_or(HnsWalletError::InvalidLookahead)?;
         Ok(Self {
             config,
+            derivation_scheme,
             next_receive_index: 0,
             next_change_index: 0,
             next_name_index: 0,
@@ -1871,29 +1989,54 @@ impl HnsWalletBootstrap {
     pub fn generate(policy: HnsBootstrapPolicy) -> Result<Self, HnsWalletError> {
         let mnemonic = generate_24_word_mnemonic()?;
         let wallet_id = generate_wallet_id()?;
-        Self::from_mnemonic(mnemonic, wallet_id, policy)
+        Self::from_mnemonic(
+            mnemonic,
+            wallet_id,
+            policy,
+            HnsKeyDerivationScheme::HsdBip44V1,
+        )
     }
 
     /// Parses exactly 24 normalized English BIP-39 words and derives the
     /// recovery wallet ID using the existing `hns-wallet-id/v1` rule.
     pub fn restore(phrase: &str, policy: HnsBootstrapPolicy) -> Result<Self, HnsWalletError> {
+        Self::restore_with_derivation(phrase, policy, HnsKeyDerivationScheme::HsdBip44V1)
+    }
+
+    /// Restore a wallet created before standard BIP-44 derivation shipped.
+    /// This is explicit because a BIP-39 phrase does not encode which address
+    /// derivation application originally used.
+    pub fn restore_legacy(
+        phrase: &str,
+        policy: HnsBootstrapPolicy,
+    ) -> Result<Self, HnsWalletError> {
+        Self::restore_with_derivation(phrase, policy, HnsKeyDerivationScheme::RoleHkdfV1)
+    }
+
+    fn restore_with_derivation(
+        phrase: &str,
+        policy: HnsBootstrapPolicy,
+        derivation_scheme: HnsKeyDerivationScheme,
+    ) -> Result<Self, HnsWalletError> {
         let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)
             .map_err(|_| HnsWalletError::InvalidRecoveryPhrase)?;
         if mnemonic.word_count() != 24 {
             return Err(HnsWalletError::InvalidRecoveryPhrase);
         }
         let wallet_id = wallet_id_from_mnemonic(&mnemonic);
-        Self::from_mnemonic(mnemonic, wallet_id, policy)
+        Self::from_mnemonic(mnemonic, wallet_id, policy, derivation_scheme)
     }
 
     fn from_mnemonic(
         mnemonic: Mnemonic,
         wallet_id: WalletId,
         policy: HnsBootstrapPolicy,
+        derivation_scheme: HnsKeyDerivationScheme,
     ) -> Result<Self, HnsWalletError> {
         let account_id = generate_account_id()?;
         let config = HnsRuntimeConfig::default_non_value(wallet_id, account_id, policy)?;
-        let account = HnsAccountRecord::initial_non_value(config)?;
+        let account =
+            HnsAccountRecord::initial_non_value_with_derivation(config, derivation_scheme)?;
         Ok(Self {
             mnemonic,
             wallet_id,
@@ -3276,6 +3419,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                         let external_scan_end = config.restore_lookahead - 1;
                         let account = HnsAccountRecord {
                             config,
+                            derivation_scheme: Default::default(),
                             next_receive_index: 0,
                             next_change_index: 0,
                             next_name_index: 0,
@@ -3877,7 +4021,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             index: account.next_name_index,
         };
         let store = self.store_lock()?;
-        let public_key = derive_hns_public_key(&store, account.config.wallet_id, derivation)?;
+        let public_key = derive_hns_account_public_key(&store, &account, derivation)?;
         let target = HnsNameReceiveTarget {
             module: ModuleId::Handshake,
             account: account.config.account_id,
@@ -4814,7 +4958,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             change: 1,
             index: account.next_change_index,
         };
-        let change_public = derive_hns_public_key(&store, config.wallet_id, change_derivation)
+        let change_public = derive_hns_account_public_key(&store, &account, change_derivation)
             .map_err(|error| {
                 evidence_error_context(
                     map_chain_error(error),
@@ -4944,7 +5088,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let transaction = if sponsors.is_empty() {
             transaction
         } else {
-            let expected_roles = vec![KeyRole::HnsCoin; sponsors.len()];
+            let expected_roles = ordinary_hns_input_roles(&sponsors).map_err(map_chain_error)?;
             let signed = sign_ordered_p2pkh_inputs_from(
                 &store,
                 &account,
@@ -7862,6 +8006,7 @@ fn validate_authoritative_reconcile_account(
 ) -> Result<(), HnsWalletError> {
     if !same_account_identity(&cached.config, &authoritative.config)
         || cached.config != authoritative.config
+        || cached.derivation_scheme != authoritative.derivation_scheme
     {
         return Err(HnsWalletError::AccountConfigurationMismatch);
     }
@@ -7991,7 +8136,7 @@ fn derive_restore_addresses(
             };
             let id = derived_address_record_id(&account.config, derivation)?;
             let persisted = store.derived_address::<DerivedHnsAddress>(&id)?;
-            let public_key = derive_hns_public_key(store, account.config.wallet_id, derivation)?;
+            let public_key = derive_hns_account_public_key(store, account, derivation)?;
             let program = match role {
                 KeyRole::HnsCoin | KeyRole::HnsName => public_key_hash(&public_key)?.to_vec(),
                 KeyRole::HnsShakedex => lock_script_hash(&public_key).to_vec(),
@@ -9049,8 +9194,12 @@ fn reconcile_coins(
     Ok(coins)
 }
 
+/// Both public P2PKH receive branches are controlled by this wallet. The
+/// dedicated name branch remains the preferred destination for TRANSFER, but
+/// an ordinary covenant-free payment sent there must not become stranded.
+/// Name-locked outputs and every Shakedex/settlement branch remain excluded.
 const fn is_ordinary_hns_derivation(derivation: DerivationReference) -> bool {
-    matches!(derivation.role, KeyRole::HnsCoin)
+    matches!(derivation.role, KeyRole::HnsCoin | KeyRole::HnsName)
 }
 
 fn is_ordinary_hns_spend_candidate(coin: &TrackedHnsCoin) -> bool {
@@ -9059,6 +9208,19 @@ fn is_ordinary_hns_spend_candidate(coin: &TrackedHnsCoin) -> bool {
 
 fn is_confirmed_ordinary_hns_spend_candidate(coin: &TrackedHnsCoin) -> bool {
     is_ordinary_hns_spend_candidate(coin) && coin.coin.confirmation_count > 0
+}
+
+fn ordinary_hns_input_roles(inputs: &[TrackedHnsCoin]) -> Result<Vec<KeyRole>, HnsWalletError> {
+    inputs
+        .iter()
+        .map(|coin| {
+            if is_ordinary_hns_derivation(coin.derivation) {
+                Ok(coin.derivation.role)
+            } else {
+                Err(HnsWalletError::InvalidPreparedArtifact)
+            }
+        })
+        .collect()
 }
 
 fn decode_transaction_for_id(
@@ -9891,9 +10053,8 @@ impl<B: HnsBackend, C: HnsClock> ChainModule for HnsWalletRuntime<B, C> {
             change: 1,
             index: account.next_change_index,
         };
-        let change_public =
-            derive_hns_public_key(&store, account.config.wallet_id, change_derivation)
-                .map_err(map_chain_error)?;
+        let change_public = derive_hns_account_public_key(&store, &account, change_derivation)
+            .map_err(map_chain_error)?;
         let change = Address::new(
             0,
             public_key_hash(&change_public)
@@ -10479,9 +10640,8 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         };
         let coins = available_unreserved_coins(&mut store, &account.config, coins, now)
             .map_err(map_chain_error)?;
-        let change_public =
-            derive_hns_public_key(&store, account.config.wallet_id, change_derivation)
-                .map_err(map_chain_error)?;
+        let change_public = derive_hns_account_public_key(&store, &account, change_derivation)
+            .map_err(map_chain_error)?;
         let change = Address::new(
             0,
             public_key_hash(&change_public)
@@ -11344,7 +11504,7 @@ fn sign_payment_plan(
 ) -> Result<Vec<u8>, HnsWalletError> {
     let transaction = Transaction::decode(&plan.unsigned_transaction)
         .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
-    let expected_roles = vec![KeyRole::HnsCoin; plan.inputs.len()];
+    let expected_roles = ordinary_hns_input_roles(&plan.inputs)?;
     sign_ordered_p2pkh_inputs(store, account, transaction, &plan.inputs, &expected_roles)
 }
 
@@ -11404,7 +11564,12 @@ fn sign_ordered_p2pkh_inputs_from(
         {
             return Err(HnsWalletError::InvalidPreparedArtifact);
         }
-        let secret = derive_secret(&seed, coin.derivation)?;
+        let secret = derive_account_secret(
+            &seed,
+            account.derivation_scheme,
+            account.config.network,
+            coin.derivation,
+        )?;
         let signing =
             SigningKey::from_slice(secret.as_slice()).map_err(|_| HnsWalletError::KeyDerivation)?;
         let public = signing.verifying_key().to_encoded_point(true);
@@ -12366,6 +12531,10 @@ mod tests {
         assert_eq!(account.config.network, HnsNetwork::Regtest);
         assert_eq!(account.config.birthday_height, 123);
         assert_eq!(account.config.restore_lookahead, DEFAULT_RESTORE_LOOKAHEAD);
+        assert_eq!(
+            account.derivation_scheme,
+            HnsKeyDerivationScheme::HsdBip44V1
+        );
         assert_eq!(account.config.minimum_confirmations, 2);
         assert_eq!(
             account.config.dust_threshold,
@@ -12454,10 +12623,78 @@ mod tests {
                 .iter()
                 .any(|byte| *byte != 0)
         );
+        assert_eq!(
+            bootstrap.account_record().derivation_scheme,
+            HnsKeyDerivationScheme::HsdBip44V1
+        );
         let phrase = bootstrap
             .into_recovery_phrase()
             .expose_for_dedicated_display();
         assert_eq!(phrase.split_whitespace().count(), 24);
+    }
+
+    #[test]
+    fn hsd_bip44_payment_branch_and_legacy_restore_are_explicit() {
+        // Generated independently by canonical hsd 8.0.0. This proves the
+        // implementation rather than comparing two paths through this crate.
+        let phrase = "april coyote civil finger crane uncle situate moon choice wrong \
+            goose client purse deer funny hobby shrug give anxiety truly rack stand salad coach";
+        let mnemonic =
+            Mnemonic::parse_in_normalized(Language::English, phrase).expect("fixture mnemonic");
+        let seed = mnemonic.to_seed_normalized("");
+        let payment = DerivationReference {
+            role: KeyRole::HnsCoin,
+            account: 0,
+            change: 0,
+            index: 0,
+        };
+        let actual =
+            derive_hsd_bip44_secret(&seed, HnsNetwork::Mainnet, payment).expect("HNS BIP-44 key");
+        let expected_path = "m/44'/5353'/0'/0/0"
+            .parse::<DerivationPath>()
+            .expect("canonical hsd path");
+        let expected = XPrv::derive_from_path(seed, &expected_path).expect("canonical hsd child");
+        assert_eq!(
+            actual.as_slice(),
+            expected.private_key().to_bytes().as_slice()
+        );
+        let public = SigningKey::from_slice(actual.as_slice())
+            .expect("hsd secret")
+            .verifying_key()
+            .to_encoded_point(true);
+        assert_eq!(
+            hex::encode(public.as_bytes()),
+            "03a527c08aeb86e99f6a4019d9bcd38290a598d7287fcca929a684004ed8d41d39"
+        );
+        let public_bytes: [u8; 33] = public.as_bytes().try_into().expect("compressed hsd key");
+        let program = public_key_hash(&public_bytes).expect("hsd key hash");
+        assert_eq!(
+            encode_v0_address(HnsNetwork::Mainnet, &program).expect("hsd address"),
+            "hs1q79vn7nsmua98v4gme98w0a07rgrvvxy9d93qw8"
+        );
+        assert_eq!(
+            [
+                hsd_bip44_coin_type(HnsNetwork::Mainnet),
+                hsd_bip44_coin_type(HnsNetwork::Testnet),
+                hsd_bip44_coin_type(HnsNetwork::Regtest),
+                hsd_bip44_coin_type(HnsNetwork::Simnet),
+            ],
+            [5353, 5354, 5355, 5356]
+        );
+
+        let policy = HnsBootstrapPolicy::new(HnsNetwork::Mainnet, 0);
+        let standard = HnsWalletBootstrap::restore(phrase, policy).expect("standard restore");
+        let legacy = HnsWalletBootstrap::restore_legacy(phrase, policy).expect("legacy restore");
+        assert_eq!(
+            standard.account_record().derivation_scheme,
+            HnsKeyDerivationScheme::HsdBip44V1
+        );
+        assert_eq!(
+            legacy.account_record().derivation_scheme,
+            HnsKeyDerivationScheme::RoleHkdfV1
+        );
+        let legacy_secret = derive_secret(&seed, payment).expect("legacy role key");
+        assert_ne!(actual.as_slice(), legacy_secret.as_slice());
     }
 
     fn test_derived_address(role: KeyRole, program: u8) -> DerivedHnsAddress {
@@ -13162,6 +13399,7 @@ mod tests {
             .expect("persist synchronized-read seed");
         let account = HnsAccountRecord {
             config: config.clone(),
+            derivation_scheme: Default::default(),
             next_receive_index: 0,
             next_change_index: 0,
             next_name_index: 0,
@@ -14283,6 +14521,7 @@ mod tests {
     fn authoritative_reconcile_account_rejects_derivation_rollback() {
         let cached = HnsAccountRecord {
             config: test_runtime_config(),
+            derivation_scheme: Default::default(),
             next_receive_index: 3,
             next_change_index: 4,
             next_name_index: 5,
@@ -14320,6 +14559,13 @@ mod tests {
             Err(HnsWalletError::InvalidEvidence)
         ));
 
+        let mut changed_scheme = advanced.clone();
+        changed_scheme.derivation_scheme = HnsKeyDerivationScheme::HsdBip44V1;
+        assert!(matches!(
+            validate_authoritative_reconcile_account(&cached, 7, &changed_scheme, 8),
+            Err(HnsWalletError::AccountConfigurationMismatch)
+        ));
+
         let mut mismatched = advanced;
         mismatched.config.minimum_confirmations += 1;
         assert!(matches!(
@@ -14332,6 +14578,7 @@ mod tests {
     fn legacy_account_state_defaults_the_independent_name_and_shakedex_scans() {
         let account = HnsAccountRecord {
             config: test_runtime_config(),
+            derivation_scheme: Default::default(),
             next_receive_index: 3,
             next_change_index: 4,
             next_name_index: 8,
@@ -14349,6 +14596,7 @@ mod tests {
         };
         let mut encoded = serde_json::to_value(account).expect("encode account");
         let object = encoded.as_object_mut().expect("account object");
+        object.remove("derivation_scheme");
         object.remove("next_name_index");
         object.remove("name_scan_end");
         object.remove("last_used_name");
@@ -14359,6 +14607,10 @@ mod tests {
         object.remove("last_used_shakedex");
         let decoded: HnsAccountRecord =
             serde_json::from_value(encoded).expect("decode legacy account");
+        assert_eq!(
+            decoded.derivation_scheme,
+            HnsKeyDerivationScheme::RoleHkdfV1
+        );
         assert_eq!(decoded.next_name_index, 0);
         assert_eq!(decoded.name_scan_end, 0);
         assert_eq!(decoded.last_used_name, None);
@@ -14586,8 +14838,11 @@ mod tests {
     }
 
     #[test]
-    fn name_and_shakedex_outputs_are_tracked_but_never_ordinary_spend_candidates() {
-        for (role, byte) in [(KeyRole::HnsName, 31), (KeyRole::HnsShakedex, 32)] {
+    fn ordinary_value_sent_to_name_branch_is_recoverable_but_shakedex_is_not() {
+        for (role, byte, spendable) in [
+            (KeyRole::HnsName, 31, true),
+            (KeyRole::HnsShakedex, 32, false),
+        ] {
             let address = test_derived_address(role, byte);
             let tracked = reconcile_coins(
                 vec![IndexedWalletCoin {
@@ -14615,7 +14870,7 @@ mod tests {
             .expect("track separated output");
             assert_eq!(tracked.len(), 1);
             assert_eq!(tracked[0].derivation.role, role);
-            assert!(!is_ordinary_hns_spend_candidate(&tracked[0]));
+            assert_eq!(is_ordinary_hns_spend_candidate(&tracked[0]), spendable);
         }
     }
 
@@ -14932,6 +15187,7 @@ mod tests {
         let mut store = WalletStore::create(":memory:", "passphrase").expect("store");
         let account = HnsAccountRecord {
             config: test_runtime_config(),
+            derivation_scheme: Default::default(),
             next_receive_index: 0,
             next_change_index: 0,
             next_name_index: 0,
@@ -14962,8 +15218,8 @@ mod tests {
                 change: 0,
                 index,
             };
-            let public = derive_hns_public_key(&store, account.config.wallet_id, derivation)
-                .expect("public key");
+            let public =
+                derive_hns_account_public_key(&store, &account, derivation).expect("public key");
             let program = public_key_hash(&public).expect("program").to_vec();
             let covenant = if role == KeyRole::HnsName {
                 Covenant {
@@ -15050,6 +15306,7 @@ mod tests {
         let mut store = WalletStore::create(":memory:", "passphrase").expect("store");
         let account = HnsAccountRecord {
             config: test_runtime_config(),
+            derivation_scheme: Default::default(),
             next_receive_index: 0,
             next_change_index: 0,
             next_name_index: 0,
@@ -15101,9 +15358,8 @@ mod tests {
             change: 0,
             index: 4,
         };
-        let sponsor_public =
-            derive_hns_public_key(&store, account.config.wallet_id, sponsor_derivation)
-                .expect("sponsor public key");
+        let sponsor_public = derive_hns_account_public_key(&store, &account, sponsor_derivation)
+            .expect("sponsor public key");
         let sponsor = TrackedHnsCoin {
             coin: WalletCoin {
                 outpoint: HnsOutpoint {

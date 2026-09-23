@@ -566,7 +566,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let stored = store
                 .derived_address::<DerivedHnsAddress>(&id)?
                 .ok_or(HnsWalletError::InvalidEvidence)?;
-            let public = derive_hns_public_key(&store, account.config.wallet_id, derivation)?;
+            let public = derive_hns_account_public_key(&store, &account, derivation)?;
             let program = public_key_hash(&public)?.to_vec();
             let display = encode_v0_address(account.config.network, &program)?;
             if stored.id != id
@@ -607,7 +607,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let stored = store
                 .derived_address::<DerivedHnsAddress>(&id)?
                 .ok_or(HnsWalletError::InvalidEvidence)?;
-            let public = derive_hns_public_key(&store, account.config.wallet_id, derivation)?;
+            let public = derive_hns_account_public_key(&store, &account, derivation)?;
             let program = public_key_hash(&public)?.to_vec();
             let display = encode_v0_address(account.config.network, &program)?;
             if stored.id != id
@@ -843,8 +843,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let mut store = self.store_lock()?;
             let available =
                 available_unreserved_coins(&mut store, &account.config, cached_coins, now_unix)?;
-            let public =
-                derive_hns_public_key(&store, account.config.wallet_id, change_derivation)?;
+            let public = derive_hns_account_public_key(&store, &account, change_derivation)?;
             let address = Address::new(0, public_key_hash(&public)?.to_vec())
                 .map_err(|_| HnsWalletError::InvalidAddress)?;
             (available, address)
@@ -1187,7 +1186,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             {
                 return Err(HnsWalletError::ApprovalRequired);
             }
-            let roles = vec![KeyRole::HnsCoin; reservation.funding_inputs.len()];
+            let roles = reservation
+                .funding_inputs
+                .iter()
+                .map(|input| input.derivation.role)
+                .collect::<Vec<_>>();
             let signed = sign_ordered_p2pkh_inputs_from(
                 &store,
                 &account,
@@ -1298,7 +1301,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             {
                 return Err(HnsWalletError::ApprovalRequired);
             }
-            let roles = vec![KeyRole::HnsCoin; reservation.funding_inputs.len()];
+            let roles = reservation
+                .funding_inputs
+                .iter()
+                .map(|input| input.derivation.role)
+                .collect::<Vec<_>>();
             let signed = sign_ordered_p2pkh_inputs_from(
                 &store,
                 &account,
