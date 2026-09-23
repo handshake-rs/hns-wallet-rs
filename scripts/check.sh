@@ -20,16 +20,16 @@ if rg -n 'name = "(electrum-client|esplora-client|bitcoincore-rpc)"' Cargo.lock;
 fi
 
 bdk_declaration='bdk_wallet = { version = "=3.1.0", features = ["keys-bip39"] }'
-sqlite_declaration='rusqlite = { version = "=0.39.0", features = ["bundled", "fallible_uint"] }'
+sqlite_declaration='rusqlite = { version = "=0.40.2", features = ["bundled", "fallible_uint"] }'
 if ! rg --fixed-strings --line-regexp --quiet "$bdk_declaration" Cargo.toml; then
   echo "bdk_wallet must remain exactly pinned without its rusqlite feature" >&2
   exit 1
 fi
 if ! rg --fixed-strings --line-regexp --quiet "$sqlite_declaration" Cargo.toml; then
-  echo "WalletStore rusqlite must remain on the sole reviewed 0.39.0 line" >&2
+  echo "WalletStore rusqlite must remain on the sole reviewed 0.40.2 line" >&2
   exit 1
 fi
-for package_version in 'bdk_wallet 3.1.0' 'rusqlite 0.39.0' 'libsqlite3-sys 0.37.0'; do
+for package_version in 'bdk_wallet 3.1.0' 'rusqlite 0.40.2' 'libsqlite3-sys 0.38.2'; do
   package="${package_version% *}"
   version="${package_version#* }"
   if ! awk -v package="$package" -v version="$version" '

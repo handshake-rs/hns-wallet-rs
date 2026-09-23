@@ -695,7 +695,8 @@ Execution rejects a clock value behind the durable preparation or latest
 attempt timestamp. A production release still requires a reviewed source of
 trusted or monotonic time across process and device restart.
 
-The pinned `bip157` 0.6.3 implementation ignores its configured `data_dir` and
+The `hns-wallet-bip157` transport, derived from `bip157` 0.6.3, ignores its
+configured `data_dir` and
 does not expose a durable full header/filter database or peer address book.
 Headers and filters are therefore re-fetched from untrusted peers after
 restart. A separate encrypted cache retains up to 32 successful NETWORK plus

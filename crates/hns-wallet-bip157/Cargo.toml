@@ -1,0 +1,36 @@
+[package]
+name = "hns-wallet-bip157"
+description = "Reviewed BIP157/BIP158 light-client transport for hns-wallet-rs"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/hns-wallet-bip157"
+
+[lib]
+name = "bip157"
+path = "src/lib.rs"
+
+[dependencies]
+addrman = { version = "0.1.1", package = "bitcoin-address-book" }
+bip324 = { version = "0.7.0", features = ["tokio"], default-features = false }
+bitcoin = { version = "0.32.8", features = ["rand-std"], default-features = false }
+hashes = { version = "0.20.0", package = "bitcoin_hashes" }
+tokio = { version = "1.19", features = ["rt-multi-thread", "sync", "time", "io-util", "net", "macros"], default-features = false }
+
+[dev-dependencies]
+corepc-node = { version = "0.12.0", features = ["30_2", "download"], default-features = false }
+hex = "0.4.0"
+serde = { version = "1.0.219", features = ["derive"] }
+tempfile = "3"
+tokio = { version = "1.19", features = ["full", "test-util"], default-features = false }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[lints]
+workspace = true

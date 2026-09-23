@@ -1,246 +1,173 @@
 # hns-wallet-rs
 
-`hns-wallet-rs` is the independent Rust wallet boundary for the Handshake DANE
-browser products. It owns encrypted local wallet state, a Handshake-first
-wallet, the Handshake Provider API core, a release-gated fixed-price Shakedex
-persistence boundary, chain-neutral market settlement, and deliberately narrow
-Bitcoin and Ethereum modules.
+`hns-wallet-rs` is the self-custodial Rust wallet boundary used by the native
+ShakeScape applications. It owns encrypted wallet state, Handshake and Bitcoin
+wallet workflows, name operations, direct ShakeDex offers, atomic-swap state,
+and the private native ABI used by Android and Apple.
 
-The workspace does not combine the browser, node, or canonical protocol
-repositories. It consumes one coherent published or reviewed immutable
-protocol source and exposes a private,
-length-prefixed wallet-service ABI, a fail-closed host-side protocol state
-machine, and machine-readable contracts for separately released browser
-adapters.
+The wallet is deliberately separate from the browser and full-node
+repositories. Website content cannot call native value operations or acquire
+wallet keys. Platform applications supply user authorization, protected
+storage, networking, background execution, and UI; this workspace supplies the
+state machines and fail-closed authority checks beneath those integrations.
 
-The checked-in service executable now requires an explicit existing wallet
-database, opens it through the platform filesystem checks in a locked state,
-and shares one decrypted-key authority between runtime control and encrypted
-provider permissions. Linux, Android, and iOS persistent paths are eligible
-in source only through a process-owned `0700` directory and a regular,
-single-link `0600` database. Creation requires an absent path and atomically
-precreates that file before SQLite opens it without create permission. The
-selected entries may not be symlinks, and the file identity is checked around
-SQLite's no-follow open. This repository's portable filesystem regressions run
-on Linux; downstream mobile products own their target/runtime evidence, app
-sandbox, ACL and data-protection policy, backup exclusion, and
-Keystore/Keychain wrapping. The downstream Shakescape Android/iOS `1.0.4`
-source pins the published `hns-wallet-rs 0.2.1` cohort and contains platform
-key wrapping, JNI/C projection, native recovery/read/value/name screens,
-off-UI-thread synchronization, direct HNS peer coordination, and the guarded
-Bitcoin runtime. Those separately maintained implementations and store
-submissions are product evidence, not package evidence for this repository. A
-platform-neutral native controller creates or restores
-exactly one non-value HNS account, opens only a complete seed/account bootstrap,
-and exposes status, unlock, lock, and account identity through a private ABI-v2
-session. A separate backend-injected native read controller reuses that exact
-shared-store authority and returns one bounded serializable balance/receive/
-history/known-name/module-status snapshot. That trusted-native snapshot now
-contains both the ordinary HNS coin `ReceiveTarget` and a structurally distinct
-`HnsNameReceiveTarget`, derived only from `HnsName`, change zero, at the exact
-post-scan `next_name_index`. The mobile facade exposes the latter through a
-freshly synchronized `name_receive_target()` call and the serialized
-`nameReceiveTarget` field. The same trusted-native controller now accepts one
-canonical HNS name through `import_name_exact_text()`. It passes UTF-8 bytes
-through unchanged, rejects trimming/case/IDNA/Unicode/dot transformations
-before node I/O, and atomically commits fresh canonical evidence with any
-exact wallet `HnsName` derivation high-water rotation. The native persisted-name
-bound is checked before evidence lookup, and the result is the same minimized
-name summary rather than proof, owner, resource, or derivation material. It
-does not add that target or import to website/provider JSON
-or change any provider, signing, value, settlement, or marketplace capability.
-It obtains the durable epoch and exact tip through a script-free chain snapshot,
-binds height-zero evidence to the selected account network, and only then
-derives and queries wallet ScriptIds. The mobile crate re-exports the concrete
-authenticated loopback adapter for downstream native composition, but it does
-not supply production device transport. Fresh history also needs archive raw
-transactions unless the authenticated wallet already cached them. A
-deadline-enforced, archive-capable (or durably indexed) device backend,
-backend credential/index provisioning, and installed-device network/resource/
-restart qualification therefore remain downstream release requirements rather
-than authorities supplied by this crate. Native HNS value and Shakedex source
-gates are enabled; no browser/provider value release path is implied.
+## Implemented capabilities
 
-ABI wallet status/unlock/lock and a narrow provider
-control surface are implemented. One library composition can bind an exact
-pre-existing HNS account selector to that identical shared authority and add
-`hns_requestAccounts`/`hns_accounts`. A second library composition adds live,
-account-scoped `hns_getBalance`, `hns_getTransactions`,
-`hns_getReceiveAddress`, `hns_getNames`, and `hns_getName` reads through the
-real HNS backend and encrypted wallet state. It authenticates the selected
-account around each bounded reconciliation, retains one exact chain/mempool
-binding internally, performs no node I/O while a `SharedWalletStore` closure is
-active, and commits only across exact account/entity revision fences. The
-service crate also provides one concrete native-launcher constructor which
-wires that same composition to the authenticated loopback RPC backend, the
-production wall clock, and the literal shared store authority. It adds no CLI
-configuration, artifact trust, browser-engine authority, or availability gate.
-An inert provisioning API can now persist one wallet-owned native-read profile
-as an encrypted CAS record. It binds the exact sole non-value HNS account and
-literal loopback endpoint to a zeroizing/redacted node Authorization value and
-a bounded label. Persisted Authorization rejects JSON escape bytes so parsing
-cannot create an unowned plaintext scratch copy. Provisioning and every load
-require unlock, re-authenticate that sole account, and require its complete
-singleton recovery-seed bootstrap.
-The ordinary profile-backed read service now also implements the exact
-native-only `hnsWalletAuthorityContextV1` contract already consumed by the
-Chromium host candidate. It keeps that request outside the frozen six-read
-enum, validates the account's canonical network/magic, and returns the active
-wallet/account with authenticated profile and account-row revisions. Opaque
-namespace and lease-generation fields are only echoed evidence for a native
-caller that already holds the matching HRM/HNSA broker guard; they confer no
-authority by themselves and never enter provider/page JSON. Generic, simnet,
-recovery-only, and checked-in executable compositions do not advertise the
-marker. A real exclusive namespace/database broker and supervised launch path
-are still required.
-Revocation replaces the secret-bearing record with a persistent tombstone, so
-later re-provisioning continues the revision/update-time high-water. The
-checked-in executable does not consume the profile, and rotation/revocation
-does not claim to stop an
-already-running process; trusted unlock transport, profile-revision admission,
-exclusive database ownership, operation-level read qualification, and signed
-browser artifact admission remain required before browser use. Tombstoning is
-not secure erasure from SQLite WALs or backups; node-side credential rotation
-remains required.
-The approval-schema-v3 Names prompt carried by private ABI v2 contains the exact
-sorted canonical name/lowercase-hash set it may grant. The service freezes that
-bounded set before prompting, re-synchronizes at approval, rejects any account
-or set change, and persists only the unchanged displayed hashes. This
-approval-v3 shape is incompatible with consumers that omit or do not understand
-`hnsNames`; browser adapters must negotiate, adopt, and render it exactly before
-provider Names access is available. The native read controller is a distinct
-trusted-app surface: exact-text import exists only as a direct Rust native API,
-is serialized with synchronization, and exposes no provider authority. The
-checked-in executable still has
-no account-selection or backend inputs, so it remains the control-only runtime.
-The native controllers are library-only compositions. The downstream mobile
-product supplies its wallet-owned direct-peer backend and private trusted UI;
-that does not make browser/provider integration available in this repository
-or turn product qualification into library qualification.
-The separately maintained `hns-dane-browser-mobile` consumer now adopts this
-producer through the published `0.2.1` cohort, including HNWR-v2, the distinct
-name receive target, exact-text name import, direct HNS value operations, and
-the private trusted-mobile Bitcoin permit. That adoption does not expose any
-of those capabilities to website JavaScript and does not transfer the mobile
-product's store, installed-device, network, or release evidence back into this
-package boundary.
+- Encrypted SQLite wallet state with one process-local lock and key authority.
+- BIP39 account creation and restoration with bounded derivation state.
+- Direct Handshake header, peer, coin, transaction, name-state, and proof
+  synchronization.
+- HNS balance, payment receive, name receive, history, and tracked-name
+  projections.
+- HNS send, TRANSFER, FINALIZE, resource update, renewal, and name-market
+  transaction preparation with exact approval and rebroadcast recovery.
+- Automatic tracking and preparation of a required name FINALIZE after the
+  transfer maturity window.
+- Bitcoin BDK/Kyoto synchronization, compact-filter scanning, receive/send,
+  transaction history, and durable broadcast recovery.
+- Signed direct HNS/BTC and BTC/HNS offers, cancellations, takes, bilateral
+  session negotiation, funding watches, redeem/refund recovery, and explicit
+  reservation accounting.
+- Direct ShakeScape peer/listener lifecycle and standard Handshake address
+  discovery events for native mobile integration.
+- A versioned private wallet-service ABI and host-side correlation state.
+- A separately gated Handshake Provider API core for account and read
+  permissions. Native wallet capability does not imply website-provider value
+  capability.
 
-Current safety status: the production-hardening source boundary is implemented.
-Native HNS send, settlement, and Shakedex paths are source-enabled but require
-the exact authenticated runtime evidence and account configuration recorded in
-[`docs/IMPLEMENTATION_STATUS.md`](docs/IMPLEMENTATION_STATUS.md) and
-[`docs/QUALIFICATION.md`](docs/QUALIFICATION.md). Bitcoin send and atomic-swap
-settlement are enabled only through the private trusted-mobile permit;
-Ethereum synchronization, signing, send, and settlement remain disabled. Test
-success is never a mainnet authorization signal. HNS name-role keys are scanned and persisted separately,
-and the protected `HnsShakedex` allocation high-water feeds an independent
-32-byte lock-script restore scan. A durable scan fence and atomic account/key
-CAS prevent another process from allocating through an incomplete mnemonic
-scan. Canonical payment, price, deadline, and fee terms are recomputed before
-the redacted purpose-bound signer can authorize a seller object. The node
-snapshot now includes HSD-compatible
-median time past, allowing non-serializable current/unspent Shakedex lock and
-TRANSFER authorities without caller-asserted chain time. These source
-boundaries do not change any release gate. The wallet now decodes canonical
-NameState/resource bytes, verifies every
-node projection and exact owner output, and binds current control only to a
-persisted `HnsName` derivation. TRANSFER owners must also bind the canonical
-transfer height to the active-chain owner-transaction inclusion height.
-Persisted name status is never action authority: value workflows must reacquire
-an ephemeral exact-snapshot proof. The wallet source implements release-gated,
-wallet-owned P2PKH TRANSFER and old-owner direct FINALIZE workflows with
-canonical index-zero construction, typed name/fee reservations, single-use
-approval, ordered signing, exact final-byte fee quoting, durable rebroadcast,
-maturity tracking, and reorg recovery. They remain unavailable through the
-browser/provider surface because provider integration and product qualification
-are incomplete; the HNS value and fee source gates themselves are enabled.
+Ethereum account derivation exists as a narrow experimental module, but
+Ethereum synchronization, signing, value transfer, and settlement remain
+disabled.
 
-The encrypted Shakedex value aggregate also has a source-level
-seller-script-FINALIZE variant. It binds an exact signed buyer-fulfillment or
-seller-recovery parent, the canonical TRANSFER transaction/output-zero coin,
-current NameState and owner inclusion, historical snapshot/mempool evidence,
-and exact renewal evidence,
-purpose-separated funding reservations, revision-bound approval, signed bytes,
-final quote, pre-broadcast fence, and the existing terminal-release audit
-state. Save, signing, and submission reacquire the non-serializable current
-TRANSFER authority; a harmless live binding advance is accepted only when the
-stable transfer/owner/state/renewal identity is unchanged, while the HNS
-runtime requires exact bindings within each immediate live fence. Persisted
-evidence never recreates authority. Shakedex and dependent HNS
-funding/value/fee source gates are enabled. Exact qualified implementation source
-`2229be849557d58a8eb723bcc03349f0f2df9796` passed its complete
-[CI](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31420628974),
-[CodeQL](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31420627924),
-and
-[14-crate normalized release preflight](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31424201574)
-on 2026-08-10. The earlier exact implementation commit
-`ba9f013a098679fe8e3d812a7e09020803e27d53` remains a historical CI/CodeQL
-baseline. Exact historical qualified implementation source
-`bc5901f794450d29fa9f5630bab4fbf91e37bedf` passed complete locked
-[CI](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31812028843),
-including Wallet qualification and RustSec, and
-[CodeQL](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31812028405)
-for Actions, JavaScript/TypeScript, Rust, and Python on 2026-08-14. That
-evidence qualifies the wallet source with its current dependency pin,
-name-target, and trusted-name-import tranche. These source results include the
-synchronized account-read,
-script-free initial binding, and purpose-separation regressions but are not
-product, regtest, installed-device, resource, or release-gate qualification; see
-[`docs/QUALIFICATION.md`](docs/QUALIFICATION.md).
+## Security and authority model
 
-Bitcoin BDK state now uses the same encrypted shared SQLite authority as the
-wallet journal instead of BDK's independent rusqlite feature. Its strict
-aggregate snapshot is CAS-protected and ordered before reconciliation/ready,
-but is limited to 1 MiB; a normalized or authenticated chunked backend and an
-explicit legacy-BDK-SQLite importer remain release blockers. The Bitcoin value
-gate stays false.
+Persistent records are evidence, not transaction authority. Any value action
+must reacquire current chain, wallet, coin, name, fee, and reservation state
+immediately before approval and signing:
 
-## Crates
+```text
+authenticated synchronized snapshot
+                │
+                ▼
+ exact coins, names, watches, and reservations
+                │
+                ▼
+      bounded user review and approval
+                │
+                ▼
+    purpose-bound signing authorization
+                │
+                ▼
+ durable pre-broadcast record and submission
+                │
+                ▼
+ confirmation, reorg, retry, or refund recovery
+```
 
-- `hns-wallet-types`: wallet-local identifiers and UI-safe summaries, including
-  structurally distinct ordinary-coin and Handshake name receive targets.
-- `hns-wallet-store`: SQLite migrations, authenticated encryption, and one
-  cloneable process-local lock/key authority.
-- `hns-wallet-chain-api`: modular chain and settlement capability traits.
-- `hns-wallet-hns`: Handshake account/name workflows, exact synchronized coin
-  and name receive-target derivation, and node backend.
-- `hns-wallet-provider`: hostile-page request, permission, and approval core.
-- `hns-wallet-shakedex`: release-gated persisted seller/buyer/recovery and
-  post-TRANSFER script-FINALIZE schemas.
-- `hns-wallet-market`: encrypted fixed-terms HNS/BTC direct offers,
-  cancellations, durable accepted-session admission, and atomic-swap recovery.
-- `hns-wallet-mobile`: platform-neutral, single-account Android/iOS lifecycle
-  controller plus an injected, synchronized, minimized HNS read composition
-  with distinct coin and name receive projections; no concrete device backend
-  or value/provider surface, and downstream HNWR-v2 adoption remains required.
-- `hns-wallet-bitcoin-kyoto`: BDK/Kyoto wallet, encrypted session-bound swap-key allocation primitive, and Bitcoin HTLC adapter.
-- `hns-wallet-ethereum`: offline native-ETH account derivation plus
-  release-gated Helios/HTLC policy.
-- `hns-wallet-ffi`: ABI v2 framing, canonical service IDs, approval prompts, and events.
-- `hns-wallet-service`: private session/authority registry plus locked,
-  existing-database control, exact-account read/value, and wallet-peer
-  Shakedex library compositions. Trusted-native value actions stay closed and
-  process-local; website-provider projection remains limited to the ordinary
-  coin receive target.
-- `hns-wallet-host`: caller-side negotiation, correlation, authority, approval,
-  binding, and event-replay state for trusted browser/mobile adapters.
-- `hns-wallet-testkit`: deterministic, non-mainnet fixtures.
+The implementation rejects stale account revisions, changed transaction
+terms, mismatched networks, incomplete peer negotiation, expired offers,
+uncorrelated session messages, duplicate reservations, and persisted evidence
+that cannot be revalidated against current state.
 
-Run `scripts/check.sh` once for the complete local qualification gate.
+Wallet databases must live in an application-owned protected directory. On
+supported Unix hosts the service requires a regular, single-link `0600` file
+inside a process-owned `0700` directory and rejects symlinks. Android and Apple
+hosts additionally own sandboxing, Keystore/Keychain wrapping, data-protection
+classes, backup exclusion, and lifecycle qualification.
+
+## ShakeDex and atomic swaps
+
+The direct market supports both directions:
+
+- BTC offered for HNS;
+- HNS offered for BTC.
+
+Offer discovery and session messages are signed and bound to the exact
+network, assets, amounts, deadlines, keys, and peer identities. A relay or
+rendezvous node routes these messages but cannot sign for either wallet or
+authorize settlement.
+
+The swap lifecycle persists enough information to recover after peer loss,
+screen lock, process restart, or an interrupted synchronization pass. Recovery
+still depends on current verified HNS and Bitcoin evidence; a UI status or
+relay acknowledgement is never treated as chain confirmation.
+
+Wallet balances distinguish confirmed on-chain funds from amounts reserved by
+active or unfunded swap commitments. Abandonment and signed cancellation
+release only reservations that can be proven safe to release.
+
+## Workspace crates
+
+| Crate | Responsibility |
+| --- | --- |
+| `hns-wallet-types` | Wallet identifiers, amounts, receive targets, and UI-safe summaries |
+| `hns-wallet-store` | Encrypted SQLite records, migrations, revisions, and shared lock authority |
+| `hns-wallet-chain-api` | Typed chain, transaction, and settlement backend capabilities |
+| `hns-wallet-hns` | Handshake accounts, synchronization, coins, names, and value actions |
+| `hns-wallet-provider` | Hostile-page request, permission, and approval core |
+| `hns-wallet-shakedex` | Handshake name-market seller, buyer, recovery, and FINALIZE state |
+| `hns-wallet-market` | Direct HNS/BTC offers, sessions, reservations, and swap recovery |
+| `hns-wallet-bitcoin-kyoto` | BDK/Kyoto wallet, compact-filter sync, Bitcoin HTLC, and broadcast recovery |
+| `hns-wallet-ethereum` | Offline derivation and disabled-by-default Ethereum policy |
+| `hns-wallet-ffi` | Private ABI v2 framing, schemas, prompts, results, and events |
+| `hns-wallet-service` | Session/authority registry and native service compositions |
+| `hns-wallet-host` | Caller correlation, lifecycle, approval, and event-replay state |
+| `hns-wallet-mobile` | Platform-neutral Android/iOS wallet and direct-peer lifecycle |
+| `hns-wallet-testkit` | Deterministic non-mainnet fixtures |
+
+The dependency-ordered public list is maintained in
+[`release/public-crates.txt`](release/public-crates.txt).
+
+## Version and dependency policy
+
+All fourteen wallet crates use one shared release version. The current source
+prepares the `0.2.4` cohort for the post-`0.2.3` mobile synchronization, name,
+swap, and recovery changes.
+
+Protocol and light-client dependencies are exact-version, checksum-recorded
+crates.io cohorts. Repository-local path patches may be used while coordinating
+an adjacent release, but a wallet crate release is not permitted until its
+tested protocol and engine dependencies have permanent registry artifacts with
+matching source provenance. See [`docs/releasing.md`](docs/releasing.md).
+
+## Build and qualification
+
+The minimum supported compiler is Rust 1.89.0.
+
+```sh
+cargo +1.89.0 test --workspace --all-targets --locked
+cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings
+./scripts/check.sh
+```
+
+Release metadata and normalized archives are checked separately:
+
+```sh
+python3 scripts/verify-release.py --toolchain 1.89.0
+./scripts/check-publish-arguments.sh
+./scripts/publish.sh --archive-only
+```
+
+Passing source tests does not itself authorize a store release, mainnet value
+operation, crates.io upload, or product feature gate. Android and iOS retain
+their own build, installed-device, lifecycle, notification, accessibility,
+and store-submission qualification.
 
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Security model](docs/SECURITY.md)
-- [Provider API](docs/PROVIDER_API.md)
 - [Persistence and recovery](docs/PERSISTENCE_AND_RECOVERY.md)
 - [Handshake node RPC adapter](docs/HNS_NODE_RPC.md)
-- [Bitcoin Kyoto-only module](docs/BITCOIN_KYOTO.md)
-- [Ethereum model and contract](docs/ETHEREUM.md)
-- [Shakedex and market state](docs/SHAKEDEX_AND_MARKET.md)
-- [Wallet service ABI v2](docs/ABI.md)
-- [ABI schemas and bounded vectors](abi/)
-- [Qualification matrix](docs/QUALIFICATION.md)
+- [Bitcoin Kyoto module](docs/BITCOIN_KYOTO.md)
+- [ShakeDex and market state](docs/SHAKEDEX_AND_MARKET.md)
+- [Provider API](docs/PROVIDER_API.md)
+- [Wallet service ABI](docs/ABI.md)
 - [Implementation status](docs/IMPLEMENTATION_STATUS.md)
-- [Future work and excluded features](FUTURE_WORK.md)
+- [Qualification matrix](docs/QUALIFICATION.md)
 - [Release procedure](docs/releasing.md)
+
+## License
+
+The workspace is licensed under either Apache-2.0 or MIT, at your option. See
+[`LICENSE-APACHE`](LICENSE-APACHE) and [`LICENSE-MIT`](LICENSE-MIT).

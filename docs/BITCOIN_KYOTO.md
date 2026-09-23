@@ -1,7 +1,9 @@
 # Bitcoin: Kyoto only
 
-Bitcoin has one synchronization implementation: direct P2P with `bip157`
-0.6.3 and `bdk_kyoto` 0.17.1, feeding a BIP84 `bdk_wallet` 3.1.0 wallet.
+Bitcoin has one synchronization implementation: direct P2P with
+`hns-wallet-bip157` 0.2.4 and `hns-wallet-bdk-kyoto` 0.2.4, derived from
+`bip157` 0.6.3 and `bdk_kyoto` 0.17.1, feeding a BIP84 `bdk_wallet` 3.1.0
+wallet.
 There is no Esplora, Electrum, hosted indexer, or Bitcoin Core RPC production
 mode. Bitcoin Core regtest is only a deterministic qualification fixture.
 
@@ -106,7 +108,8 @@ or deleted. There is no migration tool in this revision. An upgraded product
 which has such a database must retain it and stop for an explicit future import
 instead of treating `WalletNotFound` as permission to create replacement state.
 
-`bip157` 0.6.3 accepts `data_dir`, but this pinned release discards the field in
+The reviewed `hns-wallet-bip157` transport accepts `data_dir`, but the
+underlying 0.6.3 implementation discards the field in
 `Node::new`; it does not persist a full header/filter database or its address
 book. The wallet therefore keeps a separate bounded encrypted cache of up to
 32 previously successful IPv4/IPv6 compact-filter peers. Those entries are

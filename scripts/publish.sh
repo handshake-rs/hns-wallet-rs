@@ -17,19 +17,19 @@ require_clean_archive_vcs=no
 package_operation="publish-dry-run"
 release_manifest=release/public-crates.txt
 protocol_repository=https://github.com/handshake-rs/hns-rs.git
-protocol_revision=73611a0d83778e157b35f28ca2197d068e83fc61
-protocol_version=0.4.1
+protocol_revision=1a4a937a8b8367b8b96d0445b9aa2b7e6fdd7c6b
+protocol_version=0.4.2
 protocol_crates='hns-encoding hns-rollback-journal hns-hrm hns-primitives hns-covenants hns-dns-relay-protocol hns-header-consensus hns-service-authority hns-odoh-protocol hns-p2p-experimental hns-urkel-proof hns-transaction hns-chat-protocol hns-hnsr-protocol hns-script hns-mining hns-swap hns-marketplace-protocol hns-p2p-wire'
-protocol_checksum_manifest=release/hns-rs-0.4.1-crates.sha256
+protocol_checksum_manifest=release/hns-rs-0.4.2-crates.sha256
 engine_repository=https://github.com/handshake-rs/hns-dane-engine.git
 engine_revision=b7fdf8826c81b77650a0f740d1f05314b74969f9
 engine_version=0.2.2
 engine_crates='hns-dns-wire hns-browser-runtime hns-icann-dane hns-namespace-resolution hns-resolution-policy hns-light-chain hns-light-wallet hns-dane hns-dnssec hns-gateway hns-cache hns-light-p2p hns-light-sync hns-transport hns-resolver hns-browser-observability hns-p2p-transport hns-dane-engine hns-dane-engine-ffi hns-loopback-proxy'
 engine_checksum_manifest=release/hns-dane-engine-0.2.2-crates.sha256
-engine_patch_revision=87d2346c13ade4987801e0f1367bd604fd77c9f0
-engine_patch_version=0.2.3
+engine_patch_revision=77459f2ffbaa46d950fec95bd00013cc89d01007
+engine_patch_version=0.2.5
 engine_patch_crates='hns-light-chain hns-light-wallet hns-light-p2p hns-light-sync'
-engine_patch_checksum_manifest=release/hns-dane-engine-light-client-0.2.3-crates.sha256
+engine_patch_checksum_manifest=release/hns-dane-engine-mobile-wallet-0.2.5-crates.sha256
 
 cleanup_release_tmp() {
     if [ -n "$release_tmp" ] && [ -d "$release_tmp" ]
@@ -99,8 +99,12 @@ dry_run_package() {
 dry_run_with_local_dependencies() {
     package=$1
     case "$package" in
-        hns-wallet-types)
+        hns-wallet-types|hns-wallet-bip157)
             dry_run_package "$package"
+            ;;
+        hns-wallet-bdk-kyoto)
+            dry_run_package "$package" \
+                --config 'patch.crates-io.hns-wallet-bip157.path="crates/hns-wallet-bip157"'
             ;;
         hns-wallet-store|hns-wallet-chain-api)
             dry_run_package "$package" \
@@ -123,6 +127,8 @@ dry_run_with_local_dependencies() {
             ;;
         hns-wallet-market)
             dry_run_package "$package" \
+                --config 'patch.crates-io.hns-wallet-bdk-kyoto.path="crates/hns-wallet-bdk-kyoto"' \
+                --config 'patch.crates-io.hns-wallet-bip157.path="crates/hns-wallet-bip157"' \
                 --config 'patch.crates-io.hns-wallet-bitcoin-kyoto.path="crates/hns-wallet-bitcoin-kyoto"' \
                 --config 'patch.crates-io.hns-wallet-chain-api.path="crates/hns-wallet-chain-api"' \
                 --config 'patch.crates-io.hns-wallet-hns.path="crates/hns-wallet-hns"' \
@@ -138,6 +144,8 @@ dry_run_with_local_dependencies() {
             ;;
         hns-wallet-bitcoin-kyoto)
             dry_run_package "$package" \
+                --config 'patch.crates-io.hns-wallet-bdk-kyoto.path="crates/hns-wallet-bdk-kyoto"' \
+                --config 'patch.crates-io.hns-wallet-bip157.path="crates/hns-wallet-bip157"' \
                 --config 'patch.crates-io.hns-wallet-chain-api.path="crates/hns-wallet-chain-api"' \
                 --config 'patch.crates-io.hns-wallet-store.path="crates/hns-wallet-store"' \
                 --config 'patch.crates-io.hns-wallet-types.path="crates/hns-wallet-types"'
@@ -164,6 +172,8 @@ dry_run_with_local_dependencies() {
             ;;
         hns-wallet-testkit)
             dry_run_package "$package" \
+                --config 'patch.crates-io.hns-wallet-bdk-kyoto.path="crates/hns-wallet-bdk-kyoto"' \
+                --config 'patch.crates-io.hns-wallet-bip157.path="crates/hns-wallet-bip157"' \
                 --config 'patch.crates-io.hns-wallet-bitcoin-kyoto.path="crates/hns-wallet-bitcoin-kyoto"' \
                 --config 'patch.crates-io.hns-wallet-chain-api.path="crates/hns-wallet-chain-api"' \
                 --config 'patch.crates-io.hns-wallet-ethereum.path="crates/hns-wallet-ethereum"' \
@@ -176,6 +186,8 @@ dry_run_with_local_dependencies() {
             ;;
         hns-wallet-mobile)
             dry_run_package "$package" \
+                --config 'patch.crates-io.hns-wallet-bdk-kyoto.path="crates/hns-wallet-bdk-kyoto"' \
+                --config 'patch.crates-io.hns-wallet-bip157.path="crates/hns-wallet-bip157"' \
                 --config 'patch.crates-io.hns-wallet-bitcoin-kyoto.path="crates/hns-wallet-bitcoin-kyoto"' \
                 --config 'patch.crates-io.hns-wallet-chain-api.path="crates/hns-wallet-chain-api"' \
                 --config 'patch.crates-io.hns-wallet-ffi.path="crates/hns-wallet-ffi"' \

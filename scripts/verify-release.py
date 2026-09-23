@@ -15,10 +15,10 @@ from pathlib import Path
 
 REPOSITORY = "https://github.com/handshake-rs/hns-wallet-rs"
 PROTOCOL_REPOSITORY = "https://github.com/handshake-rs/hns-rs.git"
-PROTOCOL_REVISION = "73611a0d83778e157b35f28ca2197d068e83fc61"
-PROTOCOL_VERSION = "=0.4.1"
+PROTOCOL_REVISION = "1a4a937a8b8367b8b96d0445b9aa2b7e6fdd7c6b"
+PROTOCOL_VERSION = "=0.4.2"
 REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-PROTOCOL_CHECKSUM_MANIFEST = "release/hns-rs-0.4.1-crates.sha256"
+PROTOCOL_CHECKSUM_MANIFEST = "release/hns-rs-0.4.2-crates.sha256"
 PROTOCOL_PUBLIC_PACKAGES = (
     "hns-encoding",
     "hns-rollback-journal",
@@ -56,10 +56,10 @@ ENGINE_REPOSITORY = "https://github.com/handshake-rs/hns-dane-engine.git"
 ENGINE_REVISION = "b7fdf8826c81b77650a0f740d1f05314b74969f9"
 ENGINE_VERSION = "=0.2.2"
 ENGINE_CHECKSUM_MANIFEST = "release/hns-dane-engine-0.2.2-crates.sha256"
-ENGINE_PATCH_REVISION = "87d2346c13ade4987801e0f1367bd604fd77c9f0"
-ENGINE_PATCH_VERSION = "=0.2.3"
+ENGINE_PATCH_REVISION = "77459f2ffbaa46d950fec95bd00013cc89d01007"
+ENGINE_PATCH_VERSION = "=0.2.5"
 ENGINE_PATCH_CHECKSUM_MANIFEST = (
-    "release/hns-dane-engine-light-client-0.2.3-crates.sha256"
+    "release/hns-dane-engine-mobile-wallet-0.2.5-crates.sha256"
 )
 ENGINE_PATCH_PACKAGES = (
     "hns-light-chain",
@@ -282,7 +282,7 @@ def verify_release_document(repo: Path, order: list[str], version: str) -> None:
     for required in required_release_text:
         if required not in document:
             fail(f"docs/releasing.md omits {required!r}")
-    if "coherent nineteen-crate `hns-rs` `0.4.1` cohort" not in document:
+    if "coherent nineteen-crate `hns-rs` `0.4.2` cohort" not in document:
         fail("docs/releasing.md omits the current published protocol prerequisite record")
     if re.search(
         r"all 20\s+required\s+`hns-dane-engine` `0\.2\.2` archives were published",
@@ -344,9 +344,9 @@ def verify_publish_script_safety(repo: Path) -> None:
         "verify_protocol_packages_published()",
         "verify_engine_packages_published()",
         "verify_published_cohort()",
-        "protocol_checksum_manifest=release/hns-rs-0.4.1-crates.sha256",
+        "protocol_checksum_manifest=release/hns-rs-0.4.2-crates.sha256",
         "engine_checksum_manifest=release/hns-dane-engine-0.2.2-crates.sha256",
-        "engine_patch_checksum_manifest=release/hns-dane-engine-light-client-0.2.3-crates.sha256",
+        "engine_patch_checksum_manifest=release/hns-dane-engine-mobile-wallet-0.2.5-crates.sha256",
         "require_clean_archive_vcs=yes",
         '*\\"dirty\\":true*',
         'cohort_vcs_info="$release_tmp/$package-$version.cargo_vcs_info.json"',
@@ -658,7 +658,7 @@ def verify_workspace(
         )
     if set(packages) != set(order):
         fail(
-            "workspace package set differs from the 14-crate release set: "
+            "workspace package set differs from the 16-crate release set: "
             f"workspace={sorted(packages)}, allowlist={sorted(order)}"
         )
 
@@ -728,8 +728,13 @@ def verify_workspace(
             fail(f"{name} has a noncanonical docs.rs URL")
         if package["rust_version"] != workspace_package["rust-version"]:
             fail(f"{name} rust-version differs from [workspace.package]")
-        if package["edition"] != workspace_package["edition"]:
-            fail(f"{name} edition differs from [workspace.package]")
+        expected_edition = (
+            "2021"
+            if name in {"hns-wallet-bip157", "hns-wallet-bdk-kyoto"}
+            else workspace_package["edition"]
+        )
+        if package["edition"] != expected_edition:
+            fail(f"{name} edition differs from its release contract")
         if package.get("keywords") != workspace_package["keywords"]:
             fail(f"{name} keywords differ from [workspace.package]")
         if package.get("categories") != workspace_package["categories"]:

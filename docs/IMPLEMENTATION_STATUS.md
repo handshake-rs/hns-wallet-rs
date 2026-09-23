@@ -213,7 +213,8 @@ the private permit. It journals `submission_started` before the bounded
 Kyoto request and applies the rebroadcast interval before retrying an ambiguous
 submission.
 
-The pinned `bip157` 0.6.3 source ignores `data_dir`; full headers, compact-
+The `hns-wallet-bip157` source, derived from `bip157` 0.6.3, ignores
+`data_dir`; full headers, compact-
 filter headers/filters, and address-book state are re-fetched from untrusted
 peers after restart. The encrypted BDK checkpoint is the durable light-wallet
 anchor, so a pruned/full indexed node is not required. Safe archival at the

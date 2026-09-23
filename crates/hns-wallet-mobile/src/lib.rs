@@ -2305,7 +2305,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         let lock = match permit.funding_transaction() {
             Some(transaction) => self.session.service.verify_trusted_native_hns_htlc_lock(
                 session_id,
-                binding.descriptor.clone(),
+                binding.descriptor,
                 transaction,
                 confirmations,
             ),
@@ -2314,7 +2314,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
                 .service
                 .verify_trusted_native_persisted_hns_htlc_lock(
                     session_id,
-                    binding.descriptor.clone(),
+                    binding.descriptor,
                     confirmations,
                 ),
         }
@@ -2561,7 +2561,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         let verified = match permit.funding_transaction() {
             Some(transaction) => self.session.service.verify_trusted_native_hns_htlc_lock(
                 session_id,
-                binding.descriptor.clone(),
+                binding.descriptor,
                 transaction,
                 confirmations,
             ),
@@ -2570,7 +2570,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
                 .service
                 .verify_trusted_native_persisted_hns_htlc_lock(
                     session_id,
-                    binding.descriptor.clone(),
+                    binding.descriptor,
                     confirmations,
                 ),
         };

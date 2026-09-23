@@ -141,6 +141,14 @@ pub struct MobileShakescapeBitcoinSettlementPermit {
     fee_reserve: u64,
 }
 
+struct LocalFundingLocator {
+    chain: hns_marketplace_protocol::ChainId,
+    transaction_id: [u8; 32],
+    output_index: u32,
+    confirmations: u32,
+    state: FundingState,
+}
+
 impl MobileShakescapeHnsSettlementPermit {
     pub(crate) const fn hello(&self) -> &SwapSessionHello {
         &self.hello
@@ -2260,11 +2268,13 @@ impl MobileShakescapeSessionController {
     ) -> Result<SwapState, MobileWalletError> {
         self.retain_local_funding_status(
             session_id,
-            hns_marketplace_protocol::ChainId::BITCOIN,
-            *lock.funding_txid.as_bytes(),
-            lock.output_index,
-            lock.confirmation_count,
-            FundingState::Confirmed,
+            LocalFundingLocator {
+                chain: hns_marketplace_protocol::ChainId::BITCOIN,
+                transaction_id: *lock.funding_txid.as_bytes(),
+                output_index: lock.output_index,
+                confirmations: lock.confirmation_count,
+                state: FundingState::Confirmed,
+            },
             now_unix,
         )?;
         let policy = self.policy;
@@ -2290,13 +2300,15 @@ impl MobileShakescapeSessionController {
     ) -> Result<SwapState, MobileWalletError> {
         self.retain_local_funding_status(
             session_id,
-            hns_marketplace_protocol::ChainId::HANDSHAKE,
-            *lock.funding_id.as_bytes(),
-            // Native HNS HTLC construction always places the exact lock
-            // before its optional change output.
-            0,
-            lock.confirmation_count,
-            FundingState::Confirmed,
+            LocalFundingLocator {
+                chain: hns_marketplace_protocol::ChainId::HANDSHAKE,
+                transaction_id: *lock.funding_id.as_bytes(),
+                // Native HNS HTLC construction always places the exact lock
+                // before its optional change output.
+                output_index: 0,
+                confirmations: lock.confirmation_count,
+                state: FundingState::Confirmed,
+            },
             now_unix,
         )?;
         let policy = self.policy;
@@ -2327,11 +2339,13 @@ impl MobileShakescapeSessionController {
     ) -> Result<(), MobileWalletError> {
         let Some(envelope) = self.retain_local_funding_status(
             session_id,
-            self.local_funding_chain(session_id)?,
-            transaction_id,
-            output_index,
-            0,
-            FundingState::Broadcast,
+            LocalFundingLocator {
+                chain: self.local_funding_chain(session_id)?,
+                transaction_id,
+                output_index,
+                confirmations: 0,
+                state: FundingState::Broadcast,
+            },
             now_unix,
         )?
         else {
@@ -2384,16 +2398,12 @@ impl MobileShakescapeSessionController {
     fn retain_local_funding_status(
         &self,
         session_id: hns_wallet_types::SessionId,
-        chain: hns_marketplace_protocol::ChainId,
-        transaction_id: [u8; 32],
-        output_index: u32,
-        confirmations: u32,
-        state: FundingState,
+        locator: LocalFundingLocator,
         now_unix: u64,
     ) -> Result<Option<Vec<u8>>, MobileWalletError> {
-        if transaction_id == [0; 32]
+        if locator.transaction_id == [0; 32]
             || now_unix == 0
-            || (state == FundingState::Confirmed) != (confirmations > 0)
+            || (locator.state == FundingState::Confirmed) != (locator.confirmations > 0)
         {
             return Err(MobileWalletError::InvalidShakescapeSessionMessage);
         }
@@ -2430,17 +2440,17 @@ impl MobileShakescapeSessionController {
         } else {
             return Err(MobileWalletError::InvalidShakescapeSessionMessage);
         };
-        if chain != local_chain {
+        if locator.chain != local_chain {
             return Ok(None);
         }
         let existing = retained_statuses
             .iter()
-            .find(|retained| retained.status.chain == chain);
+            .find(|retained| retained.status.chain == locator.chain);
         if let Some(existing) = existing
-            && existing.status.transaction_id == transaction_id
-            && existing.status.output_index == output_index
-            && existing.status.state == state
-            && existing.status.confirmations >= confirmations
+            && existing.status.transaction_id == locator.transaction_id
+            && existing.status.output_index == locator.output_index
+            && existing.status.state == locator.state
+            && existing.status.confirmations >= locator.confirmations
             && existing.status.header.expires_at > now_unix
         {
             return CrossChainMessage::SwapFundingStatus(existing.status.clone())
@@ -2448,12 +2458,12 @@ impl MobileShakescapeSessionController {
                 .map(Some)
                 .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage);
         }
-        let (amount, lock_commitment) = if chain == hello.offered_asset.chain() {
+        let (amount, lock_commitment) = if locator.chain == hello.offered_asset.chain() {
             (hello.offered_amount, hello.offered_lock_commitment)
         } else {
             (hello.received_amount, hello.received_lock_commitment)
         };
-        let state_sequence_offset: u64 = match state {
+        let state_sequence_offset: u64 = match locator.state {
             FundingState::Broadcast => 2,
             FundingState::Seen => 3,
             FundingState::Confirmed => 4,
@@ -2487,13 +2497,13 @@ impl MobileShakescapeSessionController {
                     .max(hello.received_refund_deadline.value),
             },
             swap_session_id: hello.swap_session_id,
-            chain,
+            chain: locator.chain,
             lock_commitment,
-            transaction_id,
-            output_index,
+            transaction_id: locator.transaction_id,
+            output_index: locator.output_index,
             amount,
-            confirmations,
-            state,
+            confirmations: locator.confirmations,
+            state: locator.state,
             signature: [0; 64],
         };
         settlement_key

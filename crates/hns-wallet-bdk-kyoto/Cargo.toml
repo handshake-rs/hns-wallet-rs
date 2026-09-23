@@ -1,0 +1,26 @@
+[package]
+name = "hns-wallet-bdk-kyoto"
+description = "BDK integration for the reviewed hns-wallet-rs BIP157 transport"
+version.workspace = true
+edition = "2021"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = ["crates-io"]
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/hns-wallet-bdk-kyoto"
+autoexamples = false
+autotests = false
+
+[lib]
+name = "bdk_kyoto"
+path = "src/lib.rs"
+
+[dependencies]
+bdk_wallet.workspace = true
+bip157.workspace = true
+
+[lints]
+workspace = true

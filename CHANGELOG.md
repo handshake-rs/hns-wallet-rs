@@ -3,6 +3,33 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## 0.2.4 - 2026-09-23
+
+<!-- hns-wallet-release-state: 0.2.4 release -->
+Breaking clean-break migration of the wallet and atomic-swap boundary:
+
+- add standard Handshake `NETWORK` listener serving and stock-HSD
+  `ADDR`/ShakeScape peer discovery for native mobile networking;
+- support signed direct offers in both BTC-for-HNS and HNS-for-BTC directions,
+  including exact cancellation, take, bilateral session, and status recovery;
+- make swap admission, reservations, HNS-first funding, Bitcoin-first funding,
+  reconnect, restart, broadcast, redeem, refund, and abandoned-acceptance paths
+  durable and retryable without trusting stale relay state;
+- optimize HNS wallet reconciliation, peer rotation, proof sync, birthday
+  bootstrap, and paged transaction/name processing;
+- optimize Bitcoin compact-filter synchronization, sparse recovery, witness
+  block retrieval, approved-broadcast recovery, and repeated sync at tip;
+- publish the reviewed BIP157 transport and its BDK adapter under explicit
+  `hns-wallet-*` package identities so crates.io consumers receive the same
+  multi-peer transaction fanout and witness-block behavior as mobile builds,
+  without relying on a workspace-only `[patch]` override;
+- automate tracked ShakeDex purchase FINALIZE preparation and preserve the HSD
+  distinction between historical resource expiration and the current name
+  lifecycle; and
+- improve typed progress and failure categories so native applications can
+  report synchronization, reservation, funding, negotiation, and recovery
+  state without scraping error strings.
+
 ## 0.2.3 - 2026-09-05
 
 <!-- hns-wallet-release-state: 0.2.3 release -->

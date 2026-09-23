@@ -15,14 +15,16 @@ The release script publishes only these packages, in dependency order:
 4. `hns-wallet-ffi`
 5. `hns-wallet-provider`
 6. `hns-wallet-hns`
-7. `hns-wallet-bitcoin-kyoto`
-8. `hns-wallet-market`
-9. `hns-wallet-shakedex`
-10. `hns-wallet-ethereum`
-11. `hns-wallet-host`
-12. `hns-wallet-service`
-13. `hns-wallet-testkit`
-14. `hns-wallet-mobile`
+7. `hns-wallet-bip157`
+8. `hns-wallet-bdk-kyoto`
+9. `hns-wallet-bitcoin-kyoto`
+10. `hns-wallet-market`
+11. `hns-wallet-shakedex`
+12. `hns-wallet-ethereum`
+13. `hns-wallet-host`
+14. `hns-wallet-service`
+15. `hns-wallet-testkit`
+16. `hns-wallet-mobile`
 
 `release/public-crates.txt` is the machine-readable authority for this list.
 The cheap release validator fails if this document, the workspace package set,
@@ -40,15 +42,15 @@ Normalized archive inspection materializes complete tar listings and selected
 files before comparison so a successful match cannot hide an upstream tar read
 failure or emit a benign broken-pipe warning.
 
-## 0.2.3 release source
+## 0.2.4 release source
 
-Version `0.2.3` is the current prepared `hns-wallet-rs` release source. The
+Version `0.2.4` is the current prepared `hns-wallet-rs` release source. The
 canonical feature inventory is in `CHANGELOG.md`; source packaging, publication,
 or test success does not enable provider, value, settlement, or marketplace
 product gates. Registry and tag state are external facts and must be checked at
 release time rather than embedded as a claim in the source snapshot.
 
-The selected `0.2.3` heading and package-local changelogs use one
+The selected `0.2.4` heading and package-local changelogs use one
 version-scoped canonical `release` declaration. It describes prepared source,
 not an existing crates.io package or tag; execution requires this exact dated
 state and rejects a stale, missing, malformed, mismatched, or candidate
@@ -57,29 +59,29 @@ declaration.
 Root `CHANGELOG.md` release form:
 
 ```markdown
-<!-- hns-wallet-release-state: 0.2.3 release -->
+<!-- hns-wallet-release-state: 0.2.4 release -->
 Breaking clean-break migration of the wallet and atomic-swap boundary:
 ```
 
 `release/CRATE-CHANGELOG.md` release form:
 
 ```markdown
-<!-- hns-wallet-release-state: 0.2.3 release -->
+<!-- hns-wallet-release-state: 0.2.4 release -->
 This crate changelog describes the prepared `hns-wallet-rs` release source.
 ```
 
-Wallet source consumes the coherent nineteen-crate `hns-rs` `0.4.1` cohort
+Wallet source consumes the coherent nineteen-crate `hns-rs` `0.4.2` cohort
 from immutable release source
-`73611a0d83778e157b35f28ca2197d068e83fc61`, recorded in
-`release/hns-rs-0.4.1-crates.sha256`. It also consumes the published registry
+`1a4a937a8b8367b8b96d0445b9aa2b7e6fdd7c6b`, recorded in
+`release/hns-rs-0.4.2-crates.sha256`. It also consumes the published registry
 `hns-dane-engine` `0.2.2` cohort from immutable release source
 `b7fdf8826c81b77650a0f740d1f05314b74969f9`. All 20 required
 `hns-dane-engine` `0.2.2` archives were published to crates.io and are recorded
 in `release/hns-dane-engine-0.2.2-crates.sha256`. The wallet uses the compatible
-light-client `0.2.3` cohort (`hns-light-chain`, `hns-light-wallet`,
+light-client `0.2.5` cohort (`hns-light-chain`, `hns-light-wallet`,
 `hns-light-p2p`, and `hns-light-sync`) from immutable engine source
-`87d2346c13ade4987801e0f1367bd604fd77c9f0`, recorded in
-`release/hns-dane-engine-light-client-0.2.3-crates.sha256`; the release gate
+`77459f2ffbaa46d950fec95bd00013cc89d01007`, recorded in
+`release/hns-dane-engine-mobile-wallet-0.2.5-crates.sha256`; the release gate
 verifies both the historical engine cohort and all four exact patch archives.
 
 Execution downloads and revalidates each prerequisite immediately before any
@@ -130,7 +132,7 @@ document and verify boundaries; they grant no runtime or deployment authority.
 
 4. Qualify that exact commit with the complete locked gate, preferably in CI
    after an authorized push. The routine gate performs one archive-only pass
-   after the workspace checks; it does not repeat 14 normalized compile checks:
+   after the workspace checks; it does not repeat 16 normalized compile checks:
 
    ```bash
    ./scripts/check.sh
@@ -142,7 +144,7 @@ document and verify boundaries; they grant no runtime or deployment authority.
    [`.github/workflows/release-preflight.yml`](../.github/workflows/release-preflight.yml)
    and supply that qualified 40-character commit as `expected_commit`. The
    workflow checks out and verifies that exact immutable commit. This isolated
-   workflow performs the 14 real normalized publish dry-runs and never receives
+   workflow performs the 16 real normalized publish dry-runs and never receives
    credentials or executes publication. The equivalent local command is:
 
    ```bash
@@ -177,12 +179,12 @@ document and verify boundaries; they grant no runtime or deployment authority.
    confirmation must equal the workspace version:
 
    ```bash
-   ./scripts/publish.sh --execute --confirm-publish 0.2.3
+   ./scripts/publish.sh --execute --confirm-publish 0.2.4
    ```
 
-Execution mode first downloads all nineteen `hns-rs` `0.4.1` crates, all 20
+Execution mode first downloads all nineteen `hns-rs` `0.4.2` crates, all 20
 historical `hns-dane-engine 0.2.2` archives, and the four-crate light-client
-`0.2.3` cohort. It rejects any package whose API record, checksum,
+`0.2.5` cohort. It rejects any package whose API record, checksum,
 or `.cargo_vcs_info.json` does not identify the exact pinned release source.
 For a new wallet version, it creates and runs the custom
 inventory verifier over the normalized source package before any possible
@@ -211,7 +213,7 @@ limit:
 ```bash
 PUBLISH_NEW_INTERVAL_SECONDS=605 \
 PUBLISH_UPDATE_INTERVAL_SECONDS=65 \
-  ./scripts/publish.sh --execute --confirm-publish 0.2.3
+  ./scripts/publish.sh --execute --confirm-publish 0.2.4
 ```
 
 After each applicable cooldown, the script downloads the new archive and

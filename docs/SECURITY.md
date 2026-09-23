@@ -698,7 +698,8 @@ The journal rejects wall-clock rollback behind durable preparation or attempt
 timestamps. This fail-closed check does not replace a reviewed trusted-time or
 monotonic-clock source, which remains a Bitcoin value-release requirement.
 
-Pinned `bip157` 0.6.3 discards `data_dir` and does not expose persistent header,
+The `hns-wallet-bip157` transport, derived from `bip157` 0.6.3, discards
+`data_dir` and does not expose persistent header,
 filter-header/filter, or address-book state. BDK checkpoints and wallet records
 are durable; Kyoto re-fetches and revalidates those public chain objects after
 restart. The wallet's bounded encrypted successful-peer cache only influences

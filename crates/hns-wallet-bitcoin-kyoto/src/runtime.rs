@@ -1115,23 +1115,27 @@ fn select_earlier_scan_checkpoint(
     })
 }
 
-fn build_wallet_swap_client(
-    wallet: &Wallet,
-    config: KyotoRuntimeConfig,
+struct KyotoWalletSwapScan {
     scan_type: ScanType,
     checkpoint_lookback: u32,
     active_swap_rescan_checkpoint: Option<HashCheckpoint>,
     swap_scripts: Vec<(SessionId, ScriptBuf)>,
     progress: KyotoSyncProgressHandle,
     store: SharedWalletStore,
+}
+
+fn build_wallet_swap_client(
+    wallet: &Wallet,
+    config: KyotoRuntimeConfig,
+    scan: KyotoWalletSwapScan,
 ) -> Result<(Requester, LoggingSubscribers, KyotoWalletSwapSubscriber), BitcoinWalletError> {
     config.validate()?;
     if wallet.network() != config.network {
         return Err(BitcoinWalletError::NetworkMismatch);
     }
-    let ordinary_start = match scan_type {
+    let ordinary_start = match scan.scan_type {
         ScanType::Sync => {
-            walk_back_wallet_checkpoint(wallet.latest_checkpoint(), checkpoint_lookback)
+            walk_back_wallet_checkpoint(wallet.latest_checkpoint(), scan.checkpoint_lookback)
         }
         ScanType::Recovery { checkpoint, .. } => checkpoint,
     };
@@ -1140,7 +1144,7 @@ fn build_wallet_swap_client(
     // window. Compact filters make replay from the exact registration anchor
     // cheap; only matching blocks are downloaded. Once the spend is retained,
     // the watch no longer contributes this floor.
-    let start = select_earlier_scan_checkpoint(ordinary_start, active_swap_rescan_checkpoint)?;
+    let start = select_earlier_scan_checkpoint(ordinary_start, scan.active_swap_rescan_checkpoint)?;
     let mut builder = Builder::new(config.network)
         // BDK needs witnesses for its own SegWit transactions, and the swap
         // observer additionally extracts the HTLC redeem preimage from them.
@@ -1163,11 +1167,13 @@ fn build_wallet_swap_client(
         requester.clone(),
         event_rx,
         wallet,
-        scan_type,
-        swap_scripts,
-        progress,
-        store,
-        config.network,
+        KyotoWalletSwapSubscriberInit {
+            scan_type: scan.scan_type,
+            swap_scripts: scan.swap_scripts,
+            progress: scan.progress,
+            store: scan.store,
+            network: config.network,
+        },
     );
     bip157::tokio::task::spawn(async move { node.run().await });
     Ok((
@@ -1210,20 +1216,24 @@ struct KyotoWalletSwapSubscriber {
     network: Network,
 }
 
+struct KyotoWalletSwapSubscriberInit {
+    scan_type: ScanType,
+    swap_scripts: Vec<(SessionId, ScriptBuf)>,
+    progress: KyotoSyncProgressHandle,
+    store: SharedWalletStore,
+    network: Network,
+}
+
 impl KyotoWalletSwapSubscriber {
     fn new(
         requester: Requester,
         receiver: bip157::tokio::sync::mpsc::UnboundedReceiver<Event>,
         wallet: &Wallet,
-        scan_type: ScanType,
-        swap_scripts: Vec<(SessionId, ScriptBuf)>,
-        progress: KyotoSyncProgressHandle,
-        store: SharedWalletStore,
-        network: Network,
+        init: KyotoWalletSwapSubscriberInit,
     ) -> Self {
         let graph = IndexedTxGraph::new(wallet.spk_index().clone());
-        let wallet_scripts = wallet_scripts_for_scan(&graph.index, scan_type);
-        let recovery_gap_limit = match scan_type {
+        let wallet_scripts = wallet_scripts_for_scan(&graph.index, init.scan_type);
+        let recovery_gap_limit = match init.scan_type {
             ScanType::Recovery {
                 used_script_index, ..
             } => Some(used_script_index),
@@ -1234,14 +1244,14 @@ impl KyotoWalletSwapSubscriber {
             receiver,
             queued_blocks: BTreeMap::new(),
             wallet_scripts,
-            swap_scripts: swap_scripts.into_iter().collect(),
+            swap_scripts: init.swap_scripts.into_iter().collect(),
             chain: wallet.latest_checkpoint(),
             graph,
             recovery_gap_limit,
             recovery_script_count: recovery_gap_limit.unwrap_or(0),
-            progress,
-            store,
-            network,
+            progress: init.progress,
+            store: init.store,
+            network: init.network,
         }
     }
 
@@ -1788,12 +1798,14 @@ impl KyotoSupervisor {
         let (requester, logging, updates) = build_wallet_swap_client(
             wallet,
             config,
-            scan_type,
-            checkpoint_lookback,
-            active_swap_rescan_checkpoint,
-            watched_scripts(&watches),
-            progress.clone(),
-            store.clone(),
+            KyotoWalletSwapScan {
+                scan_type,
+                checkpoint_lookback,
+                active_swap_rescan_checkpoint,
+                swap_scripts: watched_scripts(&watches),
+                progress: progress.clone(),
+                store: store.clone(),
+            },
         )?;
         let cancellation = Arc::new(KyotoCancellation::default());
         Ok((
@@ -3877,7 +3889,7 @@ fn reconcile_transaction_records(
         let approved_raw = prior
             .as_ref()
             .and_then(|stored| stored.value.raw_transaction.as_deref())
-            .map(|raw| deserialize::<Transaction>(raw))
+            .map(deserialize::<Transaction>)
             .transpose()
             .map_err(|_| BitcoinWalletError::CorruptRuntimeState)?;
         let structural_transaction = approved_raw.as_ref().unwrap_or(raw);
