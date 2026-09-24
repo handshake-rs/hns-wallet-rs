@@ -1744,6 +1744,20 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
 }
 
 impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsValueRuntime<B, C>> {
+    /// Return the wallet-owned compressed key for one HNS HTLC branch. The
+    /// session derivation remains inside the encrypted wallet authority.
+    pub fn trusted_native_hns_settlement_key_target(
+        &self,
+        session_id: SessionId,
+        refund: bool,
+    ) -> Result<String, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .settlement_key_target(session_id, refund)
+            .map_err(hns_runtime_failure)
+    }
+
     pub fn prepare_trusted_native_hns_htlc_lock(
         &self,
         session_id: SessionId,
@@ -1780,6 +1794,29 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             .map_err(chain_failure)
     }
 
+    /// Prepare an exact native-HNS redeem with the wallet's session-derived
+    /// receiver key; no external signing handle crosses the service boundary.
+    pub fn prepare_trusted_native_hns_htlc_redeem_with_wallet_key(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: hns_wallet_chain_api::VerifiedLock,
+        preimage: hns_wallet_chain_api::Preimage,
+        maximum_fee: BaseUnits,
+    ) -> Result<hns_wallet_chain_api::PreparedSettlementRedeem, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .prepare_native_htlc_redeem_with_wallet_key(
+                session_id,
+                descriptor,
+                lock,
+                preimage,
+                maximum_fee,
+            )
+            .map_err(chain_failure)
+    }
+
     pub fn prepare_trusted_native_hns_htlc_refund(
         &self,
         session_id: SessionId,
@@ -1798,6 +1835,22 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
                 maximum_fee,
                 signer,
             )
+            .map_err(chain_failure)
+    }
+
+    /// Prepare an exact native-HNS refund with the wallet's session-derived
+    /// refund key after the authenticated chain clock shows maturity.
+    pub fn prepare_trusted_native_hns_htlc_refund_with_wallet_key(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: hns_wallet_chain_api::VerifiedLock,
+        maximum_fee: BaseUnits,
+    ) -> Result<hns_wallet_chain_api::PreparedSettlementRefund, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .prepare_native_htlc_refund_with_wallet_key(session_id, descriptor, lock, maximum_fee)
             .map_err(chain_failure)
     }
 
@@ -1860,6 +1913,37 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         self.runtime
             .runtime
             .verify_persisted_native_htlc_lock(session_id, descriptor, minimum_confirmations)
+            .map_err(chain_failure)
+    }
+
+    /// Return the exact transaction ID already committed to durable HNS lock
+    /// submission for this session and descriptor. Absence does not prove a
+    /// chain lock; callers still verify current on-chain evidence separately.
+    pub fn submitted_trusted_native_hns_htlc_lock_transaction_id(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+    ) -> Result<Option<hns_wallet_types::TransactionHash>, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .submitted_native_htlc_lock_transaction_id(session_id, descriptor)
+            .map_err(chain_failure)
+    }
+
+    /// Recover an already submitted exact HNS redeem or refund transaction ID
+    /// without accepting a peer-reported receipt as chain evidence.
+    pub fn submitted_trusted_native_hns_htlc_spend_transaction_id(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        funding_id: hns_wallet_types::TransactionHash,
+        refund: bool,
+    ) -> Result<Option<hns_wallet_types::TransactionHash>, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .submitted_native_htlc_spend_transaction_id(session_id, descriptor, funding_id, refund)
             .map_err(chain_failure)
     }
 

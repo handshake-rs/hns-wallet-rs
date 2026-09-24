@@ -5953,6 +5953,127 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         self.verify_native_htlc_lock(session_id, descriptor, transaction, minimum_confirmations)
     }
 
+    /// Recover the transaction identifier of an irreversibly submitted native
+    /// HNS lock after a caller loses the broadcast response. This checks the
+    /// exact descriptor against the wallet's persisted terms and never treats
+    /// a merely prepared or expired artifact as submitted chain evidence.
+    pub fn submitted_native_htlc_lock_transaction_id(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+    ) -> Result<Option<TransactionHash>, ChainError> {
+        self.verify_native_htlc_network(&descriptor)?;
+        let config = self
+            .cache_read()
+            .map_err(map_chain_error)?
+            .account
+            .config
+            .clone();
+        let workflow_id = settlement_workflow_id(&config, session_id, HnsSettlementAction::Lock);
+        let Some(stored) = self
+            .store_lock()
+            .map_err(map_chain_error)?
+            .load_workflow::<HnsPreparedSettlement>(workflow_id)
+            .map_err(map_chain_error)?
+        else {
+            return Ok(None);
+        };
+        let HnsSettlementTerms::Lock { request } = &stored.state.terms else {
+            return Err(ChainError::InvalidEvidence);
+        };
+        if stored.kind != settlement_workflow_kind(HnsSettlementAction::Lock)
+            || stored.state.wallet_id != config.wallet_id
+            || stored.state.account_id != config.account_id
+            || stored.state.workflow_id != workflow_id
+            || stored.state.session_id != session_id
+            || stored.state.action != HnsSettlementAction::Lock
+            || request.amount != Amount::new(WalletAsset::Hns, u128::from(descriptor.value.get()))
+            || request.hashlock != ObjectHash::new(descriptor.hashlock)
+            || request.receiver != hex::encode(descriptor.receiver_public_key)
+            || request.refund_target != hex::encode(descriptor.refund_public_key)
+            || request.absolute_timelock != u64::from(descriptor.refund_locktime)
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        if !stored.irreversible_broadcast_prepared {
+            return Ok(None);
+        }
+        if matches!(
+            stored.state.stage,
+            HnsSettlementStage::Broadcast
+                | HnsSettlementStage::Mempool
+                | HnsSettlementStage::Confirmed
+                | HnsSettlementStage::RequiresRebroadcast
+        ) {
+            Ok(Some(stored.state.transaction))
+        } else {
+            Err(ChainError::InvalidEvidence)
+        }
+    }
+
+    /// Recover the exact submitted redeem or refund transaction after an
+    /// interrupted caller response. The wallet checks the persisted verified
+    /// lock against the descriptor and funding ID before reporting an ID.
+    pub fn submitted_native_htlc_spend_transaction_id(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        funding_id: TransactionHash,
+        refund: bool,
+    ) -> Result<Option<TransactionHash>, ChainError> {
+        self.verify_native_htlc_network(&descriptor)?;
+        let config = self
+            .cache_read()
+            .map_err(map_chain_error)?
+            .account
+            .config
+            .clone();
+        let action = if refund {
+            HnsSettlementAction::Refund
+        } else {
+            HnsSettlementAction::Redeem
+        };
+        let workflow_id = settlement_workflow_id(&config, session_id, action);
+        let Some(stored) = self
+            .store_lock()
+            .map_err(map_chain_error)?
+            .load_workflow::<HnsPreparedSettlement>(workflow_id)
+            .map_err(map_chain_error)?
+        else {
+            return Ok(None);
+        };
+        let lock = match (&stored.state.terms, action) {
+            (HnsSettlementTerms::Redeem { lock }, HnsSettlementAction::Redeem)
+            | (HnsSettlementTerms::Refund { lock }, HnsSettlementAction::Refund) => lock,
+            _ => return Err(ChainError::InvalidEvidence),
+        };
+        if stored.kind != settlement_workflow_kind(action)
+            || stored.state.wallet_id != config.wallet_id
+            || stored.state.account_id != config.account_id
+            || stored.state.workflow_id != workflow_id
+            || stored.state.session_id != session_id
+            || stored.state.action != action
+            || lock.funding_id != funding_id
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        validate_native_htlc_lock(&descriptor, session_id, lock)?;
+        if !stored.irreversible_broadcast_prepared {
+            return Ok(None);
+        }
+        if matches!(
+            stored.state.stage,
+            HnsSettlementStage::Broadcast
+                | HnsSettlementStage::Mempool
+                | HnsSettlementStage::Confirmed
+                | HnsSettlementStage::RequiresRebroadcast
+        ) {
+            Ok(Some(stored.state.transaction))
+        } else {
+            Err(ChainError::InvalidEvidence)
+        }
+    }
+
     /// Prepare a refund from the exact descriptor committed by a bilateral
     /// swap session.  Height locktimes are bound to the validated tip height;
     /// HNS median-time locktimes are bound to that same tip's validated median
@@ -5964,6 +6085,42 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         lock: VerifiedLock,
         maximum_fee: BaseUnits,
         signer: &dyn SettlementSigner,
+    ) -> Result<PreparedSettlementRefund, ChainError> {
+        self.prepare_native_htlc_refund_with_optional_signer(
+            session_id,
+            descriptor,
+            lock,
+            maximum_fee,
+            Some(signer),
+        )
+    }
+
+    /// Prepare the exact native-HNS refund with this wallet's durable,
+    /// session-derived refund key. The descriptor and verified lock must bind
+    /// to that key; the caller cannot supply a scalar or a claimed chain time.
+    pub fn prepare_native_htlc_refund_with_wallet_key(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: VerifiedLock,
+        maximum_fee: BaseUnits,
+    ) -> Result<PreparedSettlementRefund, ChainError> {
+        self.prepare_native_htlc_refund_with_optional_signer(
+            session_id,
+            descriptor,
+            lock,
+            maximum_fee,
+            None,
+        )
+    }
+
+    fn prepare_native_htlc_refund_with_optional_signer(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: VerifiedLock,
+        maximum_fee: BaseUnits,
+        signer: Option<&dyn SettlementSigner>,
     ) -> Result<PreparedSettlementRefund, ChainError> {
         self.verify_native_htlc_network(&descriptor)?;
         validate_native_htlc_lock(&descriptor, session_id, &lock)?;
@@ -5985,7 +6142,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             maximum_fee,
             Some(current),
             HnsSettlementAction::Refund,
-            Some(signer),
+            signer,
         )
         .map(PreparedSettlementRefund)
     }
@@ -6000,6 +6157,46 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         preimage: Preimage,
         maximum_fee: BaseUnits,
         signer: &dyn SettlementSigner,
+    ) -> Result<PreparedSettlementRedeem, ChainError> {
+        self.prepare_native_htlc_redeem_with_optional_signer(
+            session_id,
+            descriptor,
+            lock,
+            preimage,
+            maximum_fee,
+            Some(signer),
+        )
+    }
+
+    /// Prepare the receiver branch using this wallet's durable,
+    /// session-derived receiver key. The verified lock, descriptor, and
+    /// preimage are checked before the wallet signs or persists an artifact.
+    pub fn prepare_native_htlc_redeem_with_wallet_key(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: VerifiedLock,
+        preimage: Preimage,
+        maximum_fee: BaseUnits,
+    ) -> Result<PreparedSettlementRedeem, ChainError> {
+        self.prepare_native_htlc_redeem_with_optional_signer(
+            session_id,
+            descriptor,
+            lock,
+            preimage,
+            maximum_fee,
+            None,
+        )
+    }
+
+    fn prepare_native_htlc_redeem_with_optional_signer(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: VerifiedLock,
+        preimage: Preimage,
+        maximum_fee: BaseUnits,
+        signer: Option<&dyn SettlementSigner>,
     ) -> Result<PreparedSettlementRedeem, ChainError> {
         self.verify_native_htlc_network(&descriptor)?;
         validate_native_htlc_lock(&descriptor, session_id, &lock)
@@ -6016,7 +6213,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             maximum_fee,
             None,
             HnsSettlementAction::Redeem,
-            Some(signer),
+            signer,
         )
         .map(PreparedSettlementRedeem)
     }

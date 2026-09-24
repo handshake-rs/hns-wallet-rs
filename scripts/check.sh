@@ -9,8 +9,14 @@ python3 scripts/test-verify-release.py
 ./scripts/check-publish-arguments.sh
 ./scripts/publish.sh --archive-only
 
-if rg -n 'path\s*=\s*"\.\./' --glob Cargo.toml .; then
+if rg -n 'path\s*=\s*"\.\./' --glob Cargo.toml \
+    --glob '!integrations/basicswap-bridge/Cargo.toml' .; then
   echo "sibling path dependency is forbidden" >&2
+  exit 1
+fi
+if rg -n 'path\s*=' integrations/basicswap-bridge/Cargo.toml \
+    | rg -v 'path\s*=\s*"\.\./\.\./crates/hns-wallet-[a-z-]+"'; then
+  echo "BasicSwap bridge path dependency must remain inside wallet crates" >&2
   exit 1
 fi
 
@@ -61,6 +67,18 @@ cargo check --workspace --all-targets --locked
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
+# The BasicSwap process adapter is intentionally a separate, unpublished
+# workspace. Its local path dependencies point only to the released wallet
+# crates inside this repository and must be checked in addition to the fixed
+# 16-crate release workspace above.
+(
+  cd integrations/basicswap-bridge
+  cargo fmt --all --check
+  cargo check --all-targets --locked
+  cargo clippy --all-targets --locked -- -D warnings
+  cargo test --all-targets --locked
+)
 
 contract_dir="$wallet_root/crates/hns-wallet-ethereum/contracts"
 npm --prefix "$contract_dir" ci --ignore-scripts
