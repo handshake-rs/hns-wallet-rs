@@ -5352,7 +5352,7 @@ mod tests {
         )
         .unwrap();
         let scan = coordinator.backend().light_scan_status().unwrap();
-        assert_eq!(scan.watched_scripts, 4);
+        assert_eq!(scan.watched_scripts, 3);
         assert_eq!(scan.watched_names, 0);
         assert_eq!(scan.birthday_height, 0);
     }
@@ -5407,7 +5407,7 @@ mod tests {
                 .unwrap()
         );
         let mut installed = coordinator.backend().light_watch_set().unwrap();
-        assert_eq!(installed.scripts.len(), 5);
+        assert_eq!(installed.scripts.len(), 4);
         assert!(installed.scripts.contains(&WalletAddressKey {
             version: 0,
             hash: descriptor.script_hash().unwrap().to_vec(),
@@ -5857,7 +5857,7 @@ mod tests {
                 .light_scan_status()
                 .unwrap()
                 .watched_scripts,
-            4
+            3
         );
 
         let mut stored = store
@@ -5893,7 +5893,7 @@ mod tests {
                 .light_scan_status()
                 .unwrap()
                 .watched_scripts,
-            5
+            4
         );
         assert!(
             !coordinator
@@ -5915,7 +5915,7 @@ mod tests {
                 .light_scan_status()
                 .unwrap()
                 .watched_scripts,
-            5
+            4
         );
     }
 
@@ -5951,10 +5951,10 @@ mod tests {
                 .expect("extend direct wallet restoration watch set")
         );
         let expanded = coordinator.backend().light_watch_set().unwrap();
-        // Four derivation branches each include their initial script plus all
+        // Three derivation branches each include their initial script plus all
         // eight bounded restoration gaps. This turns a boundary recovery into
         // one re-scan rather than one complete re-scan per gap.
-        assert_eq!(expanded.scripts.len(), 36);
+        assert_eq!(expanded.scripts.len(), 27);
         assert!(
             !coordinator
                 .extend_wallet_restore_watch_set(now + 2)
@@ -5975,7 +5975,7 @@ mod tests {
                 .light_scan_status()
                 .unwrap()
                 .watched_scripts,
-            36
+            27
         );
     }
 

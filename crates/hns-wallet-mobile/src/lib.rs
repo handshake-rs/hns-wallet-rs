@@ -752,22 +752,6 @@ impl MobileWalletController {
         Self::restore_bootstrap(path, database_key, platform, bootstrap, recovery_phrase)
     }
 
-    /// Restores the original pre-BIP-44 Shakescape HNS derivation. BIP-39
-    /// words do not encode an application's derivation path, so this explicit
-    /// path is required for old backups and must never be selected silently
-    /// for a newly generated standards-compatible wallet.
-    pub fn restore_legacy(
-        path: impl AsRef<Path>,
-        database_key: &MobileDatabaseKey,
-        platform: MobilePlatform,
-        policy: HnsBootstrapPolicy,
-        recovery_phrase: MobileRecoveryPhrase,
-    ) -> Result<Self, MobileWalletError> {
-        let bootstrap =
-            HnsWalletBootstrap::restore_legacy(recovery_phrase.expose_secret(), policy)?;
-        Self::restore_bootstrap(path, database_key, platform, bootstrap, recovery_phrase)
-    }
-
     fn restore_bootstrap(
         path: impl AsRef<Path>,
         database_key: &MobileDatabaseKey,
@@ -1469,9 +1453,8 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsReadController<B, C> {
         result
     }
 
-    /// Return the dedicated `HnsName`, change-zero receive target from one new
-    /// bounded synchronization. This target is never an ordinary HNS payment
-    /// receive address.
+    /// Return the name-transfer view of the canonical account-zero external
+    /// receive target from one new bounded synchronization.
     pub fn name_receive_target(&mut self) -> Result<HnsNameReceiveTarget, MobileWalletError> {
         Ok(self.synchronize()?.name_receive_target)
     }
@@ -3301,9 +3284,6 @@ fn mobile_hns_value_snapshot(
         &snapshot.receive_target,
         &snapshot.name_receive_target,
     )?;
-    if snapshot.receive_target.display == snapshot.name_receive_target.display {
-        return Err(MobileWalletError::Hns(HnsWalletError::InvalidEvidence));
-    }
     let mut known_names = snapshot
         .known_names
         .into_iter()
@@ -3434,6 +3414,8 @@ fn validate_mobile_hns_receive_targets(
     if name_receive_target.module != ModuleId::Handshake
         || name_receive_target.account != expected_account
         || name_receive_target.validate().is_err()
+        || name_receive_target.display != receive_target.display
+        || name_receive_target.derivation_index != receive_target.derivation_index
         || !name_receive_target
             .display
             .bytes()
@@ -4340,7 +4322,7 @@ mod tests {
             .expect("wallet-owned direct index");
         assert_eq!(
             scan.watched_scripts,
-            controller.account_config().restore_lookahead as usize * 4
+            controller.account_config().restore_lookahead as usize * 3
         );
         assert_eq!(scan.watched_names, 0);
         assert!(controller.status().expect("controller relocked").locked);
@@ -4837,7 +4819,7 @@ mod tests {
         assert_eq!(snapshot.name_receive_target.module, ModuleId::Handshake);
         assert_eq!(snapshot.name_receive_target.account, expected_account);
         assert!(snapshot.name_receive_target.display.starts_with("rs1"));
-        assert_ne!(
+        assert_eq!(
             snapshot.name_receive_target.display,
             snapshot.receive_target.display
         );
@@ -4928,7 +4910,7 @@ mod tests {
             .name_receive_target()
             .expect("fresh name receive target");
         assert_eq!(fresh_name_target, snapshot.name_receive_target);
-        assert_ne!(fresh_name_target.display, snapshot.receive_target.display);
+        assert_eq!(fresh_name_target.display, snapshot.receive_target.display);
         assert!(
             reads
                 .transaction_history()
@@ -5198,7 +5180,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_mobile_name_receive_target_revalidates_account_module_and_display() {
+    fn trusted_mobile_name_receive_alias_revalidates_the_canonical_target() {
         let account = AccountId::new([0x31; 16]);
         let receive = ReceiveTarget {
             module: ModuleId::Handshake,
@@ -5209,8 +5191,8 @@ mod tests {
         let name = HnsNameReceiveTarget {
             module: ModuleId::Handshake,
             account,
-            display: "rs1qname".to_owned(),
-            derivation_index: 5,
+            display: receive.display.clone(),
+            derivation_index: receive.derivation_index,
         };
         validate_mobile_hns_receive_targets(account, &receive, &name)
             .expect("valid trusted native targets");
@@ -5234,6 +5216,10 @@ mod tests {
             },
             HnsNameReceiveTarget {
                 display: "rs1qn\u{e9}me".to_owned(),
+                ..name.clone()
+            },
+            HnsNameReceiveTarget {
+                derivation_index: receive.derivation_index + 1,
                 ..name.clone()
             },
         ] {

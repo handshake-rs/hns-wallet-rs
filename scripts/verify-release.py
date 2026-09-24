@@ -100,7 +100,7 @@ ROOT_RELEASE_STATE_WORDING = {
         "Unpublished initial release candidate for the independent Handshake wallet\n"
         "boundary:"
     ),
-    "release": "Breaking clean-break migration of the wallet and atomic-swap boundary:",
+    "release": "Canonical account-zero wallet and atomic-swap boundary:",
 }
 CRATE_RELEASE_STATE_WORDING = {
     "candidate": (

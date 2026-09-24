@@ -3,6 +3,21 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## 0.2.6 - 2026-09-24
+
+<!-- hns-wallet-release-state: 0.2.6 release -->
+Canonical account-zero wallet and atomic-swap boundary:
+
+- use the canonical hsd/Bob account-zero BIP-44 external and change branches
+  for both ordinary HNS and Handshake name ownership;
+- remove the selectable derivation scheme, dedicated name-account scanner,
+  name-key high-water state, and alternate restore entry point;
+- derive payment and name-transfer presentation from one shared canonical
+  receive target, while keeping ShakeDex script and atomic-swap keys
+  role-separated where their protocols require it; and
+- simplify mobile bindings to one restore contract so Android and iOS cannot
+  select different key trees for the same recovery phrase.
+
 ## 0.2.5 - 2026-09-23
 
 <!-- hns-wallet-release-state: 0.2.5 release -->

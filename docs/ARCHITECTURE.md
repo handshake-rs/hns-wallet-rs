@@ -44,7 +44,7 @@ relay, live-chain, quote, value, or release-gate authority.
 | `hns-wallet-types` | IDs, integer amounts, capabilities, UI-safe summaries | consensus/wire types |
 | `hns-wallet-store` | schema, migrations, typed record AEAD, workflow/entity CAS and atomic batches, callback-scoped coherent entity snapshots, complete bounded untrusted binary-prefix metadata projections, compare-only authenticated revision assertions, refreshable single-use exact-prefix-set leases with private ciphertext fingerprints, primary-batch plus optional cross-kind compare-only guard transactions, complete bounded entity and opaque-workflow reads, atomic approval-consume/workflow/reservation commits, provider permission tombstones, persisted workflow approvals/replays, one cloneable process-local lock/key authority | browser storage, ABI v2 authority handles, or remote truth |
 | `hns-wallet-chain-api` | separate core, UTXO, account, and settlement capabilities | universal chain assumptions |
-| `hns-wallet-hns` | exact-existing-account selector, synchronized non-value account-read runtime, purpose-minimized board account/network/time context with a complete `WalletAccount` prefix lease captured before external work, refreshed in the related board snapshot, and consumable as an atomic write guard, read-only non-atomic unchanged-account diagnostics, HNS key roles, protected Shakedex seller-key allocation and purpose-bound signing, store-global lock-source plus account funding reservations, runtime-owned Shakedex time/chain observations, shared three-branch restoration/reconciliation, snapshot MTP, address/coin/name evidence and workflows | canonical encodings or market terms |
+| `hns-wallet-hns` | exact-existing-account selector, synchronized non-value account-read runtime, purpose-minimized board account/network/time context with a complete `WalletAccount` prefix lease captured before external work, refreshed in the related board snapshot, and consumable as an atomic write guard, read-only non-atomic unchanged-account diagnostics, HNS key roles, protected Shakedex seller-key allocation and purpose-bound signing, store-global lock-source plus account funding reservations, runtime-owned Shakedex time/chain observations, shared account-zero external/change plus Shakedex restoration/reconciliation, snapshot MTP, address/coin/name evidence and workflows | canonical encodings or market terms |
 | `hns-wallet-provider` | hostile-input parsing, bounded opaque-handle registry, origin grants, ephemeral approvals/replay/rate | engine policy or JavaScript injection |
 | `hns-wallet-shakedex` | fixed-price buyer/seller recovery state, exact two-phase listing/cancellation protocol verification, runtime-bound negative cancellation admission, canonical fulfillment/recovery/script-FINALIZE planning, encrypted parent-plan CAS, durable buyer-fulfillment/seller-recovery/seller-script-FINALIZE value aggregate, canonical Shakescape adapter, encrypted `HeadV2Indexed` with compact identity/revision/time/value-commitment/listing-hash selectors, digest-addressed identity rows and encrypted listing-hash indexes, full-load commitments and index/row bijection, board-namespace plus account-guard mutation leases, strict legacy-v1 and pre-index `HeadV2` migration, O(N) metadata for every targeted read, O(K) value authentication only for all-hit queries, and O(N) semantic fallback for any miss, bounded encrypted offline publication outbox with persist-before-return single-flight handoff recovery | proof/listing/Shakescape codecs, raw HNS keys, product coin selection, network/relay transport, remote acceptance, caller-asserted clock/chain truth, or release qualification |
 | `hns-wallet-market` | durable exact HNS/BTC direct offers, cancellations, live-level aggregation, and evidence-driven cross-chain sessions | chain networking, reporter governance, relay transport, rate/oracle policy, live chain evidence, quote/value authority, or release qualification |
@@ -102,7 +102,8 @@ a general production restore source must be archive-capable or maintain a
 durable wallet-relevant raw-transaction index.
 
 `HnsAccountReadRuntime` is the product-composable non-value read boundary. It
-uses the canonical account record, derivation, three-branch scanner, coin and
+uses the canonical account record, derivation, account-zero external/change
+plus Shakedex scanner, coin and
 transaction reconciliation, name proof validation, checkpoint, and encrypted
 persistence helpers; it is not a second wallet index or cache schema. Each
 call stages one durable discovery fence and the exact account/entity corpus in
@@ -111,18 +112,18 @@ request, and commits only if account selection, revisions, ciphertext-backed
 rows, chain tip/epoch, and mempool instance/generation still match. Provider
 service calls retain the resulting binding internally and project only the
 account's balance, transaction summaries, receive target, and approved
-known-name summaries. The synchronized snapshot also contains a structurally
-distinct name receive target, selected from `HnsName` change zero at the exact
-post-scan `next_name_index`; provider projection deliberately does not expose
-it. The trusted-native mobile composition obtains the same snapshot directly
-from its composed service only long enough to build a minimized serializable
-result containing both distinct targets; its public snapshot omits the binding
+known-name summaries. The synchronized snapshot also contains a wire-compatible
+name receive projection built from the exact same canonical external target;
+provider projection deliberately does not expose the alias. The trusted-native
+mobile composition obtains the same snapshot directly from its composed service
+only long enough to build a minimized serializable result containing that
+single target and its compatibility alias; its public snapshot omits the binding
 and all raw name proof/state/resource/owner/derivation evidence.
 Its direct native exact-text import shares the synchronization lock, validates
 before backend calls, and stages no node I/O under store closures. A fresh
-canonical ownership classification rotates `last_used_name`, `next_name_index`,
-and the trailing scan gap only for exact wallet-owned, incoming-transfer, or
-outgoing-transfer `HnsName` derivations. WalletAccount and KnownName use one
+canonical ownership classification rotates the external receive high-water and
+trailing scan gap only for exact wallet-owned, incoming-transfer, or
+outgoing-transfer account-zero derivations. WalletAccount and KnownName use one
 atomic CAS batch; watch-only/non-wallet imports never advance derivation state.
 
 Historical persisted accounts with a value or settlement bit set have one
@@ -189,15 +190,15 @@ artificially disabling this value path in source.
 
 Name evidence deliberately preserves the interval-committed Urkel proof/state/
 owner view separately from the node's current state/owner view. The proof root
-and height must exactly equal the bound tip. Ordinary HNS coin branches and the
-domain-separated `HnsName` branch are scanned in separate bounded queries that
-must share the exact chain epoch/tip and mempool instance/generation. Name-role
-outputs may enter history but are excluded from ordinary balance, selection,
-reservation, and spendability. The wallet independently decodes both raw
+and height must exactly equal the bound tip. The canonical account-zero
+external/change branches are scanned under bounded queries that share the exact
+chain epoch/tip and mempool instance/generation. Name-locked outputs may enter
+history but are excluded from ordinary balance, selection, reservation, and
+spendability. The wallet independently decodes both raw
 NameState views, compares every node projection, binds owner txid/index/value/
 name covenant and typed TRANSFER/FINALIZE shape, and accepts current resource
 bytes only from the decoded state. Current control is attributed only when the
-owner address exactly matches a persisted `HnsName` program; incoming and
+owner address exactly matches a persisted account-zero external program; incoming and
 outgoing transfers are distinguished. Reconciliation replaces this encrypted
 cache across restart/reorg, while legacy rows stay explicitly watch-only until
 fresh evidence succeeds. Cache state cannot authorize an action: the runtime

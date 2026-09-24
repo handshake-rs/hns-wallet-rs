@@ -48,44 +48,38 @@ scan/index metadata without changing its configuration, and write or clear the
 durable discovery fence used by the ordinary read scanner. These are bounded
 authenticated read-cache rows scoped to the exact existing account.
 
-Every synchronized account snapshot carries two structurally distinct receive
-projections. `ReceiveTarget` remains the ordinary `HnsCoin` change-zero target;
-`HnsNameReceiveTarget` is selected only from `HnsName`, change zero, at the
-post-scan account's exact `next_name_index`. Missing, wrong-role, wrong-account,
-wrong-branch, wrong-index, or ambiguous name-target evidence fails the whole
-read. This read projection does not allocate a key or change any value,
-settlement, provider, or browser capability.
+Every synchronized account snapshot carries one canonical account-zero
+external receive target. The wire-compatible `HnsNameReceiveTarget` projection
+is built from that same address, account, and index, and any mismatch fails the
+whole read. This presentation alias does not allocate a key or change any
+value, settlement, provider, or browser capability.
 
-New accounts derive the ordinary payment branch using hsd's network-specific
-Handshake coin type (5353 mainnet, 5354 testnet, 5355 regtest, or 5356 simnet)
-at the hsd/Bob-compatible mainnet BIP-44 path
-`m/44'/5353'/0'/change/index`. Dedicated name keys use the adjacent BIP-44
-account so name ownership remains purpose-separated. The derivation scheme is
-stored in the authenticated account record: records created before this change
-deserialize to `RoleHkdfV1` and never silently change addresses, while new
-records use `HsdBip44V1`. Since a BIP-39 phrase does not encode a derivation
-path, restore callers must explicitly choose the legacy path for an old
-Shakescape backup.
+Accounts derive ordinary payment and name ownership authority using hsd's
+network-specific Handshake coin type (5353 mainnet, 5354 testnet, 5355 regtest,
+or 5356 simnet) at the hsd/Bob-compatible BIP-44 path
+`m/44'/5353'/0'/change/index`. Change zero is the shared external receive
+branch and change one is the internal change branch. There is no selectable
+ordinary-HNS derivation scheme or separate name account.
 
-Both public receive branches are version-0 P2PKH addresses controlled by the
-wallet. A name sent to the payment address remains discoverable name authority;
-ordinary covenant-free HNS sent to the name address is included in spendable
-balance and signed with the matching name-branch key. Name-locked, coinbase,
-Shakedex, and settlement outputs are never admitted as ordinary spend inputs.
+The public receive branch uses version-0 P2PKH addresses controlled by the
+wallet. The same address can receive ordinary HNS or name ownership.
+Name-locked, coinbase, Shakedex, and settlement outputs are never admitted as
+ordinary spend inputs.
 
 The ordinary non-value read runtime also exposes `import_name_exact_text` for
 a trusted native caller. It performs no trimming, lowercasing, IDNA, Unicode
 normalization, or dot handling. Valid text is checked before backend I/O, fresh
-canonical evidence is classified against the exact derived `HnsName`
-change-zero branch, and WalletAccount plus KnownName commit in one revision-
-checked batch. Wallet-owned and incoming/outgoing-transfer evidence advances a
-monotonic derivation high-water with the complete trailing gap; watch-only and
+canonical evidence is classified against the exact account-zero external
+branch, and WalletAccount plus KnownName commit in one revision-checked batch.
+Wallet-owned and incoming/outgoing-transfer evidence advances the canonical
+external derivation high-water with the complete trailing gap; watch-only and
 non-wallet evidence persists without advancing. The existing full-runtime raw
 `import_name(&[u8])` API is unchanged.
 
 Fresh synchronization also consumes the node's versioned incoming-TRANSFER
-projection as discovery evidence for derived `HnsName` scripts. Such evidence
-may advance only the name-key high-water: the stale old-owner TRANSFER output
+projection as discovery evidence for derived account-zero external scripts.
+Such evidence may advance only the external receive high-water: the stale
+old-owner TRANSFER output
 never enters wallet balance, transaction, coin, or current ownership state. A
 wallet-script FINALIZE becomes a new or refreshed `KnownName` only after the
 node's exact-tip active-owner projection matches the exact name and canonical

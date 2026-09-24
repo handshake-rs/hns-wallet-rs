@@ -399,15 +399,14 @@ and complete reservation set, refreshes the committed account cache, and returns
 the persisted artifact without deriving or reserving another change address.
 Mismatched, expired, or advanced-stage retries fail closed.
 
-## HNS name-role derivations
+## HNS account-zero derivations
 
-The `HnsName` branch has independent encrypted next-index, scan-end, and
-last-used state. Legacy account records deserialize with deterministic defaults,
-while legacy HNS coin address identifiers remain unchanged. Name-role address
-identifiers include the role so the same branch/index cannot collide with an
-ordinary receive address. A complete reconciliation persists the combined
-account/address state only after the separate coin and name queries prove the
-same chain epoch/tip and mempool instance/generation.
+Ordinary HNS and name ownership share the canonical hsd/Bob account-zero
+external branch. The account retains independent external and internal
+next-index, scan-end, and last-used state, while ShakeDex script allocation
+remains protocol-separated. A complete reconciliation persists the combined
+account/address state only after all bounded queries prove the same chain
+epoch/tip and mempool instance/generation.
 The legacy value runtime reloads the full authoritative account and its CAS
 revision after taking its private store mutex, rejects derivation high-water
 rollback, and holds that ordering through cache installation; a concurrently
@@ -443,21 +442,22 @@ cannot create an account/profile/allocation/signer/workflow or value authority
 or rewrite configuration; the historical value/settlement bits remain
 unchanged and confer no authority.
 
-Name-role scan advancement is monotonic and bounded across restart and reorg.
-Outputs to discovered name keys remain visible to history/reconciliation but
+External scan advancement is monotonic and bounded across restart and reorg.
+Name-locked outputs to discovered account-zero keys remain visible to
+history/reconciliation but
 are excluded from ordinary balance, input selection, reservations, and
 spendable UTXOs. This persistence establishes key discovery only: it neither
 authorizes an action nor treats a node hint as ownership. Fresh reconciliation
 independently decodes the split current/proof NameState bytes, binds exact owner
 transactions and resource bytes, and persists canonical summaries plus
-account-bound `HnsName` ownership or transfer direction. Legacy rows keep their
-watch-only variant until replaced. Context-free imports authenticate canonical
+account-bound ownership or transfer direction. Watch-only rows keep their
+variant until replaced. Context-free imports authenticate canonical
 state but mark wallet ownership explicitly unevaluated. Runtime imports recheck
 the exact cache binding while holding the store lock immediately before their
 CAS write, so a concurrent reconciliation cannot be overwritten with stale
 evidence. Account, address, name, coin, transaction, and reservation reloads
-query the complete bounded binary ID prefix for the selected wallet/account
-(and the dedicated name role where applicable); a global list limit is never
+query the complete bounded binary ID prefix for the selected wallet/account; a
+global list limit is never
 applied before account filtering. Workflow IDs remain opaque, so recovery and
 transaction lookup read the complete bounded kind or fail closed on overflow
 before filtering decrypted account ownership. An action must reacquire

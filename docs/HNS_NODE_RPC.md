@@ -78,19 +78,20 @@ The wallet wire field is mandatory. Legacy persisted bindings decode with zero
 only for compatibility and cannot authorize Shakedex execution until a fresh
 node snapshot replaces them.
 
-The ordinary receive/change branches and the domain-separated `HnsName` branch
-and `HnsShakedex` 32-byte lock branch use separate bounded script queries. Each
-later query is accepted only under the exact chain and mempool bindings learned
-by the coin query, so no branch reduces another's lookahead or combines
-observations from different node views.
+The canonical account-zero external/change branches and the `HnsShakedex`
+32-byte lock branch use separate bounded script queries. Each later query is
+accepted only under the exact chain and mempool bindings learned by the coin
+query, so no branch reduces another's lookahead or combines observations from
+different node views.
 
 The version-1 `incoming_transfers_page` projection is a discovery-only input
-for the `HnsName` branch. The adapter accepts only the two frozen source labels
+for the canonical account-zero external branch. The adapter accepts only the
+two frozen source labels
 (`retained_body_verified` and `pruned_trusted_node_projection`), the exact
 epoch and complete tip, bounded script examinations and rows, canonical typed
 TRANSFER covenants, active-chain inclusion, requested recipient scripts,
 strict ordering, and unique outpoints. A matching candidate can advance only
-the monotonic name derivation high-water; its old-owner TRANSFER coin is never
+the monotonic external derivation high-water; its old-owner TRANSFER coin is never
 inserted into wallet balance, transaction, coin, or current-name ownership
 state. Paging has its own bounded allowance for up to 10,000 nonempty results
 plus the empty script-prefix pages needed to examine the complete 10,000-script

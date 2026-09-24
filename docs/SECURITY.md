@@ -639,8 +639,8 @@ adapter and canonical HNS name-state/resource ownership source are present, but
 their exact source tests do not provide cross-process or product qualification.
 A published canonical HNS settlement profile, live qualification of the
 integrated HSD fee algebra and name-action context, Bitcoin supervisor network
-qualification, embedded Helios proof construction/persistence, three-branch HNS
-restoration and Shakedex-key product qualification, restart/reorg
+qualification, embedded Helios proof construction/persistence, canonical
+account-zero restoration and Shakedex-key product qualification, restart/reorg
 demonstrations, real-chain tests, resource benchmarks, and independent review
 remain blockers.
 

@@ -1511,20 +1511,16 @@ mod tests {
     fn account() -> HnsAccountRecord {
         HnsAccountRecord {
             config: config(),
-            derivation_scheme: Default::default(),
             next_receive_index: 0,
             next_change_index: 0,
-            next_name_index: 0,
             next_shakedex_index: 0,
             external_scan_end: 9,
             internal_scan_end: 9,
-            name_scan_end: 9,
             shakedex_scan_end: 9,
             shakedex_scan_complete: true,
             shakedex_scan_in_progress: false,
             last_used_external: None,
             last_used_internal: None,
-            last_used_name: None,
             last_used_shakedex: None,
         }
     }

@@ -4041,20 +4041,16 @@ mod tests {
             store,
             HnsAccountRecord {
                 config,
-                derivation_scheme: Default::default(),
                 next_receive_index: 0,
                 next_change_index: 0,
-                next_name_index: 1,
                 next_shakedex_index: 0,
                 external_scan_end: 99,
                 internal_scan_end: 99,
-                name_scan_end: 99,
                 shakedex_scan_end: 99,
                 shakedex_scan_complete: true,
                 shakedex_scan_in_progress: false,
                 last_used_external: None,
                 last_used_internal: None,
-                last_used_name: Some(0),
                 last_used_shakedex: None,
             },
         )
@@ -4098,7 +4094,7 @@ mod tests {
         store: &WalletStore,
         account: &HnsAccountRecord,
     ) -> (TrackedHnsCoin, NameState, Transaction) {
-        owned_name_source_for_role(store, account, KeyRole::HnsName)
+        owned_name_source_for_role(store, account, KeyRole::HnsCoin)
     }
 
     fn owned_name_source_for_role(
@@ -4282,7 +4278,7 @@ mod tests {
             &account,
             unsigned.clone(),
             &inputs,
-            &[KeyRole::HnsName, KeyRole::HnsCoin],
+            &[KeyRole::HnsCoin, KeyRole::HnsCoin],
         )
         .expect("signed transfer");
         let signed = validate_witness_only_change(&unsigned, &signed).expect("witness-only");
@@ -4352,7 +4348,7 @@ mod tests {
             &account,
             unsigned.clone(),
             &inputs,
-            &[KeyRole::HnsName, KeyRole::HnsCoin],
+            &[KeyRole::HnsCoin, KeyRole::HnsCoin],
         )
         .expect("signed update");
         let signed = validate_witness_only_change(&unsigned, &signed).expect("witness-only");
@@ -4467,7 +4463,7 @@ mod tests {
             &account,
             unsigned.clone(),
             &inputs,
-            &[KeyRole::HnsName, KeyRole::HnsCoin],
+            &[KeyRole::HnsCoin, KeyRole::HnsCoin],
         )
         .expect("signed finalize");
         let signed = validate_witness_only_change(&unsigned, &signed).expect("witness-only");

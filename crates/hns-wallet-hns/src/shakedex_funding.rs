@@ -545,9 +545,9 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         })
     }
 
-    /// Derive the selected account's exact current dedicated name recipient.
-    /// This address is taken from the authenticated restore branch at
-    /// `next_name_index`; a website or market peer never supplies it.
+    /// Return the selected account's exact current canonical name recipient.
+    /// HNS payments and name ownership share account zero's external branch;
+    /// a website or market peer never supplies this address.
     pub fn shakedex_name_receive_address(&self) -> Result<Address, HnsWalletError> {
         let (account, account_revision) = {
             let cache = self.cache_read()?;
@@ -555,10 +555,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             (cache.account.clone(), cache.account_revision)
         };
         let derivation = DerivationReference {
-            role: KeyRole::HnsName,
+            role: KeyRole::HnsCoin,
             account: account_number(&account),
             change: 0,
-            index: account.next_name_index,
+            index: account.next_receive_index,
         };
         let address = {
             let store = self.store_lock()?;
