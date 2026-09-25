@@ -324,6 +324,93 @@ fn encrypted_wallet_pipe_reopens_same_session_key() {
 }
 
 #[test]
+fn private_pipe_changes_passphrase_and_preserves_wallet_identity() {
+    let directory = private_directory();
+    let database = directory.path().join("wallet-rekey.db");
+    let authorization_file = directory.path().join("hsrd-auth");
+    std::fs::write(&authorization_file, "Basic test\n").expect("auth file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&authorization_file, std::fs::Permissions::from_mode(0o600))
+            .expect("private auth file");
+    }
+    let bootstrap = HnsWalletBootstrap::generate(HnsBootstrapPolicy::new(HnsNetwork::Regtest, 0))
+        .expect("bootstrap");
+    let mut store = WalletStore::create(&database, "test passphrase").expect("store");
+    bootstrap.persist(&mut store, 1).expect("persist account");
+    drop(store);
+
+    let mut bridge = child(&database, &authorization_file);
+    assert_eq!(
+        exchange(
+            &mut bridge,
+            1,
+            json!({"operation": "unlock", "passphrase": "test passphrase"})
+        )["ok"],
+        true
+    );
+    let original = exchange(&mut bridge, 2, json!({"operation": "identity"}))["result"].clone();
+    let key_request = json!({"operation": "key", "offer_id": "11".repeat(28), "session_nonce": "22".repeat(32), "refund": false});
+    let original_key =
+        exchange(&mut bridge, 3, key_request.clone())["result"]["public_key"].clone();
+    assert_eq!(
+        exchange(
+            &mut bridge,
+            4,
+            json!({"operation": "change_passphrase", "old_passphrase": "wrong", "new_passphrase": "next passphrase"})
+        )["error"],
+        "passphrase_change_failed"
+    );
+    assert_eq!(
+        exchange(&mut bridge, 5, json!({"operation": "identity"}))["error"],
+        "wallet_locked"
+    );
+    assert_eq!(
+        exchange(
+            &mut bridge,
+            6,
+            json!({"operation": "unlock", "passphrase": "test passphrase"})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        exchange(
+            &mut bridge,
+            7,
+            json!({"operation": "change_passphrase", "old_passphrase": "test passphrase", "new_passphrase": "next passphrase"})
+        )["result"],
+        json!({"changed": true, "unlocked": false})
+    );
+    assert_eq!(
+        exchange(
+            &mut bridge,
+            8,
+            json!({"operation": "unlock", "passphrase": "test passphrase"})
+        )["error"],
+        "wallet_open_failed"
+    );
+    assert_eq!(
+        exchange(
+            &mut bridge,
+            9,
+            json!({"operation": "unlock", "passphrase": "next passphrase"})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        exchange(&mut bridge, 10, json!({"operation": "identity"}))["result"],
+        original
+    );
+    assert_eq!(
+        exchange(&mut bridge, 11, key_request)["result"]["public_key"],
+        original_key
+    );
+    drop(bridge.stdin.take());
+    assert!(bridge.wait().expect("bridge exit").success());
+}
+
+#[test]
 #[ignore = "requires isolated HSD and hsrd regtest processes with --wallet-index"]
 fn funded_lock_uses_real_hsrd_wallet_index() {
     let endpoint = std::env::var("BASICSWAP_HSRD_REGTEST_RPC").expect("regtest RPC endpoint");

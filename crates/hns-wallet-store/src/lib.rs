@@ -568,6 +568,10 @@ impl SharedWalletStore {
         self.with_store_mut(|store| store.unlock(passphrase))
     }
 
+    pub fn change_passphrase(&self, old: &str, new: &str) -> Result<(), StoreError> {
+        self.with_store_mut(|store| store.change_passphrase(old, new))
+    }
+
     /// Clear the shared record key before returning. If another operation
     /// poisoned the mutex, recover the contained store only long enough to
     /// clear its key, then report the concurrency failure so callers still
@@ -812,6 +816,269 @@ impl WalletStore {
             self.key = None;
             return Err(error);
         }
+        Ok(())
+    }
+
+    /// Replace the wallet's record key in one SQLite transaction. Every
+    /// encrypted namespace and key-derived private origin index is rewritten
+    /// before the new salt and key check become visible. A failed row
+    /// authentication rolls the entire change back.
+    pub fn change_passphrase(&mut self, old: &str, new: &str) -> Result<(), StoreError> {
+        let current_key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        validate_passphrase(new)?;
+        if old == new {
+            return Err(StoreError::InvalidPassphrase);
+        }
+        let old_key = derive_key(old, &self.salt, self.kdf)?;
+        let key_check = required_meta(&self.connection, "key_check")?;
+        let clear = decrypt_record(
+            &old_key,
+            &self.database_id,
+            SecretKind::MetadataKey.label(),
+            b"key_check",
+            &key_check,
+        )
+        .map_err(|_| StoreError::InvalidPassphrase)?;
+        if clear.as_slice() != SENTINEL || current_key.as_ref() != old_key.as_ref() {
+            return Err(StoreError::InvalidPassphrase);
+        }
+        drop(clear);
+
+        let mut salt = [0_u8; SALT_BYTES];
+        getrandom::fill(&mut salt).map_err(|_| StoreError::Randomness)?;
+        let new_key = derive_key(new, &salt, self.kdf)?;
+        let database_id = self.database_id;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        reject_unmigrated_legacy_entities(&transaction)?;
+
+        rekey_rows(
+            &transaction,
+            "SELECT rowid, id, kind, encrypted_value FROM secrets WHERE ?1 IS NULL OR rowid>?1 ORDER BY rowid LIMIT 128",
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    (
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ),
+                ))
+            },
+            |tx, rowid, (id, kind, encrypted)| {
+                let clear = decrypt_record(&old_key, &database_id, &kind, &id, &encrypted)?;
+                let encrypted = encrypt_record(&new_key, &database_id, &kind, &id, &clear)?;
+                tx.execute(
+                    "UPDATE secrets SET encrypted_value=?1 WHERE rowid=?2",
+                    params![encrypted, rowid],
+                )?;
+                Ok(())
+            },
+        )?;
+        rekey_rows(
+            &transaction,
+            "SELECT rowid, entity_kind, record_id, revision, encrypted_value, updated_at_unix FROM encrypted_entities WHERE ?1 IS NULL OR rowid>?1 ORDER BY rowid LIMIT 128",
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    (
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, u64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, u64>(5)?,
+                    ),
+                ))
+            },
+            |tx, rowid, (kind, id, revision, encrypted, updated_at)| {
+                let aad_id = revisioned_aad_id(&id, revision, updated_at, None)?;
+                let label = format!("entity/{kind}");
+                let clear = decrypt_record(&old_key, &database_id, &label, &aad_id, &encrypted)?;
+                let encrypted = encrypt_record(&new_key, &database_id, &label, &aad_id, &clear)?;
+                tx.execute(
+                    "UPDATE encrypted_entities SET encrypted_value=?1 WHERE rowid=?2",
+                    params![encrypted, rowid],
+                )?;
+                Ok(())
+            },
+        )?;
+        rekey_rows(
+            &transaction,
+            "SELECT rowid, id, kind, revision, state_json, broadcast_prepared, updated_at_unix, encryption_version FROM workflows WHERE ?1 IS NULL OR rowid>?1 ORDER BY rowid LIMIT 128",
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    (
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, u64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, bool>(5)?,
+                        row.get::<_, u64>(6)?,
+                        row.get::<_, u32>(7)?,
+                    ),
+                ))
+            },
+            |tx, rowid, (id, kind, revision, encrypted, broadcast, updated_at, version)| {
+                if version != 1 {
+                    return Err(StoreError::LegacyEncryptionPending);
+                }
+                let label = workflow_label(parse_workflow_kind(&kind)?);
+                let aad_id = revisioned_aad_id(&id, revision, updated_at, Some(broadcast))?;
+                let clear = decrypt_record(&old_key, &database_id, &label, &aad_id, &encrypted)?;
+                let encrypted = encrypt_record(&new_key, &database_id, &label, &aad_id, &clear)?;
+                tx.execute(
+                    "UPDATE workflows SET state_json=?1 WHERE rowid=?2",
+                    params![encrypted, rowid],
+                )?;
+                Ok(())
+            },
+        )?;
+        rekey_rows(
+            &transaction,
+            "SELECT rowid, origin_token, generation, encrypted_record, updated_at_unix, revoked FROM private_provider_permissions WHERE ?1 IS NULL OR rowid>?1 ORDER BY rowid LIMIT 128",
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    (
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, u64>(4)?,
+                        row.get::<_, bool>(5)?,
+                    ),
+                ))
+            },
+            |tx, rowid, (token, generation, encrypted, updated_at, revoked)| {
+                let token = exact_array::<32>(token)?;
+                let aad_id = permission_record_id(&token, generation, revoked, updated_at);
+                let clear = decrypt_record(
+                    &old_key,
+                    &database_id,
+                    "provider_permission",
+                    &aad_id,
+                    &encrypted,
+                )?;
+                let (origin, _) = decode_origin_payload(&clear)?;
+                if origin_lookup_token(&old_key, &database_id, &origin)? != token {
+                    return Err(StoreError::Encryption);
+                }
+                let new_token = origin_lookup_token(&new_key, &database_id, &origin)?;
+                let new_aad_id = permission_record_id(&new_token, generation, revoked, updated_at);
+                let encrypted = encrypt_record(
+                    &new_key,
+                    &database_id,
+                    "provider_permission",
+                    &new_aad_id,
+                    &clear,
+                )?;
+                tx.execute("UPDATE private_provider_permissions SET origin_token=?1, encrypted_record=?2 WHERE rowid=?3", params![new_token.as_slice(), encrypted, rowid])?;
+                Ok(())
+            },
+        )?;
+        rekey_rows(
+            &transaction,
+            "SELECT rowid, id, origin_token, encrypted_record, expires_at_unix FROM private_pending_approvals WHERE ?1 IS NULL OR rowid>?1 ORDER BY rowid LIMIT 128",
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    (
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, u64>(4)?,
+                    ),
+                ))
+            },
+            |tx, rowid, (id, token, encrypted, expires_at)| {
+                let id = ApprovalId::new(exact_array::<16>(id)?);
+                let token = exact_array::<32>(token)?;
+                let aad_id = approval_record_id(&id, &token, expires_at);
+                let clear = decrypt_record(
+                    &old_key,
+                    &database_id,
+                    "pending_approval",
+                    &aad_id,
+                    &encrypted,
+                )?;
+                let (origin, _) = decode_origin_payload(&clear)?;
+                if origin_lookup_token(&old_key, &database_id, &origin)? != token {
+                    return Err(StoreError::Encryption);
+                }
+                let new_token = origin_lookup_token(&new_key, &database_id, &origin)?;
+                let new_aad_id = approval_record_id(&id, &new_token, expires_at);
+                let encrypted = encrypt_record(
+                    &new_key,
+                    &database_id,
+                    "pending_approval",
+                    &new_aad_id,
+                    &clear,
+                )?;
+                tx.execute("UPDATE private_pending_approvals SET origin_token=?1, encrypted_record=?2 WHERE rowid=?3", params![new_token.as_slice(), encrypted, rowid])?;
+                Ok(())
+            },
+        )?;
+        rekey_rows(
+            &transaction,
+            "SELECT rowid, origin_token, nonce, encrypted_origin, expires_at_unix FROM private_replay_protection WHERE ?1 IS NULL OR rowid>?1 ORDER BY rowid LIMIT 128",
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    (
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, u64>(4)?,
+                    ),
+                ))
+            },
+            |tx, rowid, (token, nonce, encrypted, expires_at)| {
+                let token = exact_array::<32>(token)?;
+                let aad_id = replay_record_id(&token, nonce, expires_at);
+                let clear =
+                    decrypt_record(&old_key, &database_id, "replay_origin", &aad_id, &encrypted)?;
+                let origin = core::str::from_utf8(&clear).map_err(|_| StoreError::Encryption)?;
+                validate_origin(origin).map_err(|_| StoreError::Encryption)?;
+                if origin_lookup_token(&old_key, &database_id, origin)? != token {
+                    return Err(StoreError::Encryption);
+                }
+                let new_token = origin_lookup_token(&new_key, &database_id, origin)?;
+                let new_aad_id = replay_record_id(&new_token, nonce, expires_at);
+                let encrypted =
+                    encrypt_record(&new_key, &database_id, "replay_origin", &new_aad_id, &clear)?;
+                tx.execute("UPDATE private_replay_protection SET origin_token=?1, encrypted_origin=?2 WHERE rowid=?3", params![new_token.as_slice(), encrypted, rowid])?;
+                Ok(())
+            },
+        )?;
+
+        let sentinel = encrypt_record(
+            &new_key,
+            &database_id,
+            SecretKind::MetadataKey.label(),
+            b"key_check",
+            SENTINEL,
+        )?;
+        if transaction.execute(
+            "UPDATE wallet_meta SET value=?1 WHERE key='kdf_salt'",
+            params![salt.as_slice()],
+        )? != 1
+        {
+            return Err(StoreError::CorruptMetadata);
+        }
+        if transaction.execute(
+            "UPDATE wallet_meta SET value=?1 WHERE key='key_check'",
+            params![sentinel],
+        )? != 1
+        {
+            return Err(StoreError::CorruptMetadata);
+        }
+        set_meta(&transaction, CHECKPOINT_PENDING_KEY, b"1")?;
+        transaction.commit()?;
+        self.salt = salt;
+        self.key = Some(new_key);
+        self.complete_plaintext_checkpoint()
+            .map_err(|_| StoreError::PassphraseChangedCheckpointPending)?;
         Ok(())
     }
 
@@ -4508,6 +4775,32 @@ fn derive_key(
     Ok(key)
 }
 
+/// Walk a table by stable SQLite rowid so rekeying does not retain an
+/// unbounded wallet in memory. The caller owns one IMMEDIATE transaction and
+/// changes neither rowid nor the ordering predicate.
+fn rekey_rows<T>(
+    transaction: &rusqlite::Transaction<'_>,
+    select: &str,
+    mut decode: impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(i64, T)>,
+    mut rekey: impl FnMut(&rusqlite::Transaction<'_>, i64, T) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
+    let mut after: Option<i64> = None;
+    loop {
+        let rows = {
+            let mut statement = transaction.prepare(select)?;
+            let mapped = statement.query_map([after], &mut decode)?;
+            mapped.collect::<Result<Vec<_>, _>>()?
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        for (rowid, value) in rows {
+            rekey(transaction, rowid, value)?;
+            after = Some(rowid);
+        }
+    }
+}
+
 fn encrypt_record(
     key: &[u8; KEY_BYTES],
     database_id: &[u8; DATABASE_ID_BYTES],
@@ -4758,6 +5051,8 @@ pub enum StoreError {
     Locked,
     #[error("invalid wallet passphrase")]
     InvalidPassphrase,
+    #[error("wallet passphrase changed, but old ciphertext checkpoint is pending")]
+    PassphraseChangedCheckpointPending,
     #[error("unsafe or unsupported Argon2 parameters")]
     UnsafeKdfParameters,
     #[error("key derivation failed")]
@@ -6971,6 +7266,169 @@ mod tests {
         store
             .consume_replay_nonce("https://example", 1, 20, 30)
             .expect("expired nonce can be reused in a new bounded session");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn passphrase_change_rekeys_every_encrypted_namespace_and_survives_reopen() {
+        let directory = unix_private_tempdir();
+        let database = directory.path().join("rekey.sqlite3");
+        let mut store = WalletStore::create_with_kdf(&database, "old secret", KdfConfig::testing())
+            .expect("create");
+        store
+            .put_secret(b"secret", SecretKind::MetadataKey, b"private", 1)
+            .expect("secret");
+        store
+            .save_wallet_account(b"account", 0, &json!({"balance": 7}), 2)
+            .expect("entity");
+        for index in 0..129 {
+            let id = format!("account/{index:03}");
+            store
+                .save_wallet_account(id.as_bytes(), 0, &json!({"index": index}), 2)
+                .expect("entity page fixture");
+        }
+        let workflow = WorkflowId::new([42; 16]);
+        store
+            .save_workflow(
+                workflow,
+                WorkflowKind::AtomicSwap,
+                0,
+                &json!({"tx": "signed"}),
+                true,
+                3,
+            )
+            .expect("workflow");
+        store
+            .put_provider_permission("https://example.test", 1, b"permission", 4)
+            .expect("permission");
+        let approval = ApprovalId::new([43; 16]);
+        store
+            .put_pending_approval(approval, "https://example.test", b"approval", 5, 100)
+            .expect("approval");
+        store
+            .consume_replay_nonce("https://example.test", 8, 5, 100)
+            .expect("nonce");
+
+        assert!(matches!(
+            store.change_passphrase("incorrect", "new secret"),
+            Err(StoreError::InvalidPassphrase)
+        ));
+        store
+            .change_passphrase("old secret", "new secret")
+            .expect("atomic rekey");
+        store.lock();
+        drop(store);
+
+        let mut store = WalletStore::open(&database).expect("reopen");
+        assert!(matches!(
+            store.unlock("old secret"),
+            Err(StoreError::InvalidPassphrase)
+        ));
+        store.unlock("new secret").expect("new passphrase");
+        assert_eq!(
+            store
+                .get_secret(b"secret", SecretKind::MetadataKey)
+                .expect("secret")
+                .expect("present")
+                .as_slice(),
+            b"private"
+        );
+        assert_eq!(
+            store
+                .wallet_account::<serde_json::Value>(b"account")
+                .expect("entity")
+                .expect("present")
+                .value,
+            json!({"balance": 7})
+        );
+        assert_eq!(
+            store
+                .wallet_account::<serde_json::Value>(b"account/128")
+                .expect("last entity page")
+                .expect("present")
+                .value,
+            json!({"index": 128})
+        );
+        assert_eq!(
+            store
+                .load_workflow::<serde_json::Value>(workflow)
+                .expect("workflow")
+                .expect("present")
+                .state,
+            json!({"tx": "signed"})
+        );
+        assert_eq!(
+            store
+                .provider_permission("https://example.test")
+                .expect("permission")
+                .expect("present")
+                .1,
+            b"permission"
+        );
+        assert_eq!(
+            store
+                .get_pending_approval(approval, 6)
+                .expect("approval")
+                .expect("present")
+                .request_json
+                .as_slice(),
+            b"approval"
+        );
+        assert!(matches!(
+            store.consume_replay_nonce("https://example.test", 8, 6, 100),
+            Err(StoreError::Replay)
+        ));
+        assert!(store.change_passphrase("new secret", "new secret").is_err());
+    }
+
+    #[test]
+    fn passphrase_change_rolls_back_on_late_ciphertext_failure() {
+        let mut store = WalletStore::create_in_memory("old secret").expect("create");
+        store
+            .put_secret(b"secret", SecretKind::MetadataKey, b"private", 1)
+            .expect("secret");
+        let workflow = WorkflowId::new([44; 16]);
+        store
+            .save_workflow(
+                workflow,
+                WorkflowKind::AtomicSwap,
+                0,
+                &json!({"tx": "signed"}),
+                true,
+                2,
+            )
+            .expect("workflow");
+        store
+            .connection
+            .execute(
+                "UPDATE workflows SET state_json=?1 WHERE id=?2",
+                params![
+                    vec![0x42_u8; NONCE_BYTES + TAG_BYTES + 1],
+                    workflow.as_bytes().as_slice()
+                ],
+            )
+            .expect("corrupt workflow");
+        assert!(matches!(
+            store.change_passphrase("old secret", "new secret"),
+            Err(StoreError::Encryption)
+        ));
+        store.lock();
+        store
+            .unlock("old secret")
+            .expect("old password still valid");
+        assert_eq!(
+            store
+                .get_secret(b"secret", SecretKind::MetadataKey)
+                .expect("secret")
+                .expect("present")
+                .as_slice(),
+            b"private"
+        );
+        store.lock();
+        assert!(matches!(
+            store.unlock("new secret"),
+            Err(StoreError::InvalidPassphrase)
+        ));
     }
 
     #[test]

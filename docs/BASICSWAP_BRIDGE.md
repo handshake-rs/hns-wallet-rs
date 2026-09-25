@@ -83,6 +83,7 @@ must match the descriptor branch used by the requested action.
 | Operation | Result and authority |
 | --- | --- |
 | `unlock`, `lock` | Opens or closes the wallet key authority in this process. |
+| `change_passphrase` | Requires an unlocked wallet, no pending send review, and both old and new passphrases over the private pipe. Re-encrypts all wallet records and private origin indexes in one SQLite transaction, checkpoints old ciphertext, and closes the runtime. A fresh `unlock` with the new passphrase is required. |
 | `identity` | Returns the current wallet ID, stable seed fingerprint, and selected HNS network after unlock. |
 | `sync` | Reconciles authenticated HSRD chain/mempool evidence with the wallet before value operations. |
 | `receive` | Returns the wallet's ordinary HNS payment address and derivation index without spending authority. |
@@ -162,5 +163,9 @@ ordinary sends through this bridge. The funded app route can use either a
 mock SMSG transport or two real Particl regtest nodes; with Particl, both
 trade directions have passed through HSD, HSRD, Bitcoin Core, and SMSG v2
 in one test. The offer row is seeded in that combined test; the separate
-Particl test delivers the offer into BasicSwap's handler. Packaged binaries
-and HNS passphrase rotation remain before mainnet eligibility.
+Particl test delivers the offer into BasicSwap's handler. The store and process
+tests also cover a wrong old passphrase, atomic rollback on a corrupt late row,
+and the same wallet identity after passphrase rotation and reopening. A rare
+checkpoint failure returns `passphrase_changed_checkpoint_pending`: the new
+passphrase has already committed, and the next unlock retries the checkpoint.
+Packaged binaries and release qualification remain before mainnet eligibility.

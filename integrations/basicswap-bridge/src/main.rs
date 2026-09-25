@@ -25,7 +25,7 @@ use hns_wallet_service::{
     PersistentHnsValueConfig, PersistentHnsValueRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN,
     TrustedNativeHnsValueAction, WalletService,
 };
-use hns_wallet_store::{SecretKind, SharedWalletStore, WalletStore};
+use hns_wallet_store::{SecretKind, SharedWalletStore, StoreError, WalletStore};
 use hns_wallet_types::{
     AccountId, ApprovalId, ApprovalKind, BaseUnits, ModuleId, SessionId, TransactionHash,
     WalletAsset,
@@ -193,6 +193,10 @@ struct BootstrapRequest {
 enum Request {
     Unlock {
         passphrase: String,
+    },
+    ChangePassphrase {
+        old_passphrase: String,
+        new_passphrase: String,
     },
     Lock {},
     Sync {},
@@ -398,9 +402,37 @@ fn handle(
         }
         return Ok(json!({"unlocked": false}));
     }
+    if let Request::ChangePassphrase {
+        old_passphrase,
+        new_passphrase,
+    } = request
+    {
+        let old_passphrase = Zeroizing::new(old_passphrase);
+        let new_passphrase = Zeroizing::new(new_passphrase);
+        let bridge = state.as_mut().ok_or("wallet_locked")?;
+        if bridge.pending_send.is_some() {
+            return Err("send_review_pending");
+        }
+        let result = bridge
+            ._store
+            .0
+            .change_passphrase(&old_passphrase, &new_passphrase);
+        // Drop any ciphertext leases cached by the runtime. A fresh unlock
+        // constructs a new service with the new key.
+        state.take();
+        return match result {
+            Ok(()) => Ok(json!({"changed": true, "unlocked": false})),
+            Err(StoreError::PassphraseChangedCheckpointPending) => {
+                Err("passphrase_changed_checkpoint_pending")
+            }
+            Err(_) => Err("passphrase_change_failed"),
+        };
+    }
     let bridge = state.as_mut().ok_or("wallet_locked")?;
     match request {
-        Request::Unlock { .. } | Request::Lock {} => unreachable!(),
+        Request::Unlock { .. } | Request::Lock {} | Request::ChangePassphrase { .. } => {
+            unreachable!()
+        }
         Request::Identity {} => Ok(json!({
             "wallet_id": bridge.wallet_id,
             "seed_fingerprint": bridge.seed_fingerprint,
