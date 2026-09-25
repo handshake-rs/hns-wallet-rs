@@ -7,10 +7,12 @@ full node. BasicSwap never receives HNS signing keys or prepared signed-byte
 artifacts. The ordinary `hns-wallet-service` executable and the browser/provider
 ABI do not acquire these operations.
 
-The bridge currently opens **one existing encrypted HNS wallet account**. The
-operator must provision that wallet and supply an owner-private HSRD wallet-RPC
-Authorization file. The database path is subject to the wallet store's normal
-single-process ownership and Unix file/ancestor policy. The bridge requires an
+The settlement process opens **one existing encrypted HNS wallet account**. A
+separate one-shot initializer can create or restore that account before the
+settlement process starts. The operator must supply an owner-private HSRD
+wallet-RPC Authorization file for settlement. The database path is subject to
+the wallet store's normal single-process ownership and Unix file/ancestor
+policy. The bridge requires an
 explicit wallet unlock over its private pipe. It does not take a passphrase or
 Authorization value in arguments, environment variables, or logs. The HSRD
 endpoint must be loopback; the Authorization file must be a regular,
@@ -19,6 +21,25 @@ non-writable parent directory. Unlocking this purpose-built bridge enables the
 account's HNS value and settlement capabilities through the wallet runtime;
 the database must therefore be dedicated to this BasicSwap process and backed
 up using the wallet's normal recovery seed procedure.
+
+## Create or restore the account
+
+Run the binary with `--initialize --database PATH --network
+mainnet|testnet|regtest|simnet --restore-height HEIGHT`. This mode does not
+connect to HSRD and exits after one framed stdin request and one framed stdout
+response. The request has version 2, sequence 1, a passphrase, and a null
+`recovery_phrase` to create, or a 24-word phrase to restore. The response
+contains a 16-byte wallet ID. Only creation returns a new 24-word recovery
+phrase; the caller must present it for a private backup before allowing funds
+into that account. The phrase and passphrase never appear in command-line
+arguments, environment variables, or logs. The process exits immediately
+after the response, so it does not retain the phrase while running trades.
+
+The initializer uses the wallet store's guarded atomic creation path and
+refuses an existing database. The Python `initialize_hns_wallet` helper in
+BasicSwap implements the framing and validates the response. An interrupted
+create can leave a database whose phrase was not received; do not fund such an
+account. Restore from a backed-up phrase into a new, empty wallet path.
 
 ## Framing and session identity
 
@@ -76,8 +97,8 @@ The wallet rejects changed terms for the same session.
 ## Integration boundary
 
 This pipe is intended to be launched and called only by the local BasicSwap
-process. BasicSwap must persist the offer/bid IDs, nonce, and exact descriptor before
-requesting a value action, validate the peer's terms against its own bid and
+process. BasicSwap must persist the offer/bid IDs, nonce, and exact descriptor
+before requesting a value action, validate the peer's terms against its own bid and
 contract deadlines, and resume observation after restart. The current
 BasicSwap seller-first contract and messages use a different script/key shape;
 that protocol routing must be implemented before HNS appears as a selectable

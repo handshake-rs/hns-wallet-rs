@@ -9,12 +9,13 @@ use std::env;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use hns_swap::HnsHtlc;
 use hns_wallet_chain_api::Preimage;
 use hns_wallet_hns::{
-    HnsAccountRecord, HnsNodeRpcBackend, HnsNodeRpcConfig, HnsWalletRuntime, SystemClock,
-    VerifiedNativeHtlcSpend,
+    HnsAccountRecord, HnsBootstrapPolicy, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
+    HnsWalletBootstrap, HnsWalletRuntime, SystemClock, VerifiedNativeHtlcSpend,
 };
 use hns_wallet_service::{PersistentHnsValueConfig, PersistentHnsValueRuntime, WalletService};
 use hns_wallet_store::{SharedWalletStore, WalletStore};
@@ -122,6 +123,15 @@ struct RequestEnvelope {
     version: u16,
     sequence: u64,
     request: Request,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BootstrapRequest {
+    version: u16,
+    sequence: u64,
+    passphrase: String,
+    recovery_phrase: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -583,8 +593,74 @@ fn read_private_authorization(path: &PathBuf) -> io::Result<Zeroizing<String>> {
     }
 }
 
+fn run_initializer(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::error::Error>> {
+    if arguments.len() != 8
+        || arguments[2] != "--database"
+        || arguments[4] != "--network"
+        || arguments[6] != "--restore-height"
+    {
+        return Err("usage: hns-wallet-basicswap-bridge --initialize --database PATH --network mainnet|testnet|regtest|simnet --restore-height HEIGHT".into());
+    }
+    let database = PathBuf::from(&arguments[3]);
+    let network = match arguments[5].to_str() {
+        Some("mainnet") => HnsNetwork::Mainnet,
+        Some("testnet") => HnsNetwork::Testnet,
+        Some("regtest") => HnsNetwork::Regtest,
+        Some("simnet") => HnsNetwork::Simnet,
+        _ => return Err("invalid HNS bootstrap network".into()),
+    };
+    let birthday: u64 = arguments[7].to_string_lossy().parse()?;
+    let mut input = io::stdin().lock();
+    let mut output = io::stdout().lock();
+    let frame = read_frame(&mut input)?.ok_or("missing HNS bootstrap request")?;
+    let request: BootstrapRequest = serde_json::from_slice(&frame)?;
+    if request.version != PROTOCOL_VERSION || request.sequence != 1 {
+        return Err("HNS bootstrap protocol mismatch".into());
+    }
+    let passphrase = Zeroizing::new(request.passphrase);
+    let phrase = request.recovery_phrase.map(Zeroizing::new);
+    let policy = HnsBootstrapPolicy::new(network, birthday);
+    let bootstrap = match phrase.as_deref() {
+        Some(value) => HnsWalletBootstrap::restore(value, policy),
+        None => HnsWalletBootstrap::generate(policy),
+    }
+    .map_err(|_| "HNS bootstrap seed invalid")?;
+    let wallet_id = hex::encode(bootstrap.wallet_id().as_bytes());
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let (store, _) = WalletStore::create_with_initializer(&database, &passphrase, |store| {
+        bootstrap.persist(store, now)
+    })
+    .map_err(|_| "HNS bootstrap store creation failed")?;
+    drop(store);
+    let result = match phrase {
+        Some(_) => json!({"created": false, "wallet_id": wallet_id}),
+        None => json!({
+            "created": true,
+            "wallet_id": wallet_id,
+            "recovery_phrase": bootstrap.into_recovery_phrase().expose_for_dedicated_display(),
+        }),
+    };
+    write_frame(
+        &mut output,
+        &ResponseEnvelope {
+            version: PROTOCOL_VERSION,
+            sequence: 1,
+            ok: true,
+            result: Some(result),
+            error: None,
+        },
+    )?;
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = env::args_os().collect::<Vec<_>>();
+    if arguments
+        .get(1)
+        .is_some_and(|option| option == "--initialize")
+    {
+        return run_initializer(&arguments);
+    }
     if arguments.len() != 7
         || arguments[1] != "--database"
         || arguments[3] != "--rpc-endpoint"

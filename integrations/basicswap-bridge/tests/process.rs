@@ -81,6 +81,100 @@ fn exchange(child: &mut Child, sequence: u64, request: Value) -> Value {
     response
 }
 
+fn initialize(database: &Path, recovery_phrase: Option<&str>) -> Value {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hns-wallet-basicswap-bridge"))
+        .args([
+            "--initialize",
+            "--database",
+            database.to_str().expect("database path"),
+            "--network",
+            "regtest",
+            "--restore-height",
+            "0",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start initializer");
+    let bytes = serde_json::to_vec(&json!({
+        "version": 2,
+        "sequence": 1,
+        "passphrase": "test passphrase",
+        "recovery_phrase": recovery_phrase,
+    }))
+    .expect("bootstrap request");
+    let input = child.stdin.as_mut().expect("bootstrap input");
+    input
+        .write_all(&(bytes.len() as u32).to_le_bytes())
+        .expect("bootstrap frame length");
+    input.write_all(&bytes).expect("bootstrap frame body");
+    input.flush().expect("bootstrap flush");
+    let output = child.stdout.as_mut().expect("bootstrap output");
+    let mut length = [0_u8; 4];
+    output
+        .read_exact(&mut length)
+        .expect("bootstrap response length");
+    let mut body = vec![0_u8; u32::from_le_bytes(length) as usize];
+    output
+        .read_exact(&mut body)
+        .expect("bootstrap response body");
+    drop(child.stdin.take());
+    assert!(child.wait().expect("bootstrap exit").success());
+    let response: Value = serde_json::from_slice(&body).expect("bootstrap response JSON");
+    assert_eq!(response["version"], 2);
+    assert_eq!(response["sequence"], 1);
+    assert_eq!(response["ok"], true);
+    response["result"].clone()
+}
+
+#[test]
+fn initializer_creates_and_restores_private_hns_account() {
+    let directory = private_directory();
+    let database = directory.path().join("created.db");
+    let restored_database = directory.path().join("restored.db");
+    let created = initialize(&database, None);
+    assert_eq!(created["created"], true);
+    let phrase = created["recovery_phrase"]
+        .as_str()
+        .expect("recovery phrase");
+    assert_eq!(phrase.split_whitespace().count(), 24);
+    let restored = initialize(&restored_database, Some(phrase));
+    assert_eq!(restored["created"], false);
+    assert_eq!(restored.get("recovery_phrase"), None);
+
+    let authorization_file = directory.path().join("hsrd-auth");
+    std::fs::write(&authorization_file, "Basic test\n").expect("auth file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&authorization_file, std::fs::Permissions::from_mode(0o600))
+            .expect("private auth file");
+    }
+    for wallet in [&database, &restored_database] {
+        let mut bridge = child(wallet, &authorization_file);
+        assert_eq!(
+            exchange(
+                &mut bridge,
+                1,
+                json!({"operation": "unlock", "passphrase": "test passphrase"}),
+            )["ok"],
+            true
+        );
+        let key = exchange(
+            &mut bridge,
+            2,
+            json!({
+                "operation": "key", "offer_id": "11".repeat(28),
+                "session_nonce": "22".repeat(32), "refund": false,
+            }),
+        );
+        assert_eq!(key["ok"], true, "{key}");
+        drop(bridge.stdin.take());
+        assert!(bridge.wait().expect("bridge exit").success());
+    }
+}
+
 fn mine_regtest(address: &str, count: u32) {
     let cli = std::env::var("BASICSWAP_HSD_CLI").expect("HSD CLI path");
     let prefix = std::env::var("BASICSWAP_HSD_REGTEST_PREFIX").expect("HSD data prefix");
