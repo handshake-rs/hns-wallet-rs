@@ -4335,7 +4335,10 @@ impl NativePeer {
         key: NameHash,
         now_unix: u64,
     ) -> Result<ProofPacket, HnsDirectPeerError> {
-        self.connection.request_proof(root, key, now_unix)?;
+        // Discovery and mutex waits can age the caller's timestamp. Start the
+        // response deadline when this request is actually sent.
+        self.connection
+            .request_proof(root, key, now_unix_or(now_unix))?;
         for _ in 0..MAX_RESPONSE_EVENTS {
             match self.receive_peer_event(now_unix_or(now_unix))? {
                 PeerEvent::Proof(proof) => return Ok(proof),
@@ -5112,7 +5115,7 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
-    use hns_p2p_wire::FrameDecoder;
+    use hns_p2p_wire::{FrameDecoder, PacketType};
     use hns_primitives::Dollarydoos;
     use hns_wallet_store::{SecretKind, WalletStore};
     use hns_wallet_types::{AccountId, BaseUnits, WalletId};
@@ -5742,6 +5745,92 @@ mod tests {
                 .watch_digest,
             after.watch_digest
         );
+    }
+
+    #[test]
+    fn proof_response_deadline_begins_when_the_request_is_sent() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let peer_address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, remote) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut version = light_wallet_version(remote, [78; 8], 42, now);
+            version.services = SERVICE_NETWORK | SERVICE_BLOOM;
+            let version_frame = Frame::from_packet(&Packet::Version(version))
+                .unwrap()
+                .encode(NetworkMagic::Regtest)
+                .unwrap();
+            let verack_frame = Frame::from_packet(&Packet::Verack)
+                .unwrap()
+                .encode(NetworkMagic::Regtest)
+                .unwrap();
+            let mut decoder = FrameDecoder::new(NetworkMagic::Regtest);
+            let mut received_version = false;
+            let mut buffer = [0_u8; 8 * 1_024];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0, "wallet peer closed before GETPROOF");
+                for frame in decoder.push(&buffer[..read]).unwrap() {
+                    match frame.decode_packet().unwrap() {
+                        Packet::Version(_) if !received_version => {
+                            received_version = true;
+                            stream.write_all(&version_frame).unwrap();
+                            stream.write_all(&verack_frame).unwrap();
+                        }
+                        Packet::GetProof(request) => {
+                            let mut payload = Vec::new();
+                            payload.extend_from_slice(request.root.as_bytes());
+                            payload.extend_from_slice(request.key.as_bytes());
+                            // A structurally valid proof lets this test distinguish a
+                            // prompt response from a stale-deadline rejection.
+                            payload.extend_from_slice(&[0, 0, 0, 0]);
+                            let reply = Frame::new(PacketType::Proof, payload)
+                                .unwrap()
+                                .encode(NetworkMagic::Regtest)
+                                .unwrap();
+                            stream.write_all(&reply).unwrap();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let mut local_version = light_wallet_version(peer_address, [77; 8], 42, now);
+        local_version.services = SERVICE_NETWORK;
+        let mut connection = PeerConnection::connect(
+            peer_address,
+            PeerConfig::for_wallet_network(NetworkMagic::Regtest),
+            &local_version,
+            now,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        connection.complete_handshake(|| now).unwrap();
+        let mut peer = NativePeer {
+            address: peer_address,
+            advertised_height: 42,
+            connection,
+            deferred_wallet: VecDeque::new(),
+            address_gossip_requested: false,
+            shakescape_candidates: Arc::new(Mutex::new(HnsShakescapeCandidateCache::default())),
+            allow_private_addresses: true,
+        };
+        let stale_caller_time = now - 60;
+        let root = TreeRoot::new([79; 32]);
+        let key = NameHash::new(hash_name(b"24hour").unwrap().into_bytes());
+        let result = peer.request_proof(root, key, stale_caller_time);
+        server.join().unwrap();
+        let proof = result.expect("prompt response must not inherit the stale caller deadline");
+        assert_eq!(proof.root, root);
+        assert_eq!(proof.key, key);
     }
 
     #[test]
