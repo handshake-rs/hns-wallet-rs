@@ -3,10 +3,15 @@
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use hns_swap::HnsHtlc;
+use hns_wallet_hns::direct_shakescape_network_binding;
 use hns_wallet_hns::{HnsBootstrapPolicy, HnsNetwork, HnsWalletBootstrap};
 use hns_wallet_store::WalletStore;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 fn private_directory() -> tempfile::TempDir {
     let parent = std::env::var_os("HNS_WALLET_STORE_TEST_TMPDIR")
@@ -23,26 +28,36 @@ fn private_directory() -> tempfile::TempDir {
     directory
 }
 
-fn child(database: &Path, authorization_file: &Path) -> Child {
+fn child_at(database: &Path, authorization_file: &Path, endpoint: &str) -> Child {
     Command::new(env!("CARGO_BIN_EXE_hns-wallet-basicswap-bridge"))
         .args([
             "--database",
             database.to_str().expect("database path"),
             "--rpc-endpoint",
-            "127.0.0.1:24192",
+            endpoint,
             "--rpc-authorization-file",
             authorization_file.to_str().expect("auth path"),
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(
+            if std::env::var_os("BASICSWAP_HSRD_REGTEST_RPC").is_some() {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            },
+        )
         .spawn()
         .expect("spawn bridge")
 }
 
+fn child(database: &Path, authorization_file: &Path) -> Child {
+    child_at(database, authorization_file, "127.0.0.1:24192")
+}
+
 fn exchange(child: &mut Child, sequence: u64, request: Value) -> Value {
     let bytes = serde_json::to_vec(&json!({
-        "version": 1,
+        "version": 2,
         "sequence": sequence,
         "request": request,
     }))
@@ -61,9 +76,33 @@ fn exchange(child: &mut Child, sequence: u64, request: Value) -> Value {
     let mut body = vec![0_u8; length];
     output.read_exact(&mut body).expect("response body");
     let response: Value = serde_json::from_slice(&body).expect("response JSON");
-    assert_eq!(response["version"], 1);
+    assert_eq!(response["version"], 2);
     assert_eq!(response["sequence"], sequence);
     response
+}
+
+fn mine_regtest(address: &str, count: u32) {
+    let cli = std::env::var("BASICSWAP_HSD_CLI").expect("HSD CLI path");
+    let prefix = std::env::var("BASICSWAP_HSD_REGTEST_PREFIX").expect("HSD data prefix");
+    let output = Command::new(cli)
+        .arg("--network=regtest")
+        .arg(format!("--prefix={prefix}"))
+        .args(["rpc", "generatetoaddress", &count.to_string(), address])
+        .output()
+        .expect("run HSD miner");
+    assert!(output.status.success(), "HSD regtest mining failed");
+}
+
+fn send_regtest(address: &str, amount: &str) {
+    let cli = std::env::var("BASICSWAP_HSW_CLI").expect("HSD wallet CLI path");
+    let prefix = std::env::var("BASICSWAP_HSD_REGTEST_PREFIX").expect("HSD data prefix");
+    let output = Command::new(cli)
+        .arg("--network=regtest")
+        .arg(format!("--prefix={prefix}"))
+        .args(["send", address, amount])
+        .output()
+        .expect("run HSD wallet");
+    assert!(output.status.success(), "HSD regtest payment failed");
 }
 
 #[test]
@@ -87,7 +126,7 @@ fn encrypted_wallet_pipe_reopens_same_session_key() {
     let key_request = json!({
         "operation": "key",
         "offer_id": "11".repeat(28),
-        "bid_id": "22".repeat(28),
+        "session_nonce": "22".repeat(32),
         "refund": false,
     });
     let mut first = child(&database, &authorization_file);
@@ -111,17 +150,23 @@ fn encrypted_wallet_pipe_reopens_same_session_key() {
         )["result"]["unlocked"],
         true
     );
-    let key = exchange(&mut first, 4, key_request.clone())["result"]["public_key"]
+    let receive = exchange(&mut first, 4, json!({"operation": "receive"}));
+    let address = receive["result"]["address"]
+        .as_str()
+        .expect("HNS receive address");
+    assert!(address.starts_with("rs1q"));
+    assert_eq!(receive["result"]["derivation_index"], 0);
+    let key = exchange(&mut first, 5, key_request.clone())["result"]["public_key"]
         .as_str()
         .expect("receiver key")
         .to_owned();
     let refund = exchange(
         &mut first,
-        5,
+        6,
         json!({
             "operation": "key",
             "offer_id": "11".repeat(28),
-            "bid_id": "22".repeat(28),
+            "session_nonce": "22".repeat(32),
             "refund": true,
         }),
     )["result"]["public_key"]
@@ -167,4 +212,209 @@ fn encrypted_wallet_pipe_reopens_same_session_key() {
         drop(rejected.stdin.take());
         assert!(!rejected.wait().expect("symlink auth exit").success());
     }
+}
+
+#[test]
+#[ignore = "requires isolated HSD and hsrd regtest processes with --wallet-index"]
+fn funded_lock_uses_real_hsrd_wallet_index() {
+    let endpoint = std::env::var("BASICSWAP_HSRD_REGTEST_RPC").expect("regtest RPC endpoint");
+    let authorization_file =
+        std::env::var("BASICSWAP_HSRD_REGTEST_AUTH_FILE").expect("regtest RPC authorization file");
+    let directory = private_directory();
+    let database = directory.path().join("wallet.db");
+    let bootstrap = HnsWalletBootstrap::generate(HnsBootstrapPolicy::new(HnsNetwork::Regtest, 0))
+        .expect("bootstrap");
+    let mut store = WalletStore::create(&database, "test passphrase").expect("store");
+    bootstrap.persist(&mut store, 1).expect("persist account");
+    drop(store);
+
+    let mut bridge = child_at(&database, Path::new(&authorization_file), &endpoint);
+    assert_eq!(
+        exchange(
+            &mut bridge,
+            1,
+            json!({"operation": "unlock", "passphrase": "test passphrase"}),
+        )["ok"],
+        true
+    );
+    let snapshot = exchange(&mut bridge, 2, json!({"operation": "snapshot"}));
+    assert_eq!(snapshot["ok"], true, "{snapshot}");
+    assert_eq!(snapshot["result"]["balance"], "0");
+    let address = snapshot["result"]["receive_address"]
+        .as_str()
+        .expect("receive address");
+    assert!(address.starts_with("rs1q"));
+
+    let miner_address = std::env::var("BASICSWAP_HSD_MINER_ADDRESS").expect("miner address");
+    mine_regtest(&miner_address, 4);
+    send_regtest(address, "10");
+    mine_regtest(&miner_address, 2);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut sequence = 3;
+    loop {
+        let current = exchange(&mut bridge, sequence, json!({"operation": "snapshot"}));
+        sequence += 1;
+        if current["ok"] == true
+            && current["result"]["balance"]
+                .as_str()
+                .and_then(|balance| balance.parse::<u64>().ok())
+                .is_some_and(|balance| balance > 1_000_000)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wallet funding not indexed: {current}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    let offer_id = "11".repeat(28);
+    let bid_id = "22".repeat(28);
+    let session_nonce = "33".repeat(32);
+    let receiver = exchange(
+        &mut bridge,
+        sequence,
+        json!({
+            "operation": "key", "offer_id": offer_id,
+            "session_nonce": session_nonce, "refund": false,
+        }),
+    );
+    sequence += 1;
+    let refund = exchange(
+        &mut bridge,
+        sequence,
+        json!({
+            "operation": "key", "offer_id": offer_id,
+            "session_nonce": session_nonce, "refund": true,
+        }),
+    );
+    sequence += 1;
+    assert_eq!(receiver["ok"], true, "{receiver}");
+    assert_eq!(refund["ok"], true, "{refund}");
+    let receiver_key = hex::decode(receiver["result"]["public_key"].as_str().expect("receiver"))
+        .expect("receiver key hex");
+    let refund_key = hex::decode(refund["result"]["public_key"].as_str().expect("refund"))
+        .expect("refund key hex");
+    let preimage = [7_u8; 32];
+    let hashlock: [u8; 32] = Sha256::digest(preimage).into();
+    let network = direct_shakescape_network_binding(HnsNetwork::Regtest).expect("network");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_secs();
+    let refund_locktime = 0x8000_0000 | (((now + 86_400 + 511) / 512) as u32);
+    let mut descriptor_bytes = Vec::with_capacity(148);
+    descriptor_bytes.extend_from_slice(&1_u16.to_le_bytes());
+    descriptor_bytes.extend_from_slice(&network.magic.to_le_bytes());
+    descriptor_bytes.extend_from_slice(network.genesis.as_bytes());
+    descriptor_bytes.extend_from_slice(&1_000_000_u64.to_le_bytes());
+    descriptor_bytes.extend_from_slice(&hashlock);
+    descriptor_bytes.extend_from_slice(&receiver_key);
+    descriptor_bytes.extend_from_slice(&refund_key);
+    descriptor_bytes.extend_from_slice(&refund_locktime.to_le_bytes());
+    let descriptor = HnsHtlc::decode(&descriptor_bytes).expect("canonical descriptor");
+    let terms = json!({
+        "offer_id": offer_id,
+        "bid_id": bid_id,
+        "session_nonce": session_nonce,
+        "descriptor": hex::encode(descriptor_bytes),
+        "descriptor_hash": hex::encode(descriptor.descriptor_hash().expect("hash")),
+    });
+    let funded = exchange(
+        &mut bridge,
+        sequence,
+        json!({
+            "operation": "fund", "terms": terms.clone(), "maximum_fee": 100_000,
+        }),
+    );
+    sequence += 1;
+    assert_eq!(funded["ok"], true, "{funded}");
+    let funding_id = funded["result"]["transaction_id"]
+        .as_str()
+        .expect("funding ID")
+        .to_owned();
+    assert_eq!(funded["result"]["output_index"], 0);
+    mine_regtest(&miner_address, 2);
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let verified = exchange(
+            &mut bridge,
+            sequence,
+            json!({
+                "operation": "verify_lock", "terms": terms.clone(),
+                "funding_id": funding_id, "confirmations": 2,
+            }),
+        );
+        sequence += 1;
+        if verified["ok"] == true && verified["result"]["verified"] == true {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "HNS lock not verified: {verified}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+
+    let redeemed = exchange(
+        &mut bridge,
+        sequence,
+        json!({
+            "operation": "redeem", "terms": terms.clone(),
+            "funding_id": funding_id, "confirmations": 2,
+            "preimage": hex::encode(preimage), "maximum_fee": 100_000,
+        }),
+    );
+    sequence += 1;
+    assert_eq!(redeemed["ok"], true, "{redeemed}");
+    mine_regtest(&miner_address, 2);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let spent = exchange(
+            &mut bridge,
+            sequence,
+            json!({
+                "operation": "observe_spend", "terms": terms.clone(),
+                "funding_id": funding_id, "confirmations": 2,
+            }),
+        );
+        sequence += 1;
+        if spent["ok"] == true && spent["result"]["observed"] == true {
+            assert_eq!(spent["result"]["branch"], "redeem");
+            assert_eq!(spent["result"]["preimage"], hex::encode(preimage));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "HNS redeem not observed: {spent}"
+        );
+        thread::sleep(Duration::from_secs(1));
+    }
+    drop(bridge.stdin.take());
+    assert!(bridge.wait().expect("bridge exit").success());
+
+    let mut restarted = child_at(&database, Path::new(&authorization_file), &endpoint);
+    assert_eq!(
+        exchange(
+            &mut restarted,
+            1,
+            json!({"operation": "unlock", "passphrase": "test passphrase"}),
+        )["ok"],
+        true
+    );
+    let recovered = exchange(
+        &mut restarted,
+        2,
+        json!({
+            "operation": "observe_spend", "terms": terms,
+            "funding_id": funding_id, "confirmations": 2,
+        }),
+    );
+    assert_eq!(recovered["ok"], true, "{recovered}");
+    assert_eq!(recovered["result"]["branch"], "redeem");
+    assert_eq!(recovered["result"]["preimage"], hex::encode(preimage));
+    drop(restarted.stdin.take());
+    assert!(restarted.wait().expect("restarted bridge exit").success());
 }

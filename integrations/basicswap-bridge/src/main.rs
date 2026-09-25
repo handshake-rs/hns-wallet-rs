@@ -18,16 +18,16 @@ use hns_wallet_hns::{
 };
 use hns_wallet_service::{PersistentHnsValueConfig, PersistentHnsValueRuntime, WalletService};
 use hns_wallet_store::{SharedWalletStore, WalletStore};
-use hns_wallet_types::{BaseUnits, SessionId, TransactionHash};
+use hns_wallet_types::{BaseUnits, ModuleId, SessionId, TransactionHash, WalletAsset};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-const PROTOCOL_VERSION: u16 = 1;
+const PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 65_536;
 const MAX_AUTHORIZATION_FILE_BYTES: u64 = 4_098;
-const SESSION_DOMAIN: &[u8] = b"basicswap/hns-wallet-bridge/session/v1\0";
+const SESSION_DOMAIN: &[u8] = b"basicswap/hns-wallet-bridge/session/v2\0";
 
 type NativeValueService =
     WalletService<SharedWalletStore, PersistentHnsValueRuntime<HnsNodeRpcBackend, SystemClock>>;
@@ -132,9 +132,11 @@ enum Request {
     },
     Lock {},
     Sync {},
+    Receive {},
+    Snapshot {},
     Key {
         offer_id: String,
-        bid_id: String,
+        session_nonce: String,
         refund: bool,
     },
     Fund {
@@ -172,13 +174,15 @@ enum Request {
 struct Terms {
     offer_id: String,
     bid_id: String,
+    session_nonce: String,
     descriptor: String,
     descriptor_hash: String,
 }
 
 impl Terms {
     fn validated(&self) -> BridgeResult<(SessionId, HnsHtlc)> {
-        let session = session_id(&self.offer_id, &self.bid_id)?;
+        parse_hex::<28>(&self.bid_id, "bid_id_invalid")?;
+        let session = session_id(&self.offer_id, &self.session_nonce)?;
         let raw = hex::decode(&self.descriptor).map_err(|_| "descriptor_invalid")?;
         let descriptor = HnsHtlc::decode(&raw).map_err(|_| "descriptor_invalid")?;
         let hash = parse_hex::<32>(&self.descriptor_hash, "descriptor_hash_invalid")?;
@@ -211,13 +215,16 @@ fn parse_hex<const N: usize>(value: &str, error: &'static str) -> BridgeResult<[
     Ok(bytes)
 }
 
-fn session_id(offer_id: &str, bid_id: &str) -> BridgeResult<SessionId> {
+fn session_id(offer_id: &str, session_nonce: &str) -> BridgeResult<SessionId> {
     let offer = parse_hex::<28>(offer_id, "offer_id_invalid")?;
-    let bid = parse_hex::<28>(bid_id, "bid_id_invalid")?;
+    let nonce = parse_hex::<32>(session_nonce, "session_nonce_invalid")?;
+    if nonce == [0; 32] {
+        return Err("session_nonce_invalid");
+    }
     let mut hasher = Sha256::new();
     hasher.update(SESSION_DOMAIN);
     hasher.update(offer);
-    hasher.update(bid);
+    hasher.update(nonce);
     Ok(SessionId::new(hasher.finalize().into()))
 }
 
@@ -289,12 +296,37 @@ fn handle(
             bridge.synchronize()?;
             Ok(json!({"synchronized": true}))
         }
+        Request::Receive {} => {
+            let target = bridge
+                .service
+                .local_trusted_native_hns_value_receive_target()
+                .map_err(|_| "wallet_receive_failed")?;
+            if target.module != ModuleId::Handshake {
+                return Err("wallet_receive_failed");
+            }
+            Ok(json!({"address": target.display, "derivation_index": target.derivation_index}))
+        }
+        Request::Snapshot {} => {
+            let snapshot = bridge
+                .service
+                .synchronize_trusted_native_hns_value()
+                .map_err(|_| "wallet_sync_failed")?;
+            if snapshot.balance.asset != WalletAsset::Hns
+                || snapshot.receive_target.module != ModuleId::Handshake
+            {
+                return Err("wallet_sync_failed");
+            }
+            Ok(json!({
+                "balance": snapshot.balance.base_units.get().to_string(),
+                "receive_address": snapshot.receive_target.display,
+            }))
+        }
         Request::Key {
             offer_id,
-            bid_id,
+            session_nonce,
             refund,
         } => {
-            let session = session_id(&offer_id, &bid_id)?;
+            let session = session_id(&offer_id, &session_nonce)?;
             let public_key = bridge
                 .service
                 .trusted_native_hns_settlement_key_target(session, refund)
@@ -618,30 +650,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_id_is_stable_and_distinct_by_bid_and_offer() {
+    fn session_id_is_stable_and_distinct_by_nonce_and_offer() {
         let offer = "11".repeat(28);
-        let bid = "22".repeat(28);
-        let first = session_id(&offer, &bid).expect("session");
+        let nonce = "22".repeat(32);
+        let first = session_id(&offer, &nonce).expect("session");
         assert_eq!(
             hex::encode(first.as_bytes()),
-            "25993e216776141c0e1e4f68712c48b71b954fabbc98cb47c1c960f5a3196777"
+            "7ffd6d488a58e6a55b2e74e1aa655aa82982ab26c40091d549b1308874385cd3"
         );
-        assert_eq!(first, session_id(&offer, &bid).expect("retry"));
+        assert_eq!(first, session_id(&offer, &nonce).expect("retry"));
         assert_ne!(
             first,
-            session_id(&offer, &"23".repeat(28)).expect("other bid")
+            session_id(&offer, &"23".repeat(32)).expect("other nonce")
         );
         assert_ne!(
             first,
-            session_id(&"12".repeat(28), &bid).expect("other offer")
+            session_id(&"12".repeat(28), &nonce).expect("other offer")
         );
-        assert!(session_id("00", &bid).is_err());
+        assert!(session_id("00", &nonce).is_err());
+        assert!(session_id(&offer, &"00".repeat(32)).is_err());
     }
 
     #[test]
     fn rejects_unknown_fields_and_oversized_frames() {
         let unknown =
-            br#"{"version":1,"sequence":1,"request":{"operation":"sync","unexpected":1}}"#;
+            br#"{"version":2,"sequence":1,"request":{"operation":"sync","unexpected":1}}"#;
         assert!(serde_json::from_slice::<RequestEnvelope>(unknown).is_err());
         let mut frame = ((MAX_FRAME_BYTES + 1) as u32).to_le_bytes().to_vec();
         frame.push(0);
