@@ -146,7 +146,13 @@ a timeout refund.
 
 BasicSwap's opt-in two-chain regtest now funds and redeems both directions
 through its value adapter and its bid/worker route, with real HSRD, HSD, this
-bridge, and Bitcoin Core. The app route uses a mock SMSG transport in that
-isolated harness. A release still needs a controlled-clock funded HNS timeout
-refund, real Particl SMSG delivery, worker interruption and reorganization
-coverage, and packaged binaries before mainnet offer eligibility.
+bridge, and Bitcoin Core. The app route reopens both app databases during a
+trade, resumes an injected interruption after maker funding, and refuses maker
+redemption during an invalidated Bitcoin second-lock confirmation. A second
+isolated Linux regtest advances HSD, HSRD, and this bridge under a shared clock
+and confirms a funded HNS timeout refund. A two-node Particl Core regtest
+delivers a real HNS/BTC offer and bid to BasicSwap handlers and all three exact
+trade envelopes over SMSG v2. The funded app route uses a mock SMSG transport;
+one combined HNS, BTC, and Particl app test remains. Packaged binaries and a BasicSwap HNS
+ordinary withdrawal and passphrase-rotation path also remain before mainnet
+eligibility.
