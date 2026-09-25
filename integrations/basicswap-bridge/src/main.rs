@@ -178,6 +178,9 @@ enum Request {
         terms: Terms,
         maximum_fee: u64,
     },
+    SubmittedFunding {
+        terms: Terms,
+    },
     VerifyLock {
         terms: Terms,
         funding_id: String,
@@ -195,6 +198,11 @@ enum Request {
         funding_id: String,
         confirmations: u32,
         maximum_fee: u64,
+    },
+    SubmittedSpend {
+        terms: Terms,
+        funding_id: String,
+        refund: bool,
     },
     ObserveSpend {
         terms: Terms,
@@ -398,6 +406,15 @@ fn handle(
                 json!({"transaction_id": hex::encode(receipt.txid.as_bytes()), "output_index": 0, "recovered": false}),
             )
         }
+        Request::SubmittedFunding { terms } => {
+            let (session, descriptor) = terms.validated()?;
+            check_wallet_key(bridge, session, &descriptor, true)?;
+            let transaction = bridge
+                .service
+                .submitted_trusted_native_hns_htlc_lock_transaction_id(session, descriptor)
+                .map_err(|_| "funding_recovery_failed")?;
+            Ok(json!({"transaction_id": transaction.map(|id| hex::encode(id.as_bytes()))}))
+        }
         Request::VerifyLock {
             terms,
             funding_id,
@@ -498,6 +515,24 @@ fn handle(
                 .broadcast_trusted_native_hns_settlement(&prepared.0)
                 .map_err(|_| "refund_broadcast_failed")?;
             Ok(json!({"transaction_id": hex::encode(receipt.txid.as_bytes()), "recovered": false}))
+        }
+        Request::SubmittedSpend {
+            terms,
+            funding_id,
+            refund,
+        } => {
+            let (session, descriptor) = terms.validated()?;
+            check_wallet_key(bridge, session, &descriptor, refund)?;
+            let transaction = bridge
+                .service
+                .submitted_trusted_native_hns_htlc_spend_transaction_id(
+                    session,
+                    descriptor,
+                    transaction_id(&funding_id)?,
+                    refund,
+                )
+                .map_err(|_| "spend_recovery_failed")?;
+            Ok(json!({"transaction_id": transaction.map(|id| hex::encode(id.as_bytes()))}))
         }
         Request::ObserveSpend {
             terms,
@@ -664,7 +699,9 @@ fn run_initializer(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::
     let fingerprint = seed_fingerprint(&store, bootstrap.wallet_id().as_bytes())?;
     drop(store);
     let result = match phrase {
-        Some(_) => json!({"created": false, "wallet_id": wallet_id, "seed_fingerprint": fingerprint}),
+        Some(_) => {
+            json!({"created": false, "wallet_id": wallet_id, "seed_fingerprint": fingerprint})
+        }
         None => json!({
             "created": true,
             "wallet_id": wallet_id,

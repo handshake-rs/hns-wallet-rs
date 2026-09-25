@@ -187,9 +187,12 @@ fn initializer_creates_and_restores_private_hns_account() {
 fn mine_regtest(address: &str, count: u32) {
     let cli = std::env::var("BASICSWAP_HSD_CLI").expect("HSD CLI path");
     let prefix = std::env::var("BASICSWAP_HSD_REGTEST_PREFIX").expect("HSD data prefix");
+    let port =
+        std::env::var("BASICSWAP_HSD_REGTEST_RPC_PORT").unwrap_or_else(|_| "14037".to_owned());
     let output = Command::new(cli)
         .arg("--network=regtest")
         .arg(format!("--prefix={prefix}"))
+        .arg(format!("--http-port={port}"))
         .args(["rpc", "generatetoaddress", &count.to_string(), address])
         .output()
         .expect("run HSD miner");
@@ -199,9 +202,12 @@ fn mine_regtest(address: &str, count: u32) {
 fn send_regtest(address: &str, amount: &str) {
     let cli = std::env::var("BASICSWAP_HSW_CLI").expect("HSD wallet CLI path");
     let prefix = std::env::var("BASICSWAP_HSD_REGTEST_PREFIX").expect("HSD data prefix");
+    let port =
+        std::env::var("BASICSWAP_HSW_REGTEST_RPC_PORT").unwrap_or_else(|_| "14039".to_owned());
     let output = Command::new(cli)
         .arg("--network=regtest")
         .arg(format!("--prefix={prefix}"))
+        .arg(format!("--http-port={port}"))
         .args(["send", address, amount])
         .output()
         .expect("run HSD wallet");
@@ -424,6 +430,13 @@ fn funded_lock_uses_real_hsrd_wallet_index() {
         "descriptor": hex::encode(descriptor_bytes),
         "descriptor_hash": hex::encode(descriptor.descriptor_hash().expect("hash")),
     });
+    let before_funding = exchange(
+        &mut bridge,
+        sequence,
+        json!({"operation": "submitted_funding", "terms": terms.clone()}),
+    );
+    sequence += 1;
+    assert_eq!(before_funding["result"]["transaction_id"], Value::Null);
     let funded = exchange(
         &mut bridge,
         sequence,
@@ -438,6 +451,13 @@ fn funded_lock_uses_real_hsrd_wallet_index() {
         .expect("funding ID")
         .to_owned();
     assert_eq!(funded["result"]["output_index"], 0);
+    let submitted_funding = exchange(
+        &mut bridge,
+        sequence,
+        json!({"operation": "submitted_funding", "terms": terms.clone()}),
+    );
+    sequence += 1;
+    assert_eq!(submitted_funding["result"]["transaction_id"], funding_id);
     mine_regtest(&miner_address, 2);
 
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -472,6 +492,19 @@ fn funded_lock_uses_real_hsrd_wallet_index() {
     );
     sequence += 1;
     assert_eq!(redeemed["ok"], true, "{redeemed}");
+    let submitted_spend = exchange(
+        &mut bridge,
+        sequence,
+        json!({
+            "operation": "submitted_spend", "terms": terms.clone(),
+            "funding_id": funding_id, "refund": false,
+        }),
+    );
+    sequence += 1;
+    assert_eq!(
+        submitted_spend["result"]["transaction_id"],
+        redeemed["result"]["transaction_id"]
+    );
     mine_regtest(&miner_address, 2);
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
