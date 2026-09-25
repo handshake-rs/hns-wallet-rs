@@ -108,9 +108,11 @@ This pipe is intended to be launched and called only by the local BasicSwap
 process. BasicSwap must persist the offer/bid IDs, nonce, and exact descriptor
 before requesting a value action, validate the peer's terms against its own bid and
 contract deadlines, and resume observation after restart. The current
-BasicSwap seller-first contract and messages use a different script/key shape;
-that protocol routing must be implemented before HNS appears as a selectable
-asset. The bridge does not by itself make a BasicSwap HNS trade possible.
+BasicSwap's `hns-integration` branch now routes fixed HNS/BTC offers through
+dedicated bid, acceptance, and second-lock messages, its persisted settlement
+record, and a restartable value worker. This bridge alone still does not make
+HNS a supported asset: BasicSwap must also configure HSRD, Bitcoin Core,
+SMSG v2, and the correct wallet seed fingerprint.
 
 Run the focused bridge tests with:
 
@@ -142,6 +144,9 @@ wallet's receive address would create coinbase outputs, which its ordinary
 spendable balance excludes. The live test does not exercise a BTC contract or
 a timeout refund.
 
-An upstream release also needs a funded two-direction BasicSwap↔HSRD regtest
-test for redeem, timeout refund, response loss, process restart, reorg, stale
-index, fee rejection, and malformed witness before mainnet offer eligibility.
+BasicSwap's opt-in two-chain regtest now funds and redeems both directions
+through its value adapter and its bid/worker route, with real HSRD, HSD, this
+bridge, and Bitcoin Core. The app route uses a mock SMSG transport in that
+isolated harness. A release still needs a controlled-clock funded HNS timeout
+refund, real Particl SMSG delivery, worker interruption and reorganization
+coverage, and packaged binaries before mainnet offer eligibility.
