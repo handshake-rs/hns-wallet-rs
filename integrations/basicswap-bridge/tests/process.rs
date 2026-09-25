@@ -142,6 +142,7 @@ fn initializer_creates_and_restores_private_hns_account() {
     let restored = initialize(&restored_database, Some(phrase));
     assert_eq!(restored["created"], false);
     assert_eq!(restored.get("recovery_phrase"), None);
+    assert_eq!(restored["seed_fingerprint"], created["seed_fingerprint"]);
 
     let authorization_file = directory.path().join("hsrd-auth");
     std::fs::write(&authorization_file, "Basic test\n").expect("auth file");
@@ -151,7 +152,7 @@ fn initializer_creates_and_restores_private_hns_account() {
         std::fs::set_permissions(&authorization_file, std::fs::Permissions::from_mode(0o600))
             .expect("private auth file");
     }
-    for wallet in [&database, &restored_database] {
+    for (wallet, expected) in [(&database, &created), (&restored_database, &restored)] {
         let mut bridge = child(wallet, &authorization_file);
         assert_eq!(
             exchange(
@@ -161,9 +162,17 @@ fn initializer_creates_and_restores_private_hns_account() {
             )["ok"],
             true
         );
+        let identity = exchange(&mut bridge, 2, json!({"operation": "identity"}));
+        assert_eq!(identity["ok"], true);
+        assert_eq!(identity["result"]["wallet_id"], expected["wallet_id"]);
+        assert_eq!(
+            identity["result"]["seed_fingerprint"],
+            created["seed_fingerprint"]
+        );
+        assert_eq!(identity["result"]["network"], "regtest");
         let key = exchange(
             &mut bridge,
-            2,
+            3,
             json!({
                 "operation": "key", "offer_id": "11".repeat(28),
                 "session_nonce": "22".repeat(32), "refund": false,

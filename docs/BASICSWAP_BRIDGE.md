@@ -29,7 +29,8 @@ mainnet|testnet|regtest|simnet --restore-height HEIGHT`. This mode does not
 connect to HSRD and exits after one framed stdin request and one framed stdout
 response. The request has version 2, sequence 1, a passphrase, and a null
 `recovery_phrase` to create, or a 24-word phrase to restore. The response
-contains a 16-byte wallet ID. Only creation returns a new 24-word recovery
+contains a 16-byte wallet ID and a 32-byte seed fingerprint. Only creation
+returns a new 24-word recovery
 phrase; the caller must present it for a private backup before allowing funds
 into that account. The phrase and passphrase never appear in command-line
 arguments, environment variables, or logs. The process exits immediately
@@ -40,6 +41,12 @@ refuses an existing database. The Python `initialize_hns_wallet` helper in
 BasicSwap implements the framing and validates the response. An interrupted
 create can leave a database whose phrase was not received; do not fund such an
 account. Restore from a backed-up phrase into a new, empty wallet path.
+Creation assigns a random wallet ID; restoration derives a new wallet ID from
+the phrase. The seed fingerprint is stable across that restore and is computed
+as SHA-256 of `basicswap/hns-wallet-bridge/seed-fingerprint/v1\0` followed by
+the 64-byte recovery seed. BasicSwap must store this fingerprint and compare it
+with the unlocked bridge's `identity` response before resuming a trade. The
+response also carries the selected network and the current wallet ID.
 
 ## Framing and session identity
 
@@ -76,6 +83,7 @@ must match the descriptor branch used by the requested action.
 | Operation | Result and authority |
 | --- | --- |
 | `unlock`, `lock` | Opens or closes the wallet key authority in this process. |
+| `identity` | Returns the current wallet ID, stable seed fingerprint, and selected HNS network after unlock. |
 | `sync` | Reconciles authenticated HSRD chain/mempool evidence with the wallet before value operations. |
 | `receive` | Returns the wallet's ordinary HNS payment address and derivation index without spending authority. |
 | `snapshot` | Synchronizes against HSRD and returns the authenticated HNS balance in decimal base units and current ordinary receive address. |

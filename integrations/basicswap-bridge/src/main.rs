@@ -18,7 +18,7 @@ use hns_wallet_hns::{
     HnsWalletBootstrap, HnsWalletRuntime, SystemClock, VerifiedNativeHtlcSpend,
 };
 use hns_wallet_service::{PersistentHnsValueConfig, PersistentHnsValueRuntime, WalletService};
-use hns_wallet_store::{SharedWalletStore, WalletStore};
+use hns_wallet_store::{SecretKind, SharedWalletStore, WalletStore};
 use hns_wallet_types::{BaseUnits, ModuleId, SessionId, TransactionHash, WalletAsset};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -29,6 +29,7 @@ const PROTOCOL_VERSION: u16 = 2;
 const MAX_FRAME_BYTES: usize = 65_536;
 const MAX_AUTHORIZATION_FILE_BYTES: u64 = 4_098;
 const SESSION_DOMAIN: &[u8] = b"basicswap/hns-wallet-bridge/session/v2\0";
+const SEED_FINGERPRINT_DOMAIN: &[u8] = b"basicswap/hns-wallet-bridge/seed-fingerprint/v1\0";
 
 type NativeValueService =
     WalletService<SharedWalletStore, PersistentHnsValueRuntime<HnsNodeRpcBackend, SystemClock>>;
@@ -44,6 +45,9 @@ impl Drop for StoreGuard {
 
 struct BridgeRuntime {
     service: NativeValueService,
+    wallet_id: String,
+    seed_fingerprint: String,
+    network: HnsNetwork,
     _store: StoreGuard,
 }
 
@@ -69,8 +73,11 @@ impl BridgeRuntime {
         raw_store
             .validate_single_recovery_seed(config.wallet_id.as_bytes())
             .map_err(|_| "wallet_open_failed")?;
+        let seed_fingerprint = seed_fingerprint(&raw_store, config.wallet_id.as_bytes())?;
         config.value_operations_enabled = true;
         config.settlement_enabled = true;
+        let wallet_id = hex::encode(config.wallet_id.as_bytes());
+        let network = config.network;
         let store = StoreGuard(SharedWalletStore::new(raw_store));
         let node_config = HnsNodeRpcConfig::new(endpoint, authorization.to_owned())
             .map_err(|_| "node_config_invalid")?;
@@ -93,6 +100,9 @@ impl BridgeRuntime {
             .map_err(|_| "wallet_open_failed")?;
         Ok(Self {
             service,
+            wallet_id,
+            seed_fingerprint,
+            network,
             _store: store,
         })
     }
@@ -115,6 +125,20 @@ impl BridgeRuntime {
             .verify_trusted_native_hns_htlc_lock(session, descriptor, funding_id, confirmations)
             .map_err(|_| "lock_verification_failed")
     }
+}
+
+fn seed_fingerprint(store: &WalletStore, wallet_id: &[u8]) -> BridgeResult<String> {
+    let seed = store
+        .get_secret(wallet_id, SecretKind::RecoverySeed)
+        .map_err(|_| "seed_identity_failed")?
+        .ok_or("seed_identity_failed")?;
+    if seed.len() != 64 {
+        return Err("seed_identity_failed");
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(SEED_FINGERPRINT_DOMAIN);
+    hasher.update(seed.as_slice());
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[derive(Deserialize)]
@@ -144,6 +168,7 @@ enum Request {
     Sync {},
     Receive {},
     Snapshot {},
+    Identity {},
     Key {
         offer_id: String,
         session_nonce: String,
@@ -302,6 +327,11 @@ fn handle(
     let bridge = state.as_ref().ok_or("wallet_locked")?;
     match request {
         Request::Unlock { .. } | Request::Lock {} => unreachable!(),
+        Request::Identity {} => Ok(json!({
+            "wallet_id": bridge.wallet_id,
+            "seed_fingerprint": bridge.seed_fingerprint,
+            "network": bridge.network,
+        })),
         Request::Sync {} => {
             bridge.synchronize()?;
             Ok(json!({"synchronized": true}))
@@ -631,12 +661,14 @@ fn run_initializer(arguments: &[std::ffi::OsString]) -> Result<(), Box<dyn std::
         bootstrap.persist(store, now)
     })
     .map_err(|_| "HNS bootstrap store creation failed")?;
+    let fingerprint = seed_fingerprint(&store, bootstrap.wallet_id().as_bytes())?;
     drop(store);
     let result = match phrase {
-        Some(_) => json!({"created": false, "wallet_id": wallet_id}),
+        Some(_) => json!({"created": false, "wallet_id": wallet_id, "seed_fingerprint": fingerprint}),
         None => json!({
             "created": true,
             "wallet_id": wallet_id,
+            "seed_fingerprint": fingerprint,
             "recovery_phrase": bootstrap.into_recovery_phrase().expose_for_dedicated_display(),
         }),
     };
