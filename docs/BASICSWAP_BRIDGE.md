@@ -87,6 +87,8 @@ must match the descriptor branch used by the requested action.
 | `sync` | Reconciles authenticated HSRD chain/mempool evidence with the wallet before value operations. |
 | `receive` | Returns the wallet's ordinary HNS payment address and derivation index without spending authority. |
 | `snapshot` | Synchronizes against HSRD and returns the authenticated HNS balance in decimal base units and current ordinary receive address. |
+| `prepare_send` | Reconciles HSRD evidence, prepares one ordinary HNS payment under an explicit maximum fee, and returns the exact recipient, amount, fee cap, expiry, and random process-local review token. A new preparation discards the prior one. |
+| `approve_send`, `reject_send` | Consume the exact pending token once. Approval re-prepares, revalidates, signs, persists, and broadcasts through the wallet's native send approval; rejection discards the encrypted approval and releases its prepared coin reservation. Locking or stopping the bridge also discards a pending approval. |
 | `key` | Returns only a compressed wallet-owned session public key for receiver or refund. |
 | `fund` | Checks the exact descriptor and wallet refund key, prepares under a maximum fee, durably records and broadcasts the HNS lock. Returns the transaction ID and output index 0. |
 | `verify_lock` | Re-fetches and verifies the exact funding transaction at the required confirmation floor. |
@@ -137,7 +139,10 @@ cargo test --locked funded_lock_uses_real_hsrd_wallet_index -- --ignored
 ```
 
 The test mines to the HSD wallet, sends an ordinary transfer to the new Rust
-wallet, confirms the HNS HTLC lock at the wallet's two-confirmation default,
+wallet, sends an ordinary payment back through the native approval pipe,
+rejects a wrong and then a reused token, cancels a second prepared payment
+without retaining its coin reservation, confirms the HNS HTLC lock at the
+wallet's two-confirmation default,
 redeems with the matching preimage, verifies the observed spend, and checks
 that the spend evidence survives a bridge restart. Mining directly to the Rust
 wallet's receive address would create coinbase outputs, which its ordinary
@@ -152,7 +157,10 @@ redemption during an invalidated Bitcoin second-lock confirmation. A second
 isolated Linux regtest advances HSD, HSRD, and this bridge under a shared clock
 and confirms a funded HNS timeout refund. A two-node Particl Core regtest
 delivers a real HNS/BTC offer and bid to BasicSwap handlers and all three exact
-trade envelopes over SMSG v2. The funded app route uses a mock SMSG transport;
-one combined HNS, BTC, and Particl app test remains. Packaged binaries and a BasicSwap HNS
-ordinary withdrawal and passphrase-rotation path also remain before mainnet
-eligibility.
+trade envelopes over SMSG v2. The BasicSwap HNS wallet page now reviews
+ordinary sends through this bridge. The funded app route can use either a
+mock SMSG transport or two real Particl regtest nodes; with Particl, both
+trade directions have passed through HSD, HSRD, Bitcoin Core, and SMSG v2
+in one test. The offer row is seeded in that combined test; the separate
+Particl test delivers the offer into BasicSwap's handler. Packaged binaries
+and HNS passphrase rotation remain before mainnet eligibility.

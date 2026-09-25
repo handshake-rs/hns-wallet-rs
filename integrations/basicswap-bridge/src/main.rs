@@ -13,13 +13,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use hns_swap::HnsHtlc;
 use hns_wallet_chain_api::Preimage;
+use hns_wallet_ffi::ApprovalSummary;
 use hns_wallet_hns::{
     HnsAccountRecord, HnsBootstrapPolicy, HnsNetwork, HnsNodeRpcBackend, HnsNodeRpcConfig,
     HnsWalletBootstrap, HnsWalletRuntime, SystemClock, VerifiedNativeHtlcSpend,
 };
-use hns_wallet_service::{PersistentHnsValueConfig, PersistentHnsValueRuntime, WalletService};
+use hns_wallet_provider::{
+    APPROVAL_LIFETIME_SECONDS, ApprovedCall, Origin, ProviderMethod, SelectedNamespace,
+};
+use hns_wallet_service::{
+    PersistentHnsValueConfig, PersistentHnsValueRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN,
+    TrustedNativeHnsValueAction, WalletService,
+};
 use hns_wallet_store::{SecretKind, SharedWalletStore, WalletStore};
-use hns_wallet_types::{BaseUnits, ModuleId, SessionId, TransactionHash, WalletAsset};
+use hns_wallet_types::{
+    AccountId, ApprovalId, ApprovalKind, BaseUnits, ModuleId, SessionId, TransactionHash,
+    WalletAsset,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -45,10 +55,27 @@ impl Drop for StoreGuard {
 
 struct BridgeRuntime {
     service: NativeValueService,
+    account_id: AccountId,
     wallet_id: String,
     seed_fingerprint: String,
     network: HnsNetwork,
+    pending_send: Option<PendingSend>,
     _store: StoreGuard,
+}
+
+struct PendingSend {
+    token: [u8; 16],
+    action: TrustedNativeHnsValueAction,
+}
+
+impl Drop for BridgeRuntime {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending_send.take() {
+            let _ = self
+                .service
+                .discard_trusted_native_hns_value_action(pending.action);
+        }
+    }
 }
 
 impl BridgeRuntime {
@@ -77,6 +104,7 @@ impl BridgeRuntime {
         config.value_operations_enabled = true;
         config.settlement_enabled = true;
         let wallet_id = hex::encode(config.wallet_id.as_bytes());
+        let account_id = config.account_id;
         let network = config.network;
         let store = StoreGuard(SharedWalletStore::new(raw_store));
         let node_config = HnsNodeRpcConfig::new(endpoint, authorization.to_owned())
@@ -100,9 +128,11 @@ impl BridgeRuntime {
             .map_err(|_| "wallet_open_failed")?;
         Ok(Self {
             service,
+            account_id,
             wallet_id,
             seed_fingerprint,
             network,
+            pending_send: None,
             _store: store,
         })
     }
@@ -173,6 +203,17 @@ enum Request {
         offer_id: String,
         session_nonce: String,
         refund: bool,
+    },
+    PrepareSend {
+        recipient: String,
+        amount: u64,
+        maximum_fee: u64,
+    },
+    ApproveSend {
+        token: String,
+    },
+    RejectSend {
+        token: String,
     },
     Fund {
         terms: Terms,
@@ -285,6 +326,31 @@ fn fee(value: u64) -> BridgeResult<BaseUnits> {
     Ok(BaseUnits::new(u128::from(value)))
 }
 
+fn random_nonzero<const N: usize>() -> BridgeResult<[u8; N]> {
+    for _ in 0..8 {
+        let mut value = [0_u8; N];
+        getrandom::fill(&mut value).map_err(|_| "randomness_unavailable")?;
+        if value.iter().any(|byte| *byte != 0) {
+            return Ok(value);
+        }
+    }
+    Err("randomness_unavailable")
+}
+
+fn token_matches(expected: &[u8; 16], candidate: &str) -> bool {
+    if candidate.len() != 32 {
+        return false;
+    }
+    let Ok(actual) = parse_hex::<16>(candidate, "send_token_invalid") else {
+        return false;
+    };
+    let mut difference = 0_u8;
+    for (left, right) in expected.iter().zip(actual) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
 fn check_wallet_key(
     bridge: &BridgeRuntime,
     session: SessionId,
@@ -332,7 +398,7 @@ fn handle(
         }
         return Ok(json!({"unlocked": false}));
     }
-    let bridge = state.as_ref().ok_or("wallet_locked")?;
+    let bridge = state.as_mut().ok_or("wallet_locked")?;
     match request {
         Request::Unlock { .. } | Request::Lock {} => unreachable!(),
         Request::Identity {} => Ok(json!({
@@ -368,6 +434,114 @@ fn handle(
                 "balance": snapshot.balance.base_units.get().to_string(),
                 "receive_address": snapshot.receive_target.display,
             }))
+        }
+        Request::PrepareSend {
+            recipient,
+            amount,
+            maximum_fee,
+        } => {
+            if amount == 0 || maximum_fee == 0 || recipient.len() > 128 {
+                return Err("send_terms_invalid");
+            }
+            if let Some(pending) = bridge.pending_send.take() {
+                bridge
+                    .service
+                    .discard_trusted_native_hns_value_action(pending.action)
+                    .map_err(|_| "send_discard_failed")?;
+            }
+            let token = random_nonzero::<16>()?;
+            let approval_id = ApprovalId::new(random_nonzero::<16>()?);
+            let request_nonce = u64::from_be_bytes(random_nonzero::<8>()?);
+            let now = bridge
+                .service
+                .trusted_native_hns_value_now_unix()
+                .map_err(|_| "send_clock_unavailable")?;
+            let expires_at_unix = now
+                .checked_add(APPROVAL_LIFETIME_SECONDS)
+                .ok_or("send_clock_unavailable")?;
+            let call = ApprovedCall {
+                origin: Origin::parse(TRUSTED_NATIVE_HNS_VALUE_ORIGIN)
+                    .map_err(|_| "send_origin_invalid")?,
+                namespace: SelectedNamespace::Hns,
+                method: ProviderMethod::HnsSend,
+                params: json!({
+                    "account": bridge.account_id,
+                    "recipient": recipient,
+                    "amount": amount.to_string(),
+                    "maximumFee": maximum_fee.to_string(),
+                }),
+                request_nonce,
+            };
+            let action = bridge
+                .service
+                .prepare_trusted_native_hns_value_action(
+                    approval_id,
+                    ApprovalKind::Send,
+                    call,
+                    expires_at_unix,
+                )
+                .map_err(|_| "send_preparation_failed")?;
+            let ApprovalSummary::Send {
+                amount: prepared_amount,
+                recipient: prepared_recipient,
+                maximum_fee: prepared_fee,
+                chain: ModuleId::Handshake,
+                ..
+            } = action.summary()
+            else {
+                let _ = bridge
+                    .service
+                    .discard_trusted_native_hns_value_action(action);
+                return Err("send_summary_invalid");
+            };
+            if prepared_amount.asset != WalletAsset::Hns
+                || prepared_amount.base_units.get() != u128::from(amount)
+                || prepared_fee.asset != WalletAsset::Hns
+                || prepared_fee.base_units.get() != u128::from(maximum_fee)
+                || prepared_recipient != &recipient
+            {
+                let _ = bridge
+                    .service
+                    .discard_trusted_native_hns_value_action(action);
+                return Err("send_summary_invalid");
+            }
+            bridge.pending_send = Some(PendingSend { token, action });
+            Ok(json!({
+                "token": hex::encode(token),
+                "recipient": recipient,
+                "amount": amount.to_string(),
+                "maximum_fee": maximum_fee.to_string(),
+                "expires_at_unix": expires_at_unix,
+            }))
+        }
+        Request::ApproveSend { token } => {
+            let pending = bridge.pending_send.as_ref().ok_or("send_not_pending")?;
+            if !token_matches(&pending.token, &token) {
+                return Err("send_token_invalid");
+            }
+            let pending = bridge.pending_send.take().ok_or("send_not_pending")?;
+            let receipt = bridge
+                .service
+                .execute_trusted_native_hns_value_action(pending.action)
+                .map_err(|_| "send_broadcast_failed")?;
+            let txid = receipt
+                .get("txid")
+                .and_then(Value::as_str)
+                .ok_or("send_receipt_invalid")?;
+            parse_hex::<32>(txid, "send_receipt_invalid")?;
+            Ok(json!({"transaction_id": txid}))
+        }
+        Request::RejectSend { token } => {
+            let pending = bridge.pending_send.as_ref().ok_or("send_not_pending")?;
+            if !token_matches(&pending.token, &token) {
+                return Err("send_token_invalid");
+            }
+            let pending = bridge.pending_send.take().ok_or("send_not_pending")?;
+            bridge
+                .service
+                .discard_trusted_native_hns_value_action(pending.action)
+                .map_err(|_| "send_discard_failed")?;
+            Ok(json!({"rejected": true}))
         }
         Request::Key {
             offer_id,

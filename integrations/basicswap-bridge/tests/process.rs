@@ -378,6 +378,101 @@ fn funded_lock_uses_real_hsrd_wallet_index() {
         thread::sleep(Duration::from_secs(1));
     }
 
+    let miner_address = std::env::var("BASICSWAP_HSD_MINER_ADDRESS").expect("miner address");
+    let preview = exchange(
+        &mut bridge,
+        sequence,
+        json!({
+            "operation": "prepare_send",
+            "recipient": miner_address,
+            "amount": 1_000_000,
+            "maximum_fee": 100_000,
+        }),
+    );
+    sequence += 1;
+    assert_eq!(preview["ok"], true, "{preview}");
+    assert_eq!(preview["result"]["recipient"], miner_address);
+    assert_eq!(preview["result"]["amount"], "1000000");
+    assert_eq!(preview["result"]["maximum_fee"], "100000");
+    let token = preview["result"]["token"].as_str().expect("send token");
+    let rejected_token = exchange(
+        &mut bridge,
+        sequence,
+        json!({"operation": "approve_send", "token": "00".repeat(16)}),
+    );
+    sequence += 1;
+    assert_eq!(rejected_token["error"], "send_token_invalid");
+    let sent = exchange(
+        &mut bridge,
+        sequence,
+        json!({"operation": "approve_send", "token": token}),
+    );
+    sequence += 1;
+    assert_eq!(sent["ok"], true, "{sent}");
+    assert_eq!(
+        sent["result"]["transaction_id"]
+            .as_str()
+            .expect("send ID")
+            .len(),
+        64
+    );
+    assert_eq!(
+        exchange(
+            &mut bridge,
+            sequence,
+            json!({"operation": "approve_send", "token": token}),
+        )["error"],
+        "send_not_pending"
+    );
+    sequence += 1;
+    mine_regtest(&miner_address, 2);
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let current = exchange(&mut bridge, sequence, json!({"operation": "snapshot"}));
+        sequence += 1;
+        if current["ok"] == true
+            && current["result"]["balance"]
+                .as_str()
+                .and_then(|balance| balance.parse::<u64>().ok())
+                .is_some_and(|balance| (7_000_000..9_000_000).contains(&balance))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "sent HNS not indexed: {current}");
+        thread::sleep(Duration::from_secs(1));
+    }
+    let cancelled = exchange(
+        &mut bridge,
+        sequence,
+        json!({
+            "operation": "prepare_send",
+            "recipient": miner_address,
+            "amount": 500_000,
+            "maximum_fee": 100_000,
+        }),
+    );
+    sequence += 1;
+    assert_eq!(cancelled["ok"], true, "{cancelled}");
+    let cancelled_token = cancelled["result"]["token"].as_str().expect("cancel token");
+    assert_eq!(
+        exchange(
+            &mut bridge,
+            sequence,
+            json!({"operation": "reject_send", "token": cancelled_token}),
+        )["result"]["rejected"],
+        true
+    );
+    sequence += 1;
+    assert_eq!(
+        exchange(
+            &mut bridge,
+            sequence,
+            json!({"operation": "approve_send", "token": cancelled_token}),
+        )["error"],
+        "send_not_pending"
+    );
+    sequence += 1;
+
     let offer_id = "11".repeat(28);
     let bid_id = "22".repeat(28);
     let session_nonce = "33".repeat(32);
@@ -412,7 +507,7 @@ fn funded_lock_uses_real_hsrd_wallet_index() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock")
         .as_secs();
-    let refund_locktime = 0x8000_0000 | (((now + 86_400 + 511) / 512) as u32);
+    let refund_locktime = 0x8000_0000 | ((now + 86_400).div_ceil(512) as u32);
     let mut descriptor_bytes = Vec::with_capacity(148);
     descriptor_bytes.extend_from_slice(&1_u16.to_le_bytes());
     descriptor_bytes.extend_from_slice(&network.magic.to_le_bytes());

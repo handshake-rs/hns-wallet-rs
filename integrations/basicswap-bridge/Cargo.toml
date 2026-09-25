@@ -9,10 +9,13 @@ repository = "https://github.com/handshake-rs/hns-wallet-rs"
 publish = false
 
 [dependencies]
+getrandom = "0.3.3"
 hex = "0.4.3"
 hns-swap = "=0.4.2"
 hns-wallet-chain-api = { version = "=0.2.6", path = "../../crates/hns-wallet-chain-api" }
+hns-wallet-ffi = { version = "=0.2.6", path = "../../crates/hns-wallet-ffi" }
 hns-wallet-hns = { version = "=0.2.6", path = "../../crates/hns-wallet-hns" }
+hns-wallet-provider = { version = "=0.2.6", path = "../../crates/hns-wallet-provider" }
 hns-wallet-service = { version = "=0.2.6", path = "../../crates/hns-wallet-service" }
 hns-wallet-store = { version = "=0.2.6", path = "../../crates/hns-wallet-store" }
 hns-wallet-types = { version = "=0.2.6", path = "../../crates/hns-wallet-types" }

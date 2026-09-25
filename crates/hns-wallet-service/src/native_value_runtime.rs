@@ -2231,12 +2231,17 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         {
             return Err(invalid_request("native value approval lifetime is invalid"));
         }
-        let summary = self.runtime.prepare_trusted_hns_value_approval(
-            approval_id,
-            kind,
-            &call,
-            expires_at_unix,
-        )?;
+        let summary = self
+            .runtime
+            .prepare_trusted_hns_value_approval(approval_id, kind, &call, expires_at_unix)
+            .inspect_err(|_| {
+                if call.method == ProviderMethod::HnsSend {
+                    let _ = self
+                        .runtime
+                        .runtime
+                        .cancel_prepared_send_by_request_nonce(call.request_nonce);
+                }
+            })?;
         let validation = (|| {
             if summary.approval_kind() != kind {
                 return Err(invalid_request("native value approval kind is mismatched"));
@@ -2247,6 +2252,12 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             validate_approval_summary(&call, &summary)
         })();
         if let Err(failure) = validation {
+            if call.method == ProviderMethod::HnsSend {
+                let _ = self
+                    .runtime
+                    .runtime
+                    .cancel_prepared_send_by_request_nonce(call.request_nonce);
+            }
             let _ = self.discard_trusted_native_hns_value_action_by_id(approval_id, now_unix);
             return Err(failure);
         }
@@ -2344,13 +2355,29 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         validate_trusted_native_value_call(approval_id, kind, &call)?;
         let now_unix = self.trusted_native_hns_value_now_unix()?;
         if expires_at_unix <= now_unix {
+            if call.method == ProviderMethod::HnsSend {
+                let _ = self
+                    .runtime
+                    .runtime
+                    .cancel_prepared_send_by_request_nonce(call.request_nonce);
+            }
             self.discard_trusted_native_hns_value_action_by_id(approval_id, now_unix)?;
             return Err(invalid_request("native value approval has expired"));
         }
+        let send_nonce = (call.method == ProviderMethod::HnsSend).then_some(call.request_nonce);
         let result = self
             .runtime
             .execute_approved_provider(call, approval_id, now_unix);
         if result.is_err() {
+            if let Some(request_nonce) = send_nonce {
+                // A pre-broadcast retry can leave a prepared coin reservation.
+                // A submitted transaction has advanced stages and cannot be
+                // cancelled by this method; its reservation remains durable.
+                let _ = self
+                    .runtime
+                    .runtime
+                    .cancel_prepared_send_by_request_nonce(request_nonce);
+            }
             let _ = self.discard_trusted_native_hns_value_action_by_id(approval_id, now_unix);
         }
         result
@@ -2362,8 +2389,19 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         &self,
         action: TrustedNativeHnsValueAction,
     ) -> Result<(), ServiceFailure> {
+        let release = if action.call.method == ProviderMethod::HnsSend {
+            self.runtime
+                .runtime
+                .cancel_prepared_send_by_request_nonce(action.call.request_nonce)
+                .map_err(hns_runtime_failure)
+        } else {
+            Ok(())
+        };
         let now_unix = self.trusted_native_hns_value_now_unix()?;
-        self.discard_trusted_native_hns_value_action_by_id(action.approval_id, now_unix)
+        let discard =
+            self.discard_trusted_native_hns_value_action_by_id(action.approval_id, now_unix);
+        release?;
+        discard
     }
 
     fn discard_trusted_native_hns_value_action_by_id(

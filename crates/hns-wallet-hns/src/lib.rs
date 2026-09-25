@@ -4144,6 +4144,20 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         Ok(())
     }
 
+    /// Release the exact prepared send created by a trusted native caller.
+    /// The caller has already bound this random nonce to one local approval;
+    /// the runtime derives the workflow under its own wallet/account identity.
+    pub fn cancel_prepared_send_by_request_nonce(
+        &self,
+        request_nonce: u64,
+    ) -> Result<(), HnsWalletError> {
+        if request_nonce == 0 {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
+        let config = self.cache_read()?.account.config.clone();
+        self.cancel_prepared_send(send_workflow_id(&config, request_nonce))
+    }
+
     pub fn cancel_prepared_settlement(
         &self,
         artifact: &PreparedArtifact,

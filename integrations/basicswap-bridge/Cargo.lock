@@ -692,10 +692,13 @@ dependencies = [
 name = "hns-wallet-basicswap-bridge"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
  "hex",
  "hns-swap",
  "hns-wallet-chain-api",
+ "hns-wallet-ffi",
  "hns-wallet-hns",
+ "hns-wallet-provider",
  "hns-wallet-service",
  "hns-wallet-store",
  "hns-wallet-types",
