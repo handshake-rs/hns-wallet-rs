@@ -3,7 +3,7 @@
 
 mod direct_board;
 mod direct_maker;
-mod direct_taker;
+mod direct_responder;
 mod session_board;
 mod settlement_key;
 
@@ -41,23 +41,29 @@ pub use direct_maker::{
     is_local_shakescape_direct_maker, list_local_shakescape_direct_offer_cancellations,
     list_local_shakescape_direct_offers, load_shakescape_btc_for_hns_maker_preimage,
     load_shakescape_direct_maker_preimage, reserved_local_shakescape_btc_maker_sats,
-    reserved_local_shakescape_hns_maker_dollarydoos,
+    reserved_local_shakescape_hns_maker_dollarydoos, reserved_local_shakescape_offer_setter_amount,
 };
-pub use direct_taker::{
-    ShakescapeBtcForHnsTakeRequest, ShakescapeDirectTakeRequest, ShakescapeHnsForBtcTakeRequest,
-    ShakescapeLocalDirectTake, ShakescapeTakerAcceptedSession,
+pub use direct_responder::{
+    ShakescapeBtcForHnsTakeRequest, ShakescapeDirectOfferAcceptanceRequest,
+    ShakescapeDirectTakeRequest, ShakescapeHnsForBtcTakeRequest,
+    ShakescapeLocalDirectOfferAcceptance, ShakescapeLocalDirectTake,
+    ShakescapeOfferSetterAcceptedSession, ShakescapeTakerAcceptedSession,
+    abandon_pending_local_shakescape_direct_offer_acceptance,
     abandon_pending_local_shakescape_direct_take, accept_shakescape_direct_maker_proposal,
     accept_shakescape_hns_for_btc_maker_proposal, create_shakescape_btc_for_hns_take,
-    create_shakescape_direct_take, create_shakescape_hns_for_btc_take,
-    derive_local_direct_taker_key, derive_local_hns_for_btc_taker_key,
-    is_local_shakescape_direct_taker, list_local_shakescape_direct_takes,
-    list_pending_local_shakescape_direct_takes, reserved_local_shakescape_taker_amount,
+    create_shakescape_direct_offer_acceptance, create_shakescape_direct_take,
+    create_shakescape_hns_for_btc_take, derive_local_direct_taker_key,
+    derive_local_hns_for_btc_taker_key, is_local_shakescape_direct_taker,
+    list_local_shakescape_direct_offer_acceptances, list_local_shakescape_direct_takes,
+    list_pending_local_shakescape_direct_offer_acceptances,
+    list_pending_local_shakescape_direct_takes, reserved_local_shakescape_responder_amount,
+    reserved_local_shakescape_taker_amount,
 };
 pub use session_board::{
     MAX_SHAKESCAPE_DIRECT_SWAPS, ShakescapeDirectSwapAdmission, ShakescapeDirectSwapPeerStatus,
     ShakescapeDirectSwapPolicy, ShakescapeDirectSwapRecord, ShakescapeDirectSwapSnapshot,
     ShakescapeDirectSwapStage, ShakescapePeerFundingStatusRecord,
-    admit_shakescape_direct_offer_take, admit_shakescape_direct_swap_hello,
+    admit_shakescape_direct_offer_acceptance, admit_shakescape_direct_swap_hello,
     admit_shakescape_direct_swap_peer_status, admit_shakescape_direct_swap_proposal,
     admit_shakescape_direct_swap_watch_ready, load_shakescape_direct_swap,
     load_shakescape_direct_swaps, validate_shakescape_direct_swap_peer_status,
@@ -92,7 +98,7 @@ const SHAKESCAPE_OBSERVED_PREIMAGE_DOMAIN: &[u8] = b"hns-wallet-rs/shakescape-ob
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedQuote {
     /// Identifier of the signed exact terms that authorized this quote. For a
-    /// direct HNS/BTC swap this is the maker's direct-offer ID.
+    /// direct HNS/BTC swap this is the offer setter's signed intent ID.
     pub terms_id: ObjectHash,
     pub offered: Amount,
     pub received: Amount,
@@ -138,7 +144,9 @@ impl TimeoutPlan {
 #[serde(rename_all = "snake_case")]
 pub enum SwapState {
     OfferPublished,
-    OfferTakeReceived,
+    /// The offer responder has committed to act as the executable swap maker.
+    #[serde(rename = "offer_acceptance_received", alias = "offer_take_received")]
+    OfferAcceptanceReceived,
     OfferReserved,
     TermsFrozen,
     RefundsPrepared,
@@ -244,10 +252,10 @@ impl SwapSession {
 
     fn transition(&mut self, evidence: VerifiedEvidence, now_unix: u64) -> Result<(), MarketError> {
         let next = match (self.state, evidence) {
-            (SwapState::OfferPublished, VerifiedEvidence::OfferTakeValidated) => {
-                SwapState::OfferTakeReceived
+            (SwapState::OfferPublished, VerifiedEvidence::OfferAcceptanceValidated) => {
+                SwapState::OfferAcceptanceReceived
             }
-            (SwapState::OfferTakeReceived, VerifiedEvidence::OfferReserved) => {
+            (SwapState::OfferAcceptanceReceived, VerifiedEvidence::OfferReserved) => {
                 SwapState::OfferReserved
             }
             (SwapState::OfferReserved, VerifiedEvidence::TermsApproved { terms_id })
@@ -478,7 +486,7 @@ pub fn list_shakescape_executions(
         if record.hello.is_none() {
             continue;
         }
-        let session_id = SessionId::new(record.take.swap_session_id);
+        let session_id = SessionId::new(record.acceptance.swap_session_id);
         let execution = load_shakescape_execution(store, policy, session_id)?
             .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
         executions.push(execution);
@@ -1167,7 +1175,7 @@ fn other_chain(chain: ChainId) -> Result<ChainId, MarketError> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VerifiedEvidence {
-    OfferTakeValidated,
+    OfferAcceptanceValidated,
     OfferReserved,
     TermsApproved { terms_id: ObjectHash },
     RefundsValidated,
@@ -1348,7 +1356,7 @@ mod tests {
         .expect("session");
         let mut journal = MemoryJournal::default();
         let steps = [
-            VerifiedEvidence::OfferTakeValidated,
+            VerifiedEvidence::OfferAcceptanceValidated,
             VerifiedEvidence::OfferReserved,
             VerifiedEvidence::TermsApproved {
                 terms_id: ObjectHash::new([3; 32]),
@@ -1388,6 +1396,18 @@ mod tests {
     }
 
     #[test]
+    fn offer_acceptance_state_emits_current_name_and_reads_legacy_name() {
+        assert_eq!(
+            serde_json::to_string(&SwapState::OfferAcceptanceReceived).unwrap(),
+            "\"offer_acceptance_received\""
+        );
+        assert_eq!(
+            serde_json::from_str::<SwapState>("\"offer_take_received\"").unwrap(),
+            SwapState::OfferAcceptanceReceived
+        );
+    }
+
+    #[test]
     fn refund_path_is_available_after_first_funding() {
         let mut session = SwapSession::new(
             SessionId::new([10; 32]),
@@ -1405,7 +1425,7 @@ mod tests {
         .expect("session");
         let mut journal = MemoryJournal::default();
         for evidence in [
-            VerifiedEvidence::OfferTakeValidated,
+            VerifiedEvidence::OfferAcceptanceValidated,
             VerifiedEvidence::OfferReserved,
             VerifiedEvidence::TermsApproved {
                 terms_id: ObjectHash::new([3; 32]),

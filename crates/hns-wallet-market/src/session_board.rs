@@ -1,9 +1,9 @@
 //! Durable admission for one direct fixed-terms HNS/BTC swap session.
 
 use hns_marketplace_protocol::{
-    AssetId, CrossChainMessage, DirectOffer, DirectOfferTake, MarketPair, MarketplaceError,
-    NetworkBinding, SwapFundingStatus, SwapRedeemStatus, SwapRefundStatus, SwapSessionHello,
-    SwapSessionProposal, SwapWatchReady,
+    AssetId, CrossChainMessage, DirectOffer, DirectOfferAcceptance, DirectOfferRoleModel,
+    MarketPair, MarketplaceError, NetworkBinding, SwapFundingStatus, SwapRedeemStatus,
+    SwapRefundStatus, SwapSessionHello, SwapSessionProposal, SwapWatchReady,
 };
 use hns_wallet_store::{EntityKind, StoredEntity, WalletStore};
 use hns_wallet_types::{ObjectHash, SessionId};
@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use crate::direct_board::{decode_canonical_envelope, peer_object_validation_time};
 use crate::{MarketError, ShakescapeDirectOfferBoardPolicy, load_shakescape_direct_offer};
 
-const SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION: u16 = 1;
+const SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION: u16 = 2;
 const SHAKESCAPE_DIRECT_SWAP_POLICY_DOMAIN: &[u8] =
     b"hns-wallet-shakescape-direct-swap-policy-v1\0";
 const SHAKESCAPE_DIRECT_SWAP_RECORD_PREFIX: &[u8] = b"shakescape-v2-direct-swap\0";
@@ -57,7 +57,7 @@ impl ShakescapeDirectSwapPolicy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShakescapeDirectSwapStage {
-    TakeReceived,
+    AcceptanceReceived,
     MakerProposed,
     Accepted,
 }
@@ -65,13 +65,13 @@ pub enum ShakescapeDirectSwapStage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShakescapeDirectSwapRecord {
     pub store_revision: u64,
-    pub take_request_id: u64,
+    pub acceptance_request_id: u64,
     pub proposal_request_id: Option<u64>,
-    pub take_accepted_at_unix: u64,
+    pub acceptance_received_at_unix: u64,
     pub proposal_accepted_at_unix: Option<u64>,
     pub hello_accepted_at_unix: Option<u64>,
     pub offer: DirectOffer,
-    pub take: DirectOfferTake,
+    pub acceptance: DirectOfferAcceptance,
     pub proposal: Option<SwapSessionProposal>,
     pub hello: Option<SwapSessionHello>,
     pub watch_ready_accepted_at_unix: Option<u64>,
@@ -94,7 +94,7 @@ impl ShakescapeDirectSwapRecord {
         } else if self.proposal.is_some() {
             ShakescapeDirectSwapStage::MakerProposed
         } else {
-            ShakescapeDirectSwapStage::TakeReceived
+            ShakescapeDirectSwapStage::AcceptanceReceived
         }
     }
 
@@ -106,9 +106,9 @@ impl ShakescapeDirectSwapRecord {
         ShakescapeDirectSwapSnapshot {
             store_revision: self.store_revision,
             stage: self.stage(),
-            session_id: SessionId::new(self.take.swap_session_id),
+            session_id: SessionId::new(self.acceptance.swap_session_id),
             offer_id: ObjectHash::new(self.offer.offer_id),
-            take_request_id: self.take_request_id,
+            acceptance_request_id: self.acceptance_request_id,
             proposal_request_id: self.proposal_request_id,
             offered_asset: self.offer.offered_asset,
             offered_amount: self.offer.offered_amount.get(),
@@ -125,7 +125,7 @@ impl ShakescapeDirectSwapRecord {
                 .or(self.watch_ready_accepted_at_unix)
                 .or(self.hello_accepted_at_unix)
                 .or(self.proposal_accepted_at_unix)
-                .unwrap_or(self.take_accepted_at_unix),
+                .unwrap_or(self.acceptance_received_at_unix),
         }
     }
 }
@@ -136,7 +136,7 @@ pub struct ShakescapeDirectSwapSnapshot {
     pub stage: ShakescapeDirectSwapStage,
     pub session_id: SessionId,
     pub offer_id: ObjectHash,
-    pub take_request_id: u64,
+    pub acceptance_request_id: u64,
     pub proposal_request_id: Option<u64>,
     pub offered_asset: AssetId,
     pub offered_amount: u128,
@@ -192,13 +192,16 @@ struct PersistedShakescapeDirectSwap {
     schema_version: u16,
     policy_fingerprint: ObjectHash,
     session_id: SessionId,
-    take_request_id: u64,
+    #[serde(rename = "take_request_id")]
+    acceptance_request_id: u64,
     proposal_request_id: Option<u64>,
-    take_accepted_at_unix: u64,
+    #[serde(rename = "take_accepted_at_unix")]
+    acceptance_received_at_unix: u64,
     proposal_accepted_at_unix: Option<u64>,
     hello_accepted_at_unix: Option<u64>,
     offer_hex: String,
-    take_hex: String,
+    #[serde(rename = "take_hex")]
+    acceptance_hex: String,
     proposal_hex: Option<String>,
     hello_hex: Option<String>,
     #[serde(default)]
@@ -248,30 +251,34 @@ pub fn load_shakescape_direct_swaps(
         .collect()
 }
 
-/// Freeze a locally retained direct offer and a taker's signed exact request.
-/// It performs no reservation, funding, or broadcast; the maker must still
-/// create the separately signed proposal with HTLC commitments.
-pub fn admit_shakescape_direct_offer_take(
+/// Freeze a locally retained direct offer and the responder's signed exact
+/// acceptance. It performs no funding or broadcast; the responding maker must
+/// still create the separately signed proposal with HTLC commitments.
+pub fn admit_shakescape_direct_offer_acceptance(
     store: &mut WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
     envelope_bytes: &[u8],
     accepted_at_unix: u64,
 ) -> Result<ShakescapeDirectSwapAdmission, MarketError> {
     let (request_id, message) = decode_canonical_envelope(envelope_bytes)?;
-    let CrossChainMessage::TakeDirectOffer(take) = message else {
+    let CrossChainMessage::AcceptDirectOffer(acceptance) = message else {
         return Err(MarketError::InvalidShakescapeDirectSwap);
     };
-    let validation_time = peer_object_validation_time(take.header.created_at, accepted_at_unix)
-        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
-    let offer = load_shakescape_direct_offer(store, &policy.board_policy(), take.offer_id)?
+    if acceptance.role_model != DirectOfferRoleModel::OfferSetterTaker {
+        return Err(MarketError::InvalidShakescapeDirectSwap);
+    }
+    let validation_time =
+        peer_object_validation_time(acceptance.header.created_at, accepted_at_unix)
+            .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
+    let offer = load_shakescape_direct_offer(store, &policy.board_policy(), acceptance.offer_id)?
         .ok_or(MarketError::UnknownShakescapeDirectOffer)?;
-    let session_id = SessionId::new(take.swap_session_id);
+    let session_id = SessionId::new(acceptance.swap_session_id);
     if let Some(existing) = load_shakescape_direct_swap(store, policy, session_id)? {
         // An exact replay is recovery/routing material and remains idempotent
-        // after the public offer expires. Check it before the new-take time
+        // after the public offer expires. Check it before the new-acceptance time
         // gate so reconnecting wallets can deliver the rest of an already
         // frozen session.
-        if existing.offer == offer.offer && existing.take == take {
+        if existing.offer == offer.offer && existing.acceptance == acceptance {
             return Ok(ShakescapeDirectSwapAdmission::Existing(existing.snapshot()));
         }
         return Err(MarketError::ShakescapeDirectSwapConflict);
@@ -279,7 +286,8 @@ pub fn admit_shakescape_direct_offer_take(
     if !offer.is_active_at(accepted_at_unix) {
         return Err(MarketError::InvalidShakescapeDirectSwap);
     }
-    take.verify_for_offer(&offer.offer, policy.network(), validation_time)
+    acceptance
+        .verify_for_offer(&offer.offer, policy.network(), validation_time)
         .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     if load_shakescape_direct_swaps(store, policy)?.len() >= MAX_SHAKESCAPE_DIRECT_SWAPS {
         return Err(MarketError::ShakescapeDirectSwapCapacity);
@@ -288,13 +296,13 @@ pub fn admit_shakescape_direct_offer_take(
         schema_version: SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION,
         policy_fingerprint: policy.fingerprint(),
         session_id,
-        take_request_id: request_id,
+        acceptance_request_id: request_id,
         proposal_request_id: None,
-        take_accepted_at_unix: accepted_at_unix,
+        acceptance_received_at_unix: accepted_at_unix,
         proposal_accepted_at_unix: None,
         hello_accepted_at_unix: None,
         offer_hex: encode_hex(&offer.offer)?,
-        take_hex: encode_hex(&take)?,
+        acceptance_hex: encode_hex(&acceptance)?,
         proposal_hex: None,
         hello_hex: None,
         watch_ready_accepted_at_unix: None,
@@ -310,13 +318,13 @@ pub fn admit_shakescape_direct_offer_take(
     )?;
     let record = ShakescapeDirectSwapRecord {
         store_revision: revision,
-        take_request_id: request_id,
+        acceptance_request_id: request_id,
         proposal_request_id: None,
-        take_accepted_at_unix: accepted_at_unix,
+        acceptance_received_at_unix: accepted_at_unix,
         proposal_accepted_at_unix: None,
         hello_accepted_at_unix: None,
         offer: offer.offer,
-        take,
+        acceptance,
         proposal: None,
         hello: None,
         watch_ready_accepted_at_unix: None,
@@ -349,7 +357,7 @@ pub fn admit_shakescape_direct_swap_proposal(
         // A maker-only proposal is a bounded invitation to begin funding, not
         // a countersigned agreement. If that invitation expired in transit,
         // permit the same maker to refresh its time bounds for the exact
-        // signed offer/take pair. Once the taker has countersigned, every term
+        // signed offer/acceptance pair. Once the taker has countersigned, every term
         // is frozen and even an expired proposal remains immutable.
         let expired_maker_only = record.hello.is_none()
             && matches!(
@@ -363,7 +371,7 @@ pub fn admit_shakescape_direct_swap_proposal(
     proposal
         .verify_for_direct_offer(
             &record.offer,
-            &record.take,
+            &record.acceptance,
             policy.network(),
             validation_time,
         )
@@ -422,13 +430,13 @@ pub fn admit_shakescape_direct_swap_hello(
     // A fully countersigned hello is durable recovery material, not an
     // instruction to begin new funding. It may arrive again after a mobile
     // disconnect and after its original funding window. Verify it at receipt
-    // while live; for a late replay, verify the complete offer/take binding
+    // while live; for a late replay, verify the complete offer/acceptance binding
     // and both signatures at the hello's signed creation time. Every actual
     // funding action still calls `verify_new_funding_at(now)`, so admitting a
     // delayed agreement cannot authorize a new lock after the deadline.
     match hello.verify_for_direct_offer(
         &record.offer,
-        &record.take,
+        &record.acceptance,
         policy.network(),
         validation_time,
     ) {
@@ -436,7 +444,7 @@ pub fn admit_shakescape_direct_swap_hello(
         Err(MarketplaceError::Expired { .. }) => hello
             .verify_for_direct_offer(
                 &record.offer,
-                &record.take,
+                &record.acceptance,
                 policy.network(),
                 hello.header.created_at,
             )
@@ -628,9 +636,11 @@ fn decode_stored_swap(
     stored: StoredEntity<PersistedShakescapeDirectSwap>,
 ) -> Result<ShakescapeDirectSwapRecord, MarketError> {
     let value = stored.value;
-    let malformed_envelope = value.schema_version != SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION
-        || value.policy_fingerprint != policy.fingerprint()
-        || value.take_request_id == 0
+    let malformed_envelope = !matches!(
+        value.schema_version,
+        1 | SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION
+    ) || value.policy_fingerprint != policy.fingerprint()
+        || value.acceptance_request_id == 0
         || value.proposal_request_id == Some(0)
         || stored.id != record_id(policy, value.session_id)
         || value.proposal_accepted_at_unix.is_some() != value.proposal_hex.is_some()
@@ -647,14 +657,25 @@ fn decode_stored_swap(
     }
     let offer = decode_hex::<DirectOffer>(&value.offer_hex)
         .map_err(|_| MarketError::CorruptShakescapeDirectSwapDetail("canonical offer encoding"))?;
-    let take = decode_hex::<DirectOfferTake>(&value.take_hex)
-        .map_err(|_| MarketError::CorruptShakescapeDirectSwapDetail("canonical take encoding"))?;
-    if SessionId::new(take.swap_session_id) != value.session_id
-        || peer_object_validation_time(take.header.created_at, value.take_accepted_at_unix)
-            .is_none_or(|at| take.verify_for_offer(&offer, policy.network(), at).is_err())
+    let acceptance = decode_hex::<DirectOfferAcceptance>(&value.acceptance_hex).map_err(|_| {
+        MarketError::CorruptShakescapeDirectSwapDetail("canonical acceptance encoding")
+    })?;
+    if (value.schema_version == 1)
+        != (offer.role_model == DirectOfferRoleModel::LegacyOfferSetterMaker)
+        || acceptance.role_model != offer.role_model
+        || SessionId::new(acceptance.swap_session_id) != value.session_id
+        || peer_object_validation_time(
+            acceptance.header.created_at,
+            value.acceptance_received_at_unix,
+        )
+        .is_none_or(|at| {
+            acceptance
+                .verify_for_offer(&offer, policy.network(), at)
+                .is_err()
+        })
     {
         return Err(MarketError::CorruptShakescapeDirectSwapDetail(
-            "take authentication",
+            "acceptance authentication",
         ));
     }
     let proposal = value
@@ -695,13 +716,13 @@ fn decode_stored_swap(
         .collect::<Result<Vec<_>, MarketError>>()?;
     let record = ShakescapeDirectSwapRecord {
         store_revision: stored.revision,
-        take_request_id: value.take_request_id,
+        acceptance_request_id: value.acceptance_request_id,
         proposal_request_id: value.proposal_request_id,
-        take_accepted_at_unix: value.take_accepted_at_unix,
+        acceptance_received_at_unix: value.acceptance_received_at_unix,
         proposal_accepted_at_unix: value.proposal_accepted_at_unix,
         hello_accepted_at_unix: value.hello_accepted_at_unix,
         offer,
-        take,
+        acceptance,
         proposal,
         hello,
         watch_ready_accepted_at_unix: value.watch_ready_accepted_at_unix,
@@ -712,12 +733,17 @@ fn decode_stored_swap(
         let at = peer_object_validation_time(proposal.terms().header.created_at, at).ok_or(
             MarketError::CorruptShakescapeDirectSwapDetail("proposal authentication"),
         )?;
-        match proposal.verify_for_direct_offer(&record.offer, &record.take, policy.network(), at) {
+        match proposal.verify_for_direct_offer(
+            &record.offer,
+            &record.acceptance,
+            policy.network(),
+            at,
+        ) {
             Ok(()) => {}
             Err(MarketplaceError::Expired { .. }) => proposal
                 .verify_for_direct_offer(
                     &record.offer,
-                    &record.take,
+                    &record.acceptance,
                     policy.network(),
                     proposal.terms().header.created_at,
                 )
@@ -735,12 +761,13 @@ fn decode_stored_swap(
         let at = peer_object_validation_time(hello.header.created_at, at).ok_or(
             MarketError::CorruptShakescapeDirectSwapDetail("hello authentication"),
         )?;
-        match hello.verify_for_direct_offer(&record.offer, &record.take, policy.network(), at) {
+        match hello.verify_for_direct_offer(&record.offer, &record.acceptance, policy.network(), at)
+        {
             Ok(()) => {}
             Err(MarketplaceError::Expired { .. }) => hello
                 .verify_for_direct_offer(
                     &record.offer,
-                    &record.take,
+                    &record.acceptance,
                     policy.network(),
                     hello.header.created_at,
                 )
@@ -828,16 +855,19 @@ fn encode_persisted(
     record: &ShakescapeDirectSwapRecord,
 ) -> Result<PersistedShakescapeDirectSwap, MarketError> {
     Ok(PersistedShakescapeDirectSwap {
-        schema_version: SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION,
+        schema_version: match record.offer.role_model {
+            DirectOfferRoleModel::LegacyOfferSetterMaker => 1,
+            DirectOfferRoleModel::OfferSetterTaker => SHAKESCAPE_DIRECT_SWAP_SCHEMA_VERSION,
+        },
         policy_fingerprint: policy.fingerprint(),
-        session_id: SessionId::new(record.take.swap_session_id),
-        take_request_id: record.take_request_id,
+        session_id: SessionId::new(record.acceptance.swap_session_id),
+        acceptance_request_id: record.acceptance_request_id,
         proposal_request_id: record.proposal_request_id,
-        take_accepted_at_unix: record.take_accepted_at_unix,
+        acceptance_received_at_unix: record.acceptance_received_at_unix,
         proposal_accepted_at_unix: record.proposal_accepted_at_unix,
         hello_accepted_at_unix: record.hello_accepted_at_unix,
         offer_hex: encode_hex(&record.offer)?,
-        take_hex: encode_hex(&record.take)?,
+        acceptance_hex: encode_hex(&record.acceptance)?,
         proposal_hex: record.proposal.as_ref().map(encode_hex).transpose()?,
         hello_hex: record.hello.as_ref().map(encode_hex).transpose()?,
         watch_ready_accepted_at_unix: record.watch_ready_accepted_at_unix,
@@ -861,7 +891,7 @@ fn encode_persisted(
 
 fn timestamps_monotonic(record: &ShakescapeDirectSwapRecord) -> bool {
     [
-        Some(record.take_accepted_at_unix),
+        Some(record.acceptance_received_at_unix),
         record.proposal_accepted_at_unix,
         record.hello_accepted_at_unix,
         record.watch_ready_accepted_at_unix,
@@ -896,7 +926,7 @@ macro_rules! canonical_direct_object {
 
 canonical_direct_object!(
     DirectOffer,
-    DirectOfferTake,
+    DirectOfferAcceptance,
     SwapSessionProposal,
     SwapSessionHello,
     SwapFundingStatus,

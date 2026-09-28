@@ -437,23 +437,28 @@ composition work does not alter any release gate.
 
 ## Direct HNS/BTC offers and sessions
 
-The cross-chain Shakescape path is a direct, signed fixed-terms HNS/BTC board. A
-maker chooses one indivisible pair of integer amounts; a taker selects that
-specific offer. The protocol carries no price round, price reporter, source,
-oracle, external feed, historical rate, partial-fill reservation, or matching
-engine. A live board may group active offers by their exact BTC-per-HNS ratio,
-but that is presentation only and never changes the signed settlement amounts.
+The cross-chain Shakescape path is a direct, signed fixed-terms HNS/BTC board.
+An offer setter publishes one indivisible pair of integer amounts as an intent;
+the public offer is not itself the executable swap-maker listing. The protocol
+carries no price round, price reporter, source, oracle, external feed,
+historical rate, partial-fill reservation, or matching engine. A live board may
+group active offers by their exact BTC-per-HNS ratio, but that is presentation
+only and never changes the signed settlement amounts.
 
-An offer take binds the original offer ID to one swap-session ID and a distinct
-taker settlement key. The maker proposal and the accepted session hello bind
-both settlement authorities, the original terms, hashlock, descriptor
-commitments, confirmation requirements, and asymmetric refund deadlines. Peers
-cannot advance a swap by claiming funding, redemption, or refund; every value
-transition requires independently verified local chain evidence.
+A responding wallet signs an acceptance, becomes the execution maker, and
+proposes the atomic swap with the public offer's sides reversed into its own
+perspective. Its maker settlement key and the offer setter's precommitted taker
+key are bound to the same offer ID and session ID. The original offer setter
+verifies and countersigns the proposal as execution taker. The proposal and
+countersigned hello bind both settlement authorities, exact amounts, hashlock,
+descriptor commitments, confirmation requirements, and asymmetric refund
+deadlines.
 
-The longer-deadline offered-asset lock funds first. The other side funds only
-after the required confirmation evidence, preserving time for preimage
-observation and first-chain redemption. HNS/BTC uses SHA-256 native HTLCs on
-both chains. The Android product still requires complete wallet-controlled
-fund/redeem/refund execution, direct-peer transport/UI wiring, recovery and
-reorg testing, and release qualification before it can advertise settlement.
+The responder-maker's offered-asset lock has the longer deadline and funds
+first. The offer setter funds the asset it originally offered only after the
+required confirmation evidence, preserving time for preimage observation and
+first-chain redemption. Peer status cannot prove funding, redemption, or
+refund; every value transition requires independently verified local chain
+evidence. HNS/BTC uses SHA-256 native HTLCs on both chains. Installed-product
+transport, recovery, reorg, and live-network qualification remain separate
+release requirements.

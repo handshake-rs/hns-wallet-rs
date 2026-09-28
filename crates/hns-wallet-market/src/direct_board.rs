@@ -6,7 +6,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hns_marketplace_protocol::{
-    AssetId, CrossChainMessage, DirectOffer, DirectOfferCancellation, MarketPair, NetworkBinding,
+    AssetId, CrossChainMessage, DirectOffer, DirectOfferCancellation, DirectOfferRoleModel,
+    MarketPair, NetworkBinding,
 };
 use hns_wallet_store::{EntityKind, StoredEntity, WalletStore};
 use hns_wallet_types::{ObjectHash, SessionId};
@@ -15,9 +16,12 @@ use sha2::{Digest, Sha256};
 
 use crate::MarketError;
 
-const DIRECT_OFFER_BOARD_SCHEMA_VERSION: u16 = 1;
+const DIRECT_OFFER_BOARD_SCHEMA_VERSION: u16 = 2;
 const DIRECT_OFFER_BOARD_POLICY_DOMAIN: &[u8] = b"hns-wallet-direct-offer-board-policy-v1\0";
-const DIRECT_OFFER_BOARD_RECORD_PREFIX: &[u8] = b"shakescape-v2-direct-offer\0";
+// The new namespace prevents an unmatched legacy offer from being replayed
+// under the opposite atomic-swap role model after an upgrade. Countersigned
+// legacy sessions carry their own terms and remain recoverable separately.
+const DIRECT_OFFER_BOARD_RECORD_PREFIX: &[u8] = b"shakescape-v3-direct-offer\0";
 
 /// Mobile clocks are normally network-synchronized, but two correctly
 /// synchronized devices can still differ by a few seconds.  Accepting a
@@ -91,7 +95,7 @@ struct PersistedDirectOffer {
 }
 
 /// Fully re-authenticated board material. It is retained locally to let a
-/// later take/session bind to precisely the same signed maker terms.
+/// later acceptance/session bind to precisely the same signed setter terms.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShakescapeDirectOfferRecord {
     pub store_revision: u64,
@@ -108,7 +112,7 @@ impl ShakescapeDirectOfferRecord {
             offer_id: ObjectHash::new(self.offer.offer_id),
             session_id: SessionId::new(self.offer.swap_session_id),
             signer_public_key: self.offer.header.signer_public_key,
-            maker_settlement_public_key: self.offer.maker_settlement_public_key,
+            offer_setter_settlement_public_key: self.offer.offer_setter_settlement_public_key,
             offered_asset: self.offer.offered_asset,
             offered_amount: self.offer.offered_amount.get(),
             received_asset: self.offer.received_asset,
@@ -133,7 +137,7 @@ pub struct ShakescapeDirectOfferSnapshot {
     pub offer_id: ObjectHash,
     pub session_id: SessionId,
     pub signer_public_key: [u8; 33],
-    pub maker_settlement_public_key: [u8; 33],
+    pub offer_setter_settlement_public_key: [u8; 33],
     pub offered_asset: AssetId,
     pub offered_amount: u128,
     pub received_asset: AssetId,
@@ -178,10 +182,10 @@ impl ShakescapeDirectOfferCancellationAdmission {
 
 /// One display level of the live board. The ratio is exact integer units of
 /// satoshis per HNS base unit, reduced before grouping. It is UI metadata;
-/// taking an offer always reuses its signed exact amounts.
+/// accepting an offer always reuses its signed exact amounts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShakescapeDirectOfferLevel {
-    pub maker_sells_hns: bool,
+    pub offer_setter_sells_hns: bool,
     pub btc_per_hns_numerator: u128,
     pub btc_per_hns_denominator: u128,
     pub total_hns_amount: u128,
@@ -244,7 +248,7 @@ pub fn live_shakescape_direct_offer_levels(
         if !record.is_active_at(now_unix) {
             continue;
         }
-        let (maker_sells_hns, hns, btc) = if record.offer.offered_asset == AssetId::HNS {
+        let (offer_setter_sells_hns, hns, btc) = if record.offer.offered_asset == AssetId::HNS {
             (
                 true,
                 record.offer.offered_amount.get(),
@@ -258,9 +262,9 @@ pub fn live_shakescape_direct_offer_levels(
             )
         };
         let divisor = gcd(btc, hns);
-        let key = (maker_sells_hns, btc / divisor, hns / divisor);
+        let key = (offer_setter_sells_hns, btc / divisor, hns / divisor);
         let entry = grouped.entry(key).or_insert(ShakescapeDirectOfferLevel {
-            maker_sells_hns,
+            offer_setter_sells_hns,
             btc_per_hns_numerator: key.1,
             btc_per_hns_denominator: key.2,
             total_hns_amount: 0,
@@ -285,7 +289,7 @@ pub fn live_shakescape_direct_offer_levels(
 
 /// Admit one direct offer from a canonical Shakescape envelope. The same entry
 /// point is also used for a wallet's own offer before it is sent, ensuring a
-/// later inbound take can only reference local exact terms.
+/// later inbound acceptance can only reference local exact terms.
 pub fn admit_shakescape_direct_offer(
     store: &mut WalletStore,
     policy: &ShakescapeDirectOfferBoardPolicy,
@@ -296,6 +300,9 @@ pub fn admit_shakescape_direct_offer(
     let CrossChainMessage::DirectOffer(offer) = message else {
         return Err(MarketError::InvalidShakescapeDirectOffer);
     };
+    if offer.role_model != DirectOfferRoleModel::OfferSetterTaker {
+        return Err(MarketError::InvalidShakescapeDirectOffer);
+    }
     let validation_time = peer_object_validation_time(offer.header.created_at, accepted_at_unix)
         .ok_or(MarketError::InvalidShakescapeDirectOffer)?;
     offer
@@ -589,10 +596,11 @@ mod tests {
         let policy = ShakescapeDirectOfferBoardPolicy::new(network()).expect("board policy");
         let mut store = WalletStore::create(":memory:", PASSPHRASE).expect("wallet store");
         let mut offer = DirectOffer {
+            role_model: DirectOfferRoleModel::OfferSetterTaker,
             header: header(1),
             offer_id: [0; 32],
             swap_session_id: [3; 32],
-            maker_settlement_public_key: key(9),
+            offer_setter_settlement_public_key: key(9),
             offered_asset: AssetId::HNS,
             offered_amount: AssetAmount::new(10_000_000),
             received_asset: AssetId::BTC,
@@ -617,6 +625,7 @@ mod tests {
         assert_eq!(levels[0].btc_per_hns_denominator, 5_000);
 
         let mut cancellation = DirectOfferCancellation {
+            role_model: DirectOfferRoleModel::OfferSetterTaker,
             header: header(2),
             offer_id: offer.offer_id,
             offer_sequence: offer.header.sequence,

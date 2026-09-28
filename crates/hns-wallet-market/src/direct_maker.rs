@@ -1,4 +1,4 @@
-//! Wallet-derived maker authority for exact direct BTC-for-HNS offers.
+//! Wallet-derived authority for direct HNS/BTC offer intents and maker proposals.
 //!
 //! Listing signatures and per-offer settlement signatures deliberately use
 //! independent HKDF domains. Only public bindings and exact approved terms are
@@ -8,8 +8,8 @@
 use hkdf::Hkdf;
 use hns_marketplace_protocol::{
     AssetAmount, AssetId, CrossChainMessage, DeadlineKind, DirectOffer, DirectOfferCancellation,
-    MARKETPLACE_PROTOCOL_VERSION, MarketPair, MarketplaceError, SettlementDeadline,
-    SignedObjectHeader, SwapAssetSide, SwapSessionHello, SwapSessionProposal,
+    DirectOfferRoleModel, MARKETPLACE_PROTOCOL_VERSION, MarketPair, MarketplaceError,
+    SettlementDeadline, SignedObjectHeader, SwapAssetSide, SwapSessionHello, SwapSessionProposal,
 };
 use hns_wallet_bitcoin_kyoto::build_shakescape_bitcoin_htlc;
 use hns_wallet_chain_api::Preimage;
@@ -28,10 +28,12 @@ use crate::{
     load_shakescape_direct_swap,
 };
 
-const STORAGE_VERSION: u16 = 2;
-const RECORD_PREFIX: &[u8] = b"local-direct-offer/v1/";
-const INTENT_DOMAIN: &[u8] = b"hns-wallet/direct-offer-intent/v1\0";
-const SESSION_DOMAIN: &[u8] = b"hns-wallet/direct-offer-session/v1\0";
+const STORAGE_VERSION: u16 = 3;
+const LEGACY_STORAGE_VERSION: u16 = 2;
+const RECORD_PREFIX: &[u8] = b"local-direct-offer/v2/";
+const LEGACY_RECORD_PREFIX: &[u8] = b"local-direct-offer/v1/";
+const INTENT_DOMAIN: &[u8] = b"hns-wallet/direct-offer-intent/v2\0";
+const SESSION_DOMAIN: &[u8] = b"hns-wallet/direct-offer-session/v2\0";
 const IDENTITY_SALT: &[u8] = b"hns-wallet/direct-board-identity/hkdf-sha256/v1\0";
 const IDENTITY_INFO: &[u8] = b"hns-wallet/direct-board-identity/scalar/v1\0";
 const MAKER_PREIMAGE_SALT: &[u8] = b"hns-wallet/direct-maker-preimage/hkdf-sha256/v1\0";
@@ -96,14 +98,14 @@ impl ShakescapeBtcForHnsOfferRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PersistedLocalDirectOffer {
-    storage_version: u16,
-    wallet_id: WalletId,
-    offer_id: ObjectHash,
-    session_id: SessionId,
-    intent_id: ObjectHash,
-    bitcoin_fee_reserve_sats: u64,
-    created_at_unix: u64,
+pub(crate) struct PersistedLocalDirectOffer {
+    pub(crate) storage_version: u16,
+    pub(crate) wallet_id: WalletId,
+    pub(crate) offer_id: ObjectHash,
+    pub(crate) session_id: SessionId,
+    pub(crate) intent_id: ObjectHash,
+    pub(crate) bitcoin_fee_reserve_sats: u64,
+    pub(crate) created_at_unix: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,7 +133,8 @@ pub type ShakescapeDirectMakerProposal = ShakescapeBtcForHnsMakerProposal;
 pub struct ShakescapeLocalDirectOffer {
     pub offer: ShakescapeDirectOfferSnapshot,
     pub session_id: SessionId,
-    /// Fee reserve, denominated in the maker's offered asset base unit.
+    /// Fee reserve denominated in the offer setter's asset. The setter becomes
+    /// the swap taker if a responder creates and proposes an executable swap.
     pub offered_fee_reserve: u64,
     /// Compatibility projection for existing BTC-for-HNS callers.
     pub bitcoin_fee_reserve_sats: u64,
@@ -195,7 +198,7 @@ pub fn create_shakescape_direct_offer(
         CrossChainSwapKeyRequest {
             wallet_id: request.wallet_id,
             session_id,
-            participant: SwapParticipant::Maker,
+            participant: SwapParticipant::Taker,
             network: policy.network(),
             intent_id: intent,
         },
@@ -207,6 +210,7 @@ pub fn create_shakescape_direct_offer(
     sequence_bytes.copy_from_slice(&request.nonce[..8]);
     let sequence = (u64::from_be_bytes(sequence_bytes) & i64::MAX as u64).max(1);
     let mut offer = DirectOffer {
+        role_model: DirectOfferRoleModel::OfferSetterTaker,
         header: SignedObjectHeader {
             version: MARKETPLACE_PROTOCOL_VERSION,
             network: policy.network(),
@@ -218,7 +222,7 @@ pub fn create_shakescape_direct_offer(
         },
         offer_id: [0; 32],
         swap_session_id: session_id.into_bytes(),
-        maker_settlement_public_key: settlement.compressed_public_key(),
+        offer_setter_settlement_public_key: settlement.compressed_public_key(),
         offered_asset: request.offered_asset,
         offered_amount: AssetAmount::new(u128::from(request.offered_amount)),
         received_asset: request.received_asset,
@@ -262,7 +266,7 @@ pub fn create_shakescape_direct_offer(
     })
 }
 
-/// Turn one already admitted exact take of a local BTC-for-HNS offer into the
+/// Turn one already admitted exact offer acceptance into the responder's
 /// maker-signed canonical HTLC proposal. The maker's preimage is derived from
 /// the encrypted recovery seed and persisted before the proposal is admitted,
 /// making restart recovery independent of process memory.
@@ -283,37 +287,60 @@ pub fn create_shakescape_direct_maker_proposal(
     let record = load_shakescape_direct_swap(store, policy, request.session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
     if record.offer.swap_session_id != request.session_id.into_bytes()
-        || record.take.swap_session_id != request.session_id.into_bytes()
+        || record.acceptance.swap_session_id != request.session_id.into_bytes()
         || !is_hns_btc_direction(record.offer.offered_asset, record.offer.received_asset)
     {
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
-    let local = load_local_offer(store, request.wallet_id, record.offer.offer_id)?;
-    if local.session_id != request.session_id
-        || local.offer_id != ObjectHash::new(record.offer.offer_id)
-    {
-        return Err(MarketError::ShakescapeDirectSwapConflict);
-    }
+    let intent_id = match record.offer.role_model {
+        DirectOfferRoleModel::LegacyOfferSetterMaker => {
+            let local = load_legacy_local_offer(store, request.wallet_id, record.offer.offer_id)?;
+            if local.session_id != request.session_id
+                || local.offer_id != ObjectHash::new(record.offer.offer_id)
+            {
+                return Err(MarketError::ShakescapeDirectSwapConflict);
+            }
+            local.intent_id
+        }
+        DirectOfferRoleModel::OfferSetterTaker => {
+            let local = crate::direct_responder::load_local_acceptance(
+                store,
+                request.wallet_id,
+                request.session_id,
+            )?
+            .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
+            if local.offer_id != ObjectHash::new(record.offer.offer_id)
+                || crate::direct_responder::is_local_acceptance_abandoned(
+                    store,
+                    request.wallet_id,
+                    request.session_id,
+                )?
+            {
+                return Err(MarketError::ShakescapeDirectSwapConflict);
+            }
+            local.offer_id
+        }
+    };
     if let Some(proposal) = record.proposal.as_ref() {
         match proposal.verify_at(policy.network(), request.now_unix) {
             Ok(()) => {
                 let proposal = proposal.clone();
                 let envelope = CrossChainMessage::SwapSessionProposal(proposal.clone())
-                    .encode_envelope(record.take_request_id)
+                    .encode_envelope(record.acceptance_request_id)
                     .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
                 return Ok(ShakescapeBtcForHnsMakerProposal { proposal, envelope });
             }
             Err(MarketplaceError::Expired { .. }) if record.hello.is_some() => {
                 let proposal = proposal.clone();
                 let envelope = CrossChainMessage::SwapSessionProposal(proposal.clone())
-                    .encode_envelope(record.take_request_id)
+                    .encode_envelope(record.acceptance_request_id)
                     .map_err(|_| MarketError::CorruptShakescapeDirectSwap)?;
                 return Ok(ShakescapeBtcForHnsMakerProposal { proposal, envelope });
             }
             // No taker signature, watch, funding, or execution can exist
             // before the hello. Rebuild the exact proposal with a fresh
             // bounded funding interval while retaining the same session,
-            // offer, take, settlement key, and deterministic preimage.
+            // offer, acceptance, settlement key, and deterministic preimage.
             Err(MarketplaceError::Expired { .. }) => {}
             Err(_) => return Err(MarketError::CorruptShakescapeDirectSwap),
         }
@@ -329,7 +356,7 @@ pub fn create_shakescape_direct_maker_proposal(
     let offered_refund_at = received_refund_at
         .checked_add(request.refund_safety_margin_seconds)
         .ok_or(MarketError::UnsafeTimeouts)?;
-    if funding_expires_at > record.take.header.expires_at
+    if funding_expires_at > record.acceptance.header.expires_at
         || funding_expires_at > received_refund_at
         || u32::try_from(offered_refund_at).is_err()
     {
@@ -340,7 +367,7 @@ pub fn create_shakescape_direct_maker_proposal(
         store,
         request.wallet_id,
         request.session_id,
-        local.intent_id,
+        intent_id,
         record.offer.offer_id,
     )?;
     store.put_secret(
@@ -357,23 +384,56 @@ pub fn create_shakescape_direct_maker_proposal(
             session_id: request.session_id,
             participant: SwapParticipant::Maker,
             network: policy.network(),
-            intent_id: local.intent_id,
+            intent_id,
         },
     )
     .map_err(|_| MarketError::Persistence)?;
-    if settlement.public_key() != record.offer.maker_settlement_public_key {
+    let expected_maker_key = match record.offer.role_model {
+        DirectOfferRoleModel::LegacyOfferSetterMaker => {
+            record.offer.offer_setter_settlement_public_key
+        }
+        DirectOfferRoleModel::OfferSetterTaker => {
+            record.acceptance.responding_maker_settlement_public_key
+        }
+    };
+    if settlement.public_key() != expected_maker_key {
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
+    let (
+        maker_identity,
+        maker_sequence,
+        taker_settlement_public_key,
+        offered_asset,
+        offered_amount,
+        received_asset,
+        received_amount,
+    ) = match record.offer.role_model {
+        DirectOfferRoleModel::LegacyOfferSetterMaker => (
+            record.offer.header.signer_public_key,
+            record.offer.header.sequence,
+            record.acceptance.responding_maker_settlement_public_key,
+            record.offer.offered_asset,
+            record.offer.offered_amount,
+            record.offer.received_asset,
+            record.offer.received_amount,
+        ),
+        DirectOfferRoleModel::OfferSetterTaker => (
+            record.acceptance.header.signer_public_key,
+            record.acceptance.header.sequence,
+            record.offer.offer_setter_settlement_public_key,
+            record.offer.received_asset,
+            record.offer.received_amount,
+            record.offer.offered_asset,
+            record.offer.offered_amount,
+        ),
+    };
     let mut hello = SwapSessionHello {
         header: SignedObjectHeader {
             version: MARKETPLACE_PROTOCOL_VERSION,
             network: policy.network(),
             pair: MarketPair::HNS_BTC,
-            signer_public_key: record.offer.header.signer_public_key,
-            sequence: record
-                .offer
-                .header
-                .sequence
+            signer_public_key: maker_identity,
+            sequence: maker_sequence
                 .checked_add(1)
                 .ok_or(MarketError::InvalidShakescapeDirectSwap)?,
             created_at: request.now_unix,
@@ -382,20 +442,20 @@ pub fn create_shakescape_direct_maker_proposal(
         direct_offer_id: record.offer.offer_id,
         swap_session_id: request.session_id.into_bytes(),
         maker_settlement_public_key: settlement.public_key(),
-        taker_settlement_public_key: record.take.taker_settlement_public_key,
-        offered_asset: record.offer.offered_asset,
-        offered_amount: record.offer.offered_amount,
-        received_asset: record.offer.received_asset,
-        received_amount: record.offer.received_amount,
+        taker_settlement_public_key,
+        offered_asset,
+        offered_amount,
+        received_asset,
+        received_amount,
         hashlock,
-        first_funding_chain: record.offer.offered_asset.chain(),
+        first_funding_chain: offered_asset.chain(),
         offered_lock_commitment: [1; 32],
         offered_refund_deadline: SettlementDeadline {
             kind: DeadlineKind::UnixTime,
             value: offered_refund_at,
         },
         offered_minimum_confirmations: confirmations_for(
-            record.offer.offered_asset,
+            offered_asset,
             request.bitcoin_minimum_confirmations,
             request.hns_minimum_confirmations,
         )?,
@@ -405,7 +465,7 @@ pub fn create_shakescape_direct_maker_proposal(
             value: received_refund_at,
         },
         received_minimum_confirmations: confirmations_for(
-            record.offer.received_asset,
+            received_asset,
             request.bitcoin_minimum_confirmations,
             request.hns_minimum_confirmations,
         )?,
@@ -418,7 +478,7 @@ pub fn create_shakescape_direct_maker_proposal(
         .into_maker_proposal(hello)
         .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     let envelope = CrossChainMessage::SwapSessionProposal(proposal.clone())
-        .encode_envelope(record.take_request_id)
+        .encode_envelope(record.acceptance_request_id)
         .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
     admit_shakescape_direct_swap_proposal(store, policy, &envelope, request.now_unix)?;
     Ok(ShakescapeBtcForHnsMakerProposal { proposal, envelope })
@@ -458,7 +518,15 @@ pub fn derive_local_btc_for_hns_maker_key(
     let result = derive_local_direct_maker_key(store, policy, wallet_id, session_id)?;
     let record = load_shakescape_direct_swap(store, policy, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
-    if record.offer.offered_asset != AssetId::BTC || record.offer.received_asset != AssetId::HNS {
+    let (maker_offered, maker_received) = match record.offer.role_model {
+        DirectOfferRoleModel::LegacyOfferSetterMaker => {
+            (record.offer.offered_asset, record.offer.received_asset)
+        }
+        DirectOfferRoleModel::OfferSetterTaker => {
+            (record.offer.received_asset, record.offer.offered_asset)
+        }
+    };
+    if maker_offered != AssetId::BTC || maker_received != AssetId::HNS {
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
     Ok(result)
@@ -473,9 +541,37 @@ pub fn derive_local_direct_maker_key(
 ) -> Result<(crate::CrossChainSwapKey, u64), MarketError> {
     let record = load_shakescape_direct_swap(store, policy, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
-    let local = load_local_offer(store, wallet_id, record.offer.offer_id)?;
-    if local.session_id != session_id
-        || record.offer.swap_session_id != session_id.into_bytes()
+    let (intent_id, fee_reserve, expected_key) = match record.offer.role_model {
+        DirectOfferRoleModel::LegacyOfferSetterMaker => {
+            let local = load_legacy_local_offer(store, wallet_id, record.offer.offer_id)?;
+            if local.session_id != session_id {
+                return Err(MarketError::ShakescapeDirectSwapConflict);
+            }
+            (
+                local.intent_id,
+                local.bitcoin_fee_reserve_sats,
+                record.offer.offer_setter_settlement_public_key,
+            )
+        }
+        DirectOfferRoleModel::OfferSetterTaker => {
+            let local =
+                crate::direct_responder::load_local_acceptance(store, wallet_id, session_id)?
+                    .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
+            if local.offer_id != ObjectHash::new(record.offer.offer_id)
+                || crate::direct_responder::is_local_acceptance_abandoned(
+                    store, wallet_id, session_id,
+                )?
+            {
+                return Err(MarketError::ShakescapeDirectSwapConflict);
+            }
+            (
+                local.offer_id,
+                local.hns_fee_reserve_dollarydoos,
+                record.acceptance.responding_maker_settlement_public_key,
+            )
+        }
+    };
+    if record.offer.swap_session_id != session_id.into_bytes()
         || !is_hns_btc_direction(record.offer.offered_asset, record.offer.received_asset)
     {
         return Err(MarketError::ShakescapeDirectSwapConflict);
@@ -487,18 +583,19 @@ pub fn derive_local_direct_maker_key(
             session_id,
             participant: SwapParticipant::Maker,
             network: policy.network(),
-            intent_id: local.intent_id,
+            intent_id,
         },
     )
     .map_err(|_| MarketError::Persistence)?;
-    if key.public_key() != record.offer.maker_settlement_public_key {
+    if key.public_key() != expected_key {
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
-    Ok((key, local.bitcoin_fee_reserve_sats))
+    Ok((key, fee_reserve))
 }
 
-/// Identify a locally-created maker session from its validated durable offer
-/// record without deriving settlement key material. This is suitable for
+/// Identify the local atomic-swap maker without deriving settlement key
+/// material. Current sessions use the responder's acceptance record; legacy
+/// sessions retain the original offer-setter maker marker. This is suitable for
 /// bounded native status projections; transaction authorization still derives
 /// and proves the exact session key independently.
 pub fn is_local_shakescape_direct_maker(
@@ -510,10 +607,24 @@ pub fn is_local_shakescape_direct_maker(
     let Some(record) = load_shakescape_direct_swap(store, policy, session_id)? else {
         return Ok(false);
     };
-    match load_local_offer(store, wallet_id, record.offer.offer_id) {
-        Ok(local) => Ok(local.session_id == session_id),
-        Err(MarketError::UnknownShakescapeDirectOffer) => Ok(false),
-        Err(error) => Err(error),
+    match record.offer.role_model {
+        DirectOfferRoleModel::LegacyOfferSetterMaker => {
+            match load_legacy_local_offer(store, wallet_id, record.offer.offer_id) {
+                Ok(local) => Ok(local.session_id == session_id),
+                Err(MarketError::UnknownShakescapeDirectOffer) => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+        DirectOfferRoleModel::OfferSetterTaker => {
+            if crate::direct_responder::is_local_acceptance_abandoned(store, wallet_id, session_id)?
+            {
+                return Ok(false);
+            }
+            Ok(
+                crate::direct_responder::load_local_acceptance(store, wallet_id, session_id)?
+                    .is_some_and(|local| local.offer_id == ObjectHash::new(record.offer.offer_id)),
+            )
+        }
     }
 }
 
@@ -619,6 +730,7 @@ pub fn cancel_shakescape_local_direct_offer(
     }
     let identity = derive_board_identity(store, wallet_id, policy)?;
     let mut cancellation = DirectOfferCancellation {
+        role_model: DirectOfferRoleModel::OfferSetterTaker,
         header: SignedObjectHeader {
             version: MARKETPLACE_PROTOCOL_VERSION,
             network: policy.network(),
@@ -691,7 +803,7 @@ pub fn list_local_shakescape_direct_offers(
 
 /// Return only cancellation tombstones signed by this wallet's local board
 /// identity. A wallet may retain and display remote cancellations, but must
-/// never publish them as proof that its current transport owns the maker
+/// never publish them as proof that its current transport owns the offer-setter
 /// route for that offer.
 pub fn list_local_shakescape_direct_offer_cancellations(
     store: &WalletStore,
@@ -728,19 +840,44 @@ pub fn list_local_shakescape_direct_offer_cancellations(
     Ok(cancellations)
 }
 
-/// Sum Bitcoin still committed by local maker offers. The offered amount is
-/// the entire future HTLC value and already includes its settlement-fee cap.
-/// Once a countersigned
-/// execution exists, its durable state—not board expiry—controls reservation:
-/// funds remain reserved through pending first funding and are released only
-/// after locally verified first-chain funding has consumed them (or the
-/// execution reaches a terminal state).
+/// Sum Bitcoin committed by local offer setters. Under the current role model
+/// the setter becomes the execution taker and funds this amount second.
 pub fn reserved_local_shakescape_btc_maker_sats(
     store: &WalletStore,
     policy: &crate::ShakescapeDirectSwapPolicy,
     wallet_id: WalletId,
     now_unix: u64,
 ) -> Result<u64, MarketError> {
+    reserved_local_shakescape_offer_setter_amount(store, policy, wallet_id, AssetId::BTC, now_unix)
+}
+
+/// Sum HNS committed by local offer setters. Under the current role model the
+/// setter becomes the execution taker and funds this amount second.
+pub fn reserved_local_shakescape_hns_maker_dollarydoos(
+    store: &WalletStore,
+    policy: &crate::ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    now_unix: u64,
+) -> Result<u64, MarketError> {
+    reserved_local_shakescape_offer_setter_amount(store, policy, wallet_id, AssetId::HNS, now_unix)
+}
+
+/// Sum funds committed by local offer intents for one asset.
+///
+/// Before a response arrives, the live intent reserves the amount the setter
+/// promised. Once terms are countersigned, the setter is the swap taker, so
+/// the reservation remains until second-chain funding is confirmed (or until
+/// the still-unfunded session can no longer authorize that funding).
+pub fn reserved_local_shakescape_offer_setter_amount(
+    store: &WalletStore,
+    policy: &crate::ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    asset: AssetId,
+    now_unix: u64,
+) -> Result<u64, MarketError> {
+    if !matches!(asset, AssetId::BTC | AssetId::HNS) || now_unix == 0 {
+        return Err(MarketError::InvalidShakescapeDirectSwap);
+    }
     let stored = store.list_entities_by_id_prefix::<PersistedLocalDirectOffer>(
         EntityKind::ShakescapeBoardObject,
         &local_record_prefix(wallet_id),
@@ -758,18 +895,29 @@ pub fn reserved_local_shakescape_btc_maker_sats(
             local.offer_id.into_bytes(),
         )?
         .ok_or(MarketError::CorruptShakescapeDirectOfferBoard)?;
-        if offer.offer.offered_asset != AssetId::BTC {
+        if offer.offer.role_model != DirectOfferRoleModel::OfferSetterTaker
+            || offer.offer.offered_asset != asset
+        {
             continue;
         }
         let execution = store.load_workflow::<crate::SwapSession>(
             crate::shakescape_execution_workflow_id(local.session_id),
         )?;
-        let reserve = match execution.map(|stored| stored.state.state) {
+        let reserve = match execution.as_ref().map(|stored| stored.state.state) {
             Some(
                 crate::SwapState::TermsFrozen
                 | crate::SwapState::RefundsPrepared
-                | crate::SwapState::FirstFundingPending,
+                | crate::SwapState::FirstFundingPending
+                | crate::SwapState::SecondFundingPending,
             ) => true,
+            Some(crate::SwapState::FirstFunded) => {
+                let record = crate::load_shakescape_direct_swap(store, policy, local.session_id)?
+                    .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
+                now_unix < hello.header.expires_at
+            }
             Some(_) => false,
             None => offer.is_active_at(now_unix),
         };
@@ -781,21 +929,26 @@ pub fn reserved_local_shakescape_btc_maker_sats(
                 .ok_or(MarketError::InvalidShakescapeDirectOffer)?;
         }
     }
+    total = total
+        .checked_add(reserved_legacy_local_maker_amount(
+            store, policy, wallet_id, asset,
+        )?)
+        .ok_or(MarketError::InvalidShakescapeDirectOffer)?;
     Ok(total)
 }
 
-/// Sum HNS committed by active local HNS-for-BTC maker offers and sessions.
-/// The offered amount is the entire future HTLC value and already includes
-/// its settlement-fee cap.
-pub fn reserved_local_shakescape_hns_maker_dollarydoos(
+/// Preserve first-funding reservations for legacy offer setters only when an
+/// already-countersigned execution exists. Current transports reject legacy
+/// offer/take packets, so dormant legacy listings cannot become fundable.
+fn reserved_legacy_local_maker_amount(
     store: &WalletStore,
     policy: &crate::ShakescapeDirectSwapPolicy,
     wallet_id: WalletId,
-    now_unix: u64,
+    asset: AssetId,
 ) -> Result<u64, MarketError> {
     let stored = store.list_entities_by_id_prefix::<PersistedLocalDirectOffer>(
         EntityKind::ShakescapeBoardObject,
-        &local_record_prefix(wallet_id),
+        &legacy_local_record_prefix(wallet_id),
         crate::MAX_SHAKESCAPE_DIRECT_OFFERS + 1,
     )?;
     if stored.len() > crate::MAX_SHAKESCAPE_DIRECT_OFFERS {
@@ -803,30 +956,28 @@ pub fn reserved_local_shakescape_hns_maker_dollarydoos(
     }
     let mut total = 0_u64;
     for stored in stored {
-        let local = load_local_offer(store, wallet_id, stored.value.offer_id.into_bytes())?;
-        let offer = crate::load_shakescape_direct_offer(
-            store,
-            &policy.board_policy(),
-            local.offer_id.into_bytes(),
-        )?
-        .ok_or(MarketError::CorruptShakescapeDirectOfferBoard)?;
-        if offer.offer.offered_asset != AssetId::HNS {
+        let local = load_legacy_local_offer(store, wallet_id, stored.value.offer_id.into_bytes())?;
+        let record = crate::load_shakescape_direct_swap(store, policy, local.session_id)?
+            .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
+        if record.offer.role_model != DirectOfferRoleModel::LegacyOfferSetterMaker
+            || record.offer.offer_id != local.offer_id.into_bytes()
+            || record.offer.offered_asset != asset
+        {
             continue;
         }
-        let execution = store.load_workflow::<crate::SwapSession>(
+        let Some(execution) = store.load_workflow::<crate::SwapSession>(
             crate::shakescape_execution_workflow_id(local.session_id),
-        )?;
-        let reserve = match execution.map(|stored| stored.state.state) {
-            Some(
-                crate::SwapState::TermsFrozen
-                | crate::SwapState::RefundsPrepared
-                | crate::SwapState::FirstFundingPending,
-            ) => true,
-            Some(_) => false,
-            None => offer.is_active_at(now_unix),
+        )?
+        else {
+            continue;
         };
-        if reserve {
-            let amount = u64::try_from(offer.offer.offered_amount.get())
+        if matches!(
+            execution.state.state,
+            crate::SwapState::TermsFrozen
+                | crate::SwapState::RefundsPrepared
+                | crate::SwapState::FirstFundingPending
+        ) {
+            let amount = u64::try_from(record.offer.offered_amount.get())
                 .map_err(|_| MarketError::InvalidShakescapeDirectOffer)?;
             total = total
                 .checked_add(amount)
@@ -861,7 +1012,7 @@ fn validate_maker_proposal_request(
     Ok(())
 }
 
-fn load_local_offer(
+pub(crate) fn load_local_offer(
     store: &WalletStore,
     wallet_id: WalletId,
     offer_id: [u8; 32],
@@ -884,6 +1035,57 @@ fn load_local_offer(
         return Err(MarketError::CorruptShakescapeDirectOfferBoard);
     }
     Ok(record)
+}
+
+pub(crate) fn load_legacy_local_offer(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    offer_id: [u8; 32],
+) -> Result<PersistedLocalDirectOffer, MarketError> {
+    let stored = store
+        .load_entity::<PersistedLocalDirectOffer>(
+            EntityKind::ShakescapeBoardObject,
+            &legacy_local_record_id(wallet_id, offer_id),
+        )?
+        .ok_or(MarketError::UnknownShakescapeDirectOffer)?;
+    let record = stored.value;
+    if stored.revision != 1
+        || record.storage_version != LEGACY_STORAGE_VERSION
+        || record.wallet_id != wallet_id
+        || record.offer_id != ObjectHash::new(offer_id)
+        || record.session_id.as_bytes().iter().all(|byte| *byte == 0)
+        || record.intent_id.as_bytes().iter().all(|byte| *byte == 0)
+        || record.created_at_unix != stored.updated_at_unix
+        || stored.id != legacy_local_record_id(wallet_id, offer_id)
+    {
+        return Err(MarketError::CorruptShakescapeDirectOfferBoard);
+    }
+    Ok(record)
+}
+
+pub(crate) fn load_local_offer_for_session(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    session_id: SessionId,
+) -> Result<Option<PersistedLocalDirectOffer>, MarketError> {
+    let stored = store.list_entities_by_id_prefix::<PersistedLocalDirectOffer>(
+        EntityKind::ShakescapeBoardObject,
+        &local_record_prefix(wallet_id),
+        crate::MAX_SHAKESCAPE_DIRECT_OFFERS + 1,
+    )?;
+    if stored.len() > crate::MAX_SHAKESCAPE_DIRECT_OFFERS {
+        return Err(MarketError::ShakescapeDirectOfferCapacity);
+    }
+    let mut found = None;
+    for row in stored {
+        let local = load_local_offer(store, wallet_id, row.value.offer_id.into_bytes())?;
+        if local.session_id == session_id {
+            if found.replace(local).is_some() {
+                return Err(MarketError::CorruptShakescapeDirectOfferBoard);
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn derive_maker_preimage(
@@ -1025,11 +1227,22 @@ fn local_record_id(wallet_id: WalletId, offer_id: [u8; 32]) -> Vec<u8> {
     id
 }
 
+fn legacy_local_record_prefix(wallet_id: WalletId) -> Vec<u8> {
+    let mut id = Vec::with_capacity(LEGACY_RECORD_PREFIX.len() + 16);
+    id.extend_from_slice(LEGACY_RECORD_PREFIX);
+    id.extend_from_slice(wallet_id.as_bytes());
+    id
+}
+
+fn legacy_local_record_id(wallet_id: WalletId, offer_id: [u8; 32]) -> Vec<u8> {
+    let mut id = legacy_local_record_prefix(wallet_id);
+    id.extend_from_slice(&offer_id);
+    id
+}
+
 #[cfg(test)]
 mod tests {
-    use hns_marketplace_protocol::{
-        ChainId, DirectOfferTake, NetworkBinding, SignedObjectHeader, SwapAssetSide,
-    };
+    use hns_marketplace_protocol::{ChainId, NetworkBinding, SwapAssetSide};
     use hns_primitives::BlockHash;
     use hns_wallet_store::WalletStore;
 
@@ -1061,16 +1274,6 @@ mod tests {
         store
     }
 
-    fn public_key(secret: [u8; 32]) -> [u8; 33] {
-        SigningKey::from_bytes((&secret).into())
-            .expect("signing key")
-            .verifying_key()
-            .to_encoded_point(true)
-            .as_bytes()
-            .try_into()
-            .expect("compressed key")
-    }
-
     #[test]
     fn creates_recoverable_btc_for_hns_offer_and_lists_exact_reserve() {
         let wallet_id = WalletId::new([9; 16]);
@@ -1092,7 +1295,7 @@ mod tests {
         assert_eq!(created.offer.received_amount, 5_000_000);
         assert_ne!(
             created.offer.signer_public_key,
-            created.offer.maker_settlement_public_key
+            created.offer.offer_setter_settlement_public_key
         );
         let listed = list_local_shakescape_direct_offers(&store, &policy(), wallet_id, 101)
             .expect("local offers");
@@ -1215,18 +1418,20 @@ mod tests {
     }
 
     #[test]
-    fn admitted_take_creates_one_recoverable_canonical_btc_first_proposal() {
+    fn responding_maker_creates_one_recoverable_canonical_hns_first_proposal() {
         const START: u64 = 1_700_000_000;
-        let wallet_id = WalletId::new([6; 16]);
-        let mut store = seeded_store(wallet_id);
+        let offer_setter_id = WalletId::new([6; 16]);
+        let responding_maker_id = WalletId::new([7; 16]);
+        let mut offer_setter_store = seeded_store(offer_setter_id);
+        let mut responding_maker_store = seeded_store(responding_maker_id);
         let board_policy = policy();
         let swap_policy =
             crate::ShakescapeDirectSwapPolicy::new(board_policy).expect("swap policy");
         let created = create_shakescape_btc_for_hns_offer(
-            &mut store,
+            &mut offer_setter_store,
             &board_policy,
             ShakescapeBtcForHnsOfferRequest {
-                wallet_id,
+                wallet_id: offer_setter_id,
                 btc_amount_sats: 9_000,
                 hns_amount_dollarydoos: 2_000_000,
                 bitcoin_fee_reserve_sats: 1_000,
@@ -1236,38 +1441,43 @@ mod tests {
             },
         )
         .expect("offer");
-        let mut take = DirectOfferTake {
-            header: SignedObjectHeader {
-                version: MARKETPLACE_PROTOCOL_VERSION,
-                network: board_policy.network(),
-                pair: MarketPair::HNS_BTC,
-                signer_public_key: [0; 33],
-                sequence: 2,
-                created_at: START + 10,
-                expires_at: START + 10_000,
-            },
-            offer_id: created.offer.offer_id.into_bytes(),
-            swap_session_id: created.offer.session_id.into_bytes(),
-            taker_settlement_public_key: public_key([11; 32]),
-            signature: [0; 64],
-        };
-        take.sign(&[10; 32]).expect("take signature");
-        let take_envelope = CrossChainMessage::TakeDirectOffer(take.clone())
-            .encode_envelope(77)
-            .expect("take envelope");
-        crate::admit_shakescape_direct_offer_take(
-            &mut store,
-            &swap_policy,
-            &take_envelope,
-            START + 10,
+        let signed_offer = crate::load_shakescape_direct_offer(
+            &offer_setter_store,
+            &board_policy,
+            created.offer.offer_id.into_bytes(),
         )
-        .expect("admit take");
+        .expect("load offer")
+        .expect("offer exists")
+        .offer;
+        let offer_envelope = CrossChainMessage::DirectOffer(signed_offer)
+            .encode_envelope(1)
+            .expect("offer envelope");
+        crate::admit_shakescape_direct_offer(
+            &mut responding_maker_store,
+            &board_policy,
+            &offer_envelope,
+            START,
+        )
+        .expect("responding maker admits offer");
+        let acceptance = crate::create_shakescape_hns_for_btc_take(
+            &mut responding_maker_store,
+            &swap_policy,
+            crate::ShakescapeHnsForBtcTakeRequest {
+                wallet_id: responding_maker_id,
+                offer_id: created.offer.offer_id,
+                hns_fee_reserve_dollarydoos: 10_000,
+                created_at_unix: START + 10,
+                expires_at_unix: START + 10_000,
+                nonce: [11; 32],
+            },
+        )
+        .expect("responder accepts offer as maker");
 
         let made = create_shakescape_btc_for_hns_maker_proposal(
-            &mut store,
+            &mut responding_maker_store,
             &swap_policy,
             ShakescapeBtcForHnsMakerProposalRequest {
-                wallet_id,
+                wallet_id: responding_maker_id,
                 session_id: created.offer.session_id,
                 now_unix: START + 20,
                 funding_window_seconds: 600,
@@ -1281,48 +1491,62 @@ mod tests {
         made.proposal
             .verify_for_direct_offer(
                 &crate::load_shakescape_direct_offer(
-                    &store,
+                    &responding_maker_store,
                     &board_policy,
                     created.offer.offer_id.into_bytes(),
                 )
                 .expect("load offer")
                 .expect("offer exists")
                 .offer,
-                &take,
+                &crate::load_shakescape_direct_swap(
+                    &responding_maker_store,
+                    &swap_policy,
+                    created.offer.session_id,
+                )
+                .expect("load direct swap")
+                .expect("direct swap exists")
+                .acceptance,
                 board_policy.network(),
                 START + 20,
             )
             .expect("proposal verifies");
         let terms = made.proposal.terms();
-        assert_eq!(terms.first_funding_chain, ChainId::BITCOIN);
+        assert_eq!(terms.offered_asset, AssetId::HNS);
+        assert_eq!(terms.received_asset, AssetId::BTC);
+        assert_eq!(terms.first_funding_chain, ChainId::HANDSHAKE);
         assert_eq!(terms.offered_refund_deadline.value, START + 7_220);
         assert_eq!(terms.received_refund_deadline.value, START + 3_620);
         assert_eq!(
-            build_shakescape_bitcoin_htlc(terms, SwapAssetSide::Offered)
+            build_shakescape_bitcoin_htlc(terms, SwapAssetSide::Received)
                 .expect("bitcoin descriptor")
                 .commitment
                 .into_bytes(),
-            terms.offered_lock_commitment
+            terms.received_lock_commitment
         );
-        let preimage = load_shakescape_btc_for_hns_maker_preimage(&store, created.offer.session_id)
-            .expect("load preimage")
-            .expect("preimage retained");
+        let preimage = load_shakescape_btc_for_hns_maker_preimage(
+            &responding_maker_store,
+            created.offer.session_id,
+        )
+        .expect("load preimage")
+        .expect("preimage retained");
         assert_eq!(
             Sha256::digest(preimage.expose_for_settlement()).as_slice(),
             terms.hashlock
         );
         let (request_id, wire) =
             CrossChainMessage::decode_envelope(&made.envelope).expect("decode proposal envelope");
-        assert_eq!(request_id, 77);
+        let (acceptance_request_id, _) =
+            CrossChainMessage::decode_envelope(&acceptance.envelope).expect("decode acceptance");
+        assert_eq!(request_id, acceptance_request_id);
         assert_eq!(
             wire,
             CrossChainMessage::SwapSessionProposal(made.proposal.clone())
         );
         let retried = create_shakescape_btc_for_hns_maker_proposal(
-            &mut store,
+            &mut responding_maker_store,
             &swap_policy,
             ShakescapeBtcForHnsMakerProposalRequest {
-                wallet_id,
+                wallet_id: responding_maker_id,
                 session_id: created.offer.session_id,
                 now_unix: START + 21,
                 funding_window_seconds: 600,
@@ -1336,10 +1560,10 @@ mod tests {
         assert_eq!(retried.envelope, made.envelope);
 
         let refreshed = create_shakescape_btc_for_hns_maker_proposal(
-            &mut store,
+            &mut responding_maker_store,
             &swap_policy,
             ShakescapeBtcForHnsMakerProposalRequest {
-                wallet_id,
+                wallet_id: responding_maker_id,
                 session_id: created.offer.session_id,
                 now_unix: START + 700,
                 funding_window_seconds: 600,
@@ -1356,10 +1580,13 @@ mod tests {
             refreshed.proposal.terms().hashlock,
             made.proposal.terms().hashlock
         );
-        let stored =
-            crate::load_shakescape_direct_swap(&store, &swap_policy, created.offer.session_id)
-                .expect("load refreshed swap")
-                .expect("refreshed swap exists");
+        let stored = crate::load_shakescape_direct_swap(
+            &responding_maker_store,
+            &swap_policy,
+            created.offer.session_id,
+        )
+        .expect("load refreshed swap")
+        .expect("refreshed swap exists");
         assert_eq!(stored.proposal.as_ref(), Some(&refreshed.proposal));
         assert!(stored.hello.is_none());
     }

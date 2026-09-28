@@ -20,6 +20,7 @@ pub use hns_wallet_bitcoin_kyoto::{
 };
 pub use market::{
     MINIMUM_BITCOIN_FEE_RESERVE_SATS, MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary,
+    MobileDirectOfferAcceptanceApproval, MobileDirectOfferAcceptanceSummary,
     MobileDirectOfferSummary, MobileDirectOfferTakeApproval, MobileDirectOfferTakeSummary,
     MobileHnsForBtcOfferApproval, MobileShakescapeBitcoinAbsencePermit,
     MobileShakescapeBitcoinFundingPermit, MobileShakescapeBitcoinSettlementPermit,

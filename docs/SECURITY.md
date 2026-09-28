@@ -28,8 +28,8 @@ independently disabled.
 - The wallet database and keys live in a native/mobile wallet process. Website
   JavaScript, extension local storage, and native-messaging frames never carry
   seed or raw private-key bytes.
-- Shakescape/Brontide authenticates a connection, not a listing, live-board level,
-  swap take, chain
+- Shakescape/Brontide authenticates a connection, not a listing, live-board
+  level, offer acceptance, chain
   state, or peer claim. Fixed-price discovery checks the exact registry/message
   family, canonical signature/content hash, monotonic seller/name sequence,
   network/genesis, active time window, and exact locking coin locally. The
@@ -38,7 +38,9 @@ independently disabled.
   cache bytes never become action authority after restart. The HNS/BTC direct
   board persists only exact signed offer terms and cancellations. It has no
   price feed, price history, reporter/source set, or external oracle. A live
-  board level is a display aggregation; proposal, accepted hello, and funding
+  board level is a display aggregation. The responder is the execution maker;
+  the original offer setter becomes execution taker when it countersigns the
+  responder's proposal. Acceptance, proposal, countersigned hello, and funding
   each verify one original offer and its exact amounts. Full retained-row
   restart validation still supplies neither live chain nor value authority, and
   it does not detect rollback of the complete authenticated database snapshot.

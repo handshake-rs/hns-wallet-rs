@@ -198,10 +198,11 @@ as authenticated history without becoming market authority.
 
 The board groups live rows by an exact reduced BTC-per-HNS ratio only for UI
 presentation. It stores no price history, price calculation, reporter/source
-policy, oracle value, remote feed, or peer-supplied rate authority. A take,
-proposal, and accepted hello must each bind one original direct-offer ID and its
-exact native amounts. After restart, funding/redeem/refund behavior remains
-blocked until the wallet reacquires independent local chain evidence.
+policy, oracle value, remote feed, or peer-supplied rate authority. A responder
+acceptance, responder-maker proposal, and offer-setter countersignature must
+each bind one original direct-offer ID and its exact native amounts. After
+restart, funding/redeem/refund behavior remains blocked until the wallet
+reacquires independent local chain evidence.
 
 The offline name-market publication outbox uses a second fixed record ID in
 the encrypted `ShakescapeBoardObject` namespace and its own store CAS revision. It

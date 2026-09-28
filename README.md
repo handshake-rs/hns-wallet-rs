@@ -27,9 +27,9 @@ state machines and fail-closed authority checks beneath those integrations.
   transfer maturity window.
 - Bitcoin BDK/Kyoto synchronization, compact-filter scanning, receive/send,
   transaction history, and durable broadcast recovery.
-- Signed direct HNS/BTC and BTC/HNS offers, cancellations, takes, bilateral
-  session negotiation, funding watches, redeem/refund recovery, and explicit
-  reservation accounting.
+- Signed direct HNS/BTC and BTC/HNS offer intents, cancellations, responder
+  acceptances, bilateral session negotiation, funding watches, redeem/refund
+  recovery, and explicit reservation accounting.
 - Direct ShakeScape peer/listener lifecycle and standard Handshake address
   discovery events for native mobile integration.
 - A versioned private wallet-service ABI and host-side correlation state.
