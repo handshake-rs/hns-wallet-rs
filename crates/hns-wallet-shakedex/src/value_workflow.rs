@@ -35,10 +35,6 @@ use crate::{
     verify_signed_buyer_fulfillment, verify_signed_script_finalize, verify_signed_seller_recovery,
 };
 
-// Schema v1 gains `StructuralPlan::ScriptFinalize` as an additive tagged
-// variant: this reader continues to decode every legacy v1 row. An older
-// binary cannot decode the new variant, so downgrading a wallet after writing
-// one is unsupported and remains unqualified.
 const SHAKEDEX_VALUE_WORKFLOW_SCHEMA_VERSION: u16 = 1;
 pub const MAX_SHAKEDEX_VALUE_WORKFLOWS: usize = 10_000;
 
@@ -654,9 +650,8 @@ pub struct ShakedexValueWorkflow {
     fee_base_units: BaseUnits,
     maximum_fee: BaseUnits,
     /// Buyer consent, committed by the exact fulfillment approval, for the
-    /// later recipient-fixed script FINALIZE fee. Historical workflows omit
-    /// it and must receive one fresh native approval at maturity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// later recipient-fixed script FINALIZE fee. `None` requires a fresh
+    /// native approval at maturity.
     automatic_finalize_maximum_fee: Option<BaseUnits>,
     minimum_confirmations: u32,
     prepared_transaction: Vec<u8>,
@@ -670,7 +665,6 @@ pub struct ShakedexValueWorkflow {
     confirmed_once: bool,
     conflicted_once: bool,
     competing_spenders: Vec<TransactionHash>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     reservation_release: Option<ShakedexReservationReleaseEvidence>,
 }
 

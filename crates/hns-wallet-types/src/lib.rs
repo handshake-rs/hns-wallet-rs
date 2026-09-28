@@ -7,7 +7,7 @@ use thiserror::Error;
 
 /// The complete canonical website-provider method vocabulary in stable enum
 /// order. Availability is negotiated separately.
-pub const PROVIDER_METHOD_WIRE_NAMES: [&str; 43] = [
+pub const PROVIDER_METHOD_WIRE_NAMES: [&str; 42] = [
     "wallet_getCapabilities",
     "wallet_getEnabledModules",
     "wallet_enableModule",
@@ -45,7 +45,6 @@ pub const PROVIDER_METHOD_WIRE_NAMES: [&str; 43] = [
     "swap_listDirectOffers",
     "swap_publishDirectOffer",
     "swap_cancelDirectOffer",
-    "swap_takeDirectOffer",
     "swap_acceptDirectOffer",
     "swap_getSession",
     "swap_redeem",
@@ -596,7 +595,7 @@ pub enum ApprovalKind {
     NameMarketOffer,
     NameMarketPurchase,
     DirectOffer,
-    DirectOfferTake,
+    DirectOfferAcceptance,
     SwapRedeem,
     SwapRefund,
     RecoveryPhraseDisplay,
@@ -616,7 +615,7 @@ pub enum WorkflowKind {
     ShakedexSellerOffer,
     ShakedexValue,
     DirectOffer,
-    DirectOfferTake,
+    DirectOfferAcceptance,
     AtomicSwap,
     Refund,
 }

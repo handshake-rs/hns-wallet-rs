@@ -5007,7 +5007,7 @@ const fn workflow_kind(kind: WorkflowKind) -> &'static str {
         WorkflowKind::ShakedexSellerOffer => "shakedex_seller_offer",
         WorkflowKind::ShakedexValue => "shakedex_value",
         WorkflowKind::DirectOffer => "direct_offer",
-        WorkflowKind::DirectOfferTake => "direct_offer_take",
+        WorkflowKind::DirectOfferAcceptance => "direct_offer_acceptance",
         WorkflowKind::AtomicSwap => "atomic_swap",
         WorkflowKind::Refund => "refund",
     }
@@ -5026,7 +5026,7 @@ fn parse_workflow_kind(value: &str) -> Result<WorkflowKind, StoreError> {
         "shakedex_seller_offer" => Ok(WorkflowKind::ShakedexSellerOffer),
         "shakedex_value" => Ok(WorkflowKind::ShakedexValue),
         "direct_offer" => Ok(WorkflowKind::DirectOffer),
-        "direct_offer_take" => Ok(WorkflowKind::DirectOfferTake),
+        "direct_offer_acceptance" => Ok(WorkflowKind::DirectOfferAcceptance),
         "atomic_swap" => Ok(WorkflowKind::AtomicSwap),
         "refund" => Ok(WorkflowKind::Refund),
         _ => Err(StoreError::CorruptMetadata),

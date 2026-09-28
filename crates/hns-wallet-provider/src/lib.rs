@@ -175,7 +175,6 @@ pub enum ProviderMethod {
     SwapListDirectOffers,
     SwapPublishDirectOffer,
     SwapCancelDirectOffer,
-    SwapTakeDirectOffer,
     SwapAcceptDirectOffer,
     SwapGetSession,
     SwapRedeem,
@@ -224,7 +223,6 @@ impl ProviderMethod {
         Self::SwapListDirectOffers,
         Self::SwapPublishDirectOffer,
         Self::SwapCancelDirectOffer,
-        Self::SwapTakeDirectOffer,
         Self::SwapAcceptDirectOffer,
         Self::SwapGetSession,
         Self::SwapRedeem,
@@ -313,7 +311,6 @@ impl ProviderMethod {
             Self::SwapListDirectOffers
             | Self::SwapPublishDirectOffer
             | Self::SwapCancelDirectOffer
-            | Self::SwapTakeDirectOffer
             | Self::SwapAcceptDirectOffer => Some(PermissionCapability::CrossChainMarket),
             Self::SwapGetSession | Self::SwapRedeem | Self::SwapRefund => {
                 Some(PermissionCapability::SwapSettlement)
@@ -345,9 +342,7 @@ impl ProviderMethod {
             Self::SwapPublishDirectOffer | Self::SwapCancelDirectOffer => {
                 Some(ApprovalKind::DirectOffer)
             }
-            Self::SwapTakeDirectOffer | Self::SwapAcceptDirectOffer => {
-                Some(ApprovalKind::DirectOfferTake)
-            }
+            Self::SwapAcceptDirectOffer => Some(ApprovalKind::DirectOfferAcceptance),
             Self::SwapRedeem => Some(ApprovalKind::SwapRedeem),
             Self::SwapRefund => Some(ApprovalKind::SwapRefund),
             _ => None,
@@ -1422,12 +1417,12 @@ mod tests {
 
     #[test]
     fn canonical_provider_method_set_has_exact_wire_round_trips() {
-        assert_eq!(ProviderMethod::ALL.len(), 43);
+        assert_eq!(ProviderMethod::ALL.len(), 42);
         let names: BTreeSet<_> = ProviderMethod::ALL
             .into_iter()
             .map(ProviderMethod::wire_name)
             .collect();
-        assert_eq!(names.len(), 43);
+        assert_eq!(names.len(), 42);
         for (index, method) in ProviderMethod::ALL.into_iter().enumerate() {
             assert_eq!(method.wire_name(), PROVIDER_METHOD_WIRE_NAMES[index]);
             assert!(matches!(

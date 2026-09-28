@@ -247,7 +247,6 @@
         "swap_listDirectOffers",
         "swap_publishDirectOffer",
         "swap_cancelDirectOffer",
-        "swap_takeDirectOffer",
         "swap_acceptDirectOffer",
         "swap_getSession",
         "swap_redeem",
@@ -279,7 +278,6 @@
         "nameMarket_recoverName",
         "swap_publishDirectOffer",
         "swap_cancelDirectOffer",
-        "swap_takeDirectOffer",
         "swap_acceptDirectOffer",
         "swap_redeem",
         "swap_refund"
@@ -883,7 +881,7 @@
           "additionalProperties": false,
           "required": ["kind", "directOfferId", "swapSessionId", "offered", "received", "refundTimeoutUnixMs", "maximumFee", "warnings"],
           "properties": {
-            "kind": { "const": "directOfferTake" },
+            "kind": { "const": "directOfferAcceptance" },
             "directOfferId": { "$ref": "#/$defs/asciiString" },
             "swapSessionId": { "$ref": "#/$defs/asciiString" },
             "offered": { "$ref": "#/$defs/privateNonzeroAmount" },
@@ -998,8 +996,8 @@
           "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOffer" }, "action": { "const": "cancel" } } } } }
         },
         {
-          "if": { "properties": { "method": { "enum": ["swap_takeDirectOffer", "swap_acceptDirectOffer"] } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOfferTake" } } } } }
+          "if": { "properties": { "method": { "const": "swap_acceptDirectOffer" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOfferAcceptance" } } } } }
         },
         {
           "if": { "properties": { "method": { "const": "swap_redeem" } } },
@@ -1755,7 +1753,7 @@
           "additionalProperties": false,
           "required": ["kind", "directOfferId", "swapSessionId", "offered", "received", "refundTimeoutUnixMs", "maximumFee", "warnings"],
           "properties": {
-            "kind": { "const": "directOfferTake" },
+            "kind": { "const": "directOfferAcceptance" },
             "directOfferId": { "$ref": "#/$defs/publicString" },
             "swapSessionId": { "$ref": "#/$defs/publicString" },
             "offered": { "$ref": "#/$defs/publicNonzeroAmount" },
@@ -1868,8 +1866,8 @@
           "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOffer" }, "action": { "const": "cancel" } } } } }
         },
         {
-          "if": { "properties": { "method": { "enum": ["swap_takeDirectOffer", "swap_acceptDirectOffer"] } } },
-          "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOfferTake" } } } } }
+          "if": { "properties": { "method": { "const": "swap_acceptDirectOffer" } } },
+          "then": { "properties": { "summary": { "properties": { "kind": { "const": "directOfferAcceptance" } } } } }
         },
         {
           "if": { "properties": { "method": { "const": "swap_redeem" } } },

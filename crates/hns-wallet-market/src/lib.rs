@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod direct_board;
-mod direct_maker;
+mod direct_offer;
 mod direct_responder;
 mod session_board;
 mod settlement_key;
@@ -29,7 +29,7 @@ pub use direct_board::{
     admit_shakescape_direct_offer_cancellation, live_shakescape_direct_offer_levels,
     load_shakescape_direct_offer, load_shakescape_direct_offers, shakescape_direct_offer_inventory,
 };
-pub use direct_maker::{
+pub use direct_offer::{
     ShakescapeBtcForHnsMakerProposal, ShakescapeBtcForHnsMakerProposalRequest,
     ShakescapeBtcForHnsOfferRequest, ShakescapeDirectMakerProposal,
     ShakescapeDirectMakerProposalRequest, ShakescapeDirectOfferRequest,
@@ -40,24 +40,19 @@ pub use direct_maker::{
     derive_local_btc_for_hns_maker_key, derive_local_direct_maker_key,
     is_local_shakescape_direct_maker, list_local_shakescape_direct_offer_cancellations,
     list_local_shakescape_direct_offers, load_shakescape_btc_for_hns_maker_preimage,
-    load_shakescape_direct_maker_preimage, reserved_local_shakescape_btc_maker_sats,
-    reserved_local_shakescape_hns_maker_dollarydoos, reserved_local_shakescape_offer_setter_amount,
+    load_shakescape_direct_maker_preimage, reserved_local_shakescape_offer_setter_amount,
 };
 pub use direct_responder::{
-    ShakescapeBtcForHnsTakeRequest, ShakescapeDirectOfferAcceptanceRequest,
-    ShakescapeDirectTakeRequest, ShakescapeHnsForBtcTakeRequest,
-    ShakescapeLocalDirectOfferAcceptance, ShakescapeLocalDirectTake,
-    ShakescapeOfferSetterAcceptedSession, ShakescapeTakerAcceptedSession,
-    abandon_pending_local_shakescape_direct_offer_acceptance,
-    abandon_pending_local_shakescape_direct_take, accept_shakescape_direct_maker_proposal,
-    accept_shakescape_hns_for_btc_maker_proposal, create_shakescape_btc_for_hns_take,
-    create_shakescape_direct_offer_acceptance, create_shakescape_direct_take,
-    create_shakescape_hns_for_btc_take, derive_local_direct_taker_key,
+    ShakescapeBtcForHnsOfferAcceptanceRequest, ShakescapeDirectOfferAcceptanceRequest,
+    ShakescapeHnsForBtcOfferAcceptanceRequest, ShakescapeLocalDirectOfferAcceptance,
+    ShakescapeOfferSetterAcceptedSession, abandon_pending_local_shakescape_direct_offer_acceptance,
+    accept_shakescape_direct_maker_proposal, accept_shakescape_hns_for_btc_maker_proposal,
+    create_shakescape_btc_for_hns_offer_acceptance, create_shakescape_direct_offer_acceptance,
+    create_shakescape_hns_for_btc_offer_acceptance, derive_local_direct_taker_key,
     derive_local_hns_for_btc_taker_key, is_local_shakescape_direct_taker,
-    list_local_shakescape_direct_offer_acceptances, list_local_shakescape_direct_takes,
+    list_local_shakescape_direct_offer_acceptances,
     list_pending_local_shakescape_direct_offer_acceptances,
-    list_pending_local_shakescape_direct_takes, reserved_local_shakescape_responder_amount,
-    reserved_local_shakescape_taker_amount,
+    reserved_local_shakescape_responder_amount,
 };
 pub use session_board::{
     MAX_SHAKESCAPE_DIRECT_SWAPS, ShakescapeDirectSwapAdmission, ShakescapeDirectSwapPeerStatus,
@@ -145,7 +140,6 @@ impl TimeoutPlan {
 pub enum SwapState {
     OfferPublished,
     /// The offer responder has committed to act as the executable swap maker.
-    #[serde(rename = "offer_acceptance_received", alias = "offer_take_received")]
     OfferAcceptanceReceived,
     OfferReserved,
     TermsFrozen,
@@ -1396,14 +1390,10 @@ mod tests {
     }
 
     #[test]
-    fn offer_acceptance_state_emits_current_name_and_reads_legacy_name() {
+    fn offer_acceptance_state_uses_canonical_name() {
         assert_eq!(
             serde_json::to_string(&SwapState::OfferAcceptanceReceived).unwrap(),
             "\"offer_acceptance_received\""
-        );
-        assert_eq!(
-            serde_json::from_str::<SwapState>("\"offer_take_received\"").unwrap(),
-            SwapState::OfferAcceptanceReceived
         );
     }
 

@@ -27,7 +27,7 @@ pub struct PrepareBuyerTrade {
     pub request_nonce: u64,
     pub maximum_fee: BaseUnits,
     /// A separately disclosed cap for the delayed script FINALIZE. `None`
-    /// retains the legacy one-more-approval behavior.
+    /// requires a separate approval when FINALIZE becomes available.
     pub automatic_finalize_maximum_fee: Option<BaseUnits>,
 }
 

@@ -16,10 +16,7 @@ use crate::{
     ShakescapePublicationAcceptanceSnapshot, VerifiedListingCancellation,
 };
 
-const LEGACY_SHAKESCAPE_OUTBOX_SCHEMA_VERSION: u16 = 1;
-const HANDOFF_SHAKESCAPE_OUTBOX_SCHEMA_VERSION: u16 = 2;
-const RELAY_SHAKESCAPE_OUTBOX_SCHEMA_VERSION: u16 = 3;
-const SHAKESCAPE_OUTBOX_SCHEMA_VERSION: u16 = 4;
+const SHAKESCAPE_OUTBOX_SCHEMA_VERSION: u16 = 1;
 const SHAKESCAPE_OUTBOX_ENVELOPE_ID_DOMAIN: &[u8] = b"hns-wallet-shakescape-outbox-envelope-v1\0";
 const SHAKESCAPE_OUTBOX_ATTEMPT_ID_DOMAIN: &[u8] = b"hns-wallet-shakescape-handoff-attempt-v1\0";
 const SHAKESCAPE_OUTBOX_RECORD_ID: &[u8] = b"canonical-name-market-outbox-v1";
@@ -68,11 +65,6 @@ pub enum ShakescapeOutboxState {
         prepared_at_unix: u64,
         announced_at_unix: u64,
     },
-    /// Immutable terminal state retained only for schema-v1 compatibility.
-    /// Schemas v2/v3 expose no API that can create protocol acknowledgement.
-    Acknowledged {
-        acknowledged_at_unix: u64,
-    },
     Exhausted {
         exhausted_at_unix: u64,
     },
@@ -94,7 +86,6 @@ struct ShakescapeOutboxEntry {
     pub retry_attempts: u16,
     pub created_at_unix: u64,
     pub last_attempt_at_unix: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance: Option<PersistedShakescapePublicationAcceptance>,
 }
 
@@ -105,7 +96,7 @@ struct ShakescapeOutboxEntry {
 /// ```compile_fail
 /// use hns_wallet_shakedex::ShakescapePublicationOutbox;
 /// let _: ShakescapePublicationOutbox = serde_json::from_str(
-///     r#"{"schema_version":2,"entries":[]}"#,
+///     r#"{"schema_version":1,"entries":[]}"#,
 /// ).unwrap();
 /// ```
 ///
@@ -278,7 +269,6 @@ impl ShakescapePublicationOutbox {
                     ShakescapeOutboxState::HandoffPrepared { .. }
                     | ShakescapeOutboxState::RelayAccepted { .. }
                     | ShakescapeOutboxState::DirectAnnounced { .. }
-                    | ShakescapeOutboxState::Acknowledged { .. }
                     | ShakescapeOutboxState::Exhausted { .. } => return None,
                 };
                 (due_at_unix <= now_unix).then_some((
@@ -928,38 +918,7 @@ pub fn load_shakescape_publication_outbox(
         SHAKESCAPE_OUTBOX_RECORD_ID,
     )? {
         Some(stored) => {
-            let source_schema_version = stored.value.schema_version;
-            if !matches!(
-                source_schema_version,
-                LEGACY_SHAKESCAPE_OUTBOX_SCHEMA_VERSION
-                    | HANDOFF_SHAKESCAPE_OUTBOX_SCHEMA_VERSION
-                    | RELAY_SHAKESCAPE_OUTBOX_SCHEMA_VERSION
-                    | SHAKESCAPE_OUTBOX_SCHEMA_VERSION
-            ) || stored
-                .value
-                .entries
-                .iter()
-                .any(|entry| match source_schema_version {
-                    LEGACY_SHAKESCAPE_OUTBOX_SCHEMA_VERSION => {
-                        matches!(
-                            entry.state,
-                            ShakescapeOutboxState::HandoffPrepared { .. }
-                                | ShakescapeOutboxState::RelayAccepted { .. }
-                        ) || entry.acceptance.is_some()
-                    }
-                    HANDOFF_SHAKESCAPE_OUTBOX_SCHEMA_VERSION => {
-                        matches!(
-                            entry.state,
-                            ShakescapeOutboxState::Acknowledged { .. }
-                                | ShakescapeOutboxState::RelayAccepted { .. }
-                        ) || entry.acceptance.is_some()
-                    }
-                    RELAY_SHAKESCAPE_OUTBOX_SCHEMA_VERSION | SHAKESCAPE_OUTBOX_SCHEMA_VERSION => {
-                        false
-                    }
-                    _ => true,
-                })
-            {
+            if stored.value.schema_version != SHAKESCAPE_OUTBOX_SCHEMA_VERSION {
                 return Err(ShakedexError::CorruptShakescapeOutbox);
             }
             let outbox = ShakescapePublicationOutbox {
@@ -1512,12 +1471,6 @@ fn validate_record_time(
             )
             || matches!(
                 entry.state,
-                ShakescapeOutboxState::Acknowledged {
-                    acknowledged_at_unix
-                } if acknowledged_at_unix > updated_at_unix
-            )
-            || matches!(
-                entry.state,
                 ShakescapeOutboxState::Exhausted {
                     exhausted_at_unix
                 } if exhausted_at_unix > updated_at_unix
@@ -1712,20 +1665,6 @@ fn validate_entry(entry: &ShakescapeOutboxEntry) -> Result<(), ShakedexError> {
                         prepared_at_unix,
                     )
             {
-                return Err(ShakedexError::CorruptShakescapeOutbox);
-            }
-        }
-        ShakescapeOutboxState::Acknowledged {
-            acknowledged_at_unix,
-        } => {
-            if acknowledged_at_unix < entry.created_at_unix
-                || entry
-                    .last_attempt_at_unix
-                    .is_some_and(|attempt| acknowledged_at_unix < attempt)
-            {
-                return Err(ShakedexError::CorruptShakescapeOutbox);
-            }
-            if (entry.retry_attempts == 0) != entry.last_attempt_at_unix.is_none() {
                 return Err(ShakedexError::CorruptShakescapeOutbox);
             }
         }
@@ -2300,131 +2239,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn schema_v1_migrates_on_preparation_and_acknowledgement_stays_immutable() {
-        let (offer, listing, _, _) = publication_fixtures();
-        let (_cleanup, mut store, _) = test_wallet_store();
-        let mut pending = ShakescapePublicationOutbox::default();
-        let envelope_id = pending
-            .enqueue_offer(&offer, &listing, CREATED_AT)
-            .expect("enqueue legacy pending")
-            .envelope_id();
-        let legacy = PersistedShakescapePublicationOutbox {
-            schema_version: LEGACY_SHAKESCAPE_OUTBOX_SCHEMA_VERSION,
-            entries: pending.entries.clone(),
-        };
-        let revision = store
-            .save_shakescape_board_object(SHAKESCAPE_OUTBOX_RECORD_ID, 0, &legacy, CREATED_AT)
-            .expect("save schema-v1 pending row");
-        let loaded = load_shakescape_publication_outbox(&store).expect("load schema-v1 row");
-        assert_eq!(
-            loaded.outbox.schema_version,
-            SHAKESCAPE_OUTBOX_SCHEMA_VERSION
-        );
-        let prepared = match prepare_next_shakescape_handoff(&mut store, revision, CREATED_AT + 1)
-            .expect("prepare migrates schema")
-        {
-            ShakescapeHandoffPreparation::Prepared(prepared) => prepared,
-            _ => panic!("legacy pending row must prepare"),
-        };
-        let persisted = store
-            .shakescape_board_object::<PersistedShakescapePublicationOutbox>(
-                SHAKESCAPE_OUTBOX_RECORD_ID,
-            )
-            .expect("read migrated row")
-            .expect("migrated row exists");
-        assert_eq!(
-            persisted.value.schema_version,
-            SHAKESCAPE_OUTBOX_SCHEMA_VERSION
-        );
-        assert_eq!(prepared.envelope_id(), envelope_id);
-
-        let (_ack_cleanup, mut ack_store, _) = test_wallet_store();
-        let mut acknowledged = ShakescapePublicationOutbox::default();
-        acknowledged
-            .enqueue_offer(&offer, &listing, CREATED_AT)
-            .expect("enqueue legacy acknowledged row");
-        acknowledged.entries[0].state = ShakescapeOutboxState::Acknowledged {
-            acknowledged_at_unix: CREATED_AT + 1,
-        };
-        let legacy_acknowledged = PersistedShakescapePublicationOutbox {
-            schema_version: LEGACY_SHAKESCAPE_OUTBOX_SCHEMA_VERSION,
-            entries: acknowledged.entries.clone(),
-        };
-        ack_store
-            .save_shakescape_board_object(
-                SHAKESCAPE_OUTBOX_RECORD_ID,
-                0,
-                &legacy_acknowledged,
-                CREATED_AT + 1,
-            )
-            .expect("save legacy acknowledgement");
-        let loaded_ack = load_shakescape_publication_outbox(&ack_store)
-            .expect("load immutable legacy acknowledgement");
-        assert_eq!(
-            loaded_ack.outbox.state(envelope_id),
-            Some(ShakescapeOutboxState::Acknowledged {
-                acknowledged_at_unix: CREATED_AT + 1,
-            })
-        );
-        assert!(matches!(
-            prepare_next_shakescape_handoff(&mut ack_store, loaded_ack.revision, CREATED_AT + 2)
-                .expect("legacy acknowledgement is not due"),
-            ShakescapeHandoffPreparation::NoDue { .. }
-        ));
-        let mut rollback = loaded_ack.outbox;
-        rollback.entries[0].state = ShakescapeOutboxState::Pending;
-        assert!(matches!(
-            save_shakescape_publication_outbox(
-                &mut ack_store,
-                loaded_ack.revision,
-                &rollback,
-                CREATED_AT + 2,
-            ),
-            Err(ShakedexError::InvalidShakescapeOutboxTransition)
-        ));
-
-        let (_schema_v2_ack_cleanup, mut schema_v2_ack_store, _) = test_wallet_store();
-        schema_v2_ack_store
-            .save_shakescape_board_object(
-                SHAKESCAPE_OUTBOX_RECORD_ID,
-                0,
-                &PersistedShakescapePublicationOutbox {
-                    schema_version: HANDOFF_SHAKESCAPE_OUTBOX_SCHEMA_VERSION,
-                    entries: acknowledged.entries.clone(),
-                },
-                CREATED_AT + 1,
-            )
-            .expect("authorized test writer stores impossible schema-v2 acknowledgement");
-        assert!(matches!(
-            load_shakescape_publication_outbox(&schema_v2_ack_store),
-            Err(ShakedexError::CorruptShakescapeOutbox)
-        ));
-
-        let (_malicious_cleanup, mut malicious_store, _) = test_wallet_store();
-        let mut impossible_legacy = pending.entries.clone();
-        impossible_legacy[0].state = ShakescapeOutboxState::HandoffPrepared {
-            attempt_id: shakescape_handoff_attempt_id(envelope_id, 101, 1, CREATED_AT + 1),
-            prepared_at_unix: CREATED_AT + 1,
-        };
-        malicious_store
-            .save_shakescape_board_object(
-                SHAKESCAPE_OUTBOX_RECORD_ID,
-                0,
-                &PersistedShakescapePublicationOutbox {
-                    schema_version: LEGACY_SHAKESCAPE_OUTBOX_SCHEMA_VERSION,
-                    entries: impossible_legacy,
-                },
-                CREATED_AT + 1,
-            )
-            .expect("authorized test writer stores impossible legacy phase");
-        assert!(matches!(
-            load_shakescape_publication_outbox(&malicious_store),
-            Err(ShakedexError::CorruptShakescapeOutbox)
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn failure_sixty_four_persists_terminal_exhaustion() {
         let (offer, listing, _, _) = publication_fixtures();
         let (_cleanup, mut store, database) = test_wallet_store();
@@ -2561,22 +2375,6 @@ mod tests {
             Err(ShakedexError::CorruptShakescapeOutbox)
         ));
 
-        let mut incoherent_ack = outbox.clone();
-        incoherent_ack.entries[0].state = ShakescapeOutboxState::Acknowledged {
-            acknowledged_at_unix: CREATED_AT + 1,
-        };
-        incoherent_ack.entries[0].retry_attempts = 1;
-        assert!(matches!(
-            incoherent_ack.validate(),
-            Err(ShakedexError::CorruptShakescapeOutbox)
-        ));
-        incoherent_ack.entries[0].retry_attempts = 0;
-        incoherent_ack.entries[0].last_attempt_at_unix = Some(CREATED_AT);
-        assert!(matches!(
-            incoherent_ack.validate(),
-            Err(ShakedexError::CorruptShakescapeOutbox)
-        ));
-
         let mut incoherent_exhaustion = outbox.clone();
         incoherent_exhaustion.entries[0].state = ShakescapeOutboxState::Exhausted {
             exhausted_at_unix: CREATED_AT + 64,
@@ -2671,7 +2469,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn schema_v2_zero_magic_handoff_acceptance_is_durable_exact_and_idempotent() {
+    fn zero_magic_handoff_acceptance_is_durable_exact_and_idempotent() {
         let network = NetworkBinding {
             magic: 0,
             genesis: BlockHash::new([0x11; 32]),
@@ -2700,14 +2498,13 @@ mod tests {
                 SHAKESCAPE_OUTBOX_RECORD_ID,
                 0,
                 &PersistedShakescapePublicationOutbox {
-                    schema_version: HANDOFF_SHAKESCAPE_OUTBOX_SCHEMA_VERSION,
+                    schema_version: SHAKESCAPE_OUTBOX_SCHEMA_VERSION,
                     entries: outbox.entries.clone(),
                 },
                 prepared_at_unix,
             )
-            .expect("inject schema-v2 prepared row");
-        let loaded =
-            load_shakescape_publication_outbox(&store).expect("load schema-v2 prepared row");
+            .expect("inject prepared row");
+        let loaded = load_shakescape_publication_outbox(&store).expect("load prepared row");
         let handoff = prepared_handoff_from_entry(revision, &loaded.outbox.entries[0])
             .expect("reconstruct exact handoff");
         let endpoint_key = SigningKey::from_slice(&[0x42; 32]).expect("endpoint key");
@@ -2883,8 +2680,8 @@ mod tests {
             .shakescape_board_object::<PersistedShakescapePublicationOutbox>(
                 SHAKESCAPE_OUTBOX_RECORD_ID,
             )
-            .expect("read schema-v3 row")
-            .expect("schema-v3 row exists");
+            .expect("read current row")
+            .expect("current row exists");
         assert_eq!(
             persisted.value.schema_version,
             SHAKESCAPE_OUTBOX_SCHEMA_VERSION

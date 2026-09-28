@@ -6,8 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hns_marketplace_protocol::{
-    AssetId, CrossChainMessage, DirectOffer, DirectOfferCancellation, DirectOfferRoleModel,
-    MarketPair, NetworkBinding,
+    AssetId, CrossChainMessage, DirectOffer, DirectOfferCancellation, MarketPair, NetworkBinding,
 };
 use hns_wallet_store::{EntityKind, StoredEntity, WalletStore};
 use hns_wallet_types::{ObjectHash, SessionId};
@@ -16,12 +15,9 @@ use sha2::{Digest, Sha256};
 
 use crate::MarketError;
 
-const DIRECT_OFFER_BOARD_SCHEMA_VERSION: u16 = 2;
+const DIRECT_OFFER_BOARD_SCHEMA_VERSION: u16 = 1;
 const DIRECT_OFFER_BOARD_POLICY_DOMAIN: &[u8] = b"hns-wallet-direct-offer-board-policy-v1\0";
-// The new namespace prevents an unmatched legacy offer from being replayed
-// under the opposite atomic-swap role model after an upgrade. Countersigned
-// legacy sessions carry their own terms and remain recoverable separately.
-const DIRECT_OFFER_BOARD_RECORD_PREFIX: &[u8] = b"shakescape-v3-direct-offer\0";
+const DIRECT_OFFER_BOARD_RECORD_PREFIX: &[u8] = b"shakescape-v1-direct-offer\0";
 
 /// Mobile clocks are normally network-synchronized, but two correctly
 /// synchronized devices can still differ by a few seconds.  Accepting a
@@ -300,9 +296,6 @@ pub fn admit_shakescape_direct_offer(
     let CrossChainMessage::DirectOffer(offer) = message else {
         return Err(MarketError::InvalidShakescapeDirectOffer);
     };
-    if offer.role_model != DirectOfferRoleModel::OfferSetterTaker {
-        return Err(MarketError::InvalidShakescapeDirectOffer);
-    }
     let validation_time = peer_object_validation_time(offer.header.created_at, accepted_at_unix)
         .ok_or(MarketError::InvalidShakescapeDirectOffer)?;
     offer
@@ -596,7 +589,6 @@ mod tests {
         let policy = ShakescapeDirectOfferBoardPolicy::new(network()).expect("board policy");
         let mut store = WalletStore::create(":memory:", PASSPHRASE).expect("wallet store");
         let mut offer = DirectOffer {
-            role_model: DirectOfferRoleModel::OfferSetterTaker,
             header: header(1),
             offer_id: [0; 32],
             swap_session_id: [3; 32],
@@ -625,7 +617,6 @@ mod tests {
         assert_eq!(levels[0].btc_per_hns_denominator, 5_000);
 
         let mut cancellation = DirectOfferCancellation {
-            role_model: DirectOfferRoleModel::OfferSetterTaker,
             header: header(2),
             offer_id: offer.offer_id,
             offer_sequence: offer.header.sequence,

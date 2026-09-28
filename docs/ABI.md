@@ -87,11 +87,9 @@ Approval expiry is Unix milliseconds with a maximum lifetime of 90,000 ms.
 Free-form display lines are forbidden. The closed approval union covers
 permissions, module enablement, send, name transfer/finalize, typed signature,
 name offer/purchase, direct offer/direct-offer acceptance, and swap
-redeem/refund. The private ABI retains the legacy `DirectOfferTake` enum tag as
-a schema-stability spelling; it represents the responder's acceptance and does
-not assign that responder the execution-taker role.
-Likewise, durable swap state now emits `offer_acceptance_received`; readers
-retain `offer_take_received` only as a decode alias for pre-upgrade journals.
+redeem/refund. The private ABI uses `DirectOfferAcceptance` for the responder's
+acceptance; that responder becomes the execution maker. Durable swap state uses
+`offer_acceptance_received` for the same transition.
 Value summaries carry integer given/received asset amounts, maximum fee,
 recipient, chain/finality, and, where applicable, refund time. An incomplete or
 kind-mismatched summary fails closed. Recovery-phrase display is not a

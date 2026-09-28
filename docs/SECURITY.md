@@ -44,7 +44,7 @@ independently disabled.
   each verify one original offer and its exact amounts. Full retained-row
   restart validation still supplies neither live chain nor value authority, and
   it does not detect rollback of the complete authenticated database snapshot.
-  The schema-v3 publication outbox can separately retain a
+  The current publication outbox can separately retain a
   canonical endpoint-signed receipt for one exact prepared envelope. Its full
   wallet-supplied HRM/HNSA policy, endpoint window, maximum lifetime, exact
   handoff identity, and signature are revalidated after restart. Network
@@ -78,7 +78,7 @@ independently disabled.
   relay supervision, HRM/HNSA-currentness adapter, approval, signing,
   broadcast, quote, or product availability authority.
 - Board persistence treats SQLite identity, revision, and update-time metadata
-  as untrusted. Canonical writes use authenticated encrypted `HeadV2Indexed`,
+  as untrusted. Canonical writes use authenticated encrypted `Head`,
   digest-addressed seller/name identity rows, and encrypted digest-addressed
   listing-hash indexes. Every compact head selector binds its row identity,
   revision/update time, row-value commitment, and listing hash. A full load
@@ -99,9 +99,9 @@ independently disabled.
   revision, capacity, and same-metadata ciphertext-ABA races fail before any
   partial write. Runtime admissions additionally consume the independently
   captured `WalletAccount` prefix as a second cross-kind compare-only guard in
-  that transaction. A sole legacy-v1 aggregate and historical pre-index
-  `HeadV2` are strict read formats and migrate on their next successful
-  mutation. None of these cache-integrity properties supplies chain,
+  that transaction. Aggregate and pre-index board formats are rejected; only
+  the exact current indexed schema is accepted. None of these cache-integrity
+  properties supplies chain,
   publication, quote, signing, or value authority.
 - The single-offer board-read plan accepts only canonical V2 `GetOffer` with a
   nonzero correlation ID and internally verifies the paired singular type-7

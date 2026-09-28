@@ -544,18 +544,6 @@ fn hns_shakedex_transaction_plan_restart_cas() {
         .validate()
         .expect("aggregate restart validation");
     assert_eq!(restarted_value, value_workflow);
-    let mut legacy_value =
-        serde_json::to_value(&value_workflow).expect("legacy aggregate encoding");
-    legacy_value
-        .as_object_mut()
-        .expect("workflow object")
-        .remove("automatic_finalize_maximum_fee");
-    let legacy_workflow: ShakedexValueWorkflow =
-        serde_json::from_value(legacy_value).expect("legacy workflow decode");
-    legacy_workflow
-        .validate()
-        .expect("legacy workflow validation");
-    assert_eq!(legacy_workflow.automatic_finalize_maximum_fee(), None);
     let buyer_fulfillment = buyer_offer
         .with_fulfillment(&verified_fulfillment, std::slice::from_ref(&buyer_coin))
         .expect("buyer fulfillment plan");

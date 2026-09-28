@@ -60,9 +60,9 @@ Name market:
 Cross-chain market:
 
 `swap_getSupportedPairs`, `swap_listDirectOffers`, `swap_publishDirectOffer`,
-`swap_cancelDirectOffer`, `swap_takeDirectOffer`, `swap_acceptDirectOffer`,
+`swap_cancelDirectOffer`, `swap_acceptDirectOffer`,
 `swap_getSession`, `swap_redeem`, `swap_refund`. A direct offer carries exact
-HNS/BTC amounts selected by its maker; this API has no price feed, price round,
+HNS/BTC amounts selected by its offer setter; this API has no price feed, price round,
 or historical-rate method.
 
 ## Events

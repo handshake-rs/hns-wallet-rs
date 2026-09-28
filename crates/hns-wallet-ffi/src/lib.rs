@@ -718,7 +718,7 @@ pub enum ApprovalSummary {
         maximum_fee: Amount,
         warnings: BTreeSet<ApprovalWarning>,
     },
-    DirectOfferTake {
+    DirectOfferAcceptance {
         direct_offer_id: String,
         swap_session_id: String,
         offered: Amount,
@@ -758,7 +758,7 @@ impl ApprovalSummary {
             Self::NameMarketOffer { .. } => ApprovalKind::NameMarketOffer,
             Self::NameMarketPurchase { .. } => ApprovalKind::NameMarketPurchase,
             Self::DirectOffer { .. } => ApprovalKind::DirectOffer,
-            Self::DirectOfferTake { .. } => ApprovalKind::DirectOfferTake,
+            Self::DirectOfferAcceptance { .. } => ApprovalKind::DirectOfferAcceptance,
             Self::SwapRedeem { .. } => ApprovalKind::SwapRedeem,
             Self::SwapRefund { .. } => ApprovalKind::SwapRefund,
         }
@@ -901,7 +901,7 @@ impl ApprovalSummary {
                 validate_amount(*maximum_fee, true)?;
                 validate_warnings(warnings)?;
             }
-            Self::DirectOfferTake {
+            Self::DirectOfferAcceptance {
                 direct_offer_id,
                 swap_session_id,
                 offered,
@@ -997,9 +997,7 @@ impl ApprovalSummary {
                     DirectOfferApprovalAction::Publish
                 ) | ("swap_cancelDirectOffer", DirectOfferApprovalAction::Cancel)
             ),
-            Self::DirectOfferTake { .. } => {
-                matches!(method, "swap_takeDirectOffer" | "swap_acceptDirectOffer")
-            }
+            Self::DirectOfferAcceptance { .. } => method == "swap_acceptDirectOffer",
             Self::SwapRedeem { .. } => method == "swap_redeem",
             Self::SwapRefund { .. } => method == "swap_refund",
         };
@@ -2474,7 +2472,7 @@ mod tests {
             ApprovalKind::NameMarketOffer,
             ApprovalKind::NameMarketPurchase,
             ApprovalKind::DirectOffer,
-            ApprovalKind::DirectOfferTake,
+            ApprovalKind::DirectOfferAcceptance,
             ApprovalKind::SwapRedeem,
             ApprovalKind::SwapRefund,
         ];

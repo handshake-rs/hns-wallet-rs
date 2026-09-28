@@ -137,7 +137,7 @@ Other exact blockers are:
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED` are `true`. Seller creation,
 transition, buyer discovery, and buyer transition remain bound to their exact
 evidence, persistence, and approval checks before mutation. This also prevents
-sessions restored from legacy persisted records from bypassing the boundary.
+sessions restored from persisted records from bypassing the boundary.
 Independently usable read/discovery boundaries now require
 the exact listing hash, network, active time window, and supplied canonical
 locking coin; cancellations bind to that exact listing; Shakescape registry and
@@ -251,7 +251,7 @@ Caller-provided verification booleans cannot become a verified settlement lock.
 ## Evidence statement
 
 The settled final-source working tree passed local library runs of 38 Store
-tests, 73 HNS tests, and 42 Shakedex tests with the release-scale case ignored;
+tests, 73 HNS tests, and 44 Shakedex tests with the release-scale case ignored;
 the Shakescape board-runtime integration suite passed 26 tests. A focused normalized-
 storage run passed 18 tests with that same release-scale case ignored, so it is
 a subset/re-run rather than additive evidence. The optimized 4,096-row

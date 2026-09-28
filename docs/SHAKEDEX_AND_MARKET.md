@@ -2,9 +2,8 @@
 
 ## Fixed-price Shakedex
 
-The crate preserves the encrypted compare-and-swap seller, buyer, and recovery
-schemas and their historical transition ordering for persisted-state
-compatibility. A separate encrypted aggregate child workflow now coordinates
+The crate defines one strict encrypted compare-and-swap schema for seller,
+buyer, recovery, and board state. A separate encrypted aggregate child workflow coordinates
 post-lock buyer fulfillment, seller recovery, and the seller-script FINALIZE
 that follows either signed TRANSFER parent, but every authorization and
 submission entrypoint remains evidence- and approval-bound. The wallet dependency
@@ -159,7 +158,7 @@ persisted bytes were broadcast outside the recorded submit path. There is no
 submission polling loop and no caller-authored clock or chain status input.
 
 The name-market portion of the encrypted `ShakescapeBoardObject` namespace now writes
-normalized `HeadV2Indexed` persistence. Its encrypted head carries the logical
+normalized `Head` persistence. Its encrypted head carries the logical
 board revision and compact row selectors. Each selector binds the identity-row
 digest, physical revision and update time, row-value commitment, and listing
 hash; the head also commits to the complete row-value and listing-index metadata
@@ -187,12 +186,8 @@ transaction. The public `verify_unchanged_account` helper is read-only and
 non-atomic with a later write; mutation paths instead consume
 `revalidate_unchanged_account` and the refreshed account lease.
 
-A sole legacy-v1 aggregate remains readable and is atomically replaced by
-indexed storage on its next successful mutation; legacy/head coexistence and
-torn state are rejected. Historical normalized `HeadV2` plus row objects also
-remain strictly readable. Targeted requests use the full semantic loader for
-that format, and its next mutation preserves unchanged row revisions while
-atomically adding listing indexes and installing `HeadV2Indexed`.
+Only indexed `Head` board storage is accepted. Missing indexes,
+mismatched commitments, namespace divergence, and torn state are rejected.
 
 Indexed listing-hash reads always perform O(N) complete row/index metadata and
 selector comparison against the authenticated head, including equality with the
@@ -201,9 +196,8 @@ requested hash has an index, only O(K) encrypted index and row values are
 authenticated for K hits in requested order. A head/index-only miss cannot rule
 out a row whose authenticated semantics disagree with its selector, so any
 missing requested index invokes the O(N) full semantic row/index loader before
-returning authoritative absence. This is not an O(1) lookup. Legacy-v1 and
-pre-index `HeadV2` targeted reads, plus inventory, always use a full logical-
-board load.
+returning authoritative absence. This is not an O(1) lookup. Inventory uses a
+full logical-board load.
 
 One current record is retained per identity; a higher sequence replaces it
 without consuming another slot. Exact repeats are idempotent; sequence rollback,
@@ -253,9 +247,8 @@ currently valid and strictly advance the watermark.
 `current_offer` deliberately repeats the current-lock query after restart or
 before later use, verifies the persisted canonical listing against that exact
 coin/network/time, and finally fences the unchanged board revision and row.
-On indexed storage, both board projections use the targeted path above when the
-hash hits; a missing index, the legacy aggregate, or historical pre-index
-`HeadV2` uses the full semantic fallback.
+Both board projections use the targeted path above when the hash hits; a
+missing index uses the full semantic fallback.
 Its non-serializable result is evidence for an enclosing, still-gated value
 workflow, not permission to sign or broadcast. This join performs no Shakescape
 transport or relay I/O. The HRM draft supplies the current manifest root and
@@ -350,7 +343,7 @@ encrypting another record. No broader store-boundary redesign is part of this
 tranche.
 
 The outbox retains at most 1,024 entries, limits each exact envelope to 16 KiB,
-and rejects an aggregate serialized form above 512 KiB. Schema v3 selects due
+and rejects an aggregate serialized form above 512 KiB. Its sole schema selects due
 entries deterministically by due time, creation time, then envelope ID, and
 permits at most one aggregate-wide `HandoffPrepared` row. The attempt ID binds
 the exact envelope ID, original request ID, next failure ordinal, and
@@ -365,12 +358,9 @@ prepared rows, roll back terminal state, or regress the encrypted record
 timestamp. Restart reloads the identical outcome-unknown preparation but never
 auto-resends it; an explicit correlated recovery call records one failure and
 schedules the identical envelope and request ID. Failure 64 becomes terminal
-`Exhausted`. Schema-v1 rows are validated in place and migrate on their next
-mutating save. A schema-v1 `Acknowledged` row remains immutable terminal legacy
-state. Schema-v2 rows may retain a prepared handoff, but they cannot inject
-either that legacy acknowledgement or schema-v3 `RelayAccepted` state.
+`Exhausted`. Other schema versions and unknown states are rejected.
 
-Schema v3 can move one exact prepared handoff to terminal `RelayAccepted` only
+The outbox can move one exact prepared handoff to terminal `RelayAccepted` only
 with a bounded, canonically encoded, strict-DER low-S secp256k1 receipt signed
 by the configured HNSA endpoint key. The receipt binds the network, exact HRM
 root tuple, HNSA service/delegation/endpoint identifiers, caller-owned nonzero
@@ -398,8 +388,7 @@ Three Shakedex source gates are enabled:
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`. `SellerSession::new`,
 `SellerSession::apply`, `BuyerSession::discover`, and `BuyerSession::apply`
 still validate the complete canonical, evidence, and persistence boundary
-before mutation. Existing sessions restored from legacy persisted records
-therefore cannot bypass the boundary.
+before mutation.
 Aggregate authorization and submission also require
 `HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED`,
 `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED` and

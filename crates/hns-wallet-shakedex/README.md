@@ -5,7 +5,7 @@ funding, and recovery workflow boundaries. It also supplies a bounded,
 encrypted/CAS offline Shakescape V1 offer/cancellation outbox. The outbox preserves
 exact canonical envelope bytes, persists one deterministic single-flight
 handoff before exposing those bytes, and retains monotonic local retry state.
-Schema v3 can terminally retain a bounded, canonical, endpoint-signed receipt
+The canonical schema can terminally retain a bounded, endpoint-signed receipt
 that a named relay accepted that exact prepared envelope. The receipt binds
 the configured network, HRM root, HNSA service/delegation lineage, endpoint
 key, attempt, request, and envelope bytes and self-validates after restart.
@@ -44,23 +44,16 @@ transaction. The public `verify_unchanged_account` helper is only a coherent
 read diagnostic and is not an atomic precondition for a later write; write paths
 use `revalidate_unchanged_account` and consume the resulting guard.
 
-Canonical board mutations persist an encrypted `HeadV2Indexed`, one
+Canonical board mutations persist an encrypted `Head`, one
 digest-addressed row per seller/name identity, and one encrypted
 digest-addressed listing-hash index per row. Each compact head row selector
 binds the row identity digest, physical revision/update time, row-value
 commitment, and listing hash. The public logical board revision remains separate
 from each entity's physical store revision. A full load uses one coherent read
 snapshot to check the exact bounded namespace, authenticate every row and index,
-verify the head commitments and row/index bijection, and reject legacy/head
-coexistence or torn state. A save retains unchanged child revisions through
+verify the head commitments and row/index bijection, and reject torn state. A
+save retains unchanged child revisions through
 compare-only assertions and changes only affected children.
-
-Both older forms remain strict read formats. A sole legacy-v1 aggregate migrates
-atomically to indexed storage on its next successful mutation. The historical
-normalized `HeadV2` head and its rows also remain fully readable; targeted
-lookups fall back to a full load, and the next successful mutation preserves
-unchanged row revisions while installing `HeadV2Indexed` and its listing
-indexes.
 
 Indexed `current_offer`, `GetOffer`, and `GetOffers` lookups always compare the
 complete O(N) row/index metadata sets and compact head selectors from the
@@ -71,8 +64,7 @@ match the selector's identity, physical metadata, listing hash, and row-value
 commitment. A head/index-only negative cannot exclude a row whose authenticated
 semantics disagree with its selector, so any requested index miss falls back to
 the O(N) full semantic row/index loader before returning authoritative absence.
-Legacy-v1 and pre-index `HeadV2` targeted reads likewise decode the full board;
-inventory remains a full logical-board read.
+Inventory remains a full logical-board read.
 
 One exact canonical V2 `GetOffer` can now be evaluated into a closed response
 plan. The request and singular `Offer` response require the same nonzero

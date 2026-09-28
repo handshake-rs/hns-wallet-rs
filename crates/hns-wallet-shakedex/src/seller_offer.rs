@@ -105,7 +105,6 @@ struct SellerOfferWorkflow {
     created_at_unix: u64,
     stage: SellerOfferStage,
     queued_listing: Option<QueuedSellerListing>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     queued_cancellation: Option<QueuedSellerCancellation>,
 }
 

@@ -15,23 +15,22 @@ use crate::{
 };
 
 const NAME_MARKET_BOARD_SCHEMA_VERSION: u16 = 1;
-pub const NAME_MARKET_BOARD_RECORD_ID: &[u8] = b"canonical-name-market-board-v1";
-const NORMALIZED_NAME_MARKET_BOARD_SCHEMA_VERSION: u16 = 2;
+const NAME_MARKET_BOARD_STORAGE_SCHEMA_VERSION: u16 = 1;
 const NORMALIZED_NAME_MARKET_BOARD_NAMESPACE_PREFIX: &[u8] = b"canonical-name-market-board-";
-const NORMALIZED_NAME_MARKET_BOARD_HEAD_ID: &[u8] = b"canonical-name-market-board-head-v2";
-const NORMALIZED_NAME_MARKET_BOARD_ROW_PREFIX: &[u8] = b"canonical-name-market-board-row-v2\0";
+const NORMALIZED_NAME_MARKET_BOARD_HEAD_ID: &[u8] = b"canonical-name-market-board-head-v1";
+const NORMALIZED_NAME_MARKET_BOARD_ROW_PREFIX: &[u8] = b"canonical-name-market-board-row-v1\0";
 const NORMALIZED_NAME_MARKET_BOARD_LISTING_INDEX_PREFIX: &[u8] =
-    b"canonical-name-market-board-listing-v2\0";
+    b"canonical-name-market-board-listing-v1\0";
 const NORMALIZED_NAME_MARKET_BOARD_ROW_ID_DOMAIN: &[u8] =
-    b"hns-wallet-name-market-board-row-id-v2\0";
+    b"hns-wallet-name-market-board-row-id-v1\0";
 const NORMALIZED_NAME_MARKET_BOARD_LISTING_INDEX_ID_DOMAIN: &[u8] =
-    b"hns-wallet-name-market-board-listing-index-id-v2\0";
+    b"hns-wallet-name-market-board-listing-index-id-v1\0";
 const NORMALIZED_NAME_MARKET_BOARD_ROW_COMMITMENT_DOMAIN: &[u8] =
-    b"hns-wallet-name-market-board-row-v2\0";
+    b"hns-wallet-name-market-board-row-v1\0";
 const NORMALIZED_NAME_MARKET_BOARD_SET_COMMITMENT_DOMAIN: &[u8] =
-    b"hns-wallet-name-market-board-set-v2\0";
+    b"hns-wallet-name-market-board-set-v1\0";
 const NORMALIZED_NAME_MARKET_BOARD_LISTING_INDEX_SET_COMMITMENT_DOMAIN: &[u8] =
-    b"hns-wallet-name-market-board-listing-index-set-v2\0";
+    b"hns-wallet-name-market-board-listing-index-set-v1\0";
 const MAX_NORMALIZED_NAME_MARKET_BOARD_NAMESPACE_RECORDS: usize =
     MAX_NAME_MARKET_BOARD_OFFERS * 2 + 2;
 
@@ -78,14 +77,7 @@ struct SequenceWatermark {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case", tag = "record")]
 enum PersistedNameMarketBoardEntity {
-    HeadV2 {
-        schema_version: u16,
-        logical_revision: u64,
-        row_count: u32,
-        rows: Vec<PersistedNameMarketBoardRowIndexV2>,
-        row_set_commitment: ObjectHash,
-    },
-    HeadV2Indexed {
+    Head {
         schema_version: u16,
         logical_revision: u64,
         row_count: u32,
@@ -93,21 +85,19 @@ enum PersistedNameMarketBoardEntity {
         row_set_commitment: ObjectHash,
         listing_index_set_commitment: ObjectHash,
     },
-    RowV2 {
-        offer: Box<PersistedBoardOfferV2>,
-        watermark: SequenceWatermarkV2,
+    Row {
+        offer: Box<PersistedBoardOfferRecord>,
+        watermark: PersistedSequenceWatermark,
     },
-    ListingIndexV2 {
+    ListingIndex {
         listing_hash: ObjectHash,
         row_id_digest: ObjectHash,
     },
 }
 
-// Keep the normalized wire projection strict without changing the legacy v1
-// aggregate's public serde contract.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PersistedBoardOfferV2 {
+struct PersistedBoardOfferRecord {
     listing_hash: ObjectHash,
     listing_bytes: Vec<u8>,
     network_magic: u32,
@@ -125,7 +115,7 @@ struct PersistedBoardOfferV2 {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SequenceWatermarkV2 {
+struct PersistedSequenceWatermark {
     network_magic: u32,
     network_genesis: ObjectHash,
     name_hash: ObjectHash,
@@ -133,7 +123,7 @@ struct SequenceWatermarkV2 {
     sequence: u64,
 }
 
-impl From<&PersistedBoardOffer> for PersistedBoardOfferV2 {
+impl From<&PersistedBoardOffer> for PersistedBoardOfferRecord {
     fn from(offer: &PersistedBoardOffer) -> Self {
         Self {
             listing_hash: offer.listing_hash,
@@ -153,8 +143,8 @@ impl From<&PersistedBoardOffer> for PersistedBoardOfferV2 {
     }
 }
 
-impl From<PersistedBoardOfferV2> for PersistedBoardOffer {
-    fn from(offer: PersistedBoardOfferV2) -> Self {
+impl From<PersistedBoardOfferRecord> for PersistedBoardOffer {
+    fn from(offer: PersistedBoardOfferRecord) -> Self {
         Self {
             listing_hash: offer.listing_hash,
             listing_bytes: offer.listing_bytes,
@@ -173,7 +163,7 @@ impl From<PersistedBoardOfferV2> for PersistedBoardOffer {
     }
 }
 
-impl From<&SequenceWatermark> for SequenceWatermarkV2 {
+impl From<&SequenceWatermark> for PersistedSequenceWatermark {
     fn from(watermark: &SequenceWatermark) -> Self {
         Self {
             network_magic: watermark.network_magic,
@@ -185,8 +175,8 @@ impl From<&SequenceWatermark> for SequenceWatermarkV2 {
     }
 }
 
-impl From<SequenceWatermarkV2> for SequenceWatermark {
-    fn from(watermark: SequenceWatermarkV2) -> Self {
+impl From<PersistedSequenceWatermark> for SequenceWatermark {
+    fn from(watermark: PersistedSequenceWatermark) -> Self {
         Self {
             network_magic: watermark.network_magic,
             network_genesis: watermark.network_genesis,
@@ -195,14 +185,6 @@ impl From<SequenceWatermarkV2> for SequenceWatermark {
             sequence: watermark.sequence,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PersistedNameMarketBoardRowIndexV2 {
-    id_digest: ObjectHash,
-    store_revision: u64,
-    updated_at_unix: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -278,9 +260,6 @@ struct NormalizedNameMarketBoardListingIndex {
 
 enum NameMarketBoardStorage {
     Empty,
-    Legacy {
-        store_revision: u64,
-    },
     Normalized {
         head_store_revision: u64,
         rows: Vec<NormalizedNameMarketBoardRow>,
@@ -782,7 +761,7 @@ fn normalized_row_index(
 fn normalized_listing_index_entity(
     index: &NormalizedNameMarketBoardListingIndex,
 ) -> PersistedNameMarketBoardEntity {
-    PersistedNameMarketBoardEntity::ListingIndexV2 {
+    PersistedNameMarketBoardEntity::ListingIndex {
         listing_hash: index.listing_hash,
         row_id_digest: index.row_id_digest,
     }
@@ -969,7 +948,7 @@ fn normalized_rows_from_board(
 }
 
 fn normalized_row_entity(row: &NormalizedNameMarketBoardRow) -> PersistedNameMarketBoardEntity {
-    PersistedNameMarketBoardEntity::RowV2 {
+    PersistedNameMarketBoardEntity::Row {
         offer: Box::new((&row.offer).into()),
         watermark: (&row.watermark).into(),
     }
@@ -978,7 +957,7 @@ fn normalized_row_entity(row: &NormalizedNameMarketBoardRow) -> PersistedNameMar
 fn normalized_row_from_stored(
     stored: StoredEntity<PersistedNameMarketBoardEntity>,
 ) -> Result<NormalizedNameMarketBoardRow, ShakedexError> {
-    let PersistedNameMarketBoardEntity::RowV2 { offer, watermark } = stored.value else {
+    let PersistedNameMarketBoardEntity::Row { offer, watermark } = stored.value else {
         return Err(ShakedexError::CorruptNameMarketBoard);
     };
     if stored.kind != EntityKind::ShakescapeBoardObject
@@ -1003,7 +982,7 @@ fn normalized_row_from_stored(
 fn normalized_listing_index_from_stored(
     stored: StoredEntity<PersistedNameMarketBoardEntity>,
 ) -> Result<NormalizedNameMarketBoardListingIndex, ShakedexError> {
-    let PersistedNameMarketBoardEntity::ListingIndexV2 {
+    let PersistedNameMarketBoardEntity::ListingIndex {
         listing_hash,
         row_id_digest,
     } = stored.value
@@ -1099,28 +1078,6 @@ fn normalized_listing_index_ids_from_row_index(
     Ok(ids)
 }
 
-fn normalized_metadata_from_v2_index(
-    indexes: &[PersistedNameMarketBoardRowIndexV2],
-) -> Result<Vec<StoredEntityMetadata>, ShakedexError> {
-    if indexes.len() > MAX_NAME_MARKET_BOARD_OFFERS
-        || indexes
-            .windows(2)
-            .any(|window| window[0].id_digest >= window[1].id_digest)
-        || indexes.iter().any(|index| index.store_revision == 0)
-    {
-        return Err(ShakedexError::CorruptNameMarketBoard);
-    }
-    Ok(indexes
-        .iter()
-        .map(|index| StoredEntityMetadata {
-            kind: EntityKind::ShakescapeBoardObject,
-            id: normalized_row_id_from_digest(index.id_digest),
-            revision: index.store_revision,
-            updated_at_unix: index.updated_at_unix,
-        })
-        .collect())
-}
-
 fn load_indexed_normalized_rows(
     snapshot: &EntityReadSnapshot<'_>,
     indexes: &[PersistedNameMarketBoardRowIndex],
@@ -1148,28 +1105,6 @@ fn load_indexed_normalized_rows(
             return Err(ShakedexError::CorruptNameMarketBoard);
         }
         rows.push(row);
-    }
-    Ok(rows)
-}
-
-fn load_v2_normalized_rows(
-    snapshot: &EntityReadSnapshot<'_>,
-    indexes: &[PersistedNameMarketBoardRowIndexV2],
-) -> Result<Vec<NormalizedNameMarketBoardRow>, ShakedexError> {
-    let mut rows = Vec::with_capacity(indexes.len());
-    for index in indexes {
-        let id = normalized_row_id_from_digest(index.id_digest);
-        let Some(stored): Option<StoredEntity<PersistedNameMarketBoardEntity>> =
-            load_snapshot_entity(snapshot, &id)?
-        else {
-            return Err(ShakedexError::CorruptNameMarketBoard);
-        };
-        if stored.revision != index.store_revision
-            || stored.updated_at_unix != index.updated_at_unix
-        {
-            return Err(ShakedexError::CorruptNameMarketBoard);
-        }
-        rows.push(normalized_row_from_stored(stored)?);
     }
     Ok(rows)
 }
@@ -1232,8 +1167,7 @@ fn validate_normalized_namespace_metadata(
             {
                 return true;
             }
-            entry.id != NAME_MARKET_BOARD_RECORD_ID
-                && entry.id != NORMALIZED_NAME_MARKET_BOARD_HEAD_ID
+            entry.id != NORMALIZED_NAME_MARKET_BOARD_HEAD_ID
                 && !(entry.id.len() == NORMALIZED_NAME_MARKET_BOARD_ROW_PREFIX.len() + 32
                     && entry
                         .id
@@ -1290,11 +1224,6 @@ pub(crate) fn load_name_market_board_state_from_snapshot(
     validate_normalized_namespace_metadata(namespace_metadata)?;
     let head: Option<StoredEntity<PersistedNameMarketBoardEntity>> =
         load_snapshot_entity(snapshot, NORMALIZED_NAME_MARKET_BOARD_HEAD_ID)?;
-    let legacy: Option<StoredEntity<NameMarketBoard>> =
-        load_snapshot_entity(snapshot, NAME_MARKET_BOARD_RECORD_ID)?;
-    if head.is_some() && legacy.is_some() {
-        return Err(ShakedexError::CorruptNameMarketBoard);
-    }
     let row_metadata = namespace_metadata
         .iter()
         .filter(|entry| {
@@ -1314,25 +1243,14 @@ pub(crate) fn load_name_market_board_state_from_snapshot(
         .cloned()
         .collect::<Vec<_>>();
 
-    match (head, legacy, namespace_metadata.len()) {
-        (None, None, 0) => Ok(LoadedNameMarketBoard {
+    match (head, namespace_metadata.len()) {
+        (None, 0) => Ok(LoadedNameMarketBoard {
             logical_revision: 0,
             board: NameMarketBoard::default(),
             storage: NameMarketBoardStorage::Empty,
             namespace_lease,
         }),
-        (None, Some(stored), 1) if stored.id == NAME_MARKET_BOARD_RECORD_ID => {
-            stored.value.validate()?;
-            Ok(LoadedNameMarketBoard {
-                logical_revision: stored.revision,
-                board: stored.value,
-                storage: NameMarketBoardStorage::Legacy {
-                    store_revision: stored.revision,
-                },
-                namespace_lease,
-            })
-        }
-        (Some(head), None, _) => {
+        (Some(head), _) => {
             if head.kind != EntityKind::ShakescapeBoardObject
                 || head.id != NORMALIZED_NAME_MARKET_BOARD_HEAD_ID
             {
@@ -1340,43 +1258,7 @@ pub(crate) fn load_name_market_board_state_from_snapshot(
             }
             let head_store_revision = head.revision;
             match head.value {
-                PersistedNameMarketBoardEntity::HeadV2 {
-                    schema_version,
-                    logical_revision,
-                    row_count,
-                    rows: row_index,
-                    row_set_commitment,
-                } => {
-                    if schema_version != NORMALIZED_NAME_MARKET_BOARD_SCHEMA_VERSION
-                        || logical_revision == 0
-                        || usize::try_from(row_count).ok() != Some(row_index.len())
-                        || namespace_metadata.len()
-                            != row_index
-                                .len()
-                                .checked_add(1)
-                                .ok_or(ShakedexError::CorruptNameMarketBoard)?
-                        || normalized_metadata_from_v2_index(&row_index)? != row_metadata
-                        || !listing_index_metadata.is_empty()
-                    {
-                        return Err(ShakedexError::CorruptNameMarketBoard);
-                    }
-                    let rows = load_v2_normalized_rows(snapshot, &row_index)?;
-                    if normalized_row_set_commitment(&rows)? != row_set_commitment {
-                        return Err(ShakedexError::CorruptNameMarketBoard);
-                    }
-                    let board = board_from_normalized_rows(&rows)?;
-                    Ok(LoadedNameMarketBoard {
-                        logical_revision,
-                        board,
-                        storage: NameMarketBoardStorage::Normalized {
-                            head_store_revision,
-                            rows,
-                            listing_indexes: Vec::new(),
-                        },
-                        namespace_lease,
-                    })
-                }
-                PersistedNameMarketBoardEntity::HeadV2Indexed {
+                PersistedNameMarketBoardEntity::Head {
                     schema_version,
                     logical_revision,
                     row_count,
@@ -1384,7 +1266,7 @@ pub(crate) fn load_name_market_board_state_from_snapshot(
                     row_set_commitment,
                     listing_index_set_commitment,
                 } => {
-                    if schema_version != NORMALIZED_NAME_MARKET_BOARD_SCHEMA_VERSION
+                    if schema_version != NAME_MARKET_BOARD_STORAGE_SCHEMA_VERSION
                         || logical_revision == 0
                         || usize::try_from(row_count).ok() != Some(row_index.len())
                         || namespace_metadata.len()
@@ -1460,8 +1342,6 @@ pub(crate) fn load_name_market_board_offers_from_snapshot(
     }
     let head: Option<StoredEntity<PersistedNameMarketBoardEntity>> =
         load_snapshot_entity(snapshot, NORMALIZED_NAME_MARKET_BOARD_HEAD_ID)?;
-    let legacy: Option<StoredEntity<NameMarketBoard>> =
-        load_snapshot_entity(snapshot, NAME_MARKET_BOARD_RECORD_ID)?;
     let Some(head) = head else {
         let loaded = load_name_market_board_state_from_snapshot(snapshot)?;
         return Ok(StoredNameMarketBoardOffers {
@@ -1472,20 +1352,7 @@ pub(crate) fn load_name_market_board_offers_from_snapshot(
                 .collect(),
         });
     };
-    if legacy.is_some() {
-        return Err(ShakedexError::CorruptNameMarketBoard);
-    }
-    if matches!(&head.value, PersistedNameMarketBoardEntity::HeadV2 { .. }) {
-        let loaded = load_name_market_board_state_from_snapshot(snapshot)?;
-        return Ok(StoredNameMarketBoardOffers {
-            revision: loaded.logical_revision,
-            offers: listing_hashes
-                .iter()
-                .map(|listing_hash| loaded.board.offer(*listing_hash).cloned())
-                .collect(),
-        });
-    }
-    let PersistedNameMarketBoardEntity::HeadV2Indexed {
+    let PersistedNameMarketBoardEntity::Head {
         schema_version,
         logical_revision,
         row_count,
@@ -1500,7 +1367,7 @@ pub(crate) fn load_name_market_board_offers_from_snapshot(
     let expected_listing_index_ids = normalized_listing_index_ids_from_row_index(rows)?;
     if head.kind != EntityKind::ShakescapeBoardObject
         || head.id != NORMALIZED_NAME_MARKET_BOARD_HEAD_ID
-        || *schema_version != NORMALIZED_NAME_MARKET_BOARD_SCHEMA_VERSION
+        || *schema_version != NAME_MARKET_BOARD_STORAGE_SCHEMA_VERSION
         || *logical_revision == 0
         || usize::try_from(*row_count).ok() != Some(rows.len())
         || expected_row_metadata.len() != rows.len()
@@ -1676,18 +1543,14 @@ fn save_loaded_name_market_board(
         .checked_add(1)
         .ok_or(ShakedexError::Persistence)?;
 
-    let (head_store_revision, legacy_store_revision, current_rows, current_listing_indexes) =
-        match storage {
-            NameMarketBoardStorage::Empty => (0, None, Vec::new(), Vec::new()),
-            NameMarketBoardStorage::Legacy { store_revision } => {
-                (0, Some(store_revision), Vec::new(), Vec::new())
-            }
-            NameMarketBoardStorage::Normalized {
-                head_store_revision,
-                rows,
-                listing_indexes,
-            } => (head_store_revision, None, rows, listing_indexes),
-        };
+    let (head_store_revision, current_rows, current_listing_indexes) = match storage {
+        NameMarketBoardStorage::Empty => (0, Vec::new(), Vec::new()),
+        NameMarketBoardStorage::Normalized {
+            head_store_revision,
+            rows,
+            listing_indexes,
+        } => (head_store_revision, rows, listing_indexes),
+    };
     let mut current_rows = current_rows
         .into_iter()
         .map(|row| (row.id.clone(), row))
@@ -1784,13 +1647,6 @@ fn save_loaded_name_market_board(
                 expected_revision: index.store_revision,
             }),
     );
-    if let Some(store_revision) = legacy_store_revision {
-        deletes.push(EntityBatchDelete {
-            id: NAME_MARKET_BOARD_RECORD_ID.to_vec(),
-            expected_revision: store_revision,
-        });
-    }
-
     let row_count = u32::try_from(prospective_rows.len())
         .map_err(|_| ShakedexError::NameMarketBoardCapacity)?;
     let row_index = prospective_rows
@@ -1804,8 +1660,8 @@ fn save_loaded_name_market_board(
     saves.push(EntityBatchSave {
         id: NORMALIZED_NAME_MARKET_BOARD_HEAD_ID.to_vec(),
         expected_revision: head_store_revision,
-        value: PersistedNameMarketBoardEntity::HeadV2Indexed {
-            schema_version: NORMALIZED_NAME_MARKET_BOARD_SCHEMA_VERSION,
+        value: PersistedNameMarketBoardEntity::Head {
+            schema_version: NAME_MARKET_BOARD_STORAGE_SCHEMA_VERSION,
             logical_revision,
             row_count,
             rows: row_index,
@@ -1837,6 +1693,7 @@ fn save_loaded_name_market_board(
 
 #[cfg(test)]
 mod normalized_storage_tests {
+    use super::*;
     use hns_covenants::FinalizeCovenant;
     use hns_primitives::{BlockHash, Dollarydoos, Height, TransactionHash};
     use hns_swap::{NetworkBinding, SwapProof, lock_script_hash};
@@ -1845,23 +1702,8 @@ mod normalized_storage_tests {
     use k256::ecdsa::SigningKey;
     use serde_json::json;
 
-    use super::*;
-
     const PASSPHRASE: &str = "normalized board persistence passphrase";
     const UPDATED_AT: u64 = 1_900_000_000;
-    const OUTBOX_RECORD_ID: &[u8] = b"canonical-name-market-outbox-v1";
-    const FROZEN_PRE_INDEX_HEAD_JSON: &str = r#"{
-        "record":"head_v2",
-        "schema_version":2,
-        "logical_revision":1,
-        "row_count":1,
-        "rows":[{
-            "id_digest":[81,101,214,138,21,89,175,67,122,58,109,93,250,110,177,117,148,152,44,22,173,238,35,126,51,12,121,181,106,32,20,22],
-            "store_revision":1,
-            "updated_at_unix":1900000000
-        }],
-        "row_set_commitment":[184,201,24,127,6,155,45,96,4,131,68,156,151,201,23,198,2,14,37,129,101,149,133,84,60,116,167,210,221,101,11,211]
-    }"#;
 
     fn fixture_board_with_price(specifications: &[(u32, u64)], price: u64) -> NameMarketBoard {
         let signing_key = SigningKey::from_slice(&[0x61; 32]).expect("seller key");
@@ -2077,8 +1919,8 @@ mod normalized_storage_tests {
             );
         }
 
-        let mut head = serde_json::to_value(PersistedNameMarketBoardEntity::HeadV2Indexed {
-            schema_version: NORMALIZED_NAME_MARKET_BOARD_SCHEMA_VERSION,
+        let mut head = serde_json::to_value(PersistedNameMarketBoardEntity::Head {
+            schema_version: NAME_MARKET_BOARD_STORAGE_SCHEMA_VERSION,
             logical_revision: 1,
             row_count: 1,
             rows: vec![index],
@@ -2125,147 +1967,12 @@ mod normalized_storage_tests {
                     .expect("row value commitment")
                     .as_bytes()
             ),
-            "a66982bca93d9afac65171ea60199c31078df9255ed50797331f755d26ea8698"
+            "bd5136815d55e94f68d5f4228096fe5e5da0bbd8d410d7ecda2ed86891d274cf"
         );
     }
 
     #[test]
-    fn legacy_board_migrates_atomically_and_preserves_logical_revision_and_namespace() {
-        let legacy = fixture_board(&[(1, 1)]);
-        let updated = fixture_board(&[(1, 1), (2, 2)]);
-        let mut store = WalletStore::create(":memory:", PASSPHRASE).expect("wallet store");
-        assert_eq!(
-            store
-                .save_shakescape_board_object(
-                    NAME_MARKET_BOARD_RECORD_ID,
-                    0,
-                    &legacy,
-                    UPDATED_AT - 1
-                )
-                .expect("legacy board"),
-            1
-        );
-        let outbox_sentinel = json!({"outbox_sentinel": true});
-        assert_eq!(
-            store
-                .save_shakescape_board_object(OUTBOX_RECORD_ID, 0, &outbox_sentinel, UPDATED_AT - 1)
-                .expect("outbox sentinel"),
-            1
-        );
-
-        assert!(matches!(
-            save_name_market_board(&mut store, 0, &updated, UPDATED_AT),
-            Err(ShakedexError::StaleRevision)
-        ));
-        assert!(
-            store
-                .shakescape_board_object::<NameMarketBoard>(NAME_MARKET_BOARD_RECORD_ID)
-                .expect("legacy lookup")
-                .is_some()
-        );
-        assert!(
-            store
-                .shakescape_board_object::<PersistedNameMarketBoardEntity>(
-                    NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
-                )
-                .expect("head lookup")
-                .is_none()
-        );
-        assert!(stored_normalized_rows(&store).is_empty());
-
-        assert_eq!(
-            save_name_market_board(&mut store, 1, &updated, UPDATED_AT)
-                .expect("atomic normalized migration"),
-            2
-        );
-        assert!(
-            store
-                .shakescape_board_object::<NameMarketBoard>(NAME_MARKET_BOARD_RECORD_ID)
-                .expect("legacy lookup after migration")
-                .is_none()
-        );
-        assert_eq!(stored_normalized_rows(&store).len(), 2);
-        let loaded = load_name_market_board(&store).expect("migrated board");
-        assert_eq!(loaded.revision, 2);
-        assert_eq!(loaded.board, updated);
-        let retained = store
-            .shakescape_board_object::<serde_json::Value>(OUTBOX_RECORD_ID)
-            .expect("outbox lookup")
-            .expect("retained outbox sentinel");
-        assert_eq!(retained.revision, 1);
-        assert_eq!(retained.value, outbox_sentinel);
-    }
-
-    #[test]
-    fn pre_index_v2_head_loads_and_migrates_on_the_next_mutation() {
-        let board = fixture_board(&[(1, 1)]);
-        let mut store = WalletStore::create(":memory:", PASSPHRASE).expect("wallet store");
-        let mut rows = normalized_rows_from_board(&board).expect("normalized rows");
-        for row in &mut rows {
-            row.store_revision = 1;
-            row.updated_at_unix = UPDATED_AT;
-            assert_eq!(
-                store
-                    .save_shakescape_board_object(
-                        &row.id,
-                        0,
-                        &normalized_row_entity(row),
-                        UPDATED_AT,
-                    )
-                    .expect("pre-index row"),
-                1
-            );
-        }
-        let frozen_head: serde_json::Value = serde_json::from_str(FROZEN_PRE_INDEX_HEAD_JSON)
-            .expect("frozen historical HeadV2 JSON");
-        assert!(matches!(
-            serde_json::from_str::<PersistedNameMarketBoardEntity>(FROZEN_PRE_INDEX_HEAD_JSON)
-                .expect("decode frozen historical HeadV2"),
-            PersistedNameMarketBoardEntity::HeadV2 { .. }
-        ));
-        store
-            .save_shakescape_board_object(
-                NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
-                0,
-                &frozen_head,
-                UPDATED_AT,
-            )
-            .expect("pre-index v2 head");
-
-        let selected_hash = board.offers()[0].listing_hash;
-        let loaded = load_name_market_board(&store).expect("pre-index v2 full load");
-        assert_eq!(loaded.revision, 1);
-        assert_eq!(loaded.board, board);
-        let selected = load_name_market_board_offers(&store, &[selected_hash])
-            .expect("pre-index targeted fallback");
-        assert_eq!(selected.offers, vec![board.offer(selected_hash).cloned()]);
-        assert!(stored_normalized_listing_indexes(&store).is_empty());
-
-        assert_eq!(
-            save_name_market_board(&mut store, 1, &board, UPDATED_AT + 1)
-                .expect("atomic indexed-v2 migration"),
-            2
-        );
-        assert_eq!(stored_normalized_listing_indexes(&store).len(), 1);
-        assert!(
-            stored_normalized_rows(&store)
-                .iter()
-                .all(|row| row.revision == 1 && row.updated_at_unix == UPDATED_AT)
-        );
-        let migrated_head = store
-            .shakescape_board_object::<PersistedNameMarketBoardEntity>(
-                NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
-            )
-            .expect("migrated head lookup")
-            .expect("migrated indexed head");
-        assert!(matches!(
-            migrated_head.value,
-            PersistedNameMarketBoardEntity::HeadV2Indexed { .. }
-        ));
-    }
-
-    #[test]
-    fn normalized_board_rejects_missing_extra_wrong_revision_id_and_torn_coexistence() {
+    fn normalized_board_rejects_missing_extra_wrong_revision_and_id() {
         let board = fixture_board(&[(1, 1)]);
 
         let mut missing = normalized_store(&board);
@@ -2324,11 +2031,6 @@ mod normalized_storage_tests {
             )
             .expect("substitute wrong row ID");
         assert_corrupt(&wrong_id);
-
-        let mut torn = normalized_store(&board);
-        torn.save_shakescape_board_object(NAME_MARKET_BOARD_RECORD_ID, 0, &board, UPDATED_AT + 1)
-            .expect("inject torn legacy coexistence");
-        assert_corrupt(&torn);
     }
 
     #[test]
@@ -2354,7 +2056,7 @@ mod normalized_storage_tests {
         assert_eq!(indexes.len(), initial.offers().len());
         assert!(indexes.iter().all(|stored| matches!(
             stored.value,
-            PersistedNameMarketBoardEntity::ListingIndexV2 { .. }
+            PersistedNameMarketBoardEntity::ListingIndex { .. }
         )));
         let selected =
             load_name_market_board_offers(&store, &[old_hash, retained_hash, absent_hash])
@@ -2405,7 +2107,7 @@ mod normalized_storage_tests {
         let unselected = stored_normalized_rows(&store)
             .into_iter()
             .find(|stored| {
-                let PersistedNameMarketBoardEntity::RowV2 { offer, .. } = &stored.value else {
+                let PersistedNameMarketBoardEntity::Row { offer, .. } = &stored.value else {
                     return false;
                 };
                 offer.network_magic == 2
@@ -2415,7 +2117,7 @@ mod normalized_storage_tests {
             .save_shakescape_board_object(
                 &unselected.id,
                 unselected.revision,
-                &json!({"record": "row_v2", "malformed": true}),
+                &json!({"record": "row", "malformed": true}),
                 UPDATED_AT + 1,
             )
             .expect("authenticated malformed unselected row");
@@ -2426,7 +2128,7 @@ mod normalized_storage_tests {
             )
             .expect("head lookup")
             .expect("normalized head");
-        let PersistedNameMarketBoardEntity::HeadV2Indexed {
+        let PersistedNameMarketBoardEntity::Head {
             schema_version,
             logical_revision,
             row_count,
@@ -2448,7 +2150,7 @@ mod normalized_storage_tests {
             .save_shakescape_board_object(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
                 head.revision,
-                &PersistedNameMarketBoardEntity::HeadV2Indexed {
+                &PersistedNameMarketBoardEntity::Head {
                     schema_version,
                     logical_revision,
                     row_count,
@@ -2569,7 +2271,7 @@ mod normalized_storage_tests {
         let original_index = stored_normalized_listing_indexes(&store)
             .pop()
             .expect("one listing index");
-        let PersistedNameMarketBoardEntity::ListingIndexV2 { row_id_digest, .. } =
+        let PersistedNameMarketBoardEntity::ListingIndex { row_id_digest, .. } =
             original_index.value
         else {
             panic!("normalized listing-index variant");
@@ -2591,7 +2293,7 @@ mod normalized_storage_tests {
             )
             .expect("head lookup")
             .expect("normalized head");
-        let PersistedNameMarketBoardEntity::HeadV2Indexed {
+        let PersistedNameMarketBoardEntity::Head {
             schema_version,
             logical_revision,
             row_count,
@@ -2611,7 +2313,7 @@ mod normalized_storage_tests {
                     EntityBatchSave {
                         id: substitute_id,
                         expected_revision: 0,
-                        value: PersistedNameMarketBoardEntity::ListingIndexV2 {
+                        value: PersistedNameMarketBoardEntity::ListingIndex {
                             listing_hash: substitute_hash,
                             row_id_digest,
                         },
@@ -2620,7 +2322,7 @@ mod normalized_storage_tests {
                     EntityBatchSave {
                         id: NORMALIZED_NAME_MARKET_BOARD_HEAD_ID.to_vec(),
                         expected_revision: head.revision,
-                        value: PersistedNameMarketBoardEntity::HeadV2Indexed {
+                        value: PersistedNameMarketBoardEntity::Head {
                             schema_version,
                             logical_revision,
                             row_count,
@@ -2660,7 +2362,7 @@ mod normalized_storage_tests {
             )
             .expect("head lookup")
             .expect("normalized head");
-        let PersistedNameMarketBoardEntity::HeadV2Indexed {
+        let PersistedNameMarketBoardEntity::Head {
             schema_version,
             logical_revision,
             row_count,
@@ -2679,7 +2381,7 @@ mod normalized_storage_tests {
             .save_shakescape_board_object(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
                 head.revision,
-                &PersistedNameMarketBoardEntity::HeadV2Indexed {
+                &PersistedNameMarketBoardEntity::Head {
                     schema_version,
                     logical_revision,
                     row_count,
@@ -2740,7 +2442,7 @@ mod normalized_storage_tests {
         let index = stored_normalized_listing_indexes(&substituted)
             .pop()
             .expect("one listing index");
-        let wrong = PersistedNameMarketBoardEntity::ListingIndexV2 {
+        let wrong = PersistedNameMarketBoardEntity::ListingIndex {
             listing_hash,
             row_id_digest: ObjectHash::new([0xa5; 32]),
         };
@@ -2755,7 +2457,7 @@ mod normalized_storage_tests {
         let board = fixture_board(&[(1, 1)]);
         let mut store = normalized_store(&board);
         let row = stored_normalized_rows(&store).pop().expect("one row");
-        let malformed_row = json!({"record": "row_v2", "malformed": true});
+        let malformed_row = json!({"record": "row", "malformed": true});
         store
             .save_shakescape_board_object(&row.id, row.revision, &malformed_row, UPDATED_AT + 1)
             .expect("authenticated malformed row");
@@ -2766,7 +2468,7 @@ mod normalized_storage_tests {
             )
             .expect("head lookup")
             .expect("head present");
-        let PersistedNameMarketBoardEntity::HeadV2Indexed {
+        let PersistedNameMarketBoardEntity::Head {
             schema_version,
             logical_revision,
             mut rows,
@@ -2780,7 +2482,7 @@ mod normalized_storage_tests {
         rows[0].store_revision = row.revision + 1;
         rows[0].updated_at_unix = UPDATED_AT + 1;
         rows.push(rows[0].clone());
-        let malformed_head = PersistedNameMarketBoardEntity::HeadV2Indexed {
+        let malformed_head = PersistedNameMarketBoardEntity::Head {
             schema_version,
             logical_revision,
             row_count: 2,
@@ -2808,7 +2510,7 @@ mod normalized_storage_tests {
         let mut store = normalized_store(&board);
         let row = stored_normalized_rows(&store).pop().expect("one row");
         let mut value = serde_json::to_value(&row.value).expect("row JSON");
-        value["offer"]["unexpected_v2_field"] = json!(true);
+        value["offer"]["unexpected_field"] = json!(true);
         store
             .save_shakescape_board_object(&row.id, row.revision, &value, UPDATED_AT + 1)
             .expect("authenticated row with nested unknown field");
@@ -2819,7 +2521,7 @@ mod normalized_storage_tests {
             )
             .expect("head lookup")
             .expect("head present");
-        let PersistedNameMarketBoardEntity::HeadV2Indexed {
+        let PersistedNameMarketBoardEntity::Head {
             schema_version,
             logical_revision,
             row_count,
@@ -2836,7 +2538,7 @@ mod normalized_storage_tests {
             .save_shakescape_board_object(
                 NORMALIZED_NAME_MARKET_BOARD_HEAD_ID,
                 head.revision,
-                &PersistedNameMarketBoardEntity::HeadV2Indexed {
+                &PersistedNameMarketBoardEntity::Head {
                     schema_version,
                     logical_revision,
                     row_count,
@@ -3011,8 +2713,8 @@ mod normalized_storage_tests {
             })
             .collect::<Vec<_>>();
         assert!(normalized_metadata_from_index(&rows).is_ok());
-        let head = PersistedNameMarketBoardEntity::HeadV2Indexed {
-            schema_version: NORMALIZED_NAME_MARKET_BOARD_SCHEMA_VERSION,
+        let head = PersistedNameMarketBoardEntity::Head {
+            schema_version: NAME_MARKET_BOARD_STORAGE_SCHEMA_VERSION,
             logical_revision: 1,
             row_count: u32::try_from(rows.len()).expect("bounded row count"),
             rows: rows.clone(),
@@ -3062,10 +2764,10 @@ mod normalized_storage_tests {
         assert_eq!(board.offers().len(), MAX_NAME_MARKET_BOARD_OFFERS);
         assert!(
             serde_json::to_vec(&board)
-                .expect("legacy aggregate encoding")
+                .expect("aggregate encoding")
                 .len()
                 > MAX_STATE_BYTES,
-            "the normalized regression must exercise the legacy aggregate limit"
+            "the normalized regression must exercise the aggregate size limit"
         );
 
         let store = normalized_store(&board);

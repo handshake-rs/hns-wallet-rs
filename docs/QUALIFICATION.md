@@ -110,12 +110,12 @@ control executable do not. This is contract/source evidence, not a native
 launcher, installed extension, signed artifact, live node, or availability
 qualification. Closed-enum ABI-v2 consumers must adopt the marker in lockstep.
 
-Exact local source commit `77d891cf320f83ecb580e378d1987b3048c5c9ad`
-adds schema-v3 Shakescape relay-acceptance persistence. Its 24 Shakedex library
+Exact historical source commit `77d891cf320f83ecb580e378d1987b3048c5c9ad`
+added the former Shakescape relay-acceptance persistence. Its 24 Shakedex library
 tests passed again from an isolated clean checkout with the concurrent wallet
 publisher files absent; focused warning-denied Clippy and rustdoc also passed.
 That evidence covers canonical endpoint signatures, exact receipt replay and
-conflict, schema-v1/v2 migration denial, and restart self-validation only. It
+conflict, the then-current migration denial, and restart self-validation only. It
 was not hosted CI or CodeQL at that intermediate commit; the code is included
 in exact descendant `bc5901f`, whose qualified CI and CodeQL passed. Neither
 record supplies live relay/HRM/HNSA authority, board currentness,
@@ -189,26 +189,25 @@ contains focused source regressions for coherent read snapshots; bounded,
 sorted, never-authoritative prefix metadata; ciphertext-fingerprinted lease
 refresh; exact-prefix-set insertion, revision, capacity, and same-metadata ABA
 races; cross-kind guard rollback; compare-only assertions; and invalid assertion
-or lease shape. Board regressions cover compact `HeadV2Indexed` selectors that
+or lease shape. Board regressions cover compact `Head` selectors that
 bind row identity/revision/time/value commitment/listing hash, exact derived
 listing-index ID sets, all-hit targeted selection, miss-triggered full semantic
 fallback, selected-row ciphertext ABA, selector permutation/remapping,
 commitment and bijection checks, missing/extra/substituted/torn state, strict
 nested schemas, monotonic identity lineage, unchanged-row physical revision
-retention, per-record head/row bounds, a cryptographically real 32-row
-roundtrip, atomic legacy-v1 migration, and strict pre-index `HeadV2` read plus
-next-mutation migration. Runtime regressions cover selected-wallet account lease
+retention, per-record head/row bounds, and a cryptographically real 32-row
+roundtrip. Aggregate and pre-index formats are now rejected rather than migrated.
+Runtime regressions cover selected-wallet account lease
 capture before external work, refresh in the same account-plus-board snapshot,
 the second ciphertext-fingerprinted write guard, and the read-only/non-atomic
 unchanged-account diagnostic distinction.
 
-Local final-source runs passed 38 Store library tests, 73 HNS library tests, 42
+Local final-source runs passed 40 Store library tests, 73 HNS library tests, 44
 Shakedex library tests with one ignored, and 26 Shakescape board-runtime integration
-tests. The focused normalized-storage run passed 18 tests with the same one
-ignored; it is an overlapping subset/re-run, not 18 additional independent
+tests. The focused normalized-storage cohort contains 16 tests with the same one
+ignored; it is an overlapping subset, not 16 additional independent
 tests. The ignored case was then run explicitly in optimized release mode: the
-4,096-row persistence qualification passed 1/1, with 47.20s build time and
-15.92s test time.
+4,096-row persistence qualification passed 1/1 in 16.31 seconds of test time.
 
 These are local working-tree results, not exact-commit hosted evidence. No
 exact-commit CI or CodeQL record, database or broader resource benchmark,

@@ -111,9 +111,9 @@ restored on-chain Shakedex index, and reserves the configured trailing scan
 gap, so concurrent writers to one wallet store cannot allocate through an
 incomplete mnemonic scan and reuse a discovered lock key.
 
-The fixed-price Shakescape board now uses normalized encrypted persistence rather
-than one aggregate `ShakescapeBoardObject`. Its indexed schema-v2 namespace contains
-one `HeadV2Indexed`, one domain-separated digest-addressed row per seller/name
+The fixed-price Shakescape board uses one canonical normalized encrypted
+persistence format. Its indexed schema-v1 namespace contains one `Head`, one
+domain-separated digest-addressed row per seller/name
 identity, and one encrypted domain-separated listing-hash index per row. Each
 strict row retains the canonical latest listing or cancellation together with
 its durable identity watermark. The head separates the public logical board
@@ -123,7 +123,7 @@ and listing hash. The head also commits to the complete row-value and listing-
 index metadata sets.
 
 A full load captures the exact bounded namespace in one coherent snapshot. It
-rejects an oversized or malformed namespace, legacy/head coexistence, missing
+rejects an oversized or malformed namespace, unknown records, missing
 or extra rows or indexes, metadata drift, a row-value commitment mismatch, or a
 non-bijective listing-index-to-row mapping. It authenticates and strictly
 decodes every encrypted row and index before reconstructing the logical board.
@@ -131,7 +131,7 @@ Each entity remains subject to the store's 1 MiB per-record bound, and the
 loader authenticates one ciphertext buffer at a time rather than allocating the
 advertised row count times that bound up front.
 
-An indexed targeted read first authenticates `HeadV2Indexed`, derives the exact
+An indexed targeted read first authenticates `Head`, derives the exact
 sorted listing-index ID set from all committed selector listing hashes, and
 requires the complete O(N) index metadata set to match those IDs and the head
 commitment. When every requested hash has an index, the reader authenticates
@@ -162,12 +162,9 @@ only a coherent read check and returns no guard, so it is not an atomic
 precondition for a later write. Mutation paths instead consume
 `revalidate_unchanged_account` and the refreshed prefix lease.
 
-A legacy-v1 aggregate is accepted only as the sole namespace record and is
-deleted in the same atomic batch that installs indexed v2, preserving logical
-revision progression. Historical normalized `HeadV2` plus row objects are also
-strictly readable; targeted reads fall back to full authentication, and the
-next successful mutation keeps unchanged row revisions while atomically adding
-the indexes and replacing the head with `HeadV2Indexed`.
+No aggregate or pre-index board format is accepted. Unknown records and schema
+versions fail closed; there is no implicit migration path that could reinterpret
+pre-release state as current authority.
 
 A higher valid listing still replaces its identity's older record without
 consuming another slot. A cancellation tombstone advances the watermark, so
@@ -213,7 +210,7 @@ and bounded monotonic preparation/failure metadata. Restart validation
 re-decodes and exactly re-encodes every envelope and rejects duplicate request
 or message identity, digest mismatch, timestamp/state regression, and
 oversized state. Exact enqueue is idempotent; the same message with another
-request ID conflicts. Schema v2 permits at most one aggregate-wide
+request ID conflicts. The current schema permits at most one aggregate-wide
 `HandoffPrepared` row. Its domain-separated attempt ID binds the envelope ID,
 request ID, next attempt ordinal, and preparation time. The CAS update is
 durable before the non-cloneable, non-serializable exact-byte artifact is
@@ -230,12 +227,10 @@ additive pending entries, one exact due-state-to-prepared transition, or the
 correlated prepared-to-retry/exhausted failure transition. They reject removal,
 immutable-byte changes, skipped retry history, multiple prepared entries,
 terminal rollback, and record-time regression. Creation, preparation,
-last-attempt, legacy acknowledgement, and exhaustion timestamps cannot exceed
-the containing record's update time; a future scheduled retry may. Schema-v1
-rows are validated and normalized in memory; the next mutating CAS save writes
-schema v2. Existing schema-v1 `Acknowledged` rows remain immutable terminal
-compatibility state, while schema v2 exposes no acknowledgement constructor or
-transition. A caller with raw mutable `WalletStore` access remains a trusted
+last-attempt, relay-acceptance, direct-announcement, and exhaustion timestamps
+cannot exceed the containing record's update time; a future scheduled retry may.
+Only the exact current schema is accepted. A caller with raw mutable
+`WalletStore` access remains a trusted
 in-process composition authority: record AEAD detects external storage
 tampering, but cannot defend against an authorized writer constructing and
 encrypting another record. This tranche does not redesign that store boundary.

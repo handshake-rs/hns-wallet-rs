@@ -1,18 +1,17 @@
 //! Wallet-derived authority for responding to exact direct HNS/BTC offers.
 //!
-//! In the current role model the responder initializes the executable swap as
-//! maker. Legacy records in this module represent the old responder-as-taker
-//! model and are retained only so already-countersigned sessions can recover.
+//! The responder initializes the executable swap as maker. The original offer
+//! setter countersigns the resulting proposal as the execution taker.
 
 use hns_marketplace_protocol::{
-    AssetId, CrossChainMessage, DirectOfferAcceptance, DirectOfferRoleModel,
-    MARKETPLACE_PROTOCOL_VERSION, MarketPair, SignedObjectHeader, SwapSessionHello,
+    AssetId, CrossChainMessage, DirectOfferAcceptance, MARKETPLACE_PROTOCOL_VERSION, MarketPair,
+    SignedObjectHeader, SwapSessionHello,
 };
 use hns_wallet_store::{EntityKind, WalletStore};
 use hns_wallet_types::{ObjectHash, SessionId, WalletId};
 use serde::{Deserialize, Serialize};
 
-use crate::direct_maker::derive_board_identity;
+use crate::direct_offer::derive_board_identity;
 use crate::{
     CrossChainSwapKeyRequest, MarketError, ShakescapeDirectSwapPolicy, SwapParticipant,
     SwapSession, admit_shakescape_direct_offer_acceptance, admit_shakescape_direct_swap_hello,
@@ -20,16 +19,13 @@ use crate::{
     load_shakescape_direct_offer, load_shakescape_direct_swap, open_shakescape_execution,
 };
 
-const STORAGE_VERSION: u16 = 2;
-const LEGACY_STORAGE_VERSION: u16 = 1;
-const RECORD_PREFIX: &[u8] = b"local-direct-acceptance/v2/";
-const LEGACY_RECORD_PREFIX: &[u8] = b"local-direct-take/v1/";
+const STORAGE_VERSION: u16 = 1;
+const RECORD_PREFIX: &[u8] = b"local-direct-acceptance/v1/";
 const ABANDONMENT_STORAGE_VERSION: u16 = 1;
 const ABANDONMENT_RECORD_PREFIX: &[u8] = b"local-direct-acceptance-abandonment/v1/";
-const LEGACY_ABANDONMENT_RECORD_PREFIX: &[u8] = b"local-direct-take-abandonment/v1/";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ShakescapeHnsForBtcTakeRequest {
+pub struct ShakescapeHnsForBtcOfferAcceptanceRequest {
     pub wallet_id: WalletId,
     pub offer_id: ObjectHash,
     pub hns_fee_reserve_dollarydoos: u64,
@@ -39,7 +35,7 @@ pub struct ShakescapeHnsForBtcTakeRequest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ShakescapeBtcForHnsTakeRequest {
+pub struct ShakescapeBtcForHnsOfferAcceptanceRequest {
     pub wallet_id: WalletId,
     pub offer_id: ObjectHash,
     pub bitcoin_fee_reserve_sats: u64,
@@ -83,13 +79,6 @@ pub struct ShakescapeOfferSetterAcceptedSession {
     pub envelope: Vec<u8>,
 }
 
-// Source-compatible names for downstream applications compiled against the
-// pre-v2 role terminology. New code should use the acceptance/responder names
-// above; wire and storage compatibility are handled independently.
-pub type ShakescapeDirectTakeRequest = ShakescapeDirectOfferAcceptanceRequest;
-pub type ShakescapeLocalDirectTake = ShakescapeLocalDirectOfferAcceptance;
-pub type ShakescapeTakerAcceptedSession = ShakescapeOfferSetterAcceptedSession;
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PersistedLocalDirectAcceptance {
@@ -97,7 +86,7 @@ pub(crate) struct PersistedLocalDirectAcceptance {
     pub(crate) wallet_id: WalletId,
     pub(crate) offer_id: ObjectHash,
     pub(crate) session_id: SessionId,
-    pub(crate) hns_fee_reserve_dollarydoos: u64,
+    pub(crate) received_fee_reserve: u64,
     pub(crate) created_at_unix: u64,
 }
 
@@ -116,10 +105,10 @@ struct PersistedLocalDirectAcceptanceAbandonment {
 
 /// Sign and durably admit one exact acceptance. The session identifier comes
 /// from the signed offer; the responding maker has no authority to replace it.
-pub fn create_shakescape_hns_for_btc_take(
+pub fn create_shakescape_hns_for_btc_offer_acceptance(
     store: &mut WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
-    request: ShakescapeHnsForBtcTakeRequest,
+    request: ShakescapeHnsForBtcOfferAcceptanceRequest,
 ) -> Result<ShakescapeLocalDirectOfferAcceptance, MarketError> {
     create_shakescape_direct_offer_acceptance(
         store,
@@ -135,10 +124,10 @@ pub fn create_shakescape_hns_for_btc_take(
     )
 }
 
-pub fn create_shakescape_btc_for_hns_take(
+pub fn create_shakescape_btc_for_hns_offer_acceptance(
     store: &mut WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
-    request: ShakescapeBtcForHnsTakeRequest,
+    request: ShakescapeBtcForHnsOfferAcceptanceRequest,
 ) -> Result<ShakescapeLocalDirectOfferAcceptance, MarketError> {
     create_shakescape_direct_offer_acceptance(
         store,
@@ -199,7 +188,6 @@ pub fn create_shakescape_direct_offer_acceptance(
     sequence_bytes.copy_from_slice(&request.nonce[..8]);
     let sequence = (u64::from_be_bytes(sequence_bytes) & i64::MAX as u64).max(1);
     let mut acceptance = DirectOfferAcceptance {
-        role_model: DirectOfferRoleModel::OfferSetterTaker,
         header: SignedObjectHeader {
             version: MARKETPLACE_PROTOCOL_VERSION,
             network: policy.network(),
@@ -227,9 +215,7 @@ pub fn create_shakescape_direct_offer_acceptance(
         wallet_id: request.wallet_id,
         offer_id: request.offer_id,
         session_id,
-        // Storage field predates bidirectional takes. It now holds the fee
-        // reserve in the offer's received asset base unit.
-        hns_fee_reserve_dollarydoos: request.received_fee_reserve,
+        received_fee_reserve: request.received_fee_reserve,
         created_at_unix: request.created_at_unix,
     };
     store.save_entity(
@@ -240,16 +226,6 @@ pub fn create_shakescape_direct_offer_acceptance(
         request.created_at_unix,
     )?;
     project_local_acceptance(store, policy, persisted)
-}
-
-/// Compatibility entry point retained for callers using the old UI action
-/// name. The responder created here is the executable swap maker.
-pub fn create_shakescape_direct_take(
-    store: &mut WalletStore,
-    policy: &ShakescapeDirectSwapPolicy,
-    request: ShakescapeDirectTakeRequest,
-) -> Result<ShakescapeLocalDirectTake, MarketError> {
-    create_shakescape_direct_offer_acceptance(store, policy, request)
 }
 
 /// Verify and countersign the maker proposal, admit the accepted hello, and
@@ -276,34 +252,12 @@ pub fn accept_shakescape_direct_maker_proposal(
     }
     let record = load_shakescape_direct_swap(store, policy, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
-    let (intent_id, expected_taker_key) = match record.offer.role_model {
-        DirectOfferRoleModel::LegacyOfferSetterMaker => {
-            let local = load_legacy_local_take(store, wallet_id, session_id)?
-                .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
-            if local.offer_id != ObjectHash::new(record.offer.offer_id)
-                || load_legacy_local_take_abandonment(store, wallet_id, session_id)?.is_some()
-            {
-                return Err(MarketError::ShakescapeDirectSwapConflict);
-            }
-            (
-                local.offer_id,
-                record.acceptance.responding_maker_settlement_public_key,
-            )
-        }
-        DirectOfferRoleModel::OfferSetterTaker => {
-            let local =
-                crate::direct_maker::load_local_offer(store, wallet_id, record.offer.offer_id)?;
-            if local.session_id != session_id
-                || local.offer_id != ObjectHash::new(record.offer.offer_id)
-            {
-                return Err(MarketError::ShakescapeDirectSwapConflict);
-            }
-            (
-                local.intent_id,
-                record.offer.offer_setter_settlement_public_key,
-            )
-        }
-    };
+    let local = crate::direct_offer::load_local_offer(store, wallet_id, record.offer.offer_id)?;
+    if local.session_id != session_id || local.offer_id != ObjectHash::new(record.offer.offer_id) {
+        return Err(MarketError::ShakescapeDirectSwapConflict);
+    }
+    let intent_id = local.intent_id;
+    let expected_taker_key = record.offer.offer_setter_settlement_public_key;
     if let Some(hello) = record.hello {
         let execution = open_shakescape_execution(store, policy, session_id, now_unix)?;
         let request_id = record
@@ -372,16 +326,9 @@ pub fn list_local_shakescape_direct_offer_acceptances(
         .collect()
 }
 
-pub fn list_local_shakescape_direct_takes(
-    store: &WalletStore,
-    policy: &ShakescapeDirectSwapPolicy,
-    wallet_id: WalletId,
-) -> Result<Vec<ShakescapeLocalDirectTake>, MarketError> {
-    list_local_shakescape_direct_offer_acceptances(store, policy, wallet_id)
-}
-
-/// List local takes which still reserve funds but have not reached a durable
-/// countersigned execution. These are the only takes a user may abandon.
+/// List local acceptances which still reserve funds but have not reached a
+/// durable countersigned execution. These are the only acceptances a user may
+/// abandon.
 pub fn list_pending_local_shakescape_direct_offer_acceptances(
     store: &WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
@@ -401,15 +348,6 @@ pub fn list_pending_local_shakescape_direct_offer_acceptances(
         pending.push(acceptance);
     }
     Ok(pending)
-}
-
-pub fn list_pending_local_shakescape_direct_takes(
-    store: &WalletStore,
-    policy: &ShakescapeDirectSwapPolicy,
-    wallet_id: WalletId,
-    now_unix: u64,
-) -> Result<Vec<ShakescapeLocalDirectTake>, MarketError> {
-    list_pending_local_shakescape_direct_offer_acceptances(store, policy, wallet_id, now_unix)
 }
 
 /// Release one local acceptance before exact terms are countersigned. This
@@ -456,24 +394,10 @@ pub fn abandon_pending_local_shakescape_direct_offer_acceptance(
     Ok(projected)
 }
 
-pub fn abandon_pending_local_shakescape_direct_take(
-    store: &mut WalletStore,
-    policy: &ShakescapeDirectSwapPolicy,
-    wallet_id: WalletId,
-    session_id: SessionId,
-    now_unix: u64,
-) -> Result<ShakescapeLocalDirectTake, MarketError> {
-    abandon_pending_local_shakescape_direct_offer_acceptance(
-        store, policy, wallet_id, session_id, now_unix,
-    )
-}
-
 /// Sum funds committed by local offer responses for one asset.
 ///
-/// Current responses make this wallet the execution maker, which funds the
-/// offer's received asset on the first chain. Legacy responses made this
-/// wallet the taker and therefore retain the old second-chain reservation
-/// rules while an already-countersigned session is being recovered.
+/// Responses make this wallet the execution maker, which funds the offer's
+/// received asset on the first chain.
 pub fn reserved_local_shakescape_responder_amount(
     store: &WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
@@ -489,14 +413,9 @@ pub fn reserved_local_shakescape_responder_amount(
         if acceptance.received_asset != asset {
             continue;
         }
-        let record = load_shakescape_direct_swap(store, policy, acceptance.session_id)?
-            .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
         let execution = store.load_workflow::<SwapSession>(
             crate::shakescape_execution_workflow_id(acceptance.session_id),
         )?;
-        if record.offer.role_model != DirectOfferRoleModel::OfferSetterTaker {
-            return Err(MarketError::CorruptShakescapeDirectSwap);
-        }
         let reserve = match execution.as_ref().map(|row| row.state.state) {
             Some(
                 crate::SwapState::TermsFrozen
@@ -512,85 +431,7 @@ pub fn reserved_local_shakescape_responder_amount(
                 .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
         }
     }
-    total = total
-        .checked_add(reserved_legacy_local_taker_amount(
-            store, policy, wallet_id, asset, now_unix,
-        )?)
-        .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
     Ok(total)
-}
-
-/// Preserve reservations only for legacy sessions that had already reached a
-/// countersigned execution before the role-model upgrade. Legacy offer/acceptance
-/// packets are not accepted by the current transport, so a record without an
-/// execution cannot acquire new funding authority.
-fn reserved_legacy_local_taker_amount(
-    store: &WalletStore,
-    policy: &ShakescapeDirectSwapPolicy,
-    wallet_id: WalletId,
-    asset: AssetId,
-    now_unix: u64,
-) -> Result<u64, MarketError> {
-    let stored = store.list_entities_by_id_prefix::<PersistedLocalDirectAcceptance>(
-        EntityKind::ShakescapeBoardObject,
-        &legacy_record_prefix(wallet_id),
-        crate::MAX_SHAKESCAPE_DIRECT_SWAPS + 1,
-    )?;
-    if stored.len() > crate::MAX_SHAKESCAPE_DIRECT_SWAPS {
-        return Err(MarketError::ShakescapeDirectSwapCapacity);
-    }
-    let mut total = 0_u64;
-    for stored in stored {
-        let local = validate_stored_version(wallet_id, stored, LEGACY_STORAGE_VERSION, true)?;
-        let record = load_shakescape_direct_swap(store, policy, local.session_id)?
-            .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
-        if record.offer.role_model != DirectOfferRoleModel::LegacyOfferSetterMaker
-            || record.offer.offer_id != local.offer_id.into_bytes()
-            || record.offer.received_asset != asset
-        {
-            continue;
-        }
-        let Some(execution) = store.load_workflow::<SwapSession>(
-            crate::shakescape_execution_workflow_id(local.session_id),
-        )?
-        else {
-            continue;
-        };
-        let reserve = match execution.state.state {
-            crate::SwapState::TermsFrozen
-            | crate::SwapState::RefundsPrepared
-            | crate::SwapState::FirstFundingPending
-            | crate::SwapState::SecondFundingPending => true,
-            crate::SwapState::FirstFunded => {
-                let hello = record
-                    .hello
-                    .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
-                now_unix < hello.header.expires_at
-            }
-            _ => false,
-        };
-        if reserve {
-            let amount = u64::try_from(record.offer.received_amount.get())
-                .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
-            total = total
-                .checked_add(amount)
-                .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
-        }
-    }
-    Ok(total)
-}
-
-/// Compatibility name retained for downstream callers. New code should use
-/// [`reserved_local_shakescape_responder_amount`], because a current local
-/// response is the atomic-swap maker rather than the taker.
-pub fn reserved_local_shakescape_taker_amount(
-    store: &WalletStore,
-    policy: &ShakescapeDirectSwapPolicy,
-    wallet_id: WalletId,
-    asset: AssetId,
-    now_unix: u64,
-) -> Result<u64, MarketError> {
-    reserved_local_shakescape_responder_amount(store, policy, wallet_id, asset, now_unix)
 }
 
 #[doc(hidden)]
@@ -621,32 +462,13 @@ pub fn derive_local_direct_taker_key(
 ) -> Result<(crate::CrossChainSwapKey, u64), MarketError> {
     let record = load_shakescape_direct_swap(store, policy, session_id)?
         .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
-    let (intent_id, fee_reserve, expected_key) = match record.offer.role_model {
-        DirectOfferRoleModel::LegacyOfferSetterMaker => {
-            let local = load_legacy_local_take(store, wallet_id, session_id)?
-                .ok_or(MarketError::UnknownShakescapeDirectSwap)?;
-            if record.offer.offer_id != local.offer_id.into_bytes() {
-                return Err(MarketError::ShakescapeDirectSwapConflict);
-            }
-            (
-                local.offer_id,
-                local.hns_fee_reserve_dollarydoos,
-                record.acceptance.responding_maker_settlement_public_key,
-            )
-        }
-        DirectOfferRoleModel::OfferSetterTaker => {
-            let local =
-                crate::direct_maker::load_local_offer(store, wallet_id, record.offer.offer_id)?;
-            if local.session_id != session_id {
-                return Err(MarketError::ShakescapeDirectSwapConflict);
-            }
-            (
-                local.intent_id,
-                local.bitcoin_fee_reserve_sats,
-                record.offer.offer_setter_settlement_public_key,
-            )
-        }
-    };
+    let local = crate::direct_offer::load_local_offer(store, wallet_id, record.offer.offer_id)?;
+    if local.session_id != session_id {
+        return Err(MarketError::ShakescapeDirectSwapConflict);
+    }
+    let intent_id = local.intent_id;
+    let fee_reserve = local.offered_fee_reserve;
+    let expected_key = record.offer.offer_setter_settlement_public_key;
     if record.hello.as_ref().is_none_or(|hello| {
         hello.swap_session_id != session_id.into_bytes()
             || !matches!(
@@ -719,8 +541,8 @@ fn project_local_acceptance(
         session_id: local.session_id,
         btc_amount_sats,
         hns_amount_dollarydoos,
-        hns_fee_reserve_dollarydoos: local.hns_fee_reserve_dollarydoos,
-        received_fee_reserve: local.hns_fee_reserve_dollarydoos,
+        hns_fee_reserve_dollarydoos: local.received_fee_reserve,
+        received_fee_reserve: local.received_fee_reserve,
         offered_asset: record.offer.offered_asset,
         offered_amount,
         received_asset: record.offer.received_asset,
@@ -745,32 +567,14 @@ pub(crate) fn load_local_acceptance(
         .transpose()
 }
 
-pub(crate) fn load_legacy_local_take(
-    store: &WalletStore,
-    wallet_id: WalletId,
-    session_id: SessionId,
-) -> Result<Option<PersistedLocalDirectAcceptance>, MarketError> {
-    store
-        .load_entity::<PersistedLocalDirectAcceptance>(
-            EntityKind::ShakescapeBoardObject,
-            &legacy_record_id(wallet_id, session_id),
-        )?
-        .map(|stored| validate_stored_version(wallet_id, stored, LEGACY_STORAGE_VERSION, true))
-        .transpose()
-}
-
 /// Identify the local atomic-swap taker without deriving settlement key
-/// material. Current sessions use the original offer-setter record; legacy
-/// sessions use the responder record that was historically called a take.
+/// material. The local taker is always the original offer setter.
 pub fn is_local_shakescape_direct_taker(
     store: &WalletStore,
     wallet_id: WalletId,
     session_id: SessionId,
 ) -> Result<bool, MarketError> {
-    if load_legacy_local_take(store, wallet_id, session_id)?.is_some() {
-        return Ok(true);
-    }
-    Ok(crate::direct_maker::load_local_offer_for_session(store, wallet_id, session_id)?.is_some())
+    Ok(crate::direct_offer::load_local_offer_for_session(store, wallet_id, session_id)?.is_some())
 }
 
 fn local_acceptance_has_execution(
@@ -823,19 +627,6 @@ fn load_local_acceptance_abandonment(
     )
 }
 
-fn load_legacy_local_take_abandonment(
-    store: &WalletStore,
-    wallet_id: WalletId,
-    session_id: SessionId,
-) -> Result<Option<PersistedLocalDirectAcceptanceAbandonment>, MarketError> {
-    load_abandonment(
-        store,
-        wallet_id,
-        session_id,
-        legacy_abandonment_record_id(wallet_id, session_id),
-    )
-}
-
 fn load_abandonment(
     store: &WalletStore,
     wallet_id: WalletId,
@@ -869,29 +660,15 @@ fn validate_stored(
     wallet_id: WalletId,
     stored: hns_wallet_store::StoredEntity<PersistedLocalDirectAcceptance>,
 ) -> Result<PersistedLocalDirectAcceptance, MarketError> {
-    validate_stored_version(wallet_id, stored, STORAGE_VERSION, false)
-}
-
-fn validate_stored_version(
-    wallet_id: WalletId,
-    stored: hns_wallet_store::StoredEntity<PersistedLocalDirectAcceptance>,
-    expected_version: u16,
-    legacy: bool,
-) -> Result<PersistedLocalDirectAcceptance, MarketError> {
     let row = stored.value;
     if stored.revision != 1
-        || row.storage_version != expected_version
+        || row.storage_version != STORAGE_VERSION
         || row.wallet_id != wallet_id
         || row.offer_id.as_bytes().iter().all(|byte| *byte == 0)
         || row.session_id.as_bytes().iter().all(|byte| *byte == 0)
-        || row.hns_fee_reserve_dollarydoos == 0
+        || row.received_fee_reserve == 0
         || row.created_at_unix != stored.updated_at_unix
-        || stored.id
-            != if legacy {
-                legacy_record_id(wallet_id, row.session_id)
-            } else {
-                record_id(wallet_id, row.session_id)
-            }
+        || stored.id != record_id(wallet_id, row.session_id)
     {
         return Err(MarketError::CorruptShakescapeDirectSwap);
     }
@@ -911,30 +688,9 @@ fn record_id(wallet_id: WalletId, session_id: SessionId) -> Vec<u8> {
     id
 }
 
-fn legacy_record_prefix(wallet_id: WalletId) -> Vec<u8> {
-    let mut id = Vec::with_capacity(LEGACY_RECORD_PREFIX.len() + 16);
-    id.extend_from_slice(LEGACY_RECORD_PREFIX);
-    id.extend_from_slice(wallet_id.as_bytes());
-    id
-}
-
-fn legacy_record_id(wallet_id: WalletId, session_id: SessionId) -> Vec<u8> {
-    let mut id = legacy_record_prefix(wallet_id);
-    id.extend_from_slice(session_id.as_bytes());
-    id
-}
-
 fn abandonment_record_id(wallet_id: WalletId, session_id: SessionId) -> Vec<u8> {
     let mut id = Vec::with_capacity(ABANDONMENT_RECORD_PREFIX.len() + 16 + 32);
     id.extend_from_slice(ABANDONMENT_RECORD_PREFIX);
-    id.extend_from_slice(wallet_id.as_bytes());
-    id.extend_from_slice(session_id.as_bytes());
-    id
-}
-
-fn legacy_abandonment_record_id(wallet_id: WalletId, session_id: SessionId) -> Vec<u8> {
-    let mut id = Vec::with_capacity(LEGACY_ABANDONMENT_RECORD_PREFIX.len() + 16 + 32);
-    id.extend_from_slice(LEGACY_ABANDONMENT_RECORD_PREFIX);
     id.extend_from_slice(wallet_id.as_bytes());
     id.extend_from_slice(session_id.as_bytes());
     id
@@ -1025,10 +781,10 @@ mod tests {
         )
         .expect("responder admits offer");
 
-        let acceptance = create_shakescape_hns_for_btc_take(
+        let acceptance = create_shakescape_hns_for_btc_offer_acceptance(
             &mut responder_store,
             &policy,
-            ShakescapeHnsForBtcTakeRequest {
+            ShakescapeHnsForBtcOfferAcceptanceRequest {
                 wallet_id: responder_id,
                 offer_id: offer.offer.offer_id,
                 hns_fee_reserve_dollarydoos: 10_000,
@@ -1111,7 +867,7 @@ mod tests {
         assert_eq!(accepted.execution, maker_execution);
         assert_eq!(accepted.execution.state, crate::SwapState::TermsFrozen);
         assert_eq!(
-            list_local_shakescape_direct_takes(&responder_store, &policy, responder_id)
+            list_local_shakescape_direct_offer_acceptances(&responder_store, &policy, responder_id)
                 .expect("local acceptances"),
             vec![acceptance]
         );
@@ -1207,10 +963,10 @@ mod tests {
         )
         .expect("BTC responder admits offer");
 
-        let acceptance = create_shakescape_btc_for_hns_take(
+        let acceptance = create_shakescape_btc_for_hns_offer_acceptance(
             &mut responder_store,
             &policy,
-            ShakescapeBtcForHnsTakeRequest {
+            ShakescapeBtcForHnsOfferAcceptanceRequest {
                 wallet_id: responder_id,
                 offer_id: offer.offer.offer_id,
                 bitcoin_fee_reserve_sats: 1_000,
@@ -1323,10 +1079,10 @@ mod tests {
             START,
         )
         .expect("admit offer");
-        let acceptance = create_shakescape_hns_for_btc_take(
+        let acceptance = create_shakescape_hns_for_btc_offer_acceptance(
             &mut responder_store,
             &policy,
-            ShakescapeHnsForBtcTakeRequest {
+            ShakescapeHnsForBtcOfferAcceptanceRequest {
                 wallet_id: responder_id,
                 offer_id: offer.offer.offer_id,
                 hns_fee_reserve_dollarydoos: 50_000,
@@ -1370,7 +1126,7 @@ mod tests {
             1_000_000,
         );
         assert_eq!(
-            list_pending_local_shakescape_direct_takes(
+            list_pending_local_shakescape_direct_offer_acceptances(
                 &responder_store,
                 &policy,
                 responder_id,
@@ -1380,7 +1136,7 @@ mod tests {
             vec![acceptance.clone()],
         );
 
-        abandon_pending_local_shakescape_direct_take(
+        abandon_pending_local_shakescape_direct_offer_acceptance(
             &mut responder_store,
             &policy,
             responder_id,
@@ -1400,7 +1156,7 @@ mod tests {
             0,
         );
         assert!(
-            list_pending_local_shakescape_direct_takes(
+            list_pending_local_shakescape_direct_offer_acceptances(
                 &responder_store,
                 &policy,
                 responder_id,
@@ -1491,10 +1247,10 @@ mod tests {
             START,
         )
         .expect("admit offer");
-        create_shakescape_hns_for_btc_take(
+        create_shakescape_hns_for_btc_offer_acceptance(
             &mut responder_store,
             &policy,
-            ShakescapeHnsForBtcTakeRequest {
+            ShakescapeHnsForBtcOfferAcceptanceRequest {
                 wallet_id: responder_id,
                 offer_id: offer.offer.offer_id,
                 hns_fee_reserve_dollarydoos: 50_000,
@@ -1541,67 +1297,6 @@ mod tests {
             )
             .expect("released reservation"),
             0,
-        );
-    }
-
-    #[test]
-    fn legacy_take_and_abandonment_namespaces_remain_exactly_readable() {
-        let wallet_id = WalletId::new([0xb1; 16]);
-        let session_id = SessionId::new([0xb2; 32]);
-        let offer_id = ObjectHash::new([0xb3; 32]);
-        let mut store = store(wallet_id, 0xb4);
-        let legacy = PersistedLocalDirectAcceptance {
-            storage_version: LEGACY_STORAGE_VERSION,
-            wallet_id,
-            offer_id,
-            session_id,
-            hns_fee_reserve_dollarydoos: 42_000,
-            created_at_unix: START,
-        };
-        store
-            .save_entity(
-                EntityKind::ShakescapeBoardObject,
-                &legacy_record_id(wallet_id, session_id),
-                0,
-                &legacy,
-                START,
-            )
-            .expect("persist legacy take");
-        assert_eq!(
-            load_legacy_local_take(&store, wallet_id, session_id).expect("load legacy take"),
-            Some(legacy)
-        );
-        assert!(
-            load_local_acceptance(&store, wallet_id, session_id)
-                .expect("current namespace remains separate")
-                .is_none()
-        );
-
-        let abandoned = PersistedLocalDirectAcceptanceAbandonment {
-            storage_version: ABANDONMENT_STORAGE_VERSION,
-            wallet_id,
-            offer_id,
-            session_id,
-            abandoned_at_unix: START + 1,
-        };
-        store
-            .save_entity(
-                EntityKind::ShakescapeBoardObject,
-                &legacy_abandonment_record_id(wallet_id, session_id),
-                0,
-                &abandoned,
-                START + 1,
-            )
-            .expect("persist legacy abandonment");
-        assert_eq!(
-            load_legacy_local_take_abandonment(&store, wallet_id, session_id)
-                .expect("load legacy abandonment"),
-            Some(abandoned)
-        );
-        assert!(
-            load_local_acceptance_abandonment(&store, wallet_id, session_id)
-                .expect("current abandonment namespace remains separate")
-                .is_none()
         );
     }
 }

@@ -2185,9 +2185,9 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         Ok(target)
     }
 
-    /// Select the first mature legacy buyer fulfillment which did not carry
-    /// an automatic fee grant. Native mobile code uses this to raise one
-    /// ordinary approval without asking the user to copy a workflow ID.
+    /// Select the first mature buyer fulfillment configured for manual fee
+    /// approval. Native mobile code uses this to raise one ordinary approval
+    /// without asking the user to copy a workflow ID.
     pub fn next_trusted_native_shakedex_finalize(
         &self,
     ) -> Result<Option<(WorkflowId, BaseUnits)>, ServiceFailure> {
@@ -2581,7 +2581,6 @@ fn publication_state(state: hns_wallet_shakedex::ShakescapeOutboxState) -> &'sta
         ShakescapeOutboxState::RetryScheduled { .. } => "retryScheduled",
         ShakescapeOutboxState::RelayAccepted { .. } => "relayAccepted",
         ShakescapeOutboxState::DirectAnnounced { .. } => "directAnnounced",
-        ShakescapeOutboxState::Acknowledged { .. } => "acknowledged",
         ShakescapeOutboxState::Exhausted { .. } => "exhausted",
     }
 }

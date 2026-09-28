@@ -468,9 +468,9 @@
         "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_publishDirectOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "directOffer", "action": "publish", "directOfferId": null, "offered": { "asset": "HNS", "baseUnits": "1000" }, "received": { "asset": "BTC", "baseUnits": "20" }, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["settlementCanBeDelayed"] } }
       },
       {
-        "name": "directOfferTake",
+        "name": "directOfferAcceptance",
         "schemaPointer": "#/$defs/publicApprovalProjectionV3",
-        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_acceptDirectOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "directOfferTake", "directOfferId": "offer-1", "swapSessionId": "session-1", "offered": { "asset": "HNS", "baseUnits": "1000" }, "received": { "asset": "BTC", "baseUnits": "20" }, "refundTimeoutUnixMs": 300000, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["refundRequiresManualAction", "settlementCanBeDelayed"] } }
+        "value": { "schemaVersion": 3, "approvalId": "AgICAgICAgICAgICAgICAg", "method": "swap_acceptDirectOffer", "origin": "https://wallet.example", "expiresAtUnixMs": 200000, "summary": { "kind": "directOfferAcceptance", "directOfferId": "offer-1", "swapSessionId": "session-1", "offered": { "asset": "HNS", "baseUnits": "1000" }, "received": { "asset": "BTC", "baseUnits": "20" }, "refundTimeoutUnixMs": 300000, "maximumFee": { "asset": "HNS", "baseUnits": "10" }, "warnings": ["refundRequiresManualAction", "settlementCanBeDelayed"] } }
       },
       {
         "name": "swapRedeem",
