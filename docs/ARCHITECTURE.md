@@ -20,12 +20,13 @@ Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
 proofs, signed fixed-price listings/cancellations, Shakescape name-market envelopes,
 and Shakescape V1 direct HNS/BTC offer/session envelopes remain in `hns-rs`. This
 workspace consumes the required protocol crates as exact published registry
-`hns-rs` `0.4.1`, whose reviewed release source is
-`73611a0d83778e157b35f28ca2197d068e83fc61`. The full 19-crate archive cohort is
-recorded in `release/hns-rs-0.4.1-crates.sha256`; the direct light-wallet
-dependencies similarly use published registry `hns-dane-engine` `0.2.2` source
-`b7fdf8826c81b77650a0f740d1f05314b74969f9`, recorded in
-`release/hns-dane-engine-0.2.2-crates.sha256`. The wallet owns protocol
+`hns-rs` `0.5.0`, whose release source is
+`60eb912d615243a6bfb9741b17f16833c5a9181a`. The full 19-crate archive cohort is
+recorded in `release/hns-rs-0.5.0-crates.sha256`. The direct light-wallet
+dependencies use the published `hns-dane-engine` `0.2.6` source
+`90a5dfeb5b7c00e8fea010e79f82076de4263fd6`, recorded in
+`release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256`. Unchanged engine
+contracts remain pinned to the earlier `0.2.2` cohort. The wallet owns protocol
 verification, encrypted replay/tombstone board state, direct-offer cancellation
 state, and a direct-session journal.
 Node indexes
@@ -178,7 +179,7 @@ one full reconciliation and one retry for stale or unavailable quote evidence.
 Confirmed wallet coins retain exact inclusion height and canonical covenant
 bytes through encrypted persistence. Final transactions are checked against
 the ordered reconstructed consensus coins: published registry `hns-script`
-`0.4.1` source `73611a0d83778e157b35f28ca2197d068e83fc61` computes sigops,
+`0.5.0` source `60eb912d615243a6bfb9741b17f16833c5a9181a` computes sigops,
 policy virtual size, minimum fee, and standard weight/sigop bounds, while exact
 input/output sums independently reproduce actual fee.
 Legacy or mismatched evidence fails closed. The source gate

@@ -8,9 +8,9 @@ post-lock buyer fulfillment, seller recovery, and the seller-script FINALIZE
 that follows either signed TRANSFER parent, but every authorization and
 submission entrypoint remains evidence- and approval-bound. The wallet dependency
 boundary consumes canonical V2 `hns-swap` and `hns-marketplace-protocol` as exact
-published registry `hns-rs` `0.4.1` source
-`73611a0d83778e157b35f28ca2197d068e83fc61`, with all upstream archive checksums
-recorded in `release/hns-rs-0.4.1-crates.sha256`. The wallet does not reproduce
+published registry `hns-rs` `0.5.0` source
+`60eb912d615243a6bfb9741b17f16833c5a9181a`, with all upstream archive checksums
+recorded in `release/hns-rs-0.5.0-crates.sha256`. The wallet does not reproduce
 listing hashes, signatures, Shakedex scripts, presigns, cancellations, or Shakescape
 envelopes.
 

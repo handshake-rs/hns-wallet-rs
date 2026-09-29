@@ -19,8 +19,9 @@ state machines and fail-closed authority checks beneath those integrations.
   paths `m/44'/5353'/0'/change/index`.
 - Direct Handshake header, peer, coin, transaction, name-state, and proof
   synchronization.
-- An authenticated HSRD canonical-block client for account-local wallet scans
-  without a chain-wide node wallet index.
+- An authenticated HSRD canonical-block client that validates retained block
+  bytes without a chain-wide node wallet index. Account-local scan composition
+  remains a separate wallet integration step.
 - HNS balance, one canonical payment/name receive target, history, and
   tracked-name projections.
 - HNS send, TRANSFER, FINALIZE, resource update, renewal, and name-market
@@ -111,6 +112,8 @@ release only reservations that can be proven safe to release.
 | `hns-wallet-provider` | Hostile-page request, permission, and approval core |
 | `hns-wallet-shakedex` | Handshake name-market seller, buyer, recovery, and FINALIZE state |
 | `hns-wallet-market` | Direct HNS/BTC offers, sessions, reservations, and swap recovery |
+| `hns-wallet-bip157` | Bitcoin compact-filter peer transport and validation |
+| `hns-wallet-bdk-kyoto` | BDK wallet adapter for the Kyoto sync transport |
 | `hns-wallet-bitcoin-kyoto` | BDK/Kyoto wallet, compact-filter sync, Bitcoin HTLC, and broadcast recovery |
 | `hns-wallet-ethereum` | Offline derivation and disabled-by-default Ethereum policy |
 | `hns-wallet-ffi` | Private ABI v2 framing, schemas, prompts, results, and events |
@@ -124,8 +127,8 @@ The dependency-ordered public list is maintained in
 
 ## Version and dependency policy
 
-All sixteen wallet crates use one shared release version. The current source
-prepares the `0.3.0` cohort with one canonical hsd/Bob-compatible HNS account
+All sixteen wallet crates use one shared release version. The `0.3.0` cohort
+uses one canonical hsd/Bob-compatible HNS account
 for payments and name ownership, responder-as-maker direct swaps, and
 protocol-specific ShakeDex and atomic-swap keys.
 

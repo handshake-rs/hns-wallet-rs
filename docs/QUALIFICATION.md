@@ -1,6 +1,6 @@
 # Qualification matrix
 
-Snapshot: 2026-09-02. This file records source-scoped evidence and the durable
+Historical snapshot: 2026-09-02. Release-cohort review: 2026-09-28. This file records source-scoped evidence and the durable
 qualification procedure, not transient workflow or registry state. Unit
 coverage, source packaging, or publication never authorizes mainnet value.
 Evidence is attached to exact commits and is not inherited automatically by
@@ -59,15 +59,21 @@ light-client `0.2.3` patch source
 and
 [`four-package release preflight`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/33499010562).
 Its four archive checksums are recorded in
-`release/hns-dane-engine-light-client-0.2.3-crates.sha256`. This upstream source
-evidence anchors the wallet dependency graph; exact wallet-source qualification
-is recorded only after its own locked CI, CodeQL, and normalized preflight pass.
+`release/hns-dane-engine-light-client-0.2.3-crates.sha256`. These are historical
+upstream and wallet-source records. The current `0.3.0` release graph uses
+`hns-rs 0.5.0` from source `60eb912d615243a6bfb9741b17f16833c5a9181a`
+and the engine light-client `0.2.6` cohort from source
+`90a5dfeb5b7c00e8fea010e79f82076de4263fd6`, with archive checksums in
+`release/hns-rs-0.5.0-crates.sha256` and
+`release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256`. Unchanged engine
+contracts still use the published `0.2.2` cohort. Exact wallet-source
+qualification requires its own locked CI, CodeQL, and normalized preflight.
 
 | Area | Exact source evidence | Persistence/restart and reorg | Product/network evidence | Release status |
 | --- | --- | --- | --- | --- |
 | Types and chain traits | complete locked workspace CI passed at `2229be8` | n/a | no product dependency | exact source recorded; API review remains |
 | Encrypted store/schema v3 | exact `2229be8` CI passed, including atomic bootstrap, rollback, migrations, encrypted CRUD/CAS, and Unix filesystem regressions | source reopen/restart tests; no installed Android/iOS secure-store runtime evidence in this package boundary | Shakescape `1.0.4` contains Keystore/Keychain wrapping, but device filesystem/runtime qualification remains external | platform qualification remains product-owned |
-| HNS wallet and names | exact historical `bc5901f` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, dedicated name targets, trusted exact-text import, name workflows, and fail-closed value-evidence checks | source restart/reorg paths; no multi-process regtest | script-free wallet RPC remains compatible with node `2b267ffe`; pruning-safe wallet-owned name actions pair with selected node main `4275b4e`; the release graph uses published registry `hns-rs` `0.4.1` source `73611a0d83778e157b35f28ca2197d068e83fc61`, the historical `hns-dane-engine` `0.2.2` source `b7fdf8826c81b77650a0f740d1f05314b74969f9`, and its compatible light-client `0.2.3` source `87d2346c13ade4987801e0f1367bd604fd77c9f0`, with archive manifests in `release/` | HNS funding, value, and fee source gates enabled; exact wallet hosted qualification and live product qualification remain pending |
+| HNS wallet and names | exact historical `bc5901f` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, dedicated name targets, trusted exact-text import, name workflows, and fail-closed value-evidence checks | source restart/reorg paths; no multi-process regtest | the current `0.3.0` release graph uses published `hns-rs 0.5.0`, engine light-client `0.2.6`, and unchanged engine contracts at `0.2.2`, with source and archive manifests listed above; installed-product and live-chain evidence remains product-owned | HNS funding, value, and fee source gates enabled; exact wallet hosted qualification and live product qualification remain pending |
 | Provider core | exact `2229be8` CI passed, including account binding, scoped reads, exact Names consent, and unavailable-method ordering | grants persist; pending approval/UI authority remains process-local | no installed-browser wallet consent or backend E2E | browser and value exposure unavailable |
 | Fixed-price Shakedex | exact `2229be8` CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Shakescape, provider, trusted UI, or product coin selection | Shakedex and dependent HNS value source gates enabled; live product integration pending |
 | Market sessions | exact `2229be8` workspace CI passed | CAS journal source; recovery evidence incomplete | no pair E2E, rendezvous, or relay transport | unavailable |
@@ -271,14 +277,14 @@ crates.io and provenance-verified on 2026-08-14 at exact source commit
 satisfy the current release prerequisite.
 
 Before any wallet upload, execute mode rechecks all 19 published `hns-rs`
-`0.4.1` archives against `release/hns-rs-0.4.1-crates.sha256` and source
-`73611a0d83778e157b35f28ca2197d068e83fc61`, and all 20 published
+`0.5.0` archives against `release/hns-rs-0.5.0-crates.sha256` and source
+`60eb912d615243a6bfb9741b17f16833c5a9181a`, and all 20 published
 `hns-dane-engine` `0.2.2` archives against
 `release/hns-dane-engine-0.2.2-crates.sha256` and source
 `b7fdf8826c81b77650a0f740d1f05314b74969f9`.
-The compatible light-client `0.2.3` cohort is additionally bound to engine
-source `87d2346c13ade4987801e0f1367bd604fd77c9f0` by
-`release/hns-dane-engine-light-client-0.2.3-crates.sha256`. Execute mode verifies
+The compatible light-client `0.2.6` cohort is additionally bound to engine
+source `90a5dfeb5b7c00e8fea010e79f82076de4263fd6` by
+`release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256`. Execute mode verifies
 crates.io API checksums/non-yanked status, archive SHA-256, and clean
 `crates/<package>` VCS identity for all four patch packages before it constructs
 or uploads a wallet archive. Any missing or different upstream provenance
