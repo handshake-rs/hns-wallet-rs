@@ -69,6 +69,18 @@ and the engine light-client `0.2.6` cohort from source
 contracts still use the published `0.2.2` cohort. Exact wallet-source
 qualification requires its own locked CI, CodeQL, and normalized preflight.
 
+Exact `0.3.0` wallet release source
+`a76e9bad20bb0089f1eb8b8fb6429431e2b3955e` passed its complete locked
+[`CI` run `36521685055`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36521685055),
+[`CodeQL` run `36521684714`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36521684714),
+and all 16 normalized packages in
+[`release preflight` run `36522116509`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36522116509).
+All 16 published archives were downloaded again and checked against crates.io
+API checksums and the exact source commit; their SHA-256 values are recorded in
+`release/hns-wallet-rs-0.3.0-crates.sha256`.
+These source and archive checks do not qualify an installed Android or iOS
+product or an unattended mainnet value operation.
+
 | Area | Exact source evidence | Persistence/restart and reorg | Product/network evidence | Release status |
 | --- | --- | --- | --- | --- |
 | Types and chain traits | complete locked workspace CI passed at `2229be8` | n/a | no product dependency | exact source recorded; API review remains |

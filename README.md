@@ -137,6 +137,10 @@ The `0.3.0` source pins the exact `hns-rs 0.5.0` protocol cohort and the
 archive checksums and source revisions are recorded in `release/`; the release
 gate reads them back before any wallet upload. See
 [`docs/releasing.md`](docs/releasing.md) for the version and source policy.
+The published wallet cohort and release notes are available at
+[`v0.3.0`](https://github.com/handshake-rs/hns-wallet-rs/releases/tag/v0.3.0).
+Checksums for all 16 published wallet archives are recorded in
+[`release/hns-wallet-rs-0.3.0-crates.sha256`](release/hns-wallet-rs-0.3.0-crates.sha256).
 
 ## Build and qualification
 
