@@ -3,7 +3,10 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
-## Unreleased
+## 0.3.1 - 2026-09-29
+
+<!-- hns-wallet-release-state: 0.3.1 release -->
+Canonical account-zero wallet and atomic-swap boundary:
 
 - Give newly negotiated mobile HNS/BTC atomic swaps a 24-hour signed funding
   window, a 48-hour second-chain refund horizon, and a 72-hour first-chain
