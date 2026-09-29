@@ -81,6 +81,18 @@ API checksums and the exact source commit; their SHA-256 values are recorded in
 These source and archive checks do not qualify an installed Android or iOS
 product or an unattended mainnet value operation.
 
+Exact `0.3.1` wallet release source
+`780514d8e3cf4c393885a422b457e1bc5ff7f5da` passed its complete locked
+[`CI` run `36606752756`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36606752756),
+[`CodeQL` run `36606752055`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36606752055),
+and all 16 normalized packages in
+[`release preflight` run `36608632564`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36608632564).
+All 16 published archives were downloaded again and checked against crates.io
+API checksums and the exact source commit; their SHA-256 values are recorded in
+`release/hns-wallet-rs-0.3.1-crates.sha256`.
+These source and archive checks do not qualify an installed Android or iOS
+product or an unattended mainnet value operation.
+
 | Area | Exact source evidence | Persistence/restart and reorg | Product/network evidence | Release status |
 | --- | --- | --- | --- | --- |
 | Types and chain traits | complete locked workspace CI passed at `2229be8` | n/a | no product dependency | exact source recorded; API review remains |
