@@ -1,8 +1,8 @@
 //! Persisted direct Shakescape HNS/BTC session admission for installed wallets.
 
 use hns_marketplace_protocol::{
-    AssetId, CrossChainMessage, FundingState, SignedObjectHeader, SwapAssetSide, SwapFundingStatus,
-    SwapSessionHello,
+    AssetId, CrossChainMessage, FundingState, NetworkBinding, SignedObjectHeader, SwapAssetSide,
+    SwapFundingStatus, SwapSessionHello,
 };
 use hns_wallet_bitcoin_kyoto::{
     BitcoinHtlcWatchRequest, MIN_HTLC_DUST_SATS, build_shakescape_bitcoin_htlc,
@@ -262,11 +262,17 @@ impl MobileShakescapeBitcoinAbsencePermit {
 const DIRECT_OFFER_APPROVAL_LIFETIME_SECONDS: u64 = 300;
 /// The maker commits this much time to complete first-chain funding and let a
 /// one-confirmation Bitcoin lock become locally verified before the taker may
-/// fund the second chain. A one-hour deadline races Bitcoin's normal block
-/// variance and mobile scheduling, so new mobile sessions use a bounded
-/// six-hour window. Two windows leave equal headroom before the second-chain
-/// refund, and the first-chain refund follows one more window later.
-const DIRECT_SWAP_FUNDING_WINDOW_SECONDS: u64 = 6 * 60 * 60;
+/// fund the second chain. Mobile participants may be asleep, backgrounded, or
+/// separated by time zones, so new sessions use a full day. Two windows leave
+/// equal headroom before the second-chain refund, and the first-chain refund
+/// follows one more window later.
+const DIRECT_SWAP_FUNDING_WINDOW_SECONDS: u64 = 24 * 60 * 60;
+/// Do not begin the irreversible first-chain lock unless this much of the
+/// jointly signed new-funding window remains. This leaves time for a Bitcoin
+/// confirmation, independent mobile synchronization, and exact second-chain
+/// funding. The signed deadline remains authoritative for work already
+/// authorized before this local safety cutoff.
+const DIRECT_SWAP_FIRST_FUNDING_SAFETY_SECONDS: u64 = 3 * 60 * 60;
 const MIN_DIRECT_OFFER_LIFETIME_SECONDS: u64 = 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS;
 const MAX_DIRECT_OFFER_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
 /// Product floor for Bitcoin funding/refund headroom committed by a mobile
@@ -393,6 +399,9 @@ pub struct MobileDirectOfferAcceptanceSummary {
     pub received_fee_reserve: u64,
     pub created_at_unix: u64,
     pub expires_at_unix: u64,
+    /// Set as soon as this wallet authors the maker proposal. A pending
+    /// pre-proposal acceptance has no signed funding deadline yet.
+    pub funding_deadline_unix: Option<u64>,
 }
 
 /// Non-sensitive durable execution projection for native recovery UI. It
@@ -418,6 +427,9 @@ pub struct MobileShakescapeExecutionSummary {
     /// lock. Recovery of a transaction authorized before this instant remains
     /// valid after it; this deadline only gates creation of new funding.
     pub funding_deadline_unix: u64,
+    /// Latest instant at which this mobile policy will begin first-chain
+    /// funding while preserving confirmation and second-chain response time.
+    pub first_funding_cutoff_unix: u64,
     pub first_refund_at_unix: u64,
     pub second_refund_at_unix: u64,
     /// Latest signed status for the funding transaction owned by this wallet.
@@ -988,6 +1000,7 @@ impl MobileShakescapeSessionController {
         // ambiguous after reconnects and prevents byte-for-byte retry.
         peer.send_cross_chain_envelope(&acceptance.envelope)?;
         peer.send_cross_chain_envelope(&proposal.envelope)?;
+        let funding_deadline_unix = proposal.proposal.terms().header.expires_at;
         Ok(MobileDirectOfferAcceptanceSummary {
             offer_id: super::lowercase_hex(pending.offer_id.as_bytes()),
             session_id: super::lowercase_hex(acceptance.session_id.as_bytes()),
@@ -998,6 +1011,7 @@ impl MobileShakescapeSessionController {
             received_fee_reserve: pending.received_fee_reserve,
             created_at_unix: acceptance.created_at_unix,
             expires_at_unix: acceptance.expires_at_unix,
+            funding_deadline_unix: Some(funding_deadline_unix),
         })
     }
 
@@ -1494,16 +1508,34 @@ impl MobileShakescapeSessionController {
     ) -> Result<Vec<MobileDirectOfferAcceptanceSummary>, MobileWalletError> {
         self.store
             .try_with_store(|store| {
-                list_pending_local_shakescape_direct_offer_acceptances(
+                let acceptances = list_pending_local_shakescape_direct_offer_acceptances(
                     store,
                     &self.policy,
                     self.wallet_id,
                     now_unix,
-                )
+                )?;
+                acceptances
+                    .into_iter()
+                    .map(|acceptance| {
+                        let funding_deadline_unix = load_shakescape_direct_swap(
+                            store,
+                            &self.policy,
+                            acceptance.session_id,
+                        )?
+                        .and_then(|record| {
+                            record
+                                .proposal
+                                .map(|proposal| proposal.terms().header.expires_at)
+                        });
+                        Ok((acceptance, funding_deadline_unix))
+                    })
+                    .collect::<Result<Vec<_>, hns_wallet_market::MarketError>>()
             })
             .map_err(MobileWalletError::from)?
             .into_iter()
-            .map(direct_acceptance_summary)
+            .map(|(acceptance, funding_deadline_unix)| {
+                direct_acceptance_summary_with_deadline(acceptance, funding_deadline_unix)
+            })
             .collect()
     }
 
@@ -2052,9 +2084,7 @@ impl MobileShakescapeSessionController {
                     .hello
                     .clone()
                     .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
-                hello
-                    .verify_new_funding_at(policy.network(), now_unix)
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+                verify_first_funding_headroom(&hello, policy.network(), now_unix)?;
                 if hello.offered_asset != hns_marketplace_protocol::AssetId::BTC
                     || hello.received_asset != hns_marketplace_protocol::AssetId::HNS
                     || hello.first_funding_chain != hns_marketplace_protocol::ChainId::BITCOIN
@@ -2778,9 +2808,7 @@ impl MobileShakescapeSessionController {
                     .hello
                     .clone()
                     .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
-                hello
-                    .verify_new_funding_at(policy.network(), now_unix)
-                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+                verify_first_funding_headroom(&hello, policy.network(), now_unix)?;
                 if hello.offered_asset != AssetId::HNS || hello.received_asset != AssetId::BTC {
                     return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
@@ -3752,6 +3780,13 @@ fn direct_local_offer_summary(
 fn direct_acceptance_summary(
     take: ShakescapeLocalDirectOfferAcceptance,
 ) -> Result<MobileDirectOfferAcceptanceSummary, MobileWalletError> {
+    direct_acceptance_summary_with_deadline(take, None)
+}
+
+fn direct_acceptance_summary_with_deadline(
+    take: ShakescapeLocalDirectOfferAcceptance,
+    funding_deadline_unix: Option<u64>,
+) -> Result<MobileDirectOfferAcceptanceSummary, MobileWalletError> {
     Ok(MobileDirectOfferAcceptanceSummary {
         offer_id: super::lowercase_hex(take.offer_id.as_bytes()),
         session_id: super::lowercase_hex(take.session_id.as_bytes()),
@@ -3762,6 +3797,7 @@ fn direct_acceptance_summary(
         received_fee_reserve: take.received_fee_reserve,
         created_at_unix: take.created_at_unix,
         expires_at_unix: take.expires_at_unix,
+        funding_deadline_unix,
     })
 }
 
@@ -3830,6 +3866,23 @@ fn asset_name(asset: AssetId) -> &'static str {
     }
 }
 
+fn verify_first_funding_headroom(
+    hello: &SwapSessionHello,
+    network: NetworkBinding,
+    now_unix: u64,
+) -> Result<(), hns_wallet_market::MarketError> {
+    hello
+        .verify_new_funding_at(network, now_unix)
+        .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+    if now_unix
+        .checked_add(DIRECT_SWAP_FIRST_FUNDING_SAFETY_SECONDS)
+        .is_none_or(|minimum_deadline| minimum_deadline > hello.header.expires_at)
+    {
+        return Err(hns_wallet_market::MarketError::UnsafeTimeouts);
+    }
+    Ok(())
+}
+
 fn execution_summary(
     session: hns_wallet_market::SwapSession,
     local_role: &str,
@@ -3854,6 +3907,9 @@ fn execution_summary(
             }
         }
     };
+    let first_funding_cutoff_unix = funding_deadline_unix
+        .checked_sub(DIRECT_SWAP_FIRST_FUNDING_SAFETY_SECONDS)
+        .ok_or(MobileWalletError::InvalidShakescapeSessionMessage)?;
     Ok(MobileShakescapeExecutionSummary {
         session_id: super::lowercase_hex(session.id.as_bytes()),
         revision: session.revision,
@@ -3866,6 +3922,7 @@ fn execution_summary(
         received_amount: session.received.base_units.get(),
         local_role: local_role.to_owned(),
         funding_deadline_unix,
+        first_funding_cutoff_unix,
         first_refund_at_unix: session.timeouts.first_chain_refund_at,
         second_refund_at_unix: session.timeouts.second_chain_refund_at,
         local_funding_state,
@@ -4192,7 +4249,7 @@ mod tests {
                 btc_amount_sats: 9_000,
                 hns_fee_reserve_dollarydoos: 10_000,
                 created_at_unix: START,
-                expires_at_unix: START + 10_000,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
                 nonce: [0x8b; 32],
             },
         )
@@ -4223,7 +4280,7 @@ mod tests {
                 offer_id: offer.offer.offer_id,
                 bitcoin_fee_reserve_sats: 1_000,
                 created_at_unix: START + 10,
-                expires_at_unix: START + 10_000,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
                 nonce: [0x8c; 32],
             },
         )
@@ -4242,14 +4299,26 @@ mod tests {
                 wallet_id: responder_id,
                 session_id: offer.offer.session_id,
                 now_unix: START + 20,
-                funding_window_seconds: 600,
-                second_refund_after_seconds: 3_600,
-                refund_safety_margin_seconds: 3_600,
+                funding_window_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                second_refund_after_seconds: 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                refund_safety_margin_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
                 bitcoin_minimum_confirmations: 1,
                 hns_minimum_confirmations: 1,
             },
         )
         .expect("responder-maker proposal");
+
+        let responder_shared = SharedWalletStore::new(responder);
+        let responder_controller =
+            MobileShakescapeSessionController::new(responder_shared, policy, responder_id);
+        let responder_pending = responder_controller
+            .pending_direct_offer_acceptances(START + 21)
+            .expect("durable acceptance projection");
+        assert_eq!(responder_pending.len(), 1);
+        assert_eq!(
+            responder_pending[0].funding_deadline_unix,
+            Some(START + 20 + DIRECT_SWAP_FUNDING_WINDOW_SECONDS)
+        );
 
         let shared = SharedWalletStore::new(offer_setter);
         let controller =
@@ -4319,7 +4388,7 @@ mod tests {
                 btc_amount_sats: 9_000,
                 hns_fee_reserve_dollarydoos: 10_000,
                 created_at_unix: START,
-                expires_at_unix: START + 10_000,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
                 nonce: [0x4b; 32],
             },
         )
@@ -4350,7 +4419,7 @@ mod tests {
                 offer_id: offer.offer.offer_id,
                 bitcoin_fee_reserve_sats: 1_000,
                 created_at_unix: START + 10,
-                expires_at_unix: START + 10_000,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
                 nonce: [0x4c; 32],
             },
         )
@@ -4369,9 +4438,9 @@ mod tests {
                 wallet_id: responder_maker_id,
                 session_id: offer.offer.session_id,
                 now_unix: START + 20,
-                funding_window_seconds: 600,
-                second_refund_after_seconds: 3_600,
-                refund_safety_margin_seconds: 3_600,
+                funding_window_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                second_refund_after_seconds: 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                refund_safety_margin_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
                 bitcoin_minimum_confirmations: 1,
                 hns_minimum_confirmations: 1,
             },
@@ -4458,13 +4527,15 @@ mod tests {
         );
         assert!(
             controller
-                .direct_swap_handshake_reconciliation_envelopes(START + 621)
+                .direct_swap_handshake_reconciliation_envelopes(
+                    START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21,
+                )
                 .expect("expired reconciliation")
                 .is_empty()
         );
         assert_eq!(
             controller
-                .reconcile_direct_offer_lifecycle(START + 621)
+                .reconcile_direct_offer_lifecycle(START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21,)
                 .expect("expire untouched second-funder reservation"),
             2
         );
@@ -4477,7 +4548,7 @@ mod tests {
         );
         assert_eq!(
             controller
-                .reserved_hns_dollarydoos(START + 621)
+                .reserved_hns_dollarydoos(START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21)
                 .expect("expired taker reservation released"),
             0
         );
@@ -4499,7 +4570,7 @@ mod tests {
                 hns_amount_dollarydoos: 2_000_000,
                 bitcoin_fee_reserve_sats: 1_000,
                 created_at_unix: START,
-                expires_at_unix: START + 10_000,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
                 nonce: [0x7b; 32],
             },
         )
@@ -4530,7 +4601,7 @@ mod tests {
                 offer_id: offer.offer.offer_id,
                 hns_fee_reserve_dollarydoos: 10_000,
                 created_at_unix: START + 10,
-                expires_at_unix: START + 10_000,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
                 nonce: [0x7c; 32],
             },
         )
@@ -4549,9 +4620,9 @@ mod tests {
                 wallet_id: responder_maker_id,
                 session_id: offer.offer.session_id,
                 now_unix: START + 20,
-                funding_window_seconds: 600,
-                second_refund_after_seconds: 3_600,
-                refund_safety_margin_seconds: 3_600,
+                funding_window_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                second_refund_after_seconds: 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                refund_safety_margin_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
                 bitcoin_minimum_confirmations: 1,
                 hns_minimum_confirmations: 2,
             },
@@ -4669,7 +4740,7 @@ mod tests {
                 hns_amount_dollarydoos: 2_000_000,
                 bitcoin_fee_reserve_sats: 1_000,
                 created_at_unix: START,
-                expires_at_unix: START + 10_000,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
                 nonce: [0x4d; 32],
             },
         )
@@ -4700,7 +4771,7 @@ mod tests {
                 offer_id: offer.offer.offer_id,
                 hns_fee_reserve_dollarydoos: 10_000,
                 created_at_unix: START + 10,
-                expires_at_unix: START + 10_000,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
                 nonce: [0x4e; 32],
             },
         )
@@ -4719,9 +4790,9 @@ mod tests {
                 wallet_id: responder_maker_id,
                 session_id: offer.offer.session_id,
                 now_unix: START + 20,
-                funding_window_seconds: 600,
-                second_refund_after_seconds: 3_600,
-                refund_safety_margin_seconds: 3_600,
+                funding_window_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                second_refund_after_seconds: 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                refund_safety_margin_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
                 bitcoin_minimum_confirmations: 1,
                 hns_minimum_confirmations: 1,
             },
@@ -4740,7 +4811,7 @@ mod tests {
             MobileShakescapeSessionController::new(shared.clone(), policy, offer_setter_id);
         assert_eq!(
             controller
-                .reconcile_direct_offer_lifecycle(START + 620)
+                .reconcile_direct_offer_lifecycle(START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21,)
                 .expect("retire expired negotiation"),
             1
         );
@@ -4751,7 +4822,7 @@ mod tests {
                         store,
                         &policy.board_policy(),
                         offer_setter_id,
-                        START + 620,
+                        START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21,
                     )?
                     .is_empty()
                 );
@@ -4769,7 +4840,7 @@ mod tests {
             .expect("expired offer tombstone");
         assert_eq!(
             controller
-                .reserved_bitcoin_sats(START + 620)
+                .reserved_bitcoin_sats(START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21)
                 .expect("offer-setter reservation released"),
             0
         );
@@ -4791,7 +4862,7 @@ mod tests {
                 btc_amount_sats: 9_000,
                 hns_fee_reserve_dollarydoos: 10_000,
                 created_at_unix: START,
-                expires_at_unix: START + 10_000,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
                 nonce: [7; 32],
             },
         )
@@ -4822,7 +4893,7 @@ mod tests {
                 offer_id: offer.offer.offer_id,
                 bitcoin_fee_reserve_sats: 1_000,
                 created_at_unix: START + 10,
-                expires_at_unix: START + 10_000,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
                 nonce: [8; 32],
             },
         )
@@ -4841,9 +4912,9 @@ mod tests {
                 wallet_id: responder_maker_id,
                 session_id: offer.offer.session_id,
                 now_unix: START + 20,
-                funding_window_seconds: 600,
-                second_refund_after_seconds: 3_600,
-                refund_safety_margin_seconds: 3_600,
+                funding_window_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                second_refund_after_seconds: 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                refund_safety_margin_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
                 bitcoin_minimum_confirmations: 1,
                 hns_minimum_confirmations: 1,
             },
@@ -4945,6 +5016,20 @@ mod tests {
         assert_eq!(resumed[0].first_chain, "bitcoin");
         assert_eq!(resumed[0].local_funding_state, None);
         assert!(!resumed[0].first_funding_confirmed);
+        let funding_deadline = START + 20 + DIRECT_SWAP_FUNDING_WINDOW_SECONDS;
+        assert_eq!(resumed[0].funding_deadline_unix, funding_deadline);
+        assert_eq!(
+            resumed[0].first_funding_cutoff_unix,
+            funding_deadline - DIRECT_SWAP_FIRST_FUNDING_SAFETY_SECONDS
+        );
+        assert_eq!(
+            resumed[0].second_refund_at_unix,
+            START + 20 + 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS
+        );
+        assert_eq!(
+            resumed[0].first_refund_at_unix,
+            START + 20 + 3 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS
+        );
         let permit = controller
             .authorize_local_btc_first_funding(offer.offer.session_id, START + 40)
             .expect("funding permit");
@@ -4953,6 +5038,23 @@ mod tests {
             permit.hello().swap_session_id,
             offer.offer.session_id.into_bytes()
         );
+        assert!(
+            verify_first_funding_headroom(
+                permit.hello(),
+                policy.network(),
+                funding_deadline - DIRECT_SWAP_FIRST_FUNDING_SAFETY_SECONDS,
+            )
+            .is_ok(),
+            "the exact three-hour safety boundary remains usable"
+        );
+        assert!(matches!(
+            verify_first_funding_headroom(
+                permit.hello(),
+                policy.network(),
+                funding_deadline - DIRECT_SWAP_FIRST_FUNDING_SAFETY_SECONDS + 1,
+            ),
+            Err(hns_wallet_market::MarketError::UnsafeTimeouts)
+        ));
         assert_eq!(
             shared
                 .try_with_store(|store| {
@@ -4967,7 +5069,7 @@ mod tests {
         );
         assert_eq!(
             controller
-                .reserved_bitcoin_sats(START + 10_001)
+                .reserved_bitcoin_sats(START + MIN_DIRECT_OFFER_LIFETIME_SECONDS + 1)
                 .expect("reservation survives listing expiry"),
             9_000
         );
@@ -5090,8 +5192,10 @@ mod tests {
             .expect("local HNS recovery candidate");
         assert_eq!(local_hns_recovery.len(), 1);
         assert_eq!(local_hns_recovery[0].funding_transaction(), None);
-        let hns_permit = taker_controller
-            .authorize_local_hns_second_funding(offer.offer.session_id, START + 621);
+        let hns_permit = taker_controller.authorize_local_hns_second_funding(
+            offer.offer.session_id,
+            START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21,
+        );
         assert!(
             hns_permit.is_err(),
             "a confirmed first lock must not authorize new second funding after the signed window"
@@ -5136,6 +5240,22 @@ mod tests {
                 .state,
             SwapState::SecondFundingPending
         );
+        assert!(
+            taker_controller
+                .authorize_local_hns_second_funding(
+                    offer.offer.session_id,
+                    START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21,
+                )
+                .is_err(),
+            "a pending preparation may be retried only while new funding remains open"
+        );
+        assert_eq!(
+            taker_controller
+                .durable_executions()
+                .expect("expired retry retains recovery state")[0]
+                .state,
+            SwapState::SecondFundingPending
+        );
         let funded = controller.durable_executions().expect("funded execution");
         assert_eq!(funded[0].state, SwapState::FirstFunded);
         assert!(funded[0].first_funding_confirmed);
@@ -5147,7 +5267,10 @@ mod tests {
         );
         assert!(
             controller
-                .authorize_local_btc_first_funding(offer.offer.session_id, START + 621)
+                .authorize_local_btc_first_funding(
+                    offer.offer.session_id,
+                    START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21,
+                )
                 .is_err()
         );
 

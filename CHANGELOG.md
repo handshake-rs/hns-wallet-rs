@@ -3,6 +3,15 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## Unreleased
+
+- Give newly negotiated mobile HNS/BTC atomic swaps a 24-hour signed funding
+  window, a 48-hour second-chain refund horizon, and a 72-hour first-chain
+  refund horizon. Expose the signed funding deadline and a three-hour-safe
+  first-funding cutoff to native clients, retain that deadline across restart,
+  and reject both unsafe late first funding and new second funding after the
+  signed deadline while preserving the existing session for recovery.
+
 ## 0.3.0 - 2026-09-28
 
 <!-- hns-wallet-release-state: 0.3.0 release -->
