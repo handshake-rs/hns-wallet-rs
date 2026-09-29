@@ -51,6 +51,7 @@ use crate::{
 
 const WALLET_RPC_API_VERSION: u16 = 1;
 const WALLET_RPC_PATH: &str = "/api/v1/wallet";
+const WALLET_CHAIN_RPC_PATH: &str = "/api/v1/wallet-chain";
 const MAX_AUTHORIZATION_BYTES: usize = 4_096;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_REQUEST_BODY_BYTES: usize = 1024 * 1024;
@@ -184,6 +185,38 @@ impl HnsNodeRpcBackend {
         &self.config
     }
 
+    /// Bind to a canonical HSRD chain without enabling its global wallet index.
+    pub fn get_wallet_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError> {
+        let response: WireChainSnapshot = self.rpc_on_path(
+            WALLET_CHAIN_RPC_PATH,
+            serde_json::json!({ "method": "chain_snapshot" }),
+        )?;
+        chain_snapshot(response)
+    }
+
+    /// Read one exact canonical block for a future account-local scan. A
+    /// present hash with absent raw bytes means HSRD has already pruned the
+    /// body. Before indexing, the caller must validate the block body and
+    /// compare its computed header hash with `block_hash`.
+    pub fn get_canonical_block(
+        &self,
+        height: u64,
+        binding: SnapshotBinding,
+    ) -> Result<HnsCanonicalBlock, HnsWalletError> {
+        let height = u32::try_from(height).map_err(|_| protocol_error())?;
+        let response: WireCanonicalBlock = self.rpc_on_path(
+            WALLET_CHAIN_RPC_PATH,
+            serde_json::json!({
+                "method": "canonical_block",
+                "params": {
+                    "height": height,
+                    "expected_chain_epoch": binding.chain_epoch,
+                },
+            }),
+        )?;
+        canonical_block(response, binding, height)
+    }
+
     fn require_active_block_hash(
         &self,
         height: u64,
@@ -201,6 +234,14 @@ impl HnsNodeRpcBackend {
     }
 
     fn rpc<T: DeserializeOwned>(&self, call: Value) -> Result<T, HnsWalletError> {
+        self.rpc_on_path(WALLET_RPC_PATH, call)
+    }
+
+    fn rpc_on_path<T: DeserializeOwned>(
+        &self,
+        path: &'static str,
+        call: Value,
+    ) -> Result<T, HnsWalletError> {
         let sequence = self
             .next_request_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -220,7 +261,7 @@ impl HnsNodeRpcBackend {
         if body.is_empty() || body.len() > MAX_REQUEST_BODY_BYTES {
             return Err(protocol_error());
         }
-        let response = self.post(body.as_slice())?;
+        let response = self.post(path, body.as_slice())?;
         body.zeroize();
 
         if response.status == 401 {
@@ -310,7 +351,7 @@ impl HnsNodeRpcBackend {
         Err(backend_error(error_code_message(&error.code)))
     }
 
-    fn post(&self, body: &[u8]) -> Result<HttpResponse, HnsWalletError> {
+    fn post(&self, path: &'static str, body: &[u8]) -> Result<HttpResponse, HnsWalletError> {
         let mut stream =
             TcpStream::connect_timeout(&self.config.endpoint, self.config.connect_timeout)
                 .map_err(|_| transport_error())?;
@@ -321,7 +362,7 @@ impl HnsNodeRpcBackend {
             body.len() + self.config.authorization.len() + host.len() + 256,
         ));
         request.extend_from_slice(b"POST ");
-        request.extend_from_slice(WALLET_RPC_PATH.as_bytes());
+        request.extend_from_slice(path.as_bytes());
         request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
         request.extend_from_slice(host.as_bytes());
         request.extend_from_slice(b"\r\nAuthorization: ");
@@ -908,6 +949,58 @@ struct WireBlockHashResponse {
     tip: Option<WireTip>,
     height: u32,
     hash: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireCanonicalBlock {
+    chain_epoch: u64,
+    tip: Option<WireTip>,
+    height: u32,
+    block_hash: Option<String>,
+    block_hex: Option<String>,
+}
+
+/// One snapshot-bound block supplied by HSRD. `raw == None` with a known hash
+/// means the canonical body was pruned. Raw bytes are unverified at this wire
+/// boundary and must be validated before entering wallet history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HnsCanonicalBlock {
+    pub binding: SnapshotBinding,
+    pub height: u64,
+    pub block_hash: Option<[u8; 32]>,
+    pub raw: Option<Vec<u8>>,
+}
+
+fn canonical_block(
+    response: WireCanonicalBlock,
+    binding: SnapshotBinding,
+    height: u32,
+) -> Result<HnsCanonicalBlock, HnsWalletError> {
+    require_binding(response.chain_epoch, response.tip, binding)?;
+    if response.height != height || (response.block_hash.is_none() && response.block_hex.is_some())
+    {
+        return Err(protocol_error());
+    }
+    let block_hash = response
+        .block_hash
+        .map(|hash| decode_hex_32(&hash))
+        .transpose()?;
+    let raw = response
+        .block_hex
+        .map(|raw| {
+            if raw.len() > MAX_RESPONSE_RESULT_BYTES / 2 || raw.len() % 2 != 0 {
+                return Err(protocol_error());
+            }
+            hex::decode(raw).map_err(|_| protocol_error())
+        })
+        .transpose()?;
+    Ok(HnsCanonicalBlock {
+        binding,
+        height: u64::from(height),
+        block_hash,
+        raw,
+    })
 }
 
 #[derive(Deserialize)]
@@ -3236,6 +3329,58 @@ mod tests {
     use super::*;
     use hns_covenants::hash_name;
     use hns_primitives::{Height, Outpoint};
+
+    #[test]
+    fn canonical_block_wire_distinguishes_retained_pruned_and_stale() {
+        let binding = SnapshotBinding {
+            tip: ChainTip {
+                height: 42,
+                block_hash: [1; 32],
+                tree_root: [2; 32],
+                median_time_past: 1_800_000_000,
+            },
+            chain_epoch: 9,
+        };
+        let response = |block_hex: Option<&str>| {
+            serde_json::from_value::<WireCanonicalBlock>(serde_json::json!({
+                "chain_epoch": 9,
+                "tip": {
+                    "hash": hex::encode([1; 32]),
+                    "height": 42,
+                    "tree_root": hex::encode([2; 32]),
+                    "median_time_past": 1_800_000_000_u64,
+                },
+                "height": 42,
+                "block_hash": hex::encode([3; 32]),
+                "block_hex": block_hex,
+            }))
+            .expect("strict canonical block wire")
+        };
+        let retained =
+            canonical_block(response(Some("001122")), binding, 42).expect("retained block");
+        assert_eq!(retained.block_hash, Some([3; 32]));
+        assert_eq!(retained.raw, Some(vec![0, 0x11, 0x22]));
+        assert_eq!(
+            canonical_block(response(None), binding, 42)
+                .expect("pruned block")
+                .raw,
+            None
+        );
+        assert!(canonical_block(response(Some("0")), binding, 42).is_err());
+        assert!(canonical_block(response(None), binding, 41).is_err());
+        let mut stale = response(None);
+        stale.chain_epoch += 1;
+        assert!(canonical_block(stale, binding, 42).is_err());
+        let mut unknown = serde_json::json!({
+            "chain_epoch": 9,
+            "tip": null,
+            "height": 42,
+            "block_hash": null,
+            "block_hex": null,
+            "extra": true,
+        });
+        assert!(serde_json::from_value::<WireCanonicalBlock>(unknown.take()).is_err());
+    }
 
     #[test]
     fn chain_snapshot_wire_schema_is_closed_and_uninitialized_tip_is_stale() {

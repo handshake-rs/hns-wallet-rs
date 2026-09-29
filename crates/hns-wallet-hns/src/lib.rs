@@ -32,7 +32,7 @@ pub use name_workflow::{
     VerifiedCurrentShakedexLockEntry, VerifiedCurrentShakedexTransfer,
     VerifiedOutgoingNameTransfer,
 };
-pub use node_rpc::{HnsNodeRpcBackend, HnsNodeRpcConfig};
+pub use node_rpc::{HnsCanonicalBlock, HnsNodeRpcBackend, HnsNodeRpcConfig};
 pub use peer_coordinator::{
     ConnectedHnsPeer, HnsBlockScanBatchTelemetry, HnsBlockScanProgress, HnsDirectPeerConfig,
     HnsDirectPeerCoordinator, HnsDirectPeerError, HnsDirectShakescapeListener,

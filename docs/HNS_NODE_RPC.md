@@ -24,8 +24,18 @@ zeroizing container and every `Debug` implementation redacts it.
 
 Connect, complete-write, and complete-read deadlines are independently bounded
 and default to 5, 30, and 30 seconds. Each call opens one TCP connection and
-sends exactly `POST /api/v1/wallet` with JSON, a decimal `Content-Length`, the
-trusted Authorization value, and `Connection: close`.
+sends JSON with a decimal `Content-Length`, the trusted Authorization value,
+and `Connection: close`. Existing `HnsBackend` calls use
+`POST /api/v1/wallet`. The new chain-only reads use
+`POST /api/v1/wallet-chain`.
+
+The chain-only route works with an authenticated native HSRD that has no global
+`--wallet-index`. It currently exposes a snapshot and a canonical block by
+height. A present block hash with absent raw bytes means the body was pruned.
+The adapter checks the response envelope and snapshot binding; a future
+account-local scanner must also validate each raw block body and computed
+header hash before it updates encrypted wallet history. This transport alone
+does not attach an account or replace the global-index-backed `HnsBackend`.
 
 The response parser accepts HTTP/1.1 fixed-length JSON only. It rejects
 redirects, interim/upgrade responses, chunking, compression, duplicate header
