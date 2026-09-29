@@ -3,6 +3,20 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## 0.3.0 - 2026-09-28
+
+<!-- hns-wallet-release-state: 0.3.0 release -->
+Canonical account-zero wallet and atomic-swap boundary:
+
+- make the direct-offer responder the swap maker across durable HNS and BTC
+  trade preparation, acceptance, and recovery;
+- remove incompatible pre-release direct-offer role and message paths;
+- expose verified offer responses and swap progress to mobile applications;
+- add an authenticated HSRD canonical-block client for account-local scans
+  without requiring the node's global wallet index; and
+- retain the BasicSwap process bridge and its HNS swap/recovery paths in the
+  same versioned wallet source cohort.
+
 ## 0.2.6 - 2026-09-24
 
 <!-- hns-wallet-release-state: 0.2.6 release -->

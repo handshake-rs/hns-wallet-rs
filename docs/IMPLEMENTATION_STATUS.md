@@ -10,7 +10,7 @@ disabled by their own source gates.
 
 | Deliverable | Implemented source | Required before availability |
 | --- | --- | --- |
-| Coordinated workspace | 14 crates, resolver 3, Rust 1.89, and an independent lockfile; this role-model branch temporarily resolves the sibling `hns-rs` marketplace/P2P `0.5.0` cohort and unchanged HNS `0.4.2` crates by exact-version path dependencies so the breaking protocol change is tested atomically; historical locked CI, CodeQL, normalized preflight, and published-cohort evidence remain recorded | publish and verify the exact `hns-rs` cohort, replace development paths with registry pins, then run exact wallet CI, CodeQL, and manually dispatched normalized release preflight before authorized wallet publication/tagging |
+| Coordinated workspace | 16 crates, resolver 3, Rust 1.89, and an independent lockfile; the prepared `0.3.0` release uses exact registry `hns-rs 0.5.0` and compatible engine light-client `0.2.6` dependencies | exact wallet CI, CodeQL, normalized release preflight, and registry archive readback before product adoption |
 | Wallet types | persisted IDs unchanged; dedicated nonzero base64url service/session/handle/request/approval IDs with redacted diagnostics; decimal integer amounts, roles and capabilities; structurally distinct `ReceiveTarget` and wire-compatible `HnsNameReceiveTarget` DTOs, with the latter intrinsically restricted to the Handshake module and validated as an alias of the canonical target | API stabilization review; coordinated HNS Wallet Read v2 (HNWR-v2) consumer adoption |
 | Store | schema v3; Argon2id and XChaCha20-Poly1305; encrypted typed entities/workflows/provider records, including one deletion-protected fixed-ID native HNS read-profile namespace with closed nested schema, CAS rotation, persistent revocation tombstones, and monotonic revision/update-time fences; metadata-bound AEAD; bounded heterogeneous CAS batches; callback-scoped coherent entity snapshots; complete bounded untrusted binary-prefix metadata projections for fail-closed comparison; compare-only authenticated revision assertions; refreshable single-use exact-prefix-set leases with private ciphertext fingerprints; immediate transactions supporting one primary namespace lease plus an optional cross-kind compare-only guard; complete bounded entity and opaque-workflow reads; non-consuming authenticated approval reads; atomic unchanged-approval consume plus workflow/reservation CAS; bounded passphrase input, approvals and replays; monotonic permission tombstones; migration checkpoint; Linux-executed Unix source policy for read-only schema/metadata recognition before write migration, atomic create-new with armed identity-safe database/sidecar cleanup, effective-UID/exact-mode/single-link checks, non-writable host prefix plus an Android-only UID-1000 app-data exception, same-owner private suffix, no-symlink SQLite opens, and repeated file identity checks; cloneable non-debuggable shared lock/key authority with poison-time key clearing | installed Android/iOS filesystem/runtime qualification; host sandbox/ACL/Data Protection/backup evidence; downstream candidate Keystore/Keychain wrapping is not supplied or qualified by this crate; non-Unix secure-open policy; migration/import tooling for populated schema-v1 entity tables; DB benchmarks and audit |
 | HNS | create/restore; canonical hsd/Bob account-zero external/change authority for ordinary HNS and names; protocol-separated ShakeDex and atomic-swap keys; BLAKE2b-160 version-0 addresses; authenticated loopback `hns-node-rs` wallet RPC; synchronized coin, name, and Shakedex snapshots; encrypted restart/reorg state; direct HNS account, transfer, FINALIZE, funding, quote, signing, approval, and broadcast composition; canonical current/proof/owner/spender validation; deterministic encrypted workflows and settlement supervision. | exact locked CI, CodeQL, and preflight evidence; multi-process regtest, restart/reorg, mempool-conflict, adversarial, resource, and installed-product qualification remain |
@@ -93,19 +93,13 @@ or unavailable quote input gets one full reconciliation and one retry, never a
 polling loop. Wallet-owned P2PKH TRANSFER and direct FINALIZE use the same
 boundary and require the same fresh evidence and explicit approval.
 
-This coordinated role-model branch uses sibling path dependencies for the
-`hns-rs` marketplace/P2P `0.5.0` cohort and unchanged HNS `0.4.2` crates. It
-must not be published in that form: publish and verify the exact upstream
-cohort, replace the paths with exact registry pins, and regenerate release
-evidence first. Historical evidence for published registry `hns-rs` `0.4.1`
-source `73611a0d83778e157b35f28ca2197d068e83fc61` remains in
-`release/hns-rs-0.4.1-crates.sha256`; published registry `hns-dane-engine`
-`0.2.2` source
-`b7fdf8826c81b77650a0f740d1f05314b74969f9`, with all 20 upstream archive
-checksums in `release/hns-dane-engine-0.2.2-crates.sha256`, is unchanged.
-Execute mode must revalidate the eventual release cohorts before any wallet
-upload. Wallet authorization and installed-product qualification remain
-separate from the enabled HNS source gates.
+The `0.3.0` release source uses the exact registry `hns-rs 0.5.0` cohort from
+`60eb912d615243a6bfb9741b17f16833c5a9181a`, with all 19 published
+checksums in `release/hns-rs-0.5.0-crates.sha256`. The wallet also consumes the
+targeted engine light-client `0.2.6` cohort and the historical engine `0.2.2`
+cohort. Execute mode revalidates their published archives and source
+provenance before any wallet upload. Wallet authorization and installed-product
+qualification remain separate from the enabled HNS source gates.
 
 Other exact blockers are:
 

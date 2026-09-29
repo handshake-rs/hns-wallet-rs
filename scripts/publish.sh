@@ -17,19 +17,19 @@ require_clean_archive_vcs=no
 package_operation="publish-dry-run"
 release_manifest=release/public-crates.txt
 protocol_repository=https://github.com/handshake-rs/hns-rs.git
-protocol_revision=1a4a937a8b8367b8b96d0445b9aa2b7e6fdd7c6b
-protocol_version=0.4.2
+protocol_revision=60eb912d615243a6bfb9741b17f16833c5a9181a
+protocol_version=0.5.0
 protocol_crates='hns-encoding hns-rollback-journal hns-hrm hns-primitives hns-covenants hns-dns-relay-protocol hns-header-consensus hns-service-authority hns-odoh-protocol hns-p2p-experimental hns-urkel-proof hns-transaction hns-chat-protocol hns-hnsr-protocol hns-script hns-mining hns-swap hns-marketplace-protocol hns-p2p-wire'
-protocol_checksum_manifest=release/hns-rs-0.4.2-crates.sha256
+protocol_checksum_manifest=release/hns-rs-0.5.0-crates.sha256
 engine_repository=https://github.com/handshake-rs/hns-dane-engine.git
 engine_revision=b7fdf8826c81b77650a0f740d1f05314b74969f9
 engine_version=0.2.2
 engine_crates='hns-dns-wire hns-browser-runtime hns-icann-dane hns-namespace-resolution hns-resolution-policy hns-light-chain hns-light-wallet hns-dane hns-dnssec hns-gateway hns-cache hns-light-p2p hns-light-sync hns-transport hns-resolver hns-browser-observability hns-p2p-transport hns-dane-engine hns-dane-engine-ffi hns-loopback-proxy'
 engine_checksum_manifest=release/hns-dane-engine-0.2.2-crates.sha256
-engine_patch_revision=77459f2ffbaa46d950fec95bd00013cc89d01007
-engine_patch_version=0.2.5
+engine_patch_revision=90a5dfeb5b7c00e8fea010e79f82076de4263fd6
+engine_patch_version=0.2.6
 engine_patch_crates='hns-light-chain hns-light-wallet hns-light-p2p hns-light-sync'
-engine_patch_checksum_manifest=release/hns-dane-engine-mobile-wallet-0.2.5-crates.sha256
+engine_patch_checksum_manifest=release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256
 
 cleanup_release_tmp() {
     if [ -n "$release_tmp" ] && [ -d "$release_tmp" ]

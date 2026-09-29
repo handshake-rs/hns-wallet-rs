@@ -68,25 +68,23 @@ thiserror = "2.0.12"
 url = { version = "2.5.4", features = ["serde"] }
 zeroize = { version = "1.8.1", features = ["derive"] }
 
-# Canonical Handshake and light-engine sources. The coordinated role-model
-# branch temporarily resolves the HNS cohort from its sibling workspace while
-# retaining exact versions; release preparation replaces those paths with
-# checksum-bearing registry sources from the reviewed upstream commits.
-hns-covenants = { version = "=0.4.2", path = "../hns-rs/crates/hns-covenants" }
-hns-header-consensus = { version = "=0.4.2", path = "../hns-rs/crates/hns-header-consensus" }
-hns-mining = { version = "=0.4.2", path = "../hns-rs/crates/hns-mining" }
-hns-marketplace-protocol = { version = "=0.5.0", path = "../hns-rs/crates/hns-marketplace-protocol" }
-hns-p2p-experimental = { version = "=0.5.0", path = "../hns-rs/crates/hns-p2p-experimental" }
-hns-light-chain = { version = "=0.2.5" }
-hns-light-p2p = { version = "=0.2.5" }
-hns-light-sync = { version = "=0.2.5" }
-hns-light-wallet = { version = "=0.2.5" }
-hns-p2p-wire = { version = "=0.4.2", path = "../hns-rs/crates/hns-p2p-wire" }
-hns-primitives = { version = "=0.4.2", path = "../hns-rs/crates/hns-primitives" }
-hns-script = { version = "=0.4.2", path = "../hns-rs/crates/hns-script" }
-hns-swap = { version = "=0.4.2", path = "../hns-rs/crates/hns-swap" }
-hns-transaction = { version = "=0.4.2", path = "../hns-rs/crates/hns-transaction" }
-hns-urkel-proof = { version = "=0.4.2", path = "../hns-rs/crates/hns-urkel-proof" }
+# Canonical Handshake and light-engine sources. All external cohorts are
+# exact, checksum-bearing crates.io dependencies.
+hns-covenants = { version = "=0.5.0" }
+hns-header-consensus = { version = "=0.5.0" }
+hns-mining = { version = "=0.5.0" }
+hns-marketplace-protocol = { version = "=0.5.0" }
+hns-p2p-experimental = { version = "=0.5.0" }
+hns-light-chain = { version = "=0.2.6" }
+hns-light-p2p = { version = "=0.2.6" }
+hns-light-sync = { version = "=0.2.6" }
+hns-light-wallet = { version = "=0.2.6" }
+hns-p2p-wire = { version = "=0.5.0" }
+hns-primitives = { version = "=0.5.0" }
+hns-script = { version = "=0.5.0" }
+hns-swap = { version = "=0.5.0" }
+hns-transaction = { version = "=0.5.0" }
+hns-urkel-proof = { version = "=0.5.0" }
 
 # The only Bitcoin production synchronization implementation. The exact BDK
 # release is part of the encrypted changeset format contract.
@@ -101,19 +99,3 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
-
-# Development integration for the coordinated cross-chain role-model update.
-# Release commits replace these paths with the corresponding published hns-rs
-# version before packaging crates.
-[patch.crates-io]
-hns-covenants = { path = "../hns-rs/crates/hns-covenants" }
-hns-encoding = { path = "../hns-rs/crates/hns-encoding" }
-hns-header-consensus = { path = "../hns-rs/crates/hns-header-consensus" }
-hns-mining = { path = "../hns-rs/crates/hns-mining" }
-hns-p2p-experimental = { path = "../hns-rs/crates/hns-p2p-experimental" }
-hns-p2p-wire = { path = "../hns-rs/crates/hns-p2p-wire" }
-hns-primitives = { path = "../hns-rs/crates/hns-primitives" }
-hns-script = { path = "../hns-rs/crates/hns-script" }
-hns-swap = { path = "../hns-rs/crates/hns-swap" }
-hns-transaction = { path = "../hns-rs/crates/hns-transaction" }
-hns-urkel-proof = { path = "../hns-rs/crates/hns-urkel-proof" }

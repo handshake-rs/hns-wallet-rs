@@ -19,6 +19,8 @@ state machines and fail-closed authority checks beneath those integrations.
   paths `m/44'/5353'/0'/change/index`.
 - Direct Handshake header, peer, coin, transaction, name-state, and proof
   synchronization.
+- An authenticated HSRD canonical-block client for account-local wallet scans
+  without a chain-wide node wallet index.
 - HNS balance, one canonical payment/name receive target, history, and
   tracked-name projections.
 - HNS send, TRANSFER, FINALIZE, resource update, renewal, and name-market
@@ -123,15 +125,15 @@ The dependency-ordered public list is maintained in
 ## Version and dependency policy
 
 All sixteen wallet crates use one shared release version. The current source
-prepares the `0.2.6` cohort with one canonical hsd/Bob-compatible HNS account
-for payments and name ownership while retaining protocol-specific ShakeDex and
-atomic-swap keys.
+prepares the `0.3.0` cohort with one canonical hsd/Bob-compatible HNS account
+for payments and name ownership, responder-as-maker direct swaps, and
+protocol-specific ShakeDex and atomic-swap keys.
 
-Protocol and light-client dependencies are exact-version, checksum-recorded
-crates.io cohorts. Repository-local path patches may be used while coordinating
-an adjacent release, but a wallet crate release is not permitted until its
-tested protocol and engine dependencies have permanent registry artifacts with
-matching source provenance. See [`docs/releasing.md`](docs/releasing.md).
+The `0.3.0` source pins the exact `hns-rs 0.5.0` protocol cohort and the
+`hns-dane-engine 0.2.6` light-client cohort from crates.io. Their published
+archive checksums and source revisions are recorded in `release/`; the release
+gate reads them back before any wallet upload. See
+[`docs/releasing.md`](docs/releasing.md) for the version and source policy.
 
 ## Build and qualification
 
