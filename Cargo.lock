@@ -1154,6 +1154,7 @@ dependencies = [
  "hns-light-sync",
  "hns-light-wallet",
  "hns-marketplace-protocol",
+ "hns-mining",
  "hns-p2p-experimental",
  "hns-p2p-wire",
  "hns-primitives",

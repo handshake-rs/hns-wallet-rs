@@ -30,12 +30,14 @@ and `Connection: close`. Existing `HnsBackend` calls use
 `POST /api/v1/wallet-chain`.
 
 The chain-only route works with an authenticated native HSRD that has no global
-`--wallet-index`. It currently exposes a snapshot and a canonical block by
-height. A present block hash with absent raw bytes means the body was pruned.
-The adapter checks the response envelope and snapshot binding; a future
-account-local scanner must also validate each raw block body and computed
-header hash before it updates encrypted wallet history. This transport alone
-does not attach an account or replace the global-index-backed `HnsBackend`.
+`--wallet-index`. It exposes a snapshot, a height hash, and a canonical block
+by height. A present block hash with absent raw bytes means the body was pruned. The adapter
+checks the response envelope and snapshot binding, validates every retained
+Handshake block body, and compares its computed header hash with the canonical
+hash before returning it. `get_wallet_chain_snapshot_for_network` checks the
+genesis height hash for the selected account network without disclosing scripts.
+This transport alone does not attach an account or replace the
+global-index-backed `HnsBackend`.
 
 The response parser accepts HTTP/1.1 fixed-length JSON only. It rejects
 redirects, interim/upgrade responses, chunking, compression, duplicate header

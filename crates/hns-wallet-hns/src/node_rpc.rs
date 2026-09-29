@@ -22,6 +22,7 @@ use hns_marketplace_protocol::{
     MAX_SHAKESCAPE_PUBLICATION_ACCEPTANCE_BYTES, ShakescapePublicationAcceptanceExpectation,
     ShakescapePublicationMessageKind, verify_shakescape_publication_acceptance,
 };
+use hns_mining::{Block as HnsBlock, MAX_BLOCK_WEIGHT};
 use hns_primitives::{Dollarydoos, Height, NameHash, TransactionHash as CanonicalTransactionHash};
 use hns_transaction::{Address, Coin, MAX_TRANSACTION_RAW_SIZE, Outpoint, Output, Transaction};
 use hns_wallet_types::{BaseUnits, TransactionHash};
@@ -194,10 +195,42 @@ impl HnsNodeRpcBackend {
         chain_snapshot(response)
     }
 
-    /// Read one exact canonical block for a future account-local scan. A
-    /// present hash with absent raw bytes means HSRD has already pruned the
-    /// body. Before indexing, the caller must validate the block body and
-    /// compare its computed header hash with `block_hash`.
+    /// Bind an account to the exact network genesis before scanning blocks.
+    /// This uses the chain-only route and does not disclose account scripts.
+    pub fn get_wallet_chain_snapshot_for_network(
+        &self,
+        network: HnsNetwork,
+    ) -> Result<SnapshotBinding, HnsWalletError> {
+        let binding = self.get_wallet_chain_snapshot()?;
+        let genesis = self.get_wallet_chain_block_hash(0, binding)?;
+        require_chain_network(network, &genesis)?;
+        Ok(binding)
+    }
+
+    /// Read a canonical height hash without loading a retained block body.
+    /// This remains available after the body has been pruned.
+    pub fn get_wallet_chain_block_hash(
+        &self,
+        height: u64,
+        binding: SnapshotBinding,
+    ) -> Result<BlockHashEvidence, HnsWalletError> {
+        let height = u32::try_from(height).map_err(|_| protocol_error())?;
+        let response: WireBlockHashResponse = self.rpc_on_path(
+            WALLET_CHAIN_RPC_PATH,
+            serde_json::json!({
+                "method": "block_hash",
+                "params": {
+                    "height": height,
+                    "expected_chain_epoch": binding.chain_epoch,
+                },
+            }),
+        )?;
+        chain_block_hash(response, binding, height)
+    }
+
+    /// Read one exact canonical block for an account-local scan. Retained raw
+    /// bytes are validated and hash-bound before this method returns them. A
+    /// present hash with absent raw bytes means HSRD has pruned the body.
     pub fn get_canonical_block(
         &self,
         height: u64,
@@ -962,8 +995,8 @@ struct WireCanonicalBlock {
 }
 
 /// One snapshot-bound block supplied by HSRD. `raw == None` with a known hash
-/// means the canonical body was pruned. Raw bytes are unverified at this wire
-/// boundary and must be validated before entering wallet history.
+/// means the canonical body was pruned. Present raw bytes passed Handshake
+/// body validation and have a header hash matching `block_hash`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HnsCanonicalBlock {
     pub binding: SnapshotBinding,
@@ -972,13 +1005,55 @@ pub struct HnsCanonicalBlock {
     pub raw: Option<Vec<u8>>,
 }
 
+fn require_chain_network(
+    network: HnsNetwork,
+    genesis: &BlockHashEvidence,
+) -> Result<(), HnsWalletError> {
+    let consensus_network = match network {
+        HnsNetwork::Mainnet => hns_header_consensus::Network::Mainnet,
+        HnsNetwork::Testnet => hns_header_consensus::Network::Testnet,
+        HnsNetwork::Regtest => hns_header_consensus::Network::Regtest,
+        HnsNetwork::Simnet => hns_header_consensus::Network::Simnet,
+    };
+    if genesis.height != 0
+        || genesis.block_hash != Some(consensus_network.parameters().genesis_hash.into_bytes())
+    {
+        return Err(HnsWalletError::InvalidEvidence);
+    }
+    Ok(())
+}
+
+fn chain_block_hash(
+    response: WireBlockHashResponse,
+    binding: SnapshotBinding,
+    height: u32,
+) -> Result<BlockHashEvidence, HnsWalletError> {
+    require_binding(response.chain_epoch, response.tip, binding)?;
+    if response.height != height
+        || (u64::from(height) <= binding.tip.height) != response.hash.is_some()
+    {
+        return Err(protocol_error());
+    }
+    let block_hash = response.hash.map(|hash| decode_hex_32(&hash)).transpose()?;
+    if u64::from(height) == binding.tip.height && block_hash != Some(binding.tip.block_hash) {
+        return Err(protocol_error());
+    }
+    Ok(BlockHashEvidence {
+        binding,
+        height: u64::from(height),
+        block_hash,
+    })
+}
+
 fn canonical_block(
     response: WireCanonicalBlock,
     binding: SnapshotBinding,
     height: u32,
 ) -> Result<HnsCanonicalBlock, HnsWalletError> {
     require_binding(response.chain_epoch, response.tip, binding)?;
-    if response.height != height || (response.block_hash.is_none() && response.block_hex.is_some())
+    if response.height != height
+        || (u64::from(height) <= binding.tip.height) != response.block_hash.is_some()
+        || (response.block_hash.is_none() && response.block_hex.is_some())
     {
         return Err(protocol_error());
     }
@@ -986,15 +1061,21 @@ fn canonical_block(
         .block_hash
         .map(|hash| decode_hex_32(&hash))
         .transpose()?;
+    if u64::from(height) == binding.tip.height && block_hash != Some(binding.tip.block_hash) {
+        return Err(protocol_error());
+    }
     let raw = response
         .block_hex
-        .map(|raw| {
-            if raw.len() > MAX_RESPONSE_RESULT_BYTES / 2 || raw.len() % 2 != 0 {
-                return Err(protocol_error());
-            }
-            hex::decode(raw).map_err(|_| protocol_error())
-        })
+        .map(|raw| decode_lower_hex(&raw, MAX_BLOCK_WEIGHT))
         .transpose()?;
+    if let Some(raw) = raw.as_ref() {
+        let block = HnsBlock::decode_validated(raw).map_err(|_| protocol_error())?;
+        if Some(block.header.block_hash().into_bytes()) != block_hash
+            || block.encode().map_err(|_| protocol_error())? != *raw
+        {
+            return Err(protocol_error());
+        }
+    }
     Ok(HnsCanonicalBlock {
         binding,
         height: u64::from(height),
@@ -3331,7 +3412,125 @@ mod tests {
     use hns_primitives::{Height, Outpoint};
 
     #[test]
+    fn chain_only_client_uses_authenticated_route_and_binds_genesis() {
+        let raw_hex = include_str!("../tests/fixtures/regtest-genesis.hex")
+            .trim()
+            .to_owned();
+        let raw = hex::decode(&raw_hex).expect("genesis fixture hex");
+        let genesis_hash = HnsBlock::decode_validated(&raw)
+            .expect("validated genesis fixture")
+            .header
+            .block_hash()
+            .into_bytes();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let endpoint = listener.local_addr().expect("listener address");
+        let server = std::thread::spawn(move || {
+            for request_number in 0..3 {
+                let (mut stream, _) = listener.accept().expect("accept wallet request");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut byte = [0_u8; 1];
+                    stream.read_exact(&mut byte).expect("request header byte");
+                    request.push(byte[0]);
+                    assert!(request.len() < 16 * 1024, "request headers bounded");
+                    if request.ends_with(b"\r\n\r\n") {
+                        break request.len();
+                    }
+                };
+                let header = std::str::from_utf8(&request[..header_end]).expect("request header");
+                assert!(header.starts_with("POST /api/v1/wallet-chain HTTP/1.1\r\n"));
+                assert!(header.contains("\r\nAuthorization: Bearer test-chain-feed\r\n"));
+                let content_length = header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length: "))
+                    .expect("content length")
+                    .parse::<usize>()
+                    .expect("decimal content length");
+                assert!(content_length < 16 * 1024);
+                let mut body = vec![0_u8; content_length];
+                stream.read_exact(&mut body).expect("request body");
+                let call: Value = serde_json::from_slice(&body).expect("request JSON");
+                let expected_method = match request_number {
+                    0 => "chain_snapshot",
+                    1 => "block_hash",
+                    _ => "canonical_block",
+                };
+                assert_eq!(call["call"]["method"], expected_method);
+                let tip = serde_json::json!({
+                    "hash": hex::encode(genesis_hash),
+                    "height": 0,
+                    "tree_root": hex::encode([0; 32]),
+                    "median_time_past": 1_800_000_000_u64,
+                });
+                let result = match request_number {
+                    0 => serde_json::json!({"chain_epoch": 3, "tip": tip}),
+                    1 => {
+                        assert_eq!(call["call"]["params"]["height"], 0);
+                        assert_eq!(call["call"]["params"]["expected_chain_epoch"], 3);
+                        serde_json::json!({
+                            "chain_epoch": 3,
+                            "tip": tip,
+                            "height": 0,
+                            "hash": hex::encode(genesis_hash),
+                        })
+                    }
+                    _ => {
+                        assert_eq!(call["call"]["params"]["height"], 0);
+                        assert_eq!(call["call"]["params"]["expected_chain_epoch"], 3);
+                        serde_json::json!({
+                            "chain_epoch": 3,
+                            "tip": tip,
+                            "height": 0,
+                            "block_hash": hex::encode(genesis_hash),
+                            "block_hex": raw_hex.clone(),
+                        })
+                    }
+                };
+                let response = serde_json::json!({
+                    "api_version": 1,
+                    "request_id": call["request_id"],
+                    "result": result,
+                })
+                .to_string();
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .expect("response header");
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("response body");
+            }
+        });
+        let client = HnsNodeRpcBackend::new(
+            HnsNodeRpcConfig::new(endpoint, "Bearer test-chain-feed")
+                .expect("client configuration"),
+        )
+        .expect("client");
+        let binding = client
+            .get_wallet_chain_snapshot_for_network(HnsNetwork::Regtest)
+            .expect("bound regtest chain snapshot");
+        assert_eq!(binding.chain_epoch, 3);
+        assert_eq!(binding.tip.block_hash, genesis_hash);
+        let genesis = client
+            .get_canonical_block(0, binding)
+            .expect("validated retained genesis");
+        assert_eq!(genesis.block_hash, Some(genesis_hash));
+        assert_eq!(genesis.raw, Some(raw));
+        server.join().expect("server assertions");
+    }
+
+    #[test]
     fn canonical_block_wire_distinguishes_retained_pruned_and_stale() {
+        let raw_hex = include_str!("../tests/fixtures/regtest-genesis.hex").trim();
+        let raw = hex::decode(raw_hex).expect("genesis fixture hex");
+        let block = HnsBlock::decode_validated(&raw).expect("validated genesis fixture");
+        let genesis_hash = block.header.block_hash().into_bytes();
         let binding = SnapshotBinding {
             tip: ChainTip {
                 height: 42,
@@ -3341,7 +3540,7 @@ mod tests {
             },
             chain_epoch: 9,
         };
-        let response = |block_hex: Option<&str>| {
+        let response = |height: u32, block_hash: Option<[u8; 32]>, block_hex: Option<&str>| {
             serde_json::from_value::<WireCanonicalBlock>(serde_json::json!({
                 "chain_epoch": 9,
                 "tip": {
@@ -3350,27 +3549,42 @@ mod tests {
                     "tree_root": hex::encode([2; 32]),
                     "median_time_past": 1_800_000_000_u64,
                 },
-                "height": 42,
-                "block_hash": hex::encode([3; 32]),
+                "height": height,
+                "block_hash": block_hash.map(hex::encode),
                 "block_hex": block_hex,
             }))
             .expect("strict canonical block wire")
         };
-        let retained =
-            canonical_block(response(Some("001122")), binding, 42).expect("retained block");
-        assert_eq!(retained.block_hash, Some([3; 32]));
-        assert_eq!(retained.raw, Some(vec![0, 0x11, 0x22]));
+        let retained = canonical_block(response(0, Some(genesis_hash), Some(raw_hex)), binding, 0)
+            .expect("retained block");
+        assert_eq!(retained.block_hash, Some(genesis_hash));
+        assert_eq!(retained.raw, Some(raw));
+        let genesis = BlockHashEvidence {
+            binding,
+            height: 0,
+            block_hash: retained.block_hash,
+        };
+        assert!(require_chain_network(HnsNetwork::Regtest, &genesis).is_ok());
+        assert!(require_chain_network(HnsNetwork::Mainnet, &genesis).is_err());
         assert_eq!(
-            canonical_block(response(None), binding, 42)
+            canonical_block(response(0, Some(genesis_hash), None), binding, 0)
                 .expect("pruned block")
                 .raw,
             None
         );
-        assert!(canonical_block(response(Some("0")), binding, 42).is_err());
-        assert!(canonical_block(response(None), binding, 41).is_err());
-        let mut stale = response(None);
+        assert!(canonical_block(response(0, Some(genesis_hash), Some("0")), binding, 0).is_err());
+        assert!(canonical_block(response(0, Some([3; 32]), Some(raw_hex)), binding, 0).is_err());
+        assert!(
+            canonical_block(response(0, Some(genesis_hash), Some("001122")), binding, 0).is_err()
+        );
+        assert!(canonical_block(response(0, None, None), binding, 0).is_err());
+        assert!(canonical_block(response(43, None, None), binding, 43).is_ok());
+        assert!(canonical_block(response(43, Some(genesis_hash), None), binding, 43).is_err());
+        assert!(canonical_block(response(42, Some(genesis_hash), None), binding, 42).is_err());
+        assert!(canonical_block(response(0, Some(genesis_hash), None), binding, 1).is_err());
+        let mut stale = response(0, Some(genesis_hash), None);
         stale.chain_epoch += 1;
-        assert!(canonical_block(stale, binding, 42).is_err());
+        assert!(canonical_block(stale, binding, 0).is_err());
         let mut unknown = serde_json::json!({
             "chain_epoch": 9,
             "tip": null,
@@ -3380,6 +3594,25 @@ mod tests {
             "extra": true,
         });
         assert!(serde_json::from_value::<WireCanonicalBlock>(unknown.take()).is_err());
+
+        let hash_response = |height: u32, hash: Option<[u8; 32]>| {
+            serde_json::from_value::<WireBlockHashResponse>(serde_json::json!({
+                "chain_epoch": 9,
+                "tip": {
+                    "hash": hex::encode([1; 32]),
+                    "height": 42,
+                    "tree_root": hex::encode([2; 32]),
+                    "median_time_past": 1_800_000_000_u64,
+                },
+                "height": height,
+                "hash": hash.map(hex::encode),
+            }))
+            .expect("strict block hash wire")
+        };
+        assert!(chain_block_hash(hash_response(0, Some(genesis_hash)), binding, 0).is_ok());
+        assert!(chain_block_hash(hash_response(0, None), binding, 0).is_err());
+        assert!(chain_block_hash(hash_response(42, Some([3; 32])), binding, 42).is_err());
+        assert!(chain_block_hash(hash_response(43, None), binding, 43).is_ok());
     }
 
     #[test]

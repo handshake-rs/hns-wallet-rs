@@ -74,6 +74,7 @@ zeroize = { version = "1.8.1", features = ["derive"] }
 # checksum-bearing registry sources from the reviewed upstream commits.
 hns-covenants = { version = "=0.4.2", path = "../hns-rs/crates/hns-covenants" }
 hns-header-consensus = { version = "=0.4.2", path = "../hns-rs/crates/hns-header-consensus" }
+hns-mining = { version = "=0.4.2", path = "../hns-rs/crates/hns-mining" }
 hns-marketplace-protocol = { version = "=0.5.0", path = "../hns-rs/crates/hns-marketplace-protocol" }
 hns-p2p-experimental = { version = "=0.5.0", path = "../hns-rs/crates/hns-p2p-experimental" }
 hns-light-chain = { version = "=0.2.5" }
