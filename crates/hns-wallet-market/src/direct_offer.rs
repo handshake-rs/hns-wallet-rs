@@ -893,10 +893,8 @@ pub(crate) fn load_local_offer_for_session(
     let mut found = None;
     for row in stored {
         let local = load_local_offer(store, wallet_id, row.value.offer_id.into_bytes())?;
-        if local.session_id == session_id {
-            if found.replace(local).is_some() {
-                return Err(MarketError::CorruptShakescapeDirectOfferBoard);
-            }
+        if local.session_id == session_id && found.replace(local).is_some() {
+            return Err(MarketError::CorruptShakescapeDirectOfferBoard);
         }
     }
     Ok(found)
