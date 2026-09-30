@@ -82,6 +82,7 @@ pub enum EntityKind {
     EthereumAccount,
     EthereumTransaction,
     SwapSession,
+    SwapFundingAuthorization,
     RefundTransaction,
     HnsRecoveryState,
     HnsShakescapeWatch,
@@ -121,6 +122,7 @@ impl EntityKind {
             Self::EthereumAccount => "ethereum_account",
             Self::EthereumTransaction => "ethereum_transaction",
             Self::SwapSession => "swap_session",
+            Self::SwapFundingAuthorization => "swap_funding_authorization",
             Self::RefundTransaction => "refund_transaction",
             Self::HnsRecoveryState => "hns_recovery_state",
             Self::HnsShakescapeWatch => "hns_shakescape_watch",
@@ -316,6 +318,16 @@ pub struct EntityBatchDelete {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EntityRevisionAssertion {
     pub id: Vec<u8>,
+    pub expected_revision: u64,
+}
+
+/// Compare-only workflow CAS condition checked in the same transaction as a
+/// separate workflow write. The asserted workflow is authenticated but not
+/// rewritten.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WorkflowRevisionAssertion {
+    pub id: WorkflowId,
+    pub kind: WorkflowKind,
     pub expected_revision: u64,
 }
 
@@ -1639,6 +1651,63 @@ impl WalletStore {
         Ok(true)
     }
 
+    /// Atomically delete exact authenticated entities across non-protected
+    /// namespaces. This is the pre-workflow counterpart to terminal workflow
+    /// retirement and prevents local routing metadata from becoming orphaned
+    /// if cleanup is interrupted.
+    pub fn delete_entities(
+        &mut self,
+        entity_deletes: &[(EntityKind, EntityBatchDelete)],
+    ) -> Result<(), StoreError> {
+        if entity_deletes.is_empty() {
+            return Err(StoreError::InvalidRevision);
+        }
+        if entity_deletes.len() > MAX_ENTITY_BATCH_OPERATIONS {
+            return Err(StoreError::BatchCapacity);
+        }
+        let mut identities = BTreeSet::new();
+        for (entity_kind, delete) in entity_deletes {
+            validate_id(&delete.id)?;
+            if entity_kind.deletion_protected() {
+                return Err(StoreError::ProtectedEntity);
+            }
+            if delete.expected_revision == 0 {
+                return Err(StoreError::InvalidRevision);
+            }
+            if !identities.insert((*entity_kind, delete.id.clone())) {
+                return Err(StoreError::DuplicateBatchEntity);
+            }
+        }
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for (entity_kind, delete) in entity_deletes {
+            let actual = authenticated_entity_revision(
+                &transaction,
+                key,
+                &self.database_id,
+                *entity_kind,
+                &delete.id,
+            )?
+            .unwrap_or(0);
+            if actual != delete.expected_revision {
+                return Err(StoreError::StaleRevision {
+                    expected: delete.expected_revision,
+                    actual,
+                });
+            }
+        }
+        for (entity_kind, delete) in entity_deletes {
+            transaction.execute(
+                "DELETE FROM encrypted_entities WHERE entity_kind=?1 AND record_id=?2",
+                params![entity_kind.label(), &delete.id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     entity_crud_methods!(
         (
             save_wallet_account,
@@ -1982,6 +2051,141 @@ impl WalletStore {
             &prepared_entities,
             deletes,
         )?;
+        let next = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
+        let encrypted = encrypt_record(
+            key,
+            &self.database_id,
+            &workflow_label(kind),
+            &revisioned_aad_id(
+                id.as_bytes(),
+                next,
+                updated_at_unix,
+                Some(irreversible_broadcast_prepared),
+            )?,
+            &encoded_workflow,
+        )?;
+        transaction.execute(
+            "INSERT INTO workflows(
+                 id, kind, revision, state_json, broadcast_prepared, updated_at_unix,
+                 encryption_version
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, 1)
+             ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,
+             state_json=excluded.state_json, broadcast_prepared=excluded.broadcast_prepared,
+             updated_at_unix=excluded.updated_at_unix,
+             encryption_version=excluded.encryption_version",
+            params![
+                id.as_bytes().as_slice(),
+                workflow_kind(kind),
+                next,
+                encrypted,
+                irreversible_broadcast_prepared,
+                updated_at_unix,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(next)
+    }
+
+    /// Atomically advances one workflow while an independently authenticated
+    /// workflow and entity remain at their exact revisions. The entity guard
+    /// can optionally be consumed in that transaction, providing a single-use
+    /// authority boundary for an irreversible chain checkpoint while the
+    /// checkpoint also activates a separate reservation batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_workflow_with_entity_batch_and_guards<W: Serialize, E: Serialize>(
+        &mut self,
+        id: WorkflowId,
+        kind: WorkflowKind,
+        expected_revision: u64,
+        state: &W,
+        irreversible_broadcast_prepared: bool,
+        updated_at_unix: u64,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+        workflow_guard: WorkflowRevisionAssertion,
+        entity_guard_kind: EntityKind,
+        entity_guard: &EntityRevisionAssertion,
+        consume_entity_guard: bool,
+    ) -> Result<u64, StoreError> {
+        if workflow_guard.expected_revision == 0
+            || entity_guard.expected_revision == 0
+            || workflow_guard.id == id
+        {
+            return Err(StoreError::InvalidRevision);
+        }
+        validate_id(&entity_guard.id)?;
+        if consume_entity_guard && entity_guard_kind.deletion_protected() {
+            return Err(StoreError::ProtectedEntity);
+        }
+        if entity_guard_kind == entity_kind
+            && (saves.iter().any(|save| save.id == entity_guard.id)
+                || deletes.iter().any(|delete| delete.id == entity_guard.id))
+        {
+            return Err(StoreError::DuplicateBatchEntity);
+        }
+        let encoded_workflow = Zeroizing::new(serde_json::to_vec(state)?);
+        if encoded_workflow.is_empty() || encoded_workflow.len() > MAX_STATE_BYTES {
+            return Err(StoreError::RecordTooLarge);
+        }
+        let prepared_entities = prepare_entity_batch(saves, deletes)?;
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let actual =
+            authenticated_workflow_revision(&transaction, key, &self.database_id, id, kind)?;
+        if actual != expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: expected_revision,
+                actual,
+            });
+        }
+        let guarded_workflow_revision = authenticated_workflow_revision(
+            &transaction,
+            key,
+            &self.database_id,
+            workflow_guard.id,
+            workflow_guard.kind,
+        )?;
+        if guarded_workflow_revision != workflow_guard.expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: workflow_guard.expected_revision,
+                actual: guarded_workflow_revision,
+            });
+        }
+        let guarded_entity_revision = authenticated_entity_revision(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_guard_kind,
+            &entity_guard.id,
+        )?
+        .unwrap_or(0);
+        if guarded_entity_revision != entity_guard.expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: entity_guard.expected_revision,
+                actual: guarded_entity_revision,
+            });
+        }
+        apply_entity_batch_in_transaction(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            &prepared_entities,
+            deletes,
+        )?;
+        if consume_entity_guard {
+            consume_authenticated_entity_revision(
+                &transaction,
+                key,
+                &self.database_id,
+                entity_guard_kind,
+                entity_guard,
+                updated_at_unix,
+            )?;
+        }
         let next = actual.checked_add(1).ok_or(StoreError::RevisionOverflow)?;
         let encrypted = encrypt_record(
             key,
@@ -2371,6 +2575,88 @@ impl WalletStore {
             assertions,
         )?;
         write_entity_batch_in_transaction(&transaction, entity_kind, &encrypted_saves, deletes)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically applies one same-kind entity batch while an independent
+    /// workflow remains at its exact authenticated revision and consumes one
+    /// exact authority entity. This is intended for persisting a signed chain
+    /// broadcast record: reconciliation may revoke the authority first, while
+    /// a successful record write makes later recovery independent of it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_entity_batch_with_workflow_guard_and_consumed_entity<E: Serialize>(
+        &mut self,
+        entity_kind: EntityKind,
+        saves: &[EntityBatchSave<E>],
+        deletes: &[EntityBatchDelete],
+        workflow_guard: WorkflowRevisionAssertion,
+        consumed_entity_kind: EntityKind,
+        consumed_entity: &EntityRevisionAssertion,
+        consumed_at_unix: u64,
+    ) -> Result<(), StoreError> {
+        if workflow_guard.expected_revision == 0
+            || consumed_entity.expected_revision == 0
+            || consumed_entity_kind.deletion_protected()
+            || consumed_at_unix == 0
+        {
+            return Err(StoreError::InvalidRevision);
+        }
+        validate_id(&consumed_entity.id)?;
+        if consumed_entity_kind == entity_kind
+            && (saves.iter().any(|save| save.id == consumed_entity.id)
+                || deletes.iter().any(|delete| delete.id == consumed_entity.id))
+        {
+            return Err(StoreError::DuplicateBatchEntity);
+        }
+        let prepared_entities = prepare_entity_batch(saves, deletes)?;
+        let key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let guarded_workflow_revision = authenticated_workflow_revision(
+            &transaction,
+            key,
+            &self.database_id,
+            workflow_guard.id,
+            workflow_guard.kind,
+        )?;
+        if guarded_workflow_revision != workflow_guard.expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: workflow_guard.expected_revision,
+                actual: guarded_workflow_revision,
+            });
+        }
+        let consumed_revision = authenticated_entity_revision(
+            &transaction,
+            key,
+            &self.database_id,
+            consumed_entity_kind,
+            &consumed_entity.id,
+        )?
+        .unwrap_or(0);
+        if consumed_revision != consumed_entity.expected_revision {
+            return Err(StoreError::StaleRevision {
+                expected: consumed_entity.expected_revision,
+                actual: consumed_revision,
+            });
+        }
+        apply_entity_batch_in_transaction(
+            &transaction,
+            key,
+            &self.database_id,
+            entity_kind,
+            &prepared_entities,
+            deletes,
+        )?;
+        consume_authenticated_entity_revision(
+            &transaction,
+            key,
+            &self.database_id,
+            consumed_entity_kind,
+            consumed_entity,
+            consumed_at_unix,
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -3774,6 +4060,70 @@ fn authenticated_entity_revision(
             Ok(revision)
         })
         .transpose()
+}
+
+/// Advance an authenticated entity revision without changing its plaintext.
+/// The new revision is an immutable consumption tombstone: an old authority
+/// assertion can no longer succeed, while its owner can distinguish consumed
+/// authority from an entity that was merely revoked and deleted.
+fn consume_authenticated_entity_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    key: &[u8; KEY_BYTES],
+    database_id: &[u8; DATABASE_ID_BYTES],
+    kind: EntityKind,
+    assertion: &EntityRevisionAssertion,
+    consumed_at_unix: u64,
+) -> Result<(), StoreError> {
+    let current: Option<(u64, Vec<u8>, u64)> = transaction
+        .query_row(
+            "SELECT revision, encrypted_value, updated_at_unix
+             FROM encrypted_entities WHERE entity_kind=?1 AND record_id=?2",
+            params![kind.label(), &assertion.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((revision, encrypted, updated_at_unix)) = current else {
+        return Err(StoreError::StaleRevision {
+            expected: assertion.expected_revision,
+            actual: 0,
+        });
+    };
+    if revision != assertion.expected_revision {
+        return Err(StoreError::StaleRevision {
+            expected: assertion.expected_revision,
+            actual: revision,
+        });
+    }
+    let plaintext = Zeroizing::new(decrypt_record(
+        key,
+        database_id,
+        &entity_label(kind),
+        &revisioned_aad_id(&assertion.id, revision, updated_at_unix, None)?,
+        &encrypted,
+    )?);
+    let next = revision
+        .checked_add(1)
+        .ok_or(StoreError::RevisionOverflow)?;
+    let encrypted = encrypt_record(
+        key,
+        database_id,
+        &entity_label(kind),
+        &revisioned_aad_id(&assertion.id, next, consumed_at_unix, None)?,
+        &plaintext,
+    )?;
+    transaction.execute(
+        "UPDATE encrypted_entities
+         SET revision=?1, encrypted_value=?2, updated_at_unix=?3
+         WHERE entity_kind=?4 AND record_id=?5",
+        params![
+            next,
+            encrypted,
+            consumed_at_unix,
+            kind.label(),
+            &assertion.id,
+        ],
+    )?;
+    Ok(())
 }
 
 fn apply_entity_batch_in_transaction(
@@ -7707,6 +8057,205 @@ mod tests {
                 .input_reservation::<serde_json::Value>(&funding_id)
                 .expect("load absent funding after reopen")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn guarded_workflow_checkpoint_consumes_authority_once() {
+        let mut store = WalletStore::create_in_memory("guarded-workflow").expect("store");
+        let target_id = WorkflowId::new([0x51; 16]);
+        let execution_id = WorkflowId::new([0x52; 16]);
+        let authority_id = vec![0x53; 32];
+        store
+            .save_workflow(
+                target_id,
+                WorkflowKind::Refund,
+                0,
+                &json!({"stage": "prepared"}),
+                false,
+                10,
+            )
+            .expect("target workflow");
+        store
+            .save_workflow(
+                execution_id,
+                WorkflowKind::AtomicSwap,
+                0,
+                &json!({"stage": "authorized"}),
+                true,
+                10,
+            )
+            .expect("execution workflow");
+        store
+            .save_entity(
+                EntityKind::SwapFundingAuthorization,
+                &authority_id,
+                0,
+                &json!({"authorization": "exact"}),
+                10,
+            )
+            .expect("funding authority");
+
+        let empty_saves: [EntityBatchSave<serde_json::Value>; 0] = [];
+        assert_eq!(
+            store
+                .save_workflow_with_entity_batch_and_guards(
+                    target_id,
+                    WorkflowKind::Refund,
+                    1,
+                    &json!({"stage": "requires_rebroadcast"}),
+                    true,
+                    20,
+                    EntityKind::InputReservation,
+                    &empty_saves,
+                    &[],
+                    WorkflowRevisionAssertion {
+                        id: execution_id,
+                        kind: WorkflowKind::AtomicSwap,
+                        expected_revision: 1,
+                    },
+                    EntityKind::SwapFundingAuthorization,
+                    &EntityRevisionAssertion {
+                        id: authority_id.clone(),
+                        expected_revision: 1,
+                    },
+                    true,
+                )
+                .expect("guarded checkpoint"),
+            2
+        );
+        let consumed = store
+            .load_entity::<serde_json::Value>(EntityKind::SwapFundingAuthorization, &authority_id)
+            .expect("load consumed authority")
+            .expect("consumed authority retained");
+        assert_eq!(consumed.revision, 2);
+        assert_eq!(consumed.value["authorization"], "exact");
+
+        assert!(matches!(
+            store.save_workflow_with_entity_batch_and_guards(
+                target_id,
+                WorkflowKind::Refund,
+                2,
+                &json!({"stage": "broadcast"}),
+                true,
+                21,
+                EntityKind::InputReservation,
+                &empty_saves,
+                &[],
+                WorkflowRevisionAssertion {
+                    id: execution_id,
+                    kind: WorkflowKind::AtomicSwap,
+                    expected_revision: 1,
+                },
+                EntityKind::SwapFundingAuthorization,
+                &EntityRevisionAssertion {
+                    id: authority_id,
+                    expected_revision: 1,
+                },
+                true,
+            ),
+            Err(StoreError::StaleRevision {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        let target = store
+            .load_workflow::<serde_json::Value>(target_id)
+            .expect("load target")
+            .expect("target retained");
+        assert_eq!(target.revision, 2);
+        assert_eq!(target.state["stage"], "requires_rebroadcast");
+    }
+
+    #[test]
+    fn guarded_entity_batch_rolls_back_when_authority_was_consumed() {
+        let mut store = WalletStore::create_in_memory("guarded-entity-batch").expect("store");
+        let execution_id = WorkflowId::new([0x61; 16]);
+        let authority_id = vec![0x62; 32];
+        let broadcast_id = vec![0x63; 32];
+        store
+            .save_workflow(
+                execution_id,
+                WorkflowKind::AtomicSwap,
+                0,
+                &json!({"stage": "authorized"}),
+                true,
+                10,
+            )
+            .expect("execution workflow");
+        store
+            .save_entity(
+                EntityKind::SwapFundingAuthorization,
+                &authority_id,
+                0,
+                &json!({"authorization": "exact"}),
+                10,
+            )
+            .expect("funding authority");
+        let first_save = [EntityBatchSave {
+            id: broadcast_id.clone(),
+            expected_revision: 0,
+            value: json!({"raw_transaction": "first"}),
+            updated_at_unix: 20,
+        }];
+        let workflow_guard = WorkflowRevisionAssertion {
+            id: execution_id,
+            kind: WorkflowKind::AtomicSwap,
+            expected_revision: 1,
+        };
+        let entity_guard = EntityRevisionAssertion {
+            id: authority_id.clone(),
+            expected_revision: 1,
+        };
+        store
+            .apply_entity_batch_with_workflow_guard_and_consumed_entity(
+                EntityKind::BitcoinTransaction,
+                &first_save,
+                &[],
+                workflow_guard,
+                EntityKind::SwapFundingAuthorization,
+                &entity_guard,
+                20,
+            )
+            .expect("guarded broadcast persistence");
+
+        let replacement = [EntityBatchSave {
+            id: broadcast_id.clone(),
+            expected_revision: 1,
+            value: json!({"raw_transaction": "replacement"}),
+            updated_at_unix: 21,
+        }];
+        assert!(matches!(
+            store.apply_entity_batch_with_workflow_guard_and_consumed_entity(
+                EntityKind::BitcoinTransaction,
+                &replacement,
+                &[],
+                workflow_guard,
+                EntityKind::SwapFundingAuthorization,
+                &entity_guard,
+                21,
+            ),
+            Err(StoreError::StaleRevision {
+                expected: 1,
+                actual: 2
+            })
+        ));
+        let broadcast = store
+            .load_entity::<serde_json::Value>(EntityKind::BitcoinTransaction, &broadcast_id)
+            .expect("load broadcast")
+            .expect("broadcast retained");
+        assert_eq!(broadcast.revision, 1);
+        assert_eq!(broadcast.value["raw_transaction"], "first");
+        assert_eq!(
+            store
+                .load_entity::<serde_json::Value>(
+                    EntityKind::SwapFundingAuthorization,
+                    &authority_id,
+                )
+                .expect("load authority")
+                .expect("authority tombstone")
+                .revision,
+            2
         );
     }
 

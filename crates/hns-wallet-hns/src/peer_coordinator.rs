@@ -108,10 +108,11 @@ const SHAKESCAPE_MAX_ATTEMPTS_PER_OBSERVATION: u8 = 8;
 /// re-scan makes a legitimate wallet at successive boundaries re-scan the
 /// same chain repeatedly.
 const MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS: u32 = 8;
-/// The market runtime admits at most sixteen concurrent direct swaps. Keep the
-/// independently persisted HNS watch overlay at the same hard bound without
-/// introducing a dependency from the HNS wallet back into the market crate.
-const MAX_DURABLE_SHAKESCAPE_HNS_WATCH_SCRIPTS: usize = 16;
+/// The market runtime retains sixteen active direct swaps plus 240 terminal
+/// recovery records. Keep one HNS watch descriptor for every retained record
+/// without introducing a dependency from the HNS wallet back into the market
+/// crate.
+const MAX_DURABLE_SHAKESCAPE_HNS_WATCH_SCRIPTS: usize = 256;
 const SHAKESCAPE_HNS_WATCH_SCHEMA_VERSION: u32 = 1;
 
 /// Wallet-encrypted authority for the public HNS scripts which were derived
@@ -2375,19 +2376,30 @@ impl HnsDirectPeerCoordinator {
             authenticated_scripts,
             now_unix,
         )?;
+        let base = source
+            .store
+            .try_with_store(|wallet| derive_hns_light_watch_set(wallet, &account))
+            .map_err(HnsDirectPeerError::Wallet)?;
         let mut overlay = self
             .shakescape_hns_htlc_watch_scripts
             .lock()
             .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
-        overlay.extend(authenticated_scripts);
-        let mut scripts = installed.scripts.clone();
-        scripts.extend(overlay.iter().cloned());
-        drop(overlay);
+        let previous = overlay.clone();
+        let mut scripts = installed
+            .scripts
+            .into_iter()
+            .filter(|script| !previous.contains(script))
+            .collect::<BTreeSet<_>>();
+        scripts.extend(base.scripts);
+        scripts.extend(authenticated_scripts.iter().cloned());
         let watch_set = crate::HnsLightWatchSet::new(scripts, installed.name_hashes)
             .map_err(|_| HnsDirectPeerError::Wallet(HnsWalletError::InvalidEvidence))?;
-        self.backend
+        let changed = self
+            .backend
             .install_watch_set(watch_set, now_unix)
-            .map_err(HnsDirectPeerError::Wallet)
+            .map_err(HnsDirectPeerError::Wallet)?;
+        *overlay = authenticated_scripts;
+        Ok(changed)
     }
 
     /// Finalize the one-time birthday discovery for a wallet imported without
@@ -4026,8 +4038,10 @@ fn reusable_wallet_watch_set(
         })
         .map_err(HnsDirectPeerError::Wallet)?;
 
-    let mut shakescape_scripts = load_shakescape_hns_watch_scripts(store, account)?;
-    if shakescape_scripts.is_empty() && deterministic_watch_set_covers(installed, &base, installed)
+    let stored_shakescape_scripts = load_shakescape_hns_watch_scripts(store, account)?;
+    let mut shakescape_scripts = stored_shakescape_scripts.clone().unwrap_or_default();
+    if stored_shakescape_scripts.is_none()
+        && deterministic_watch_set_covers(installed, &base, installed)
     {
         // One-time upgrade for an authenticated pre-registry light index. Only
         // the exact P2WSH shape produced by HnsHtlc is eligible, and the same
@@ -4098,7 +4112,7 @@ fn validate_durable_shakescape_hns_watch_set(
 fn load_shakescape_hns_watch_scripts(
     store: &SharedWalletStore,
     account: &HnsRuntimeConfig,
-) -> Result<BTreeSet<WalletAddressKey>, HnsDirectPeerError> {
+) -> Result<Option<BTreeSet<WalletAddressKey>>, HnsDirectPeerError> {
     let id = shakescape_hns_watch_entity_id(account);
     let stored = store
         .try_with_store(|wallet| {
@@ -4108,22 +4122,20 @@ fn load_shakescape_hns_watch_scripts(
         })
         .map_err(HnsDirectPeerError::Wallet)?;
     stored
-        .map_or_else(
-            || Ok(BTreeSet::new()),
-            |stored| validate_durable_shakescape_hns_watch_set(&stored.value, account),
-        )
+        .map(|stored| validate_durable_shakescape_hns_watch_set(&stored.value, account))
+        .transpose()
         .map_err(HnsDirectPeerError::Wallet)
 }
 
 fn persist_shakescape_hns_watch_scripts(
     store: &SharedWalletStore,
     account: &HnsRuntimeConfig,
-    additions: BTreeSet<WalletAddressKey>,
+    desired: BTreeSet<WalletAddressKey>,
     now_unix: u64,
 ) -> Result<BTreeSet<WalletAddressKey>, HnsDirectPeerError> {
     if now_unix == 0
-        || additions.len() > MAX_DURABLE_SHAKESCAPE_HNS_WATCH_SCRIPTS
-        || additions
+        || desired.len() > MAX_DURABLE_SHAKESCAPE_HNS_WATCH_SCRIPTS
+        || desired
             .iter()
             .any(|script| script.version != 0 || script.hash.len() != 32)
     {
@@ -4135,14 +4147,14 @@ fn persist_shakescape_hns_watch_scripts(
             let stored = wallet
                 .load_entity::<DurableShakescapeHnsWatchSet>(EntityKind::HnsShakescapeWatch, &id)
                 .map_err(HnsWalletError::from)?;
-            let (revision, mut scripts) = match stored.as_ref() {
-                Some(stored) => (
-                    stored.revision,
-                    validate_durable_shakescape_hns_watch_set(&stored.value, account)?,
-                ),
-                None => (0, BTreeSet::new()),
+            let revision = match stored.as_ref() {
+                Some(stored) => {
+                    validate_durable_shakescape_hns_watch_set(&stored.value, account)?;
+                    stored.revision
+                }
+                None => 0,
             };
-            scripts.extend(additions);
+            let scripts = desired;
             if scripts.len() > MAX_DURABLE_SHAKESCAPE_HNS_WATCH_SCRIPTS {
                 return Err(HnsWalletError::ScanCapacityExhausted);
             }
@@ -5327,6 +5339,50 @@ mod tests {
             value_operations_enabled: false,
             settlement_enabled: false,
         }
+    }
+
+    #[test]
+    fn durable_shakescape_watch_registry_covers_active_and_retained_sessions() {
+        let config = direct_wallet_config();
+        let scripts = (0..MAX_DURABLE_SHAKESCAPE_HNS_WATCH_SCRIPTS)
+            .map(|index| {
+                let mut hash = vec![0_u8; 32];
+                hash[..2].copy_from_slice(
+                    &u16::try_from(index)
+                        .expect("bounded watch index")
+                        .to_be_bytes(),
+                );
+                WalletAddressKey { version: 0, hash }
+            })
+            .collect::<Vec<_>>();
+        let record = DurableShakescapeHnsWatchSet {
+            schema_version: SHAKESCAPE_HNS_WATCH_SCHEMA_VERSION,
+            wallet_id: config.wallet_id.as_bytes().to_vec(),
+            account_id: config.account_id.as_bytes().to_vec(),
+            network: config.network,
+            scripts,
+        };
+        assert_eq!(
+            validate_durable_shakescape_hns_watch_set(&record, &config)
+                .expect("sixteen active plus 240 recovery watches")
+                .len(),
+            MAX_DURABLE_SHAKESCAPE_HNS_WATCH_SCRIPTS
+        );
+
+        let mut oversized = record;
+        let mut hash = vec![0_u8; 32];
+        hash[..2].copy_from_slice(
+            &u16::try_from(MAX_DURABLE_SHAKESCAPE_HNS_WATCH_SCRIPTS)
+                .expect("bounded overflow fixture")
+                .to_be_bytes(),
+        );
+        oversized
+            .scripts
+            .push(WalletAddressKey { version: 0, hash });
+        assert!(matches!(
+            validate_durable_shakescape_hns_watch_set(&oversized, &config),
+            Err(HnsWalletError::InvalidEvidence)
+        ));
     }
 
     #[test]

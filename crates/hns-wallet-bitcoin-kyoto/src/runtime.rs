@@ -19,9 +19,10 @@ use bdk_wallet::chain::{
 };
 use bdk_wallet::{KeychainKind, Update, Wallet};
 use hns_wallet_store::{
-    EntityBatchDelete, EntityBatchSave, EntityKind, SharedWalletStore, StoredEntity, WalletStore,
+    EntityBatchDelete, EntityBatchSave, EntityKind, EntityRevisionAssertion, SharedWalletStore,
+    StoredEntity, WalletStore, WorkflowRevisionAssertion,
 };
-use hns_wallet_types::SessionId;
+use hns_wallet_types::{SessionId, WorkflowKind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -3277,6 +3278,35 @@ pub struct BitcoinBroadcastApprovalBinding {
     pub commitment: [u8; 32],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BitcoinBroadcastAuthorizationGuard {
+    workflow: WorkflowRevisionAssertion,
+    authorization: EntityRevisionAssertion,
+    expires_at_unix: u64,
+}
+
+impl BitcoinBroadcastAuthorizationGuard {
+    pub fn new(
+        workflow: WorkflowRevisionAssertion,
+        authorization: EntityRevisionAssertion,
+        expires_at_unix: u64,
+    ) -> Result<Self, BitcoinWalletError> {
+        if workflow.kind != WorkflowKind::AtomicSwap
+            || workflow.expected_revision == 0
+            || authorization.expected_revision == 0
+            || authorization.id.is_empty()
+            || expires_at_unix == 0
+        {
+            return Err(BitcoinWalletError::InvalidBroadcastApproval);
+        }
+        Ok(Self {
+            workflow,
+            authorization,
+            expires_at_unix,
+        })
+    }
+}
+
 pub fn derive_bitcoin_broadcast_approval(
     wallet: &Wallet,
     raw_transaction: &[u8],
@@ -3430,6 +3460,43 @@ pub fn persist_prepared_bitcoin_broadcast(
         approval_commitment,
         expected_revision,
         now_unix,
+        None,
+    )
+}
+
+/// Persist one signed Bitcoin funding transaction while atomically consuming
+/// the exact second-funding authority that remains current. Once this record
+/// exists, ordinary broadcast recovery no longer depends on the revocable
+/// cross-chain lease.
+#[allow(clippy::too_many_arguments)]
+pub fn persist_guarded_prepared_bitcoin_broadcast(
+    wallet: &Wallet,
+    store: &mut WalletStore,
+    raw_transaction: &[u8],
+    approval_commitment: [u8; 32],
+    maximum_fee_sats: u64,
+    expected_revision: u64,
+    now_unix: u64,
+    expires_at_unix: u64,
+    authorization_guard: BitcoinBroadcastAuthorizationGuard,
+) -> Result<PreparedBitcoinBroadcast, BitcoinWalletError> {
+    if now_unix >= authorization_guard.expires_at_unix {
+        return Err(BitcoinWalletError::InvalidBroadcastApproval);
+    }
+    let approval = derive_bitcoin_broadcast_approval(
+        wallet,
+        raw_transaction,
+        maximum_fee_sats,
+        expires_at_unix,
+    )?;
+    persist_approved_bitcoin_broadcast(
+        store,
+        raw_transaction,
+        approval,
+        approval_commitment,
+        expected_revision,
+        now_unix,
+        Some(authorization_guard),
     )
 }
 
@@ -3467,6 +3534,7 @@ pub fn persist_prepared_bitcoin_htlc_spend_broadcast(
         approval_commitment,
         expected_revision,
         now_unix,
+        None,
     )
 }
 
@@ -3477,6 +3545,7 @@ fn persist_approved_bitcoin_broadcast(
     approval_commitment: [u8; 32],
     expected_revision: u64,
     now_unix: u64,
+    authorization_guard: Option<BitcoinBroadcastAuthorizationGuard>,
 ) -> Result<PreparedBitcoinBroadcast, BitcoinWalletError> {
     if approval_commitment == [0; 32]
         || approval.commitment != approval_commitment
@@ -3485,6 +3554,9 @@ fn persist_approved_bitcoin_broadcast(
             .expires_at_unix
             .checked_sub(now_unix)
             .is_none_or(|lifetime| lifetime > MAX_BROADCAST_APPROVAL_LIFETIME_SECONDS)
+        || authorization_guard
+            .as_ref()
+            .is_some_and(|guard| now_unix >= guard.expires_at_unix)
     {
         return Err(BitcoinWalletError::InvalidBroadcastApproval);
     }
@@ -3549,6 +3621,9 @@ fn persist_approved_bitcoin_broadcast(
         if !same_terms {
             return Err(BitcoinWalletError::BroadcastConflict);
         }
+        if authorization_guard.is_some() {
+            return Err(BitcoinWalletError::BroadcastConflict);
+        }
         return Ok(PreparedBitcoinBroadcast {
             txid,
             revision: expected_revision,
@@ -3573,7 +3648,28 @@ fn persist_approved_bitcoin_broadcast(
     });
     record.last_changed_at_unix = now_unix;
     record.validate()?;
-    let revision = store.save_bitcoin_transaction(&txid, expected_revision, &record, now_unix)?;
+    let revision = if let Some(guard) = authorization_guard {
+        let revision = expected_revision
+            .checked_add(1)
+            .ok_or(BitcoinWalletError::BroadcastConflict)?;
+        store.apply_entity_batch_with_workflow_guard_and_consumed_entity(
+            EntityKind::BitcoinTransaction,
+            &[EntityBatchSave {
+                id: txid.to_vec(),
+                expected_revision,
+                value: record,
+                updated_at_unix: now_unix,
+            }],
+            &[],
+            guard.workflow,
+            EntityKind::SwapFundingAuthorization,
+            &guard.authorization,
+            now_unix,
+        )?;
+        revision
+    } else {
+        store.save_bitcoin_transaction(&txid, expected_revision, &record, now_unix)?
+    };
     Ok(PreparedBitcoinBroadcast { txid, revision })
 }
 

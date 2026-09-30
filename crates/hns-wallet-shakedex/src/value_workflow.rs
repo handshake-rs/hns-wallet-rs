@@ -2660,7 +2660,11 @@ fn rebroadcast_shakedex_value_workflow<B: HnsBackend, C: HnsClock>(
     if stored.workflow.stage != ShakedexValueStage::RequiresRebroadcast {
         return Err(ShakedexError::InvalidTransition);
     }
-    submit_value_workflow(store, runtime, scope, stored)
+    let reconciled = reconcile_shakedex_value_workflow(store, runtime, scope, stored)?;
+    if reconciled.workflow.stage != ShakedexValueStage::RequiresRebroadcast {
+        return Ok(reconciled);
+    }
+    submit_value_workflow(store, runtime, scope, &reconciled)
 }
 
 fn terminate_prepared_value_workflow(

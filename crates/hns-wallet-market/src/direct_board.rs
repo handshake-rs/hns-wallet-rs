@@ -8,7 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use hns_marketplace_protocol::{
     AssetId, CrossChainMessage, DirectOffer, DirectOfferCancellation, MarketPair, NetworkBinding,
 };
-use hns_wallet_store::{EntityKind, MAX_ENTITY_LIST_RESULTS, StoredEntity, WalletStore};
+use hns_wallet_store::{
+    EntityBatchDelete, EntityKind, MAX_ENTITY_LIST_RESULTS, StoredEntity, WalletStore,
+};
 use hns_wallet_types::{ObjectHash, SessionId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -579,6 +581,19 @@ fn record_id(policy: &ShakescapeDirectOfferBoardPolicy, offer_id: [u8; 32]) -> V
     let mut id = record_prefix(policy);
     id.extend_from_slice(&offer_id);
     id
+}
+
+pub(crate) fn direct_offer_retirement_delete(
+    store: &WalletStore,
+    policy: &ShakescapeDirectOfferBoardPolicy,
+    offer_id: [u8; 32],
+) -> Result<EntityBatchDelete, MarketError> {
+    let record = load_shakescape_direct_offer(store, policy, offer_id)?
+        .ok_or(MarketError::CorruptShakescapeDirectOfferBoard)?;
+    Ok(EntityBatchDelete {
+        id: record_id(policy, offer_id),
+        expected_revision: record.store_revision,
+    })
 }
 
 fn gcd(mut left: u128, mut right: u128) -> u128 {

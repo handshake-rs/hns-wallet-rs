@@ -15,7 +15,9 @@ use hns_marketplace_protocol::{
 };
 use hns_wallet_bitcoin_kyoto::build_shakescape_bitcoin_htlc;
 use hns_wallet_chain_api::Preimage;
-use hns_wallet_store::{EntityKind, RECOVERY_SEED_BYTES, SecretKind, WalletStore};
+use hns_wallet_store::{
+    EntityBatchDelete, EntityKind, RECOVERY_SEED_BYTES, SecretKind, WalletStore,
+};
 use hns_wallet_types::{ObjectHash, SessionId, WalletId};
 use k256::ecdsa::SigningKey;
 use serde::{Deserialize, Serialize};
@@ -44,7 +46,7 @@ const MIN_FUNDING_WINDOW_SECONDS: u64 = 10 * 60;
 const MIN_SECOND_REFUND_AFTER_SECONDS: u64 =
     MIN_FUNDING_WINDOW_SECONDS + crate::MIN_SECOND_CHAIN_REDEMPTION_WINDOW_SECONDS;
 const MIN_REFUND_SAFETY_MARGIN_SECONDS: u64 = crate::MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS;
-const MAX_SETTLEMENT_HORIZON_SECONDS: u64 = 7 * 24 * 60 * 60;
+const MAX_SETTLEMENT_HORIZON_SECONDS: u64 = crate::SHAKESCAPE_MAX_SETTLEMENT_HORIZON_SECONDS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ShakescapeBtcForHnsOfferRequest {
@@ -883,8 +885,8 @@ fn validate_maker_proposal_request(
             .second_refund_after_seconds
             .checked_add(request.refund_safety_margin_seconds)
             .is_none_or(|horizon| horizon > MAX_SETTLEMENT_HORIZON_SECONDS)
-        || request.bitcoin_minimum_confirmations == 0
-        || request.hns_minimum_confirmations == 0
+        || request.bitcoin_minimum_confirmations != crate::SHAKESCAPE_BITCOIN_MINIMUM_CONFIRMATIONS
+        || request.hns_minimum_confirmations != crate::SHAKESCAPE_HNS_MINIMUM_CONFIRMATIONS
     {
         return Err(MarketError::UnsafeTimeouts);
     }
@@ -937,6 +939,22 @@ pub(crate) fn load_local_offer_for_session(
         }
     }
     Ok(found)
+}
+
+pub(crate) fn local_offer_retirement_delete(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    session_id: SessionId,
+) -> Result<Option<EntityBatchDelete>, MarketError> {
+    let Some(local) = load_local_offer_for_session(store, wallet_id, session_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(EntityBatchDelete {
+        id: local_record_id(wallet_id, local.offer_id.into_bytes()),
+        // Local offer intents are immutable after their initial authenticated
+        // write; cancellation lives in the separate board row.
+        expected_revision: 1,
+    }))
 }
 
 pub(crate) fn local_direct_offer_ids(
@@ -1356,7 +1374,7 @@ mod tests {
                 second_refund_after_seconds: 4_200,
                 refund_safety_margin_seconds: 3_600,
                 bitcoin_minimum_confirmations: 1,
-                hns_minimum_confirmations: 1,
+                hns_minimum_confirmations: 2,
             },
         )
         .expect("maker proposal");
@@ -1425,7 +1443,7 @@ mod tests {
                 second_refund_after_seconds: 4_200,
                 refund_safety_margin_seconds: 3_600,
                 bitcoin_minimum_confirmations: 1,
-                hns_minimum_confirmations: 1,
+                hns_minimum_confirmations: 2,
             },
         )
         .expect("idempotent retry");
@@ -1442,7 +1460,7 @@ mod tests {
                 second_refund_after_seconds: 4_200,
                 refund_safety_margin_seconds: 3_600,
                 bitcoin_minimum_confirmations: 1,
-                hns_minimum_confirmations: 1,
+                hns_minimum_confirmations: 2,
             },
         )
         .expect("expired maker-only proposal refreshes");

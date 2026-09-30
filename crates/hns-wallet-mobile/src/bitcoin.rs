@@ -15,22 +15,22 @@ use bdk_wallet::bitcoin::consensus::deserialize;
 use bdk_wallet::bitcoin::hashes::Hash;
 use bdk_wallet::bitcoin::{Transaction, Txid, Wtxid};
 use hns_wallet_bitcoin_kyoto::{
-    BIP39_SEED_BYTES, BitcoinActivityStatus, BitcoinBirthdaySource, BitcoinBroadcastReceipt,
-    BitcoinBroadcastRecoverySummary, BitcoinCheckpoint, BitcoinHtlcWatchRequest,
-    BitcoinRecentActivity, BitcoinTransactionRecord, BitcoinWalletError,
-    DEFAULT_RECOVERY_GAP_LIMIT, EncryptedPersistedBitcoinWallet, HtlcSpendBranch,
-    KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor, KyotoSyncProgressHandle,
-    KyotoSyncReceipt, KyotoSyncStage, KyotoTipDiscovery, KyotoWalletState,
+    BIP39_SEED_BYTES, BitcoinActivityStatus, BitcoinBirthdaySource,
+    BitcoinBroadcastAuthorizationGuard, BitcoinBroadcastReceipt, BitcoinBroadcastRecoverySummary,
+    BitcoinCheckpoint, BitcoinHtlcWatchRequest, BitcoinRecentActivity, BitcoinTransactionRecord,
+    BitcoinWalletError, DEFAULT_RECOVERY_GAP_LIMIT, EncryptedPersistedBitcoinWallet,
+    HtlcSpendBranch, KyotoRuntimeConfig, KyotoShutdownHandle, KyotoSupervisor,
+    KyotoSyncProgressHandle, KyotoSyncReceipt, KyotoSyncStage, KyotoTipDiscovery, KyotoWalletState,
     PreparedBitcoinHtlcFunding, StoredKyotoWalletState, VerifiedBitcoinLock,
     approved_bitcoin_broadcast_has_output, authorize_native_send, bitcoin_activity_page,
     bitcoin_broadcast_recovery_summary, bitcoin_value_runtime_permit,
     build_shakescape_bitcoin_htlc, create_persisted_descriptor_wallet_from_seed,
     initialize_pristine_wallet_at_creation_tip, initialize_pristine_wallet_at_recovery_checkpoint,
     load_bitcoin_htlc_watch, load_cached_bitcoin_peers, load_persisted_descriptor_wallet_from_seed,
-    monitor_kyoto_sync_progress, persist_prepared_bitcoin_broadcast,
-    persist_prepared_bitcoin_htlc_spend_broadcast, prepare_bitcoin_htlc_funding_excluding,
-    prepare_native_send_excluding, recommended_initialization_checkpoint,
-    sign_bitcoin_htlc_redeem_with_wallet_fee_sponsor,
+    monitor_kyoto_sync_progress, persist_guarded_prepared_bitcoin_broadcast,
+    persist_prepared_bitcoin_broadcast, persist_prepared_bitcoin_htlc_spend_broadcast,
+    prepare_bitcoin_htlc_funding_excluding, prepare_native_send_excluding,
+    recommended_initialization_checkpoint, sign_bitcoin_htlc_redeem_with_wallet_fee_sponsor,
     sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
     unobserved_approved_broadcast_inputs, verify_htlc_funding,
     verify_signed_bitcoin_htlc_spend_with_wallet,
@@ -317,6 +317,8 @@ struct PendingMobileBitcoinHtlcSettlement {
     lock: VerifiedBitcoinLock,
     maximum_fee_sats: u64,
     expires_at_unix: u64,
+    policy: hns_wallet_market::ShakescapeDirectSwapPolicy,
+    requires_current_first_funding: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1040,6 +1042,10 @@ impl MobileBitcoinValueController {
         if binding.commitment.into_bytes() != expected_commitment {
             return Err(MobileWalletError::InvalidBitcoinAction);
         }
+        let session_id = SessionId::new(hello.swap_session_id);
+        if !permit.authorizes_pending_funding(session_id, side, maximum_fee_sats, now_unix) {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
         let runtime = self
             .runtime
             .as_ref()
@@ -1083,7 +1089,6 @@ impl MobileBitcoinValueController {
             _ => return Err(MobileWalletError::BitcoinRuntimeInactive),
         }
         let action_token = random_nonzero_bytes()?;
-        let session_id = SessionId::new(hello.swap_session_id);
         let approval = MobileBitcoinHtlcFundingApproval {
             action_token: lowercase_hex(&action_token),
             session_id: lowercase_hex(session_id.as_bytes()),
@@ -1210,6 +1215,8 @@ impl MobileBitcoinValueController {
         {
             return Err(MobileWalletError::InvalidBitcoinAction);
         }
+        let funding_authorization_expires_at_unix = reauthorization.authorization_expires_at_unix();
+        let second_funding_guard = reauthorization.into_second_funding_broadcast_guard(now_unix)?;
         self.wallet_mut()?.persist(now_unix)?;
         let txid = pending.prepared.txid.into_bytes();
         let expected_revision = self.store.try_with_store(|store| {
@@ -1227,18 +1234,47 @@ impl MobileBitcoinValueController {
             pending.maximum_fee_sats,
             pending.expires_at_unix,
         )?;
-        let prepared = self.store.try_with_store_mut(|store| {
-            persist_prepared_bitcoin_broadcast(
-                wallet,
-                store,
-                pending.prepared.raw_transaction(),
-                approval.commitment,
-                pending.maximum_fee_sats,
-                expected_revision,
-                now_unix,
-                pending.expires_at_unix,
-            )
-        })?;
+        let (prepared, checkpoint_now_unix) =
+            self.store
+                .try_with_store_mut(|store| -> Result<_, MobileWalletError> {
+                    // The store mutex is the reconciliation/authorization
+                    // serialization boundary. Read time only after acquiring it,
+                    // so waiting for the mutex cannot extend a 30-second lease.
+                    let checkpoint_now_unix = self::now_unix()?;
+                    if checkpoint_now_unix >= funding_authorization_expires_at_unix {
+                        return Err(MobileWalletError::BitcoinActionExpired);
+                    }
+                    let prepared = if let Some(guard) = second_funding_guard {
+                        let authorization_guard = BitcoinBroadcastAuthorizationGuard::new(
+                            guard.workflow_assertion(),
+                            guard.authorization_assertion(),
+                            guard.expires_at_unix(),
+                        )?;
+                        persist_guarded_prepared_bitcoin_broadcast(
+                            wallet,
+                            store,
+                            pending.prepared.raw_transaction(),
+                            approval.commitment,
+                            pending.maximum_fee_sats,
+                            expected_revision,
+                            checkpoint_now_unix,
+                            pending.expires_at_unix,
+                            authorization_guard,
+                        )?
+                    } else {
+                        persist_prepared_bitcoin_broadcast(
+                            wallet,
+                            store,
+                            pending.prepared.raw_transaction(),
+                            approval.commitment,
+                            pending.maximum_fee_sats,
+                            expected_revision,
+                            checkpoint_now_unix,
+                            pending.expires_at_unix,
+                        )?
+                    };
+                    Ok((prepared, checkpoint_now_unix))
+                })?;
         let runtime = self
             .runtime
             .as_ref()
@@ -1250,7 +1286,7 @@ impl MobileBitcoinValueController {
         let receipt = runtime.block_on(supervisor.broadcast_prepared_transaction(
             &bitcoin_value_runtime_permit()?,
             prepared.txid,
-            now_unix,
+            checkpoint_now_unix,
         ))?;
         Ok(MobileBitcoinHtlcFundingReceipt {
             session_id: lowercase_hex(pending.session_id.as_bytes()),
@@ -1293,6 +1329,8 @@ impl MobileBitcoinValueController {
             .ok_or(MobileWalletError::InvalidBitcoinAction)?;
         let hello = permit.hello().clone();
         let side = permit.side();
+        let policy = permit.policy();
+        let requires_current_first_funding = permit.requires_current_first_funding();
         let binding = build_shakescape_bitcoin_htlc(&hello, side)?;
         let expected_commitment = match side {
             hns_marketplace_protocol::SwapAssetSide::Offered => hello.offered_lock_commitment,
@@ -1408,6 +1446,8 @@ impl MobileBitcoinValueController {
             lock,
             maximum_fee_sats,
             expires_at_unix,
+            policy,
+            requires_current_first_funding,
         });
         Ok(approval)
     }
@@ -1448,6 +1488,21 @@ impl MobileBitcoinValueController {
                 .map(|record| record.map_or(0, |stored| stored.revision))
         })?;
         let prepared = self.store.try_with_store_mut(|store| {
+            // Approval expiry and the current-first-funding fence must be
+            // evaluated after taking the mutex that serializes the durable
+            // checkpoint. Waiting for that mutex cannot extend a stale UI
+            // approval across the irreversible persistence boundary.
+            let checkpoint_now_unix = self::now_unix()?;
+            if checkpoint_now_unix >= pending.expires_at_unix {
+                return Err(MobileWalletError::BitcoinActionExpired);
+            }
+            if pending.requires_current_first_funding {
+                crate::market::require_current_first_funding_for_settlement(
+                    store,
+                    pending.policy,
+                    pending.session_id,
+                )?;
+            }
             persist_prepared_bitcoin_htlc_spend_broadcast(
                 wallet,
                 store,
@@ -1457,10 +1512,21 @@ impl MobileBitcoinValueController {
                 approval.commitment,
                 pending.maximum_fee_sats,
                 expected_revision,
-                now_unix,
+                checkpoint_now_unix,
                 pending.expires_at_unix,
             )
-        })?;
+            .map(|prepared| (prepared, checkpoint_now_unix))
+            .map_err(MobileWalletError::from)
+        });
+        let (prepared, checkpoint_now_unix) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if !matches!(&error, MobileWalletError::BitcoinActionExpired) {
+                    self.pending_htlc_settlement = Some(pending);
+                }
+                return Err(error);
+            }
+        };
         let runtime = self
             .runtime
             .as_ref()
@@ -1472,7 +1538,7 @@ impl MobileBitcoinValueController {
         let receipt = runtime.block_on(supervisor.broadcast_prepared_transaction(
             &bitcoin_value_runtime_permit()?,
             prepared.txid,
-            now_unix,
+            checkpoint_now_unix,
         ))?;
         Ok(MobileBitcoinHtlcSettlementReceipt {
             session_id: lowercase_hex(pending.session_id.as_bytes()),

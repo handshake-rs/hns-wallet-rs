@@ -7,7 +7,9 @@ use hns_marketplace_protocol::{
     NetworkBinding, SwapFundingStatus, SwapRedeemStatus, SwapRefundStatus, SwapSessionHello,
     SwapSessionProposal, SwapWatchReady,
 };
-use hns_wallet_store::{EntityKind, MAX_ENTITY_LIST_RESULTS, StoredEntity, WalletStore};
+use hns_wallet_store::{
+    EntityBatchDelete, EntityKind, MAX_ENTITY_LIST_RESULTS, StoredEntity, WalletStore,
+};
 use hns_wallet_types::{ObjectHash, SessionId, WalletId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,6 +23,12 @@ const SHAKESCAPE_DIRECT_SWAP_POLICY_DOMAIN: &[u8] =
 const SHAKESCAPE_DIRECT_SWAP_RECORD_PREFIX: &[u8] = b"shakescape-v1-direct-swap\0";
 
 pub const MAX_SHAKESCAPE_DIRECT_SWAPS: usize = crate::MAX_CONCURRENT_SWAP_SESSIONS;
+/// Separate retained recovery/history budget. Terminal executions keep both
+/// chain descriptors indefinitely within this finite cap; automatic eviction
+/// could otherwise strand funds after a deep reorganization.
+pub const MAX_SHAKESCAPE_DIRECT_SWAP_HISTORY: usize = 240;
+pub const MAX_SHAKESCAPE_DIRECT_SWAP_RECORDS: usize =
+    MAX_SHAKESCAPE_DIRECT_SWAPS + MAX_SHAKESCAPE_DIRECT_SWAP_HISTORY;
 
 /// The direct-session policy has precisely one authority: the locally
 /// reconstructed HNS/BTC network binding. It contains no price inputs.
@@ -241,9 +249,9 @@ pub fn load_shakescape_direct_swaps(
     let stored = store.list_entities_by_id_prefix::<PersistedShakescapeDirectSwap>(
         EntityKind::SwapSession,
         &record_prefix(policy),
-        MAX_SHAKESCAPE_DIRECT_SWAPS + 1,
+        MAX_SHAKESCAPE_DIRECT_SWAP_RECORDS + 1,
     )?;
-    if stored.len() > MAX_SHAKESCAPE_DIRECT_SWAPS {
+    if stored.len() > MAX_SHAKESCAPE_DIRECT_SWAP_RECORDS {
         return Err(MarketError::ShakescapeDirectSwapCapacity);
     }
     stored
@@ -252,9 +260,50 @@ pub fn load_shakescape_direct_swaps(
         .collect()
 }
 
-/// Remove expired acceptance-only rows that have no local ownership or
-/// execution authority. Proposals, countersigned terms, peer evidence, local
-/// offers, local responses, and execution workflows are always retained.
+pub(crate) fn swap_has_active_obligation(
+    store: &WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    record: &ShakescapeDirectSwapRecord,
+) -> Result<bool, MarketError> {
+    if record.hello.is_none() {
+        // Acceptances and maker-only proposals cannot move funds. They live in
+        // the separate bounded, expiring negotiation/history budget and must
+        // not consume one of the sixteen locally countersigned execution
+        // slots.
+        return Ok(false);
+    }
+    let session_id = SessionId::new(record.acceptance.swap_session_id);
+    let Some(execution) = crate::load_shakescape_execution(store, policy, session_id)? else {
+        // A countersigned row whose derivative journal has not yet been
+        // reconstructed is recoverable work, never disposable history.
+        return Ok(true);
+    };
+    Ok(!(execution.state == crate::SwapState::Completed
+        || (execution.state == crate::SwapState::Refunded && execution.all_funded_legs_settled()))
+        && !(execution.state == crate::SwapState::Failed
+            && execution.first_funding.is_none()
+            && execution.second_funding.is_none()))
+}
+
+/// Terminal execution history is intentionally retained with its chain watch
+/// descriptors. There is no sound cross-chain atomic deletion boundary between
+/// the market journal, Kyoto watch store, and HNS watch set, so reaching the
+/// separate finite history cap fails new admission instead of discarding
+/// recovery evidence.
+pub(crate) fn prune_terminal_shakescape_direct_swap_history(
+    _store: &mut WalletStore,
+    _policy: &ShakescapeDirectSwapPolicy,
+    _wallet_id: WalletId,
+) -> Result<usize, MarketError> {
+    Ok(0)
+}
+
+/// Remove pre-hello negotiation rows whose signed lifetime ended or whose
+/// local responder wrote an authenticated abandonment tombstone. A maker-only
+/// proposal cannot move funds; countersigned terms, watches, peer evidence,
+/// and execution workflows are always retained. Local responder metadata is
+/// retired atomically with its inactive row; a local offer is retained
+/// independently.
 pub(crate) fn prune_expired_unowned_shakescape_direct_swaps(
     store: &mut WalletStore,
     policy: &ShakescapeDirectSwapPolicy,
@@ -275,29 +324,71 @@ pub(crate) fn prune_expired_unowned_shakescape_direct_swaps(
         let revision = row.revision;
         let record = decode_stored_swap(policy, row)?;
         let session_id = SessionId::new(record.acceptance.swap_session_id);
-        let acceptance_only = record.proposal.is_none()
-            && record.hello.is_none()
+        let prefunding_negotiation_only = record.hello.is_none()
             && record.first_chain_watch_ready.is_none()
             && record.peer_funding_statuses.is_empty();
-        if !acceptance_only || record.acceptance.header.expires_at > now_unix {
+        if !prefunding_negotiation_only {
             continue;
         }
-        let locally_owned =
-            crate::direct_offer::load_local_offer_for_session(store, wallet_id, session_id)?
-                .is_some()
-                || crate::direct_responder::load_local_acceptance(store, wallet_id, session_id)?
-                    .is_some();
         let has_execution = store
             .load_workflow::<crate::SwapSession>(crate::shakescape_execution_workflow_id(
                 session_id,
             ))?
             .is_some();
-        if locally_owned || has_execution {
+        if has_execution {
             continue;
         }
-        if store.delete_entity(EntityKind::SwapSession, &id, revision)? {
-            removed = removed.checked_add(1).ok_or(MarketError::Invariant)?;
+        let local_acceptance = crate::direct_responder::local_acceptance_retirement_delete(
+            store, wallet_id, session_id,
+        )?;
+        let abandonment = crate::direct_responder::local_acceptance_abandonment_retirement_delete(
+            store, wallet_id, session_id,
+        )?;
+        let negotiation_expires_at =
+            record
+                .proposal
+                .as_ref()
+                .map_or(record.acceptance.header.expires_at, |proposal| {
+                    proposal
+                        .terms()
+                        .header
+                        .expires_at
+                        .max(record.acceptance.header.expires_at)
+                });
+        let expired = negotiation_expires_at <= now_unix;
+        if !expired && abandonment.is_none() {
+            continue;
         }
+        let local_offer =
+            crate::direct_offer::local_offer_retirement_delete(store, wallet_id, session_id)?;
+        if local_acceptance.is_some() && local_offer.is_some()
+            || (abandonment.is_some() && local_acceptance.is_none())
+        {
+            return Err(MarketError::CorruptShakescapeDirectSwap);
+        }
+        let mut deletes = vec![(
+            EntityKind::SwapSession,
+            EntityBatchDelete {
+                id,
+                expected_revision: revision,
+            },
+        )];
+        if let Some(delete) = local_acceptance {
+            deletes.push((EntityKind::ShakescapeBoardObject, delete));
+            deletes.push((
+                EntityKind::ShakescapeBoardObject,
+                crate::direct_board::direct_offer_retirement_delete(
+                    store,
+                    &policy.board_policy(),
+                    record.offer.offer_id,
+                )?,
+            ));
+        }
+        if let Some(delete) = abandonment {
+            deletes.push((EntityKind::ShakescapeBoardObject, delete));
+        }
+        store.delete_entities(&deletes)?;
+        removed = removed.checked_add(1).ok_or(MarketError::Invariant)?;
     }
     Ok(removed)
 }
@@ -354,7 +445,17 @@ pub fn admit_shakescape_direct_offer_acceptance(
     acceptance
         .verify_for_offer(&offer.offer, policy.network(), validation_time)
         .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;
-    if load_shakescape_direct_swaps(store, policy)?.len() >= MAX_SHAKESCAPE_DIRECT_SWAPS {
+    let retained = load_shakescape_direct_swaps(store, policy)?;
+    if retained.len() >= MAX_SHAKESCAPE_DIRECT_SWAP_RECORDS
+        || retained
+            .iter()
+            .map(|record| swap_has_active_obligation(store, policy, record))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|active| *active)
+            .count()
+            >= MAX_SHAKESCAPE_DIRECT_SWAPS
+    {
         return Err(MarketError::ShakescapeDirectSwapCapacity);
     }
     let persisted = PersistedShakescapeDirectSwap {
@@ -515,6 +616,22 @@ pub fn admit_shakescape_direct_swap_hello(
             )
             .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?,
         Err(_) => return Err(MarketError::InvalidShakescapeDirectSwap),
+    }
+    // This is the first transition that creates a locally countersigned
+    // obligation. Pre-hello negotiations use the separate expiring record
+    // budget, so several of them may legitimately race for the last execution
+    // slot. Count and persist while this caller holds the same mutable store
+    // authority; the rejected row stays pre-hello and remains safely
+    // retryable/prunable.
+    let active_obligations = load_shakescape_direct_swaps(store, policy)?
+        .iter()
+        .map(|retained| swap_has_active_obligation(store, policy, retained))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|active| *active)
+        .count();
+    if active_obligations >= MAX_SHAKESCAPE_DIRECT_SWAPS {
+        return Err(MarketError::ShakescapeDirectSwapCapacity);
     }
     let mut persisted = encode_persisted(policy, &record)?;
     persisted.hello_accepted_at_unix = Some(accepted_at_unix);
@@ -1017,7 +1134,7 @@ fn record_prefix(policy: &ShakescapeDirectSwapPolicy) -> Vec<u8> {
     id
 }
 
-fn record_id(policy: &ShakescapeDirectSwapPolicy, session_id: SessionId) -> Vec<u8> {
+pub(crate) fn record_id(policy: &ShakescapeDirectSwapPolicy, session_id: SessionId) -> Vec<u8> {
     let mut id = record_prefix(policy);
     id.extend_from_slice(session_id.as_bytes());
     id

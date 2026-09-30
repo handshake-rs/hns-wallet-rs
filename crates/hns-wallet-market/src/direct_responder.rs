@@ -7,7 +7,7 @@ use hns_marketplace_protocol::{
     AssetId, CrossChainMessage, DirectOfferAcceptance, MARKETPLACE_PROTOCOL_VERSION, MarketPair,
     SignedObjectHeader, SwapSessionHello,
 };
-use hns_wallet_store::{EntityKind, WalletStore};
+use hns_wallet_store::{EntityBatchDelete, EntityKind, WalletStore};
 use hns_wallet_types::{ObjectHash, SessionId, WalletId};
 use serde::{Deserialize, Serialize};
 
@@ -323,7 +323,7 @@ pub fn list_local_shakescape_direct_offer_acceptances(
         .list_entities_by_id_prefix::<PersistedLocalDirectAcceptance>(
             EntityKind::ShakescapeBoardObject,
             &record_prefix(wallet_id),
-            crate::MAX_SHAKESCAPE_DIRECT_SWAPS + 1,
+            crate::MAX_SHAKESCAPE_DIRECT_SWAP_RECORDS,
         )?
         .into_iter()
         .map(|stored| {
@@ -572,6 +572,36 @@ pub(crate) fn load_local_acceptance(
         )?
         .map(|stored| validate_stored(wallet_id, stored))
         .transpose()
+}
+
+pub(crate) fn local_acceptance_retirement_delete(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    session_id: SessionId,
+) -> Result<Option<EntityBatchDelete>, MarketError> {
+    if load_local_acceptance(store, wallet_id, session_id)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(EntityBatchDelete {
+        id: record_id(wallet_id, session_id),
+        // Signed local acceptances are immutable; abandonment uses a separate
+        // tombstone which cannot coexist with an executable terminal swap.
+        expected_revision: 1,
+    }))
+}
+
+pub(crate) fn local_acceptance_abandonment_retirement_delete(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    session_id: SessionId,
+) -> Result<Option<EntityBatchDelete>, MarketError> {
+    if load_local_acceptance_abandonment(store, wallet_id, session_id)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(EntityBatchDelete {
+        id: abandonment_record_id(wallet_id, session_id),
+        expected_revision: 1,
+    }))
 }
 
 /// Identify the local atomic-swap taker without deriving settlement key
@@ -838,7 +868,7 @@ mod tests {
                 second_refund_after_seconds: 4_200,
                 refund_safety_margin_seconds: 3_600,
                 bitcoin_minimum_confirmations: 1,
-                hns_minimum_confirmations: 1,
+                hns_minimum_confirmations: 2,
             },
         )
         .expect("maker proposal");
@@ -1002,7 +1032,7 @@ mod tests {
                 second_refund_after_seconds: 4_200,
                 refund_safety_margin_seconds: 3_600,
                 bitcoin_minimum_confirmations: 1,
-                hns_minimum_confirmations: 1,
+                hns_minimum_confirmations: 2,
             },
         )
         .expect("BTC responder-maker proposal");
@@ -1117,7 +1147,7 @@ mod tests {
                 second_refund_after_seconds: 4_200,
                 refund_safety_margin_seconds: 3_600,
                 bitcoin_minimum_confirmations: 1,
-                hns_minimum_confirmations: 1,
+                hns_minimum_confirmations: 2,
             },
         )
         .expect("responding maker signs proposal before abandonment");

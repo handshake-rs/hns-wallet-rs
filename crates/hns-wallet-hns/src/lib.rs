@@ -104,8 +104,8 @@ use hns_wallet_chain_api::{
 };
 use hns_wallet_store::{
     EntityBatchDelete, EntityBatchSave, EntityKind, EntityPrefixSetLease, EntityReadSnapshot,
-    SecretKind, SharedWalletStore, SharedWalletStoreGuard, StoreError, StoredEntity,
-    StoredWorkflow, WalletStore,
+    EntityRevisionAssertion, SecretKind, SharedWalletStore, SharedWalletStoreGuard, StoreError,
+    StoredEntity, StoredWorkflow, WalletStore, WorkflowRevisionAssertion,
 };
 use hns_wallet_types::{
     AccountId, Amount, ApprovalId, BaseUnits, ChainCapabilities, DerivationReference, FeeModel,
@@ -517,7 +517,7 @@ fn encode_v0_address(network: HnsNetwork, program: &[u8]) -> Result<String, HnsW
     segwit::encode_v0(hrp, program).map_err(|_| HnsWalletError::Address)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WalletCoin {
     pub outpoint: HnsOutpoint,
     pub value: BaseUnits,
@@ -3160,6 +3160,146 @@ enum HnsSettlementStage {
     Cancelled,
 }
 
+/// Exact persisted ShakeScape state that must still authorize a guarded HNS
+/// redeem when its signed transaction crosses the irreversible broadcast
+/// checkpoint. The workflow revision binds current funding authority; the
+/// signed-session entity revision binds the session and network policy that
+/// produced it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HnsSettlementBroadcastGuard {
+    session_id: SessionId,
+    execution_workflow_id: WorkflowId,
+    execution_revision: u64,
+    entity_id: Vec<u8>,
+    entity_revision: u64,
+    purpose: HnsSettlementBroadcastGuardPurpose,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "purpose")]
+enum HnsSettlementBroadcastGuardPurpose {
+    CurrentRedeem,
+    SecondFunding {
+        authorization_id: ObjectHash,
+        module: ModuleId,
+        expires_at_unix: u64,
+    },
+}
+
+impl HnsSettlementBroadcastGuard {
+    pub fn new(
+        session_id: SessionId,
+        execution_workflow_id: WorkflowId,
+        execution_revision: u64,
+        session_record_id: Vec<u8>,
+        session_record_revision: u64,
+    ) -> Result<Self, HnsWalletError> {
+        let guard = Self {
+            session_id,
+            execution_workflow_id,
+            execution_revision,
+            entity_id: session_record_id,
+            entity_revision: session_record_revision,
+            purpose: HnsSettlementBroadcastGuardPurpose::CurrentRedeem,
+        };
+        if !guard.is_valid() {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        Ok(guard)
+    }
+
+    pub fn new_second_funding(
+        session_id: SessionId,
+        execution_workflow_id: WorkflowId,
+        execution_revision: u64,
+        authorization_entity_id: Vec<u8>,
+        authorization_entity_revision: u64,
+        authorization_id: ObjectHash,
+        module: ModuleId,
+        expires_at_unix: u64,
+    ) -> Result<Self, HnsWalletError> {
+        let guard = Self {
+            session_id,
+            execution_workflow_id,
+            execution_revision,
+            entity_id: authorization_entity_id,
+            entity_revision: authorization_entity_revision,
+            purpose: HnsSettlementBroadcastGuardPurpose::SecondFunding {
+                authorization_id,
+                module,
+                expires_at_unix,
+            },
+        };
+        if !guard.is_valid() || module != ModuleId::Handshake {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        Ok(guard)
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.session_id.as_bytes().iter().all(|byte| *byte == 0)
+            && !self
+                .execution_workflow_id
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+            && self.execution_revision != 0
+            && !self.entity_id.is_empty()
+            && self.entity_revision != 0
+            && match self.purpose {
+                HnsSettlementBroadcastGuardPurpose::CurrentRedeem => true,
+                HnsSettlementBroadcastGuardPurpose::SecondFunding {
+                    authorization_id,
+                    module,
+                    expires_at_unix,
+                } => {
+                    authorization_id.as_bytes().iter().any(|byte| *byte != 0)
+                        && module == ModuleId::Handshake
+                        && expires_at_unix != 0
+                }
+            }
+    }
+
+    fn authorizes_action(
+        &self,
+        action: HnsSettlementAction,
+        session_id: SessionId,
+        now_unix: Option<u64>,
+    ) -> bool {
+        if self.session_id != session_id || !self.is_valid() {
+            return false;
+        }
+        match self.purpose {
+            HnsSettlementBroadcastGuardPurpose::CurrentRedeem => {
+                action == HnsSettlementAction::Redeem
+            }
+            HnsSettlementBroadcastGuardPurpose::SecondFunding {
+                expires_at_unix, ..
+            } => {
+                action == HnsSettlementAction::Lock
+                    && now_unix.is_none_or(|now_unix| now_unix < expires_at_unix)
+            }
+        }
+    }
+
+    const fn entity_kind(&self) -> EntityKind {
+        match self.purpose {
+            HnsSettlementBroadcastGuardPurpose::CurrentRedeem => EntityKind::SwapSession,
+            HnsSettlementBroadcastGuardPurpose::SecondFunding { .. } => {
+                EntityKind::SwapFundingAuthorization
+            }
+        }
+    }
+
+    const fn consumes_entity(&self) -> bool {
+        matches!(
+            self.purpose,
+            HnsSettlementBroadcastGuardPurpose::SecondFunding { .. }
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "action")]
 enum HnsSettlementTerms {
@@ -3218,6 +3358,8 @@ struct HnsPreparedSettlement {
     fee_quote: Option<HnsTransactionFeeQuote>,
     expires_at_unix: u64,
     terms: HnsSettlementTerms,
+    #[serde(default)]
+    broadcast_guard: Option<HnsSettlementBroadcastGuard>,
 }
 
 /// Exact value accounting for a prepared HNS settlement transaction.
@@ -4312,6 +4454,30 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         &self,
         artifact: &PreparedArtifact,
     ) -> Result<BroadcastReceipt, HnsWalletError> {
+        self.broadcast_prepared_settlement_inner(artifact, None)
+    }
+
+    /// Submit a still-reversible prepared settlement only before an external
+    /// short-lived authority expires. The deadline is re-read at the same
+    /// mutex-protected checkpoint that marks the exact signed transaction
+    /// recoverably broadcastable; it does not disable later recovery after
+    /// that checkpoint has already been crossed.
+    pub fn broadcast_prepared_settlement_before(
+        &self,
+        artifact: &PreparedArtifact,
+        not_after_unix: u64,
+    ) -> Result<BroadcastReceipt, HnsWalletError> {
+        if not_after_unix == 0 {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
+        self.broadcast_prepared_settlement_inner(artifact, Some(not_after_unix))
+    }
+
+    fn broadcast_prepared_settlement_inner(
+        &self,
+        artifact: &PreparedArtifact,
+        not_after_unix: Option<u64>,
+    ) -> Result<BroadcastReceipt, HnsWalletError> {
         if artifact.module != ModuleId::Handshake {
             return Err(HnsWalletError::InvalidPreparedArtifact);
         }
@@ -4366,22 +4532,24 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     accepted_at_unix: now,
                 });
             }
-            if now >= stored.state.expires_at_unix {
-                if stored.state.stage == HnsSettlementStage::Prepared {
-                    stored.state.stage = HnsSettlementStage::Expired;
-                    let deletes = reservation_deletes(&store, &config, stored.id)?;
-                    store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
-                        stored.id,
-                        kind,
-                        stored.revision,
-                        &stored.state,
-                        false,
-                        now,
-                        EntityKind::InputReservation,
-                        &[],
-                        &deletes,
-                    )?;
-                }
+            let activation_expires_at = not_after_unix
+                .map_or(stored.state.expires_at_unix, |deadline| {
+                    deadline.min(stored.state.expires_at_unix)
+                });
+            if stored.state.stage == HnsSettlementStage::Prepared && now >= activation_expires_at {
+                stored.state.stage = HnsSettlementStage::Expired;
+                let deletes = reservation_deletes(&store, &config, stored.id)?;
+                store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+                    stored.id,
+                    kind,
+                    stored.revision,
+                    &stored.state,
+                    false,
+                    now,
+                    EntityKind::InputReservation,
+                    &[],
+                    &deletes,
+                )?;
                 return Err(HnsWalletError::PreparedArtifactExpired);
             }
             if !matches!(
@@ -4417,9 +4585,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             stored.state.fee,
             stored.state.maximum_fee,
         )?;
-        let submission_started_at = self.clock.now_unix()?;
         let (submission_revision, submission_state) = {
             let mut store = self.store_lock()?;
+            // Read time after acquiring the same mutex that protects the
+            // guarded transaction. A lease which expires while waiting for
+            // this lock must not cross the irreversible checkpoint.
+            let submission_started_at = self.clock.now_unix()?;
             let current = store
                 .load_workflow::<HnsPreparedSettlement>(stored.id)?
                 .ok_or(HnsWalletError::InvalidWorkflow)?;
@@ -4427,6 +4598,27 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 return Err(HnsWalletError::InvalidWorkflow);
             }
             let activate = current.state.stage == HnsSettlementStage::Prepared;
+            let activation_expires_at = not_after_unix
+                .map_or(current.state.expires_at_unix, |deadline| {
+                    deadline.min(current.state.expires_at_unix)
+                });
+            if activate && submission_started_at >= activation_expires_at {
+                let mut expired = current.state;
+                expired.stage = HnsSettlementStage::Expired;
+                let deletes = reservation_deletes(&store, &config, current.id)?;
+                store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+                    current.id,
+                    kind,
+                    current.revision,
+                    &expired,
+                    false,
+                    submission_started_at,
+                    EntityKind::InputReservation,
+                    &[],
+                    &deletes,
+                )?;
+                return Err(HnsWalletError::PreparedArtifactExpired);
+            }
             let activation_saves = if activate {
                 reservation_activation_saves(&store, &config, current.id, submission_started_at)?
             } else {
@@ -4435,17 +4627,52 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let mut state = current.state;
             state.stage = HnsSettlementStage::RequiresRebroadcast;
             state.fee_quote = Some(quote);
-            let revision = store.save_workflow_with_entity_batch(
-                current.id,
-                kind,
-                current.revision,
-                &state,
-                true,
-                submission_started_at,
-                EntityKind::InputReservation,
-                &activation_saves,
-                &[],
-            )?;
+            if activate
+                && state.broadcast_guard.as_ref().is_some_and(|guard| {
+                    !guard.authorizes_action(
+                        state.action,
+                        state.session_id,
+                        Some(submission_started_at),
+                    )
+                })
+            {
+                return Err(HnsWalletError::InvalidWorkflow);
+            }
+            let revision = match (activate, state.broadcast_guard.as_ref()) {
+                (true, Some(guard)) => store.save_workflow_with_entity_batch_and_guards(
+                    current.id,
+                    kind,
+                    current.revision,
+                    &state,
+                    true,
+                    submission_started_at,
+                    EntityKind::InputReservation,
+                    &activation_saves,
+                    &[],
+                    WorkflowRevisionAssertion {
+                        id: guard.execution_workflow_id,
+                        kind: WorkflowKind::AtomicSwap,
+                        expected_revision: guard.execution_revision,
+                    },
+                    guard.entity_kind(),
+                    &EntityRevisionAssertion {
+                        id: guard.entity_id.clone(),
+                        expected_revision: guard.entity_revision,
+                    },
+                    guard.consumes_entity(),
+                )?,
+                _ => store.save_workflow_with_entity_batch(
+                    current.id,
+                    kind,
+                    current.revision,
+                    &state,
+                    true,
+                    submission_started_at,
+                    EntityKind::InputReservation,
+                    &activation_saves,
+                    &[],
+                )?,
+            };
             (revision, state)
         };
         let accepted = self
@@ -4474,7 +4701,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
 
     /// Resume exact HNS settlements that reached the durable submission
     /// checkpoint but were not observed in the mempool or chain. The original
-    /// signed bytes, fee cap, and still-live policy quote are reused.
+    /// signed bytes and fee cap remain recoverable after the reversible
+    /// prepared-artifact review window has elapsed.
     pub fn rebroadcast_pending_settlements(&self) -> Result<usize, HnsWalletError> {
         let now = self.clock.now_unix()?;
         let config = self.cache_read()?.account.config.clone();
@@ -4482,13 +4710,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let store = self.store_lock()?;
             let mut candidates = Vec::new();
             for kind in [WorkflowKind::AtomicSwap, WorkflowKind::Refund] {
-                for stored in store
-                    .list_workflows_complete::<HnsPreparedSettlement>(kind, MAX_HISTORY_RESULTS)?
-                {
+                for stored in list_hns_prepared_settlement_workflows(&store, kind)? {
                     if stored.state.wallet_id == config.wallet_id
                         && stored.state.account_id == config.account_id
                         && stored.state.stage == HnsSettlementStage::RequiresRebroadcast
-                        && stored.state.expires_at_unix > now
                         && now.saturating_sub(stored.updated_at_unix)
                             >= SEND_PROPAGATION_GRACE_SECONDS
                     {
@@ -4530,6 +4755,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         maximum_fee: BaseUnits,
         fee_quote: HnsTransactionFeeQuote,
         terms: HnsSettlementTerms,
+        broadcast_guard: Option<HnsSettlementBroadcastGuard>,
         reservation_saves: &[EntityBatchSave<HnsInputReservation>],
         account_save: Option<&EntityBatchSave<HnsAccountRecord>>,
         now_unix: u64,
@@ -4549,6 +4775,12 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             maximum_fee,
         )?;
         let workflow_id = settlement_workflow_id(&account.config, session_id, action);
+        if broadcast_guard
+            .as_ref()
+            .is_some_and(|guard| !guard.authorizes_action(action, session_id, Some(now_unix)))
+        {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
         let expires_at_unix = now_unix
             .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
             .ok_or(HnsWalletError::Arithmetic)?;
@@ -4567,6 +4799,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             fee_quote: Some(fee_quote),
             expires_at_unix,
             terms,
+            broadcast_guard,
         };
         let kind = settlement_workflow_kind(action);
         let artifact = Self::prepared_settlement_artifact(&prepared)?;
@@ -4611,7 +4844,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 kind,
                 expected_workflow_revision,
                 &prepared,
-                true,
+                false,
                 now_unix,
                 account_save,
                 EntityKind::InputReservation,
@@ -4631,7 +4864,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 kind,
                 expected_workflow_revision,
                 &prepared,
-                true,
+                false,
                 now_unix,
                 EntityKind::InputReservation,
                 reservation_saves,
@@ -4651,6 +4884,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         current_height: Option<u64>,
         action: HnsSettlementAction,
         external_signer: Option<&dyn SettlementSigner>,
+        broadcast_guard: Option<HnsSettlementBroadcastGuard>,
     ) -> Result<PreparedArtifact, ChainError> {
         if lock.module != ModuleId::Handshake
             || lock.session_id != session_id
@@ -4725,11 +4959,13 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     "persisted Handshake settlement spend does not match retry",
                 ));
             }
+            let guard_changed = stored.state.broadcast_guard != broadcast_guard;
             let active_retry = stored.state.stage == HnsSettlementStage::Prepared
-                && stored.state.expires_at_unix > now;
+                && stored.state.expires_at_unix > now
+                && !guard_changed;
             if !active_retry {
                 let replaceable = (stored.state.stage == HnsSettlementStage::Prepared
-                    && stored.state.expires_at_unix <= now)
+                    && (stored.state.expires_at_unix <= now || guard_changed))
                     || (matches!(
                         stored.state.stage,
                         HnsSettlementStage::Expired | HnsSettlementStage::Cancelled
@@ -4740,7 +4976,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     ));
                 }
                 if stored.state.stage == HnsSettlementStage::Prepared {
-                    stored.state.stage = HnsSettlementStage::Expired;
+                    stored.state.stage = if stored.state.expires_at_unix <= now {
+                        HnsSettlementStage::Expired
+                    } else {
+                        HnsSettlementStage::Cancelled
+                    };
                     let deletes = reservation_deletes(&store, &config, workflow_id)
                         .map_err(map_chain_error)?;
                     store
@@ -5100,6 +5340,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             maximum_fee,
             quote,
             terms,
+            broadcast_guard,
             &reservation_saves,
             Some(&account_save),
             now,
@@ -5667,6 +5908,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     fn prepared_settlement_artifact(
         prepared: &HnsPreparedSettlement,
     ) -> Result<PreparedArtifact, HnsWalletError> {
+        if prepared.broadcast_guard.as_ref().is_some_and(|guard| {
+            !guard.authorizes_action(prepared.action, prepared.session_id, None)
+        }) {
+            return Err(HnsWalletError::InvalidPreparedArtifact);
+        }
         let decoded = Transaction::decode(&prepared.signed_transaction)
             .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
         if wallet_transaction_hash(&decoded)? != prepared.transaction {
@@ -5842,6 +6088,62 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             absolute_timelock: u64::from(descriptor.refund_locktime),
             maximum_fee,
         })
+    }
+
+    /// Bind or refresh a reversible prepared HNS lock with the exact durable
+    /// second-funding authority that its first irreversible submission must
+    /// consume. The signed transaction and reservations remain unchanged.
+    pub fn bind_prepared_native_htlc_lock_broadcast_guard(
+        &self,
+        artifact: &PreparedSettlementLock,
+        broadcast_guard: HnsSettlementBroadcastGuard,
+    ) -> Result<PreparedSettlementLock, ChainError> {
+        let mut prepared: HnsPreparedSettlement =
+            serde_json::from_slice(artifact.0.commitment_bytes())
+                .map_err(|_| ChainError::InvalidEvidence)?;
+        let now_unix = self.clock.now_unix().map_err(map_chain_error)?;
+        if artifact.0.module != ModuleId::Handshake
+            || prepared.stage != HnsSettlementStage::Prepared
+            || prepared.action != HnsSettlementAction::Lock
+            || prepared.session_id != artifact.0.session_id
+            || prepared.fee != artifact.0.fee
+            || prepared.expires_at_unix != artifact.0.expires_at_unix
+            || prepared.expires_at_unix <= now_unix
+            || !broadcast_guard.authorizes_action(
+                HnsSettlementAction::Lock,
+                prepared.session_id,
+                Some(now_unix),
+            )
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        let kind = settlement_workflow_kind(HnsSettlementAction::Lock);
+        let mut store = self.store_lock().map_err(map_chain_error)?;
+        let stored = store
+            .load_workflow::<HnsPreparedSettlement>(prepared.workflow_id)
+            .map_err(map_chain_error)?
+            .ok_or(ChainError::InvalidEvidence)?;
+        if stored.kind != kind
+            || stored.state.stage != HnsSettlementStage::Prepared
+            || !same_prepared_settlement_except_guard(&stored.state, &prepared)
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        prepared = stored.state;
+        prepared.broadcast_guard = Some(broadcast_guard);
+        store
+            .save_workflow(
+                prepared.workflow_id,
+                kind,
+                stored.revision,
+                &prepared,
+                false,
+                now_unix,
+            )
+            .map_err(map_chain_error)?;
+        Self::prepared_settlement_artifact(&prepared)
+            .map(PreparedSettlementLock)
+            .map_err(map_chain_error)
     }
 
     /// Independently retrieve and verify the exact native-HNS lock committed
@@ -6106,6 +6408,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             lock,
             maximum_fee,
             Some(signer),
+            None,
         )
     }
 
@@ -6125,6 +6428,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             lock,
             maximum_fee,
             None,
+            None,
         )
     }
 
@@ -6135,6 +6439,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         lock: VerifiedLock,
         maximum_fee: BaseUnits,
         signer: Option<&dyn SettlementSigner>,
+        broadcast_guard: Option<HnsSettlementBroadcastGuard>,
     ) -> Result<PreparedSettlementRefund, ChainError> {
         self.verify_native_htlc_network(&descriptor)?;
         validate_native_htlc_lock(&descriptor, session_id, &lock)?;
@@ -6157,6 +6462,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             Some(current),
             HnsSettlementAction::Refund,
             signer,
+            broadcast_guard,
         )
         .map(PreparedSettlementRefund)
     }
@@ -6179,6 +6485,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             preimage,
             maximum_fee,
             Some(signer),
+            None,
         )
     }
 
@@ -6200,6 +6507,33 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             preimage,
             maximum_fee,
             None,
+            None,
+        )
+    }
+
+    /// Prepare a native-HNS redeem whose first submission is atomically bound
+    /// to the exact ShakeScape funding and signed-session revisions that
+    /// authorized it. A stale guard can never cross the irreversible
+    /// broadcast checkpoint; an already checkpointed transaction remains
+    /// recoverable through the ordinary rebroadcast path.
+    pub fn prepare_native_htlc_redeem_with_settlement_signer_and_broadcast_guard(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: VerifiedLock,
+        preimage: Preimage,
+        maximum_fee: BaseUnits,
+        signer: &dyn SettlementSigner,
+        broadcast_guard: HnsSettlementBroadcastGuard,
+    ) -> Result<PreparedSettlementRedeem, ChainError> {
+        self.prepare_native_htlc_redeem_with_optional_signer(
+            session_id,
+            descriptor,
+            lock,
+            preimage,
+            maximum_fee,
+            Some(signer),
+            Some(broadcast_guard),
         )
     }
 
@@ -6211,6 +6545,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         preimage: Preimage,
         maximum_fee: BaseUnits,
         signer: Option<&dyn SettlementSigner>,
+        broadcast_guard: Option<HnsSettlementBroadcastGuard>,
     ) -> Result<PreparedSettlementRedeem, ChainError> {
         self.verify_native_htlc_network(&descriptor)?;
         validate_native_htlc_lock(&descriptor, session_id, &lock)
@@ -6228,6 +6563,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             None,
             HnsSettlementAction::Redeem,
             signer,
+            broadcast_guard,
         )
         .map(PreparedSettlementRedeem)
     }
@@ -6391,6 +6727,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             None,
             HnsSettlementAction::Redeem,
             Some(signer),
+            None,
         )
         .map(PreparedSettlementRedeem)
     }
@@ -6416,6 +6753,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             Some(request.current_chain_time),
             HnsSettlementAction::Refund,
             Some(signer),
+            None,
         )
         .map(PreparedSettlementRefund)
     }
@@ -6764,8 +7102,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let config = self.cache_read()?.account.config.clone();
         let mut pending = Vec::new();
         for kind in [WorkflowKind::AtomicSwap, WorkflowKind::Refund] {
-            let workflows = store
-                .list_workflows_complete::<HnsPreparedSettlement>(kind, MAX_HISTORY_RESULTS)?;
+            let workflows = list_hns_prepared_settlement_workflows(store, kind)?;
             for mut stored in workflows {
                 if stored.state.wallet_id != config.wallet_id
                     || stored.state.account_id != config.account_id
@@ -6774,32 +7111,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     continue;
                 }
                 let previous_stage = stored.state.stage;
-                let next_stage = if previous_stage == HnsSettlementStage::Prepared {
-                    let evidence = self.backend.get_transaction_evidence(
-                        stored.state.transaction,
-                        binding,
-                        Some(mempool_binding),
-                    )?;
-                    if evidence.binding != binding || evidence.mempool != mempool_binding {
-                        return Err(HnsWalletError::StaleNodeSnapshot);
-                    }
-                    if evidence.status.conflicted {
-                        HnsSettlementStage::Conflicted
-                    } else if evidence.status.confirmation_count > 0 {
-                        HnsSettlementStage::Confirmed
-                    } else if evidence.status.in_mempool {
-                        HnsSettlementStage::Mempool
-                    } else if stored.state.expires_at_unix <= now_unix {
-                        HnsSettlementStage::Expired
-                    } else {
-                        previous_stage
-                    }
-                } else if matches!(
+                let observe_transaction = settlement_requires_chain_observation(
                     previous_stage,
-                    HnsSettlementStage::Broadcast
-                        | HnsSettlementStage::Mempool
-                        | HnsSettlementStage::RequiresRebroadcast
-                ) {
+                    stored.irreversible_broadcast_prepared,
+                );
+                let next_stage = if observe_transaction {
                     let evidence = self.backend.get_transaction_evidence(
                         stored.state.transaction,
                         binding,
@@ -6814,11 +7130,17 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                         HnsSettlementStage::Confirmed
                     } else if evidence.status.in_mempool {
                         HnsSettlementStage::Mempool
-                    } else if stored.state.expires_at_unix <= now_unix {
-                        HnsSettlementStage::Expired
                     } else {
-                        pending.push(stored.id);
-                        HnsSettlementStage::RequiresRebroadcast
+                        let (unobserved_stage, requires_rebroadcast) = unobserved_settlement_stage(
+                            previous_stage,
+                            stored.irreversible_broadcast_prepared,
+                            stored.state.expires_at_unix,
+                            now_unix,
+                        );
+                        if requires_rebroadcast {
+                            pending.push(stored.id);
+                        }
+                        unobserved_stage
                     }
                 } else {
                     previous_stage
@@ -10682,6 +11004,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
                 HnsSettlementTerms::Lock {
                     request: request.clone(),
                 },
+                None,
                 &reservation_saves,
                 Some(&account_save),
                 now,
@@ -10858,6 +11181,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
             None,
             HnsSettlementAction::Redeem,
             None,
+            None,
         )
         .map(PreparedSettlementRedeem)
     }
@@ -10878,6 +11202,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
             request.maximum_fee,
             Some(request.current_chain_time),
             HnsSettlementAction::Refund,
+            None,
             None,
         )
         .map(PreparedSettlementRefund)
@@ -11783,11 +12108,90 @@ fn settlement_workflow_id(
     WorkflowId::new(id)
 }
 
+/// `AtomicSwap` is a broad store kind shared with the market coordinator.
+/// Decode only rows carrying the native-HNS signed-transaction discriminator,
+/// then validate their embedded identity. A malformed HNS settlement still
+/// fails closed, while another authenticated protocol schema is left to its
+/// own recovery registry.
+fn list_hns_prepared_settlement_workflows(
+    store: &WalletStore,
+    kind: WorkflowKind,
+) -> Result<Vec<StoredWorkflow<HnsPreparedSettlement>>, HnsWalletError> {
+    let mut settlements = Vec::new();
+    for stored in store.list_workflows_complete::<serde_json::Value>(kind, MAX_HISTORY_RESULTS)? {
+        let is_hns_settlement = stored
+            .state
+            .as_object()
+            .is_some_and(|object| object.contains_key("signed_transaction"));
+        if !is_hns_settlement {
+            continue;
+        }
+        let state: HnsPreparedSettlement = serde_json::from_value(stored.state)?;
+        if state.workflow_id != stored.id || settlement_workflow_kind(state.action) != stored.kind {
+            return Err(HnsWalletError::InvalidWorkflow);
+        }
+        settlements.push(StoredWorkflow {
+            id: stored.id,
+            kind: stored.kind,
+            revision: stored.revision,
+            state,
+            irreversible_broadcast_prepared: stored.irreversible_broadcast_prepared,
+            updated_at_unix: stored.updated_at_unix,
+        });
+    }
+    Ok(settlements)
+}
+
 fn settlement_workflow_kind(action: HnsSettlementAction) -> WorkflowKind {
     if action == HnsSettlementAction::Refund {
         WorkflowKind::Refund
     } else {
         WorkflowKind::AtomicSwap
+    }
+}
+
+fn settlement_requires_chain_observation(
+    stage: HnsSettlementStage,
+    irreversible_broadcast_prepared: bool,
+) -> bool {
+    stage == HnsSettlementStage::Prepared
+        || matches!(
+            stage,
+            HnsSettlementStage::Broadcast
+                | HnsSettlementStage::Mempool
+                | HnsSettlementStage::RequiresRebroadcast
+        )
+        || (irreversible_broadcast_prepared
+            && !matches!(
+                stage,
+                HnsSettlementStage::Confirmed | HnsSettlementStage::Conflicted
+            ))
+}
+
+fn unobserved_settlement_stage(
+    stage: HnsSettlementStage,
+    irreversible_broadcast_prepared: bool,
+    expires_at_unix: u64,
+    now_unix: u64,
+) -> (HnsSettlementStage, bool) {
+    let irreversible = matches!(
+        stage,
+        HnsSettlementStage::Broadcast
+            | HnsSettlementStage::Mempool
+            | HnsSettlementStage::RequiresRebroadcast
+    ) || (irreversible_broadcast_prepared
+        && !matches!(
+            stage,
+            HnsSettlementStage::Prepared
+                | HnsSettlementStage::Confirmed
+                | HnsSettlementStage::Conflicted
+        ));
+    if irreversible {
+        (HnsSettlementStage::RequiresRebroadcast, true)
+    } else if stage == HnsSettlementStage::Prepared && expires_at_unix <= now_unix {
+        (HnsSettlementStage::Expired, false)
+    } else {
+        (stage, false)
     }
 }
 
@@ -11819,6 +12223,28 @@ fn same_prepared_settlement(
         && stored.input_coins == artifact.input_coins
         && stored.fee == artifact.fee
         && stored.maximum_fee == artifact.maximum_fee
+        && stored.expires_at_unix == artifact.expires_at_unix
+        && stored.terms == artifact.terms
+        && stored.broadcast_guard == artifact.broadcast_guard
+}
+
+fn same_prepared_settlement_except_guard(
+    stored: &HnsPreparedSettlement,
+    artifact: &HnsPreparedSettlement,
+) -> bool {
+    stored.wallet_id == artifact.wallet_id
+        && stored.account_id == artifact.account_id
+        && stored.workflow_id == artifact.workflow_id
+        && stored.session_id == artifact.session_id
+        && stored.action == artifact.action
+        && stored.stage == HnsSettlementStage::Prepared
+        && artifact.stage == HnsSettlementStage::Prepared
+        && stored.transaction == artifact.transaction
+        && stored.signed_transaction == artifact.signed_transaction
+        && stored.input_coins == artifact.input_coins
+        && stored.fee == artifact.fee
+        && stored.maximum_fee == artifact.maximum_fee
+        && stored.fee_quote == artifact.fee_quote
         && stored.expires_at_unix == artifact.expires_at_unix
         && stored.terms == artifact.terms
 }
@@ -16281,6 +16707,59 @@ mod tests {
             assert!(!settlement_lock_workflow_may_be_reprepared(
                 stage, 0, false, 100,
             ));
+        }
+    }
+
+    #[test]
+    fn irreversible_hns_settlements_outlive_the_prepared_artifact_window() {
+        assert_eq!(
+            unobserved_settlement_stage(HnsSettlementStage::Prepared, false, 100, 100),
+            (HnsSettlementStage::Expired, false)
+        );
+        assert!(!settlement_requires_chain_observation(
+            HnsSettlementStage::Expired,
+            false,
+        ));
+
+        for stage in [
+            HnsSettlementStage::Broadcast,
+            HnsSettlementStage::Mempool,
+            HnsSettlementStage::RequiresRebroadcast,
+        ] {
+            assert!(settlement_requires_chain_observation(stage, false));
+            assert_eq!(
+                unobserved_settlement_stage(stage, false, 100, 10_000),
+                (HnsSettlementStage::RequiresRebroadcast, true)
+            );
+        }
+
+        // Wallets created by the preceding release may carry the historical
+        // irreversible bit on a merely prepared artifact. Stage is the
+        // authoritative submission checkpoint during migration: a Prepared
+        // row can be observed, but absence must never promote it to an
+        // automatic rebroadcast.
+        assert!(settlement_requires_chain_observation(
+            HnsSettlementStage::Prepared,
+            true,
+        ));
+        assert_eq!(
+            unobserved_settlement_stage(HnsSettlementStage::Prepared, true, 100, 10_000),
+            (HnsSettlementStage::Expired, false)
+        );
+        assert_eq!(
+            unobserved_settlement_stage(HnsSettlementStage::Expired, true, 100, 10_000),
+            (HnsSettlementStage::RequiresRebroadcast, true),
+            "a legacy terminal row that really retained an irreversible checkpoint remains recoverable"
+        );
+        for stage in [
+            HnsSettlementStage::Confirmed,
+            HnsSettlementStage::Conflicted,
+        ] {
+            assert!(!settlement_requires_chain_observation(stage, true));
+            assert_eq!(
+                unobserved_settlement_stage(stage, true, 100, 10_000),
+                (stage, false)
+            );
         }
     }
 

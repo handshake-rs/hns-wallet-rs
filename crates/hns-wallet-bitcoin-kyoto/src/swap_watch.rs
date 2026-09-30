@@ -20,7 +20,10 @@ const BITCOIN_SWAP_WATCH_SCHEMA_VERSION: u16 = 1;
 const BITCOIN_SWAP_WATCH_PREFIX: &[u8] = b"bitcoin-htlc-watch-v1\0";
 const BITCOIN_SWAP_WATCH_ACCOUNT_DOMAIN: &[u8] = b"hns-wallet-bitcoin-watch-account/v1\0";
 const BITCOIN_SWAP_WATCH_TERMS_DOMAIN: &[u8] = b"hns-wallet-bitcoin-watch-terms/v1\0";
-pub const MAX_BITCOIN_SWAP_WATCHES: usize = 16;
+/// Match the direct market's active plus retained-history capacity. Bitcoin
+/// descriptors remain durable for every retained execution, including
+/// terminal sessions, so deep reorganizations cannot erase recovery data.
+pub const MAX_BITCOIN_SWAP_WATCHES: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BitcoinHtlcWatchRequest {

@@ -23,9 +23,9 @@ use hns_wallet_ffi::{
 use hns_wallet_hns::{
     HNS_SHAKEDEX_FUNDING_RELEASE_QUALIFIED, HNS_VALUE_RUNTIME_RELEASE_QUALIFIED, HnsBackend,
     HnsClock, HnsDirectShakescapePeer, HnsNameAction, HnsNetwork,
-    HnsPreparedSettlementValueSummary, HnsRuntimeConfig, HnsWalletError, HnsWalletRuntime,
-    KnownName, NameOperation, NameOperationState, NameOwnershipStatus, PrepareNameFinalize,
-    PrepareNameTransfer, PrepareNameUpdate,
+    HnsPreparedSettlementValueSummary, HnsRuntimeConfig, HnsSettlementBroadcastGuard,
+    HnsWalletError, HnsWalletRuntime, KnownName, NameOperation, NameOperationState,
+    NameOwnershipStatus, PrepareNameFinalize, PrepareNameTransfer, PrepareNameUpdate,
 };
 use hns_wallet_provider::{
     APPROVAL_LIFETIME_SECONDS, ApprovedCall, PendingApproval, ProviderMethod, SelectedNamespace,
@@ -1771,6 +1771,18 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             .map_err(chain_failure)
     }
 
+    pub fn bind_trusted_native_hns_htlc_lock_broadcast_guard(
+        &self,
+        prepared: &PreparedSettlementLock,
+        broadcast_guard: HnsSettlementBroadcastGuard,
+    ) -> Result<PreparedSettlementLock, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .bind_prepared_native_htlc_lock_broadcast_guard(prepared, broadcast_guard)
+            .map_err(chain_failure)
+    }
+
     pub fn prepare_trusted_native_hns_htlc_redeem(
         &self,
         session_id: SessionId,
@@ -1790,6 +1802,31 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
                 preimage,
                 maximum_fee,
                 signer,
+            )
+            .map_err(chain_failure)
+    }
+
+    pub fn prepare_trusted_native_hns_htlc_redeem_with_broadcast_guard(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        lock: hns_wallet_chain_api::VerifiedLock,
+        preimage: hns_wallet_chain_api::Preimage,
+        maximum_fee: BaseUnits,
+        signer: &dyn hns_wallet_chain_api::SettlementSigner,
+        broadcast_guard: HnsSettlementBroadcastGuard,
+    ) -> Result<hns_wallet_chain_api::PreparedSettlementRedeem, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .prepare_native_htlc_redeem_with_settlement_signer_and_broadcast_guard(
+                session_id,
+                descriptor,
+                lock,
+                preimage,
+                maximum_fee,
+                signer,
+                broadcast_guard,
             )
             .map_err(chain_failure)
     }
@@ -1862,6 +1899,21 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
         self.runtime
             .runtime
             .broadcast_prepared_settlement(artifact)
+            .map_err(hns_runtime_failure)
+    }
+
+    /// Cross the initial HNS settlement broadcast checkpoint only before the
+    /// caller's short-lived funding authority expires. Once checkpointed,
+    /// ordinary recovery remains independent of that reversible lease.
+    pub fn broadcast_trusted_native_hns_settlement_before(
+        &self,
+        artifact: &PreparedArtifact,
+        not_after_unix: u64,
+    ) -> Result<BroadcastReceipt, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .broadcast_prepared_settlement_before(artifact, not_after_unix)
             .map_err(hns_runtime_failure)
     }
 

@@ -27,9 +27,10 @@ pub use market::{
     MobileShakescapeBitcoinWatchPermit, MobileShakescapeDirectAdmission,
     MobileShakescapeDirectInventoryReport, MobileShakescapeDirectMessageKind,
     MobileShakescapeDirectTransportReport, MobileShakescapeExecutionSummary,
-    MobileShakescapeHnsFundingPermit, MobileShakescapeHnsSettlementPermit,
-    MobileShakescapeHnsVerificationPermit, MobileShakescapeHnsWatchPermit,
-    MobileShakescapeSessionController, MobileShakescapeSettlementAction,
+    MobileShakescapeFirstFundingObservation, MobileShakescapeHnsFundingPermit,
+    MobileShakescapeHnsSettlementPermit, MobileShakescapeHnsVerificationPermit,
+    MobileShakescapeHnsWatchPermit, MobileShakescapeSessionController,
+    MobileShakescapeSettlementAction,
 };
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
@@ -375,6 +376,24 @@ impl MobileShakescapeNetworking {
 struct PendingMobileHnsValueAction {
     action_token: [u8; MOBILE_ACTION_TOKEN_BYTES],
     action: TrustedNativeHnsValueAction,
+}
+
+fn hns_second_funding_broadcast_guard(
+    guard: hns_wallet_market::SecondFundingBroadcastGuard,
+) -> Result<hns_wallet_hns::HnsSettlementBroadcastGuard, MobileWalletError> {
+    let workflow = guard.workflow_assertion();
+    let authorization = guard.authorization_assertion();
+    hns_wallet_hns::HnsSettlementBroadcastGuard::new_second_funding(
+        guard.session_id(),
+        workflow.id,
+        workflow.expected_revision,
+        authorization.id,
+        authorization.expected_revision,
+        guard.authorization_id(),
+        guard.module(),
+        guard.expires_at_unix(),
+    )
+    .map_err(MobileWalletError::from)
 }
 
 /// Closed native value vocabulary. The selected account and native origin are
@@ -2129,8 +2148,22 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         {
             return Err(MobileWalletError::InvalidValueAction);
         }
+        let now_unix = self
+            .session
+            .service
+            .trusted_native_hns_value_now_unix()
+            .map_err(mobile_service_failure)?;
         let hello = permit.hello();
         let side = permit.side();
+        let session_id = hns_wallet_types::SessionId::new(hello.swap_session_id);
+        if !permit.authorizes_pending_funding(
+            session_id,
+            side,
+            u128::from(maximum_fee_dollarydoos),
+            now_unix,
+        ) {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
         let binding = hello
             .build_hns_htlc(
                 side,
@@ -2169,13 +2202,23 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         {
             return Err(MobileWalletError::InvalidValueAction);
         }
-        let session_id = hns_wallet_types::SessionId::new(hello.swap_session_id);
+        let second_funding_guard = permit.into_second_funding_broadcast_guard(now_unix)?;
         let maximum_fee = BaseUnits::new(u128::from(maximum_fee_dollarydoos));
-        let prepared = self
+        let mut prepared = self
             .session
             .service
             .prepare_trusted_native_hns_htlc_lock(session_id, binding.descriptor, maximum_fee)
             .map_err(mobile_service_failure)?;
+        if let Some(guard) = second_funding_guard {
+            prepared = self
+                .session
+                .service
+                .bind_trusted_native_hns_htlc_lock_broadcast_guard(
+                    &prepared,
+                    hns_second_funding_broadcast_guard(guard)?,
+                )
+                .map_err(mobile_service_failure)?;
+        }
         let transaction_id = self
             .session
             .service
@@ -2232,7 +2275,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         ) {
             return Err(MobileWalletError::InvalidValueAction);
         }
-        let pending = self
+        let mut pending = self
             .pending_shakescape_hns_funding
             .take()
             .ok_or(MobileWalletError::NoPendingValueAction)?;
@@ -2243,10 +2286,24 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         if pending.prepared.0.fee > pending.maximum_fee {
             return Err(MobileWalletError::InvalidValueAction);
         }
+        let funding_authorization_expires_at_unix = reauthorization.authorization_expires_at_unix();
+        if let Some(guard) = reauthorization.into_second_funding_broadcast_guard(now_unix)? {
+            pending.prepared = self
+                .session
+                .service
+                .bind_trusted_native_hns_htlc_lock_broadcast_guard(
+                    &pending.prepared,
+                    hns_second_funding_broadcast_guard(guard)?,
+                )
+                .map_err(mobile_service_failure)?;
+        }
         let receipt = self
             .session
             .service
-            .broadcast_trusted_native_hns_settlement(&pending.prepared.0)
+            .broadcast_trusted_native_hns_settlement_before(
+                &pending.prepared.0,
+                funding_authorization_expires_at_unix,
+            )
             .map_err(mobile_service_failure)?;
         Ok(MobileShakescapeHnsFundingReceipt {
             session_id: lowercase_hex(pending.session_id.as_bytes()),
@@ -2298,6 +2355,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         }
         let hello = permit.hello().clone();
         let side = permit.side();
+        let hns_broadcast_guard = permit.take_hns_broadcast_guard();
         let binding = hello
             .build_hns_htlc(
                 side,
@@ -2362,8 +2420,23 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         .ok_or(MobileWalletError::InvalidValueAction)?;
         let maximum_fee = BaseUnits::new(u128::from(maximum_fee_dollarydoos));
         let action = permit.action();
-        let prepared = match action {
-            MobileShakescapeSettlementAction::Redeem => self
+        let prepared = match (action, hns_broadcast_guard) {
+            (MobileShakescapeSettlementAction::Redeem, Some(guard)) => self
+                .session
+                .service
+                .prepare_trusted_native_hns_htlc_redeem_with_broadcast_guard(
+                    session_id,
+                    binding.descriptor,
+                    lock,
+                    permit
+                        .take_preimage()
+                        .ok_or(MobileWalletError::InvalidValueAction)?,
+                    maximum_fee,
+                    permit.settlement_key(),
+                    guard,
+                )
+                .map(|prepared| prepared.0),
+            (MobileShakescapeSettlementAction::Redeem, None) => self
                 .session
                 .service
                 .prepare_trusted_native_hns_htlc_redeem(
@@ -2377,7 +2450,7 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
                     permit.settlement_key(),
                 )
                 .map(|prepared| prepared.0),
-            MobileShakescapeSettlementAction::Refund => self
+            (MobileShakescapeSettlementAction::Refund, None) => self
                 .session
                 .service
                 .prepare_trusted_native_hns_htlc_refund(
@@ -2388,6 +2461,9 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
                     permit.settlement_key(),
                 )
                 .map(|prepared| prepared.0),
+            (MobileShakescapeSettlementAction::Refund, Some(_)) => {
+                return Err(MobileWalletError::InvalidValueAction);
+            }
         }
         .map_err(mobile_service_failure)?;
         let transaction_id = self
@@ -2463,7 +2539,14 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .session
             .service
             .broadcast_trusted_native_hns_settlement(&pending.prepared)
-            .map_err(mobile_service_failure)?;
+            .map_err(mobile_service_failure);
+        let receipt = match receipt {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.pending_shakescape_hns_settlement = Some(pending);
+                return Err(error);
+            }
+        };
         Ok(MobileShakescapeHnsSettlementReceipt {
             session_id: lowercase_hex(pending.session_id.as_bytes()),
             action: pending.action,
