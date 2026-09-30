@@ -40,7 +40,7 @@ const MAKER_PREIMAGE_RECORD_DOMAIN: &[u8] = b"hns-wallet/direct-maker-preimage/r
 const MAX_DERIVATION_ATTEMPTS: u32 = 256;
 const MIN_FUNDING_WINDOW_SECONDS: u64 = 10 * 60;
 const MIN_SECOND_REFUND_AFTER_SECONDS: u64 = 60 * 60;
-const MIN_REFUND_SAFETY_MARGIN_SECONDS: u64 = 60 * 60;
+const MIN_REFUND_SAFETY_MARGIN_SECONDS: u64 = crate::MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS;
 const MAX_SETTLEMENT_HORIZON_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,11 +331,24 @@ pub fn create_shakescape_direct_maker_proposal(
         .now_unix
         .checked_add(request.second_refund_after_seconds)
         .ok_or(MarketError::UnsafeTimeouts)?;
-    let offered_refund_at = received_refund_at
+    let received_refund_deadline = SettlementDeadline {
+        kind: DeadlineKind::UnixTime,
+        value: received_refund_at,
+    };
+    let effective_received_refund_at = crate::shakescape_effective_refund_at(
+        record.offer.offered_asset,
+        received_refund_deadline,
+    )?;
+    let offered_refund_at = effective_received_refund_at
         .checked_add(request.refund_safety_margin_seconds)
+        .ok_or(MarketError::UnsafeTimeouts)?;
+    let maximum_refund_at = request
+        .now_unix
+        .checked_add(MAX_SETTLEMENT_HORIZON_SECONDS)
         .ok_or(MarketError::UnsafeTimeouts)?;
     if funding_expires_at > record.acceptance.header.expires_at
         || funding_expires_at > received_refund_at
+        || offered_refund_at > maximum_refund_at
         || u32::try_from(offered_refund_at).is_err()
     {
         return Err(MarketError::UnsafeTimeouts);
@@ -420,10 +433,7 @@ pub fn create_shakescape_direct_maker_proposal(
             request.hns_minimum_confirmations,
         )?,
         received_lock_commitment: [1; 32],
-        received_refund_deadline: SettlementDeadline {
-            kind: DeadlineKind::UnixTime,
-            value: received_refund_at,
-        },
+        received_refund_deadline,
         received_minimum_confirmations: confirmations_for(
             received_asset,
             request.bitcoin_minimum_confirmations,
@@ -434,6 +444,7 @@ pub fn create_shakescape_direct_maker_proposal(
     };
     bind_canonical_lock(&mut hello, SwapAssetSide::Offered)?;
     bind_canonical_lock(&mut hello, SwapAssetSide::Received)?;
+    crate::validate_shakescape_effective_refund_safety(&hello)?;
     let proposal = settlement
         .into_maker_proposal(hello)
         .map_err(|_| MarketError::InvalidShakescapeDirectSwap)?;

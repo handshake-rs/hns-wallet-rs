@@ -7,7 +7,10 @@ mod direct_responder;
 mod session_board;
 mod settlement_key;
 
-use hns_marketplace_protocol::{AssetId, ChainId, DeadlineKind, SwapAssetSide, SwapSessionHello};
+use hns_marketplace_protocol::{
+    AssetId, ChainId, DeadlineKind, SettlementDeadline, SwapAssetSide, SwapSessionHello,
+    hns_refund_time_lock,
+};
 use hns_wallet_bitcoin_kyoto::{
     HtlcSpendBranch, VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock,
     build_shakescape_bitcoin_htlc,
@@ -86,6 +89,12 @@ pub const PREFUNDING_BITCOIN_ABSENCE_FAILURE: &str =
     "funding deadline expired with verified absence of a Bitcoin lock";
 
 pub const MAX_CONCURRENT_SWAP_SESSIONS: usize = 16;
+
+/// Product-level headroom required between the effective refund times of the
+/// first-funded and second-funded chains. Native HNS deadlines are rounded to
+/// HSD's 512-second encoding, so validating only the signed Unix values is not
+/// sufficient.
+pub const MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS: u64 = 60 * 60;
 
 const SHAKESCAPE_EXECUTION_WORKFLOW_DOMAIN: &[u8] =
     b"hns-wallet-rs/shakescape-execution-workflow/v1";
@@ -1062,6 +1071,45 @@ fn verify_canonical_shakescape_lock_commitments(
     verify_canonical_shakescape_lock_commitment(hello, SwapAssetSide::Received)
 }
 
+pub(crate) fn shakescape_effective_refund_at(
+    asset: AssetId,
+    deadline: SettlementDeadline,
+) -> Result<u64, MarketError> {
+    if deadline.kind != DeadlineKind::UnixTime {
+        return Err(MarketError::UnsafeTimeouts);
+    }
+    match asset {
+        AssetId::HNS => hns_refund_time_lock(deadline)
+            .map(|lock| lock.effective_time_seconds)
+            .map_err(|_| MarketError::UnsafeTimeouts),
+        AssetId::BTC => Ok(deadline.value),
+        _ => Err(MarketError::InvalidPair),
+    }
+}
+
+/// Validate executable refund ordering after each chain's consensus encoding
+/// is applied. This is called before countersigning and again before every new
+/// funding authorization. Historical sessions remain loadable so already
+/// locked funds can still be redeemed or refunded.
+pub fn validate_shakescape_effective_refund_safety(
+    hello: &SwapSessionHello,
+) -> Result<(), MarketError> {
+    if hello.first_funding_chain != hello.offered_asset.chain() {
+        return Err(MarketError::InvalidPair);
+    }
+    let first_refund =
+        shakescape_effective_refund_at(hello.offered_asset, hello.offered_refund_deadline)?;
+    let second_refund =
+        shakescape_effective_refund_at(hello.received_asset, hello.received_refund_deadline)?;
+    if first_refund
+        .checked_sub(second_refund)
+        .is_none_or(|margin| margin < MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS)
+    {
+        return Err(MarketError::UnsafeTimeouts);
+    }
+    Ok(())
+}
+
 fn verify_canonical_shakescape_lock_commitment(
     hello: &SwapSessionHello,
     side: SwapAssetSide,
@@ -1588,6 +1636,32 @@ mod tests {
             shakescape_execution_workflow_id(btc_first.id),
             "workflow identity is session-bound, not chain-order-bound"
         );
+    }
+
+    #[test]
+    fn effective_refund_safety_accounts_for_hns_time_lock_rounding() {
+        let mut terms = accepted_terms(ChainId::BITCOIN);
+        terms.offered_asset = AssetId::BTC;
+        terms.offered_amount = AssetAmount::new(25);
+        terms.received_asset = AssetId::HNS;
+        terms.received_amount = AssetAmount::new(1_000);
+        terms.received_refund_deadline.value = 6_401;
+        terms.offered_refund_deadline.value =
+            terms.received_refund_deadline.value + MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS;
+
+        assert_eq!(
+            validate_shakescape_effective_refund_safety(&terms),
+            Err(MarketError::UnsafeTimeouts),
+            "a nominal one-hour gap is shorter after the HNS deadline rounds up"
+        );
+
+        let effective_hns_refund =
+            shakescape_effective_refund_at(AssetId::HNS, terms.received_refund_deadline)
+                .expect("effective HNS deadline");
+        terms.offered_refund_deadline.value =
+            effective_hns_refund + MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS;
+        validate_shakescape_effective_refund_safety(&terms)
+            .expect("effective one-hour margin is safe");
     }
 
     #[test]

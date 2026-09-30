@@ -1739,6 +1739,8 @@ impl MobileShakescapeSessionController {
         hello
             .verify_new_funding_at(policy.network(), now_unix)
             .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
+        hns_wallet_market::validate_shakescape_effective_refund_safety(&hello)
+            .map_err(MobileWalletError::from)?;
         let settlement_key = self
             .store
             .try_with_store(|store| {
@@ -2189,6 +2191,7 @@ impl MobileShakescapeSessionController {
                 hello
                     .verify_new_funding_at(policy.network(), now_unix)
                     .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+                hns_wallet_market::validate_shakescape_effective_refund_safety(&hello)?;
                 if hello.offered_asset != AssetId::HNS || hello.received_asset != AssetId::BTC {
                     return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
                 }
@@ -2245,6 +2248,7 @@ impl MobileShakescapeSessionController {
                 hello
                     .verify_new_funding_at(policy.network(), now_unix)
                     .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+                hns_wallet_market::validate_shakescape_effective_refund_safety(&hello)?;
                 if hello.offered_asset != hns_marketplace_protocol::AssetId::BTC
                     || hello.received_asset != hns_marketplace_protocol::AssetId::HNS
                     || hello.first_funding_chain != hns_marketplace_protocol::ChainId::BITCOIN
@@ -2758,6 +2762,7 @@ impl MobileShakescapeSessionController {
                 hello
                     .verify_new_funding_at(policy.network(), now_unix)
                     .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+                hns_wallet_market::validate_shakescape_effective_refund_safety(&hello)?;
                 let (settlement_key, hns_fee_reserve_dollarydoos) =
                     hns_wallet_market::derive_local_hns_for_btc_taker_key(
                         store, &policy, wallet_id, session_id,
@@ -3890,6 +3895,7 @@ fn verify_first_funding_headroom(
     hello
         .verify_new_funding_at(network, now_unix)
         .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+    hns_wallet_market::validate_shakescape_effective_refund_safety(hello)?;
     if now_unix
         .checked_add(DIRECT_SWAP_FIRST_FUNDING_SAFETY_SECONDS)
         .is_none_or(|minimum_deadline| minimum_deadline > hello.header.expires_at)

@@ -275,6 +275,7 @@ pub fn accept_shakescape_direct_maker_proposal(
     let proposal = record
         .proposal
         .ok_or(MarketError::InvalidShakescapeDirectSwap)?;
+    crate::validate_shakescape_effective_refund_safety(proposal.terms())?;
     let request_id = record
         .proposal_request_id
         .ok_or(MarketError::CorruptShakescapeDirectSwap)?;
