@@ -21,11 +21,12 @@ use hns_wallet_market::{
     cancel_shakescape_local_direct_offer, create_shakescape_btc_for_hns_offer,
     create_shakescape_direct_maker_proposal, create_shakescape_direct_offer_acceptance,
     create_shakescape_hns_for_btc_offer, is_local_shakescape_direct_maker,
-    is_local_shakescape_direct_taker, list_local_shakescape_direct_offer_cancellations,
-    list_local_shakescape_direct_offers, list_pending_local_shakescape_direct_offer_acceptances,
-    list_shakescape_executions, load_shakescape_direct_offer, load_shakescape_direct_offers,
-    load_shakescape_direct_swap, load_shakescape_direct_swaps, load_shakescape_execution,
-    open_shakescape_execution, shakescape_execution_workflow_id,
+    is_local_shakescape_direct_offer_setter, is_local_shakescape_direct_taker,
+    list_local_shakescape_direct_offer_cancellations, list_local_shakescape_direct_offers,
+    list_pending_local_shakescape_direct_offer_acceptances, list_shakescape_executions,
+    load_shakescape_direct_offer, load_shakescape_direct_offers, load_shakescape_direct_swap,
+    load_shakescape_direct_swaps, load_shakescape_execution, open_shakescape_execution,
+    shakescape_execution_workflow_id,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::{TransactionHash, WalletId};
@@ -802,6 +803,10 @@ impl MobileShakescapeSessionController {
             .map_err(MobileWalletError::from)?
             .into_iter()
             .filter(|record| direct_offer_has_funding_horizon(record, now_unix))
+            .filter(|record| {
+                record.offer.offered_amount.get() <= u128::from(u64::MAX)
+                    && record.offer.received_amount.get() <= u128::from(u64::MAX)
+            })
             .map(|record| direct_board_offer_summary(record, false))
             .collect::<Result<Vec<_>, _>>()
             .map(|offers| {
@@ -3257,6 +3262,8 @@ impl MobileShakescapeSessionController {
             };
             if bitcoin_amount < u128::from(MIN_HTLC_DUST_SATS)
                 || hns_amount < DEFAULT_DUST_THRESHOLD
+                || bitcoin_amount > u128::from(u64::MAX)
+                || hns_amount > u128::from(u64::MAX)
             {
                 return Err(MobileWalletError::InvalidShakescapeSessionMessage);
             }
@@ -3283,7 +3290,14 @@ impl MobileShakescapeSessionController {
                         ))
                     })
                 }
-                CrossChainMessage::AcceptDirectOffer(_) => {
+                CrossChainMessage::AcceptDirectOffer(acceptance) => {
+                    if !is_local_shakescape_direct_offer_setter(
+                        store,
+                        self.wallet_id,
+                        hns_wallet_types::ObjectHash::new(acceptance.offer_id),
+                    )? {
+                        return Err(hns_wallet_market::MarketError::InvalidShakescapePeerMessage);
+                    }
                     admit_shakescape_direct_offer_acceptance(
                         store,
                         &self.policy,

@@ -310,9 +310,17 @@ pub fn admit_shakescape_direct_offer(
         }
         return Err(MarketError::ShakescapeDirectOfferConflict);
     }
-    if load_shakescape_direct_offers(store, policy, accepted_at_unix)?.len()
-        >= MAX_SHAKESCAPE_DIRECT_OFFERS
-    {
+    // Capacity is a physical-store bound. Counting only the live projection
+    // lets expired rows accumulate until the next insert creates an unreadable
+    // MAX+1 board. Exact replays were handled above, so a full physical board
+    // must reject every new identifier until bounded maintenance removes safe
+    // expired rows.
+    let physical = store.list_entities_by_id_prefix::<PersistedDirectOffer>(
+        EntityKind::ShakescapeBoardObject,
+        &record_prefix(policy),
+        MAX_SHAKESCAPE_DIRECT_OFFERS + 1,
+    )?;
+    if physical.len() >= MAX_SHAKESCAPE_DIRECT_OFFERS {
         return Err(MarketError::ShakescapeDirectOfferCapacity);
     }
     let persisted = PersistedDirectOffer {

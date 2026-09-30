@@ -38,9 +38,10 @@ pub use direct_offer::{
     create_shakescape_btc_for_hns_offer, create_shakescape_direct_maker_proposal,
     create_shakescape_direct_offer, create_shakescape_hns_for_btc_offer,
     derive_local_btc_for_hns_maker_key, derive_local_direct_maker_key,
-    is_local_shakescape_direct_maker, list_local_shakescape_direct_offer_cancellations,
-    list_local_shakescape_direct_offers, load_shakescape_btc_for_hns_maker_preimage,
-    load_shakescape_direct_maker_preimage, reserved_local_shakescape_offer_setter_amount,
+    is_local_shakescape_direct_maker, is_local_shakescape_direct_offer_setter,
+    list_local_shakescape_direct_offer_cancellations, list_local_shakescape_direct_offers,
+    load_shakescape_btc_for_hns_maker_preimage, load_shakescape_direct_maker_preimage,
+    reserved_local_shakescape_offer_setter_amount,
 };
 pub use direct_responder::{
     ShakescapeBtcForHnsOfferAcceptanceRequest, ShakescapeDirectOfferAcceptanceRequest,

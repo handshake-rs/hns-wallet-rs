@@ -549,6 +549,21 @@ pub fn is_local_shakescape_direct_maker(
     )
 }
 
+/// Identify an offer that was authored by this installed wallet. This check
+/// deliberately does not require the public offer to remain live: an exact
+/// acceptance replay can still be recovery material after listing expiry.
+pub fn is_local_shakescape_direct_offer_setter(
+    store: &WalletStore,
+    wallet_id: WalletId,
+    offer_id: ObjectHash,
+) -> Result<bool, MarketError> {
+    match load_local_offer(store, wallet_id, offer_id.into_bytes()) {
+        Ok(local) => Ok(local.offer_id == offer_id),
+        Err(MarketError::UnknownShakescapeDirectOffer) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn is_hns_btc_direction(offered: AssetId, received: AssetId) -> bool {
     matches!(
         (offered, received),
