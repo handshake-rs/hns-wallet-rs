@@ -14,6 +14,7 @@ pub use bitcoin::{
     MobileBitcoinHtlcSettlementReceipt, MobileBitcoinSendApproval, MobileBitcoinShutdownHandle,
     MobileBitcoinSnapshot, MobileBitcoinSyncProgress, MobileBitcoinSyncProgressHandle,
     MobileBitcoinValueController, MobileShakescapeUnfundedBitcoinProof,
+    ReconciledShakescapeBitcoinFunding,
 };
 pub use hns_wallet_bitcoin_kyoto::{
     BitcoinBroadcastRecoverySummary, VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock,
@@ -2231,6 +2232,12 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             output_index: 0,
             accepted_at_unix: receipt.accepted_at_unix,
         })
+    }
+
+    pub fn pending_shakescape_hns_funding_session_id(&self) -> Option<hns_wallet_types::SessionId> {
+        self.pending_shakescape_hns_funding
+            .as_ref()
+            .map(|pending| pending.session_id)
     }
 
     pub fn reject_shakescape_hns_funding(

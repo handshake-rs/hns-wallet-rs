@@ -281,6 +281,16 @@ pub struct MobileBitcoinBroadcastReceipt {
     pub submitted_at_unix: Option<u64>,
 }
 
+/// Current result for one durable HTLC watch. `NotConfirmed` is returned only
+/// after the watch has been reconciled to the controller's exact current
+/// checkpoint, so callers can distinguish authoritative absence/reorg from a
+/// watch that is merely still catching up.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReconciledShakescapeBitcoinFunding {
+    Confirmed(VerifiedBitcoinLock),
+    NotConfirmed,
+}
+
 struct PendingMobileBitcoinSend {
     action_token: [u8; MOBILE_ACTION_TOKEN_BYTES],
     prepared: hns_wallet_bitcoin_kyoto::PreparedBitcoinSend,
@@ -1508,6 +1518,16 @@ impl MobileBitcoinValueController {
         &self,
         session_id: SessionId,
     ) -> Result<Option<VerifiedBitcoinLock>, MobileWalletError> {
+        Ok(match self.reconciled_shakescape_htlc_funding(session_id)? {
+            Some(ReconciledShakescapeBitcoinFunding::Confirmed(lock)) => Some(lock),
+            Some(ReconciledShakescapeBitcoinFunding::NotConfirmed) | None => None,
+        })
+    }
+
+    pub fn reconciled_shakescape_htlc_funding(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<ReconciledShakescapeBitcoinFunding>, MobileWalletError> {
         let wallet = self
             .wallet
             .as_ref()
@@ -1520,9 +1540,24 @@ impl MobileBitcoinValueController {
         self.store
             .try_with_store(|store| {
                 load_bitcoin_htlc_watch(store, wallet.network(), wallet.account_id(), session_id)
-                    .map(|watch| watch.and_then(|watch| watch.verified_lock_at(checkpoint)))
+                    .map(|watch| {
+                        watch.and_then(|watch| {
+                            (watch.snapshot().scanned_checkpoint == checkpoint).then(|| {
+                                watch.verified_lock_at(checkpoint).map_or(
+                                    ReconciledShakescapeBitcoinFunding::NotConfirmed,
+                                    ReconciledShakescapeBitcoinFunding::Confirmed,
+                                )
+                            })
+                        })
+                    })
             })
             .map_err(MobileWalletError::from)
+    }
+
+    pub fn pending_shakescape_htlc_funding_session_id(&self) -> Option<SessionId> {
+        self.pending_htlc_funding
+            .as_ref()
+            .map(|pending| pending.session_id)
     }
 
     /// Prove that an exact registered swap lock is absent from the current

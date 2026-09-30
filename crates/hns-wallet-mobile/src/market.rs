@@ -1132,11 +1132,24 @@ impl MobileShakescapeSessionController {
                         } else {
                             hello.received_asset.chain()
                         };
-                        let local_funding_state = record
+                        let retained_local_funding = record
                             .peer_funding_statuses
                             .iter()
-                            .find(|retained| retained.status.chain == local_chain)
-                            .map(|retained| funding_state_name(retained.status.state).to_owned());
+                            .find(|retained| retained.status.chain == local_chain);
+                        let local_funding_state = retained_local_funding.map(|retained| {
+                            if retained.status.state == FundingState::Confirmed
+                                && local_chain == hello.first_funding_chain
+                                && (session.first_funding.is_none()
+                                    || session.first_funding_revoked)
+                            {
+                                // The signed locator remains useful if the same
+                                // transaction returns, but the current local
+                                // chain view has revoked its confirmation.
+                                funding_state_name(FundingState::Reorged).to_owned()
+                            } else {
+                                funding_state_name(retained.status.state).to_owned()
+                            }
+                        });
                         execution_summary(
                             session,
                             local_role,
@@ -1636,8 +1649,27 @@ impl MobileShakescapeSessionController {
             .try_with_store(|store| {
                 let mut pending = Vec::new();
                 for session in list_shakescape_executions(store, &self.policy)? {
-                    let ordinary_pending = (session.state == SwapState::FirstFundingPending
-                        && session.first_module == hns_wallet_types::ModuleId::Bitcoin)
+                    let first_chain_revalidation = session.first_module
+                        == hns_wallet_types::ModuleId::Bitcoin
+                        && session.first_funding_revoked
+                        && matches!(
+                            session.state,
+                            SwapState::SecondFundingPending
+                                | SwapState::BothFunded
+                                | SwapState::FirstRedeemed
+                                | SwapState::SecretObserved
+                                | SwapState::RefundEligible
+                        );
+                    let ordinary_pending = (session.first_module
+                        == hns_wallet_types::ModuleId::Bitcoin
+                        && session.second_funding.is_none()
+                        && matches!(
+                            session.state,
+                            SwapState::FirstFundingPending
+                                | SwapState::FirstFunded
+                                | SwapState::SecondFundingPending
+                        ))
+                        || first_chain_revalidation
                         || (session.state == SwapState::SecondFundingPending
                             && session.second_module == hns_wallet_types::ModuleId::Bitcoin);
                     let recoverable_timeout = session.state == SwapState::Failed
@@ -1905,6 +1937,26 @@ impl MobileShakescapeSessionController {
                     .filter(|session| {
                         (session.state == SwapState::FirstFundingPending
                             && session.first_module == hns_wallet_types::ModuleId::Handshake)
+                            // Until the other chain confirms, continue proving
+                            // that a previously journaled first HNS lock still
+                            // exists at the current authenticated chain view.
+                            || (session.first_module
+                                == hns_wallet_types::ModuleId::Handshake
+                                && session.second_funding.is_none()
+                                && matches!(
+                                    session.state,
+                                    SwapState::FirstFunded | SwapState::SecondFundingPending
+                                ))
+                            || (session.first_module
+                                == hns_wallet_types::ModuleId::Handshake
+                                && session.first_funding_revoked
+                                && matches!(
+                                    session.state,
+                                    SwapState::BothFunded
+                                        | SwapState::FirstRedeemed
+                                        | SwapState::SecretObserved
+                                        | SwapState::RefundEligible
+                                ))
                             // The counterparty does not execute the local
                             // second-funding authorization that advances this
                             // checkpoint.  Its independently verified HNS
@@ -1983,6 +2035,16 @@ impl MobileShakescapeSessionController {
                 Ok::<_, hns_wallet_market::MarketError>(permits.into_iter().flatten().collect())
             })
             .map_err(MobileWalletError::from)
+    }
+
+    pub fn hns_funding_verification_permit(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+    ) -> Result<MobileShakescapeHnsVerificationPermit, MobileWalletError> {
+        self.pending_second_hns_funding_verifications()?
+            .into_iter()
+            .find(|permit| permit.session_id() == session_id)
+            .ok_or(MobileWalletError::InvalidShakescapeSessionMessage)
     }
 
     pub fn pending_hns_spend_verifications(
@@ -2163,8 +2225,10 @@ impl MobileShakescapeSessionController {
     pub fn authorize_local_btc_second_funding(
         &mut self,
         session_id: hns_wallet_types::SessionId,
+        first_funding: hns_wallet_chain_api::VerifiedLock,
         now_unix: u64,
     ) -> Result<MobileShakescapeBitcoinFundingPermit, MobileWalletError> {
+        self.apply_local_verified_hns_funding(session_id, first_funding, now_unix)?;
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         self.store
@@ -2439,6 +2503,79 @@ impl MobileShakescapeSessionController {
                     now_unix,
                 )
                 .map(|session| session.state)
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    /// Reconcile a first-chain Bitcoin watch at the exact current Kyoto
+    /// checkpoint. A confirmed replacement refreshes its evidence; a
+    /// reconciled absence revokes second-funding readiness.
+    pub fn reconcile_local_bitcoin_funding(
+        &mut self,
+        session_id: hns_wallet_types::SessionId,
+        observation: crate::ReconciledShakescapeBitcoinFunding,
+        now_unix: u64,
+    ) -> Result<bool, MobileWalletError> {
+        match observation {
+            crate::ReconciledShakescapeBitcoinFunding::Confirmed(lock) => {
+                self.apply_local_verified_bitcoin_funding(session_id, lock, now_unix)?;
+                Ok(false)
+            }
+            crate::ReconciledShakescapeBitcoinFunding::NotConfirmed => self
+                .invalidate_first_funding_if_unconfirmed(
+                    session_id,
+                    hns_wallet_types::ModuleId::Bitcoin,
+                    now_unix,
+                ),
+        }
+    }
+
+    /// Reconcile a fresh authenticated HNS query. `None` is authoritative for
+    /// the queried current chain snapshot and revokes a stale first-funding
+    /// latch while the second leg is still absent.
+    pub fn reconcile_local_hns_funding(
+        &mut self,
+        session_id: hns_wallet_types::SessionId,
+        lock: Option<hns_wallet_chain_api::VerifiedLock>,
+        now_unix: u64,
+    ) -> Result<bool, MobileWalletError> {
+        if let Some(lock) = lock {
+            self.apply_local_verified_hns_funding(session_id, lock, now_unix)?;
+            return Ok(false);
+        }
+        self.invalidate_first_funding_if_unconfirmed(
+            session_id,
+            hns_wallet_types::ModuleId::Handshake,
+            now_unix,
+        )
+    }
+
+    fn invalidate_first_funding_if_unconfirmed(
+        &mut self,
+        session_id: hns_wallet_types::SessionId,
+        module: hns_wallet_types::ModuleId,
+        now_unix: u64,
+    ) -> Result<bool, MobileWalletError> {
+        let policy = self.policy;
+        self.store
+            .try_with_store_mut(|store| {
+                let execution =
+                    hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
+                if execution.first_module != module
+                    || execution.second_funding.is_some()
+                    || execution.first_funding_revoked
+                    || !matches!(
+                        execution.state,
+                        SwapState::FirstFunded | SwapState::SecondFundingPending
+                    )
+                {
+                    return Ok(false);
+                }
+                hns_wallet_market::invalidate_locally_verified_shakescape_first_funding(
+                    store, &policy, session_id, now_unix,
+                )?;
+                Ok(true)
             })
             .map_err(MobileWalletError::from)
     }
@@ -2734,8 +2871,10 @@ impl MobileShakescapeSessionController {
     pub fn authorize_local_hns_second_funding(
         &mut self,
         session_id: hns_wallet_types::SessionId,
+        first_funding: hns_wallet_bitcoin_kyoto::VerifiedBitcoinLock,
         now_unix: u64,
     ) -> Result<MobileShakescapeHnsFundingPermit, MobileWalletError> {
+        self.apply_local_verified_bitcoin_funding(session_id, first_funding, now_unix)?;
         let policy = self.policy;
         let wallet_id = self.wallet_id;
         self.store
@@ -2886,6 +3025,9 @@ impl MobileShakescapeSessionController {
                 let execution =
                     hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
                         .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
+                if execution.first_funding_revoked {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
                 let record = load_shakescape_direct_swap(store, &policy, session_id)?
                     .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 let funding_transaction = record
@@ -3059,6 +3201,9 @@ impl MobileShakescapeSessionController {
                 let execution =
                     hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
                         .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
+                if execution.first_funding_revoked {
+                    return Err(hns_wallet_market::MarketError::InvalidTransition);
+                }
                 let record = load_shakescape_direct_swap(store, &policy, session_id)?
                     .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
                 let hello = record
@@ -3940,7 +4085,7 @@ fn execution_summary(
         first_refund_at_unix: session.timeouts.first_chain_refund_at,
         second_refund_at_unix: session.timeouts.second_chain_refund_at,
         local_funding_state,
-        first_funding_confirmed: session.first_funding.is_some(),
+        first_funding_confirmed: session.first_funding.is_some() && !session.first_funding_revoked,
         second_funding_confirmed: session.second_funding.is_some(),
         first_redemption_confirmed: session.first_redemption.is_some(),
         second_redemption_confirmed: session.second_redemption.is_some(),
@@ -5095,6 +5240,13 @@ mod tests {
             hns_marketplace_protocol::SwapAssetSide::Offered,
         )
         .expect("bitcoin binding");
+        let verified_bitcoin_lock = || hns_wallet_bitcoin_kyoto::VerifiedBitcoinLock {
+            funding_txid: hns_wallet_types::TransactionHash::new([9; 32]),
+            output_index: 0,
+            value_sats: binding.value_sats,
+            confirmation_count: 1,
+            htlc: binding.htlc.clone(),
+        };
         let maker_key = shared
             .try_with_store(|store| {
                 hns_wallet_market::derive_local_direct_maker_key(
@@ -5158,13 +5310,7 @@ mod tests {
             controller
                 .apply_local_verified_bitcoin_funding(
                     offer.offer.session_id,
-                    hns_wallet_bitcoin_kyoto::VerifiedBitcoinLock {
-                        funding_txid: hns_wallet_types::TransactionHash::new([9; 32]),
-                        output_index: 0,
-                        value_sats: binding.value_sats,
-                        confirmation_count: 1,
-                        htlc: binding.htlc.clone(),
-                    },
+                    verified_bitcoin_lock(),
                     START + 50,
                 )
                 .expect("verified funding"),
@@ -5182,13 +5328,7 @@ mod tests {
             taker_controller
                 .apply_local_verified_bitcoin_funding(
                     offer.offer.session_id,
-                    hns_wallet_bitcoin_kyoto::VerifiedBitcoinLock {
-                        funding_txid: hns_wallet_types::TransactionHash::new([9; 32]),
-                        output_index: 0,
-                        value_sats: binding.value_sats,
-                        confirmation_count: 1,
-                        htlc: binding.htlc.clone(),
-                    },
+                    verified_bitcoin_lock(),
                     START + 50,
                 )
                 .expect("taker independently verifies funding"),
@@ -5208,6 +5348,7 @@ mod tests {
         assert_eq!(local_hns_recovery[0].funding_transaction(), None);
         let hns_permit = taker_controller.authorize_local_hns_second_funding(
             offer.offer.session_id,
+            verified_bitcoin_lock(),
             START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21,
         );
         assert!(
@@ -5222,7 +5363,11 @@ mod tests {
             SwapState::FirstFunded
         );
         let hns_permit = taker_controller
-            .authorize_local_hns_second_funding(offer.offer.session_id, START + 51)
+            .authorize_local_hns_second_funding(
+                offer.offer.session_id,
+                verified_bitcoin_lock(),
+                START + 51,
+            )
             .expect("ordered HNS funding permit");
         assert_eq!(
             hns_permit.hello().swap_session_id,
@@ -5237,7 +5382,11 @@ mod tests {
             SwapState::SecondFundingPending
         );
         let retried_hns_permit = taker_controller
-            .authorize_local_hns_second_funding(offer.offer.session_id, START + 52)
+            .authorize_local_hns_second_funding(
+                offer.offer.session_id,
+                verified_bitcoin_lock(),
+                START + 52,
+            )
             .expect("second-chain HNS funding permit is restart-safe");
         assert_eq!(
             retried_hns_permit.hello().swap_session_id,
@@ -5256,8 +5405,38 @@ mod tests {
         );
         assert!(
             taker_controller
+                .reconcile_local_bitcoin_funding(
+                    offer.offer.session_id,
+                    crate::ReconciledShakescapeBitcoinFunding::NotConfirmed,
+                    START + 53,
+                )
+                .expect("reconcile first-chain reorganization")
+        );
+        let reorged = taker_controller
+            .durable_executions()
+            .expect("reorged execution");
+        assert_eq!(reorged[0].state, SwapState::SecondFundingPending);
+        assert!(!reorged[0].first_funding_confirmed);
+        assert_eq!(reorged[0].local_funding_state, None);
+        taker_controller
+            .authorize_local_hns_second_funding(
+                offer.offer.session_id,
+                verified_bitcoin_lock(),
+                START + 54,
+            )
+            .expect("fresh first-chain proof restores second-funding readiness");
+        assert_eq!(
+            taker_controller
+                .durable_executions()
+                .expect("reverified execution")[0]
+                .state,
+            SwapState::SecondFundingPending
+        );
+        assert!(
+            taker_controller
                 .authorize_local_hns_second_funding(
                     offer.offer.session_id,
+                    verified_bitcoin_lock(),
                     START + DIRECT_SWAP_FUNDING_WINDOW_SECONDS + 21,
                 )
                 .is_err(),

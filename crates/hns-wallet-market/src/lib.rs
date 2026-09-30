@@ -224,6 +224,12 @@ pub struct SwapSession {
     pub accepted_shakescape_terms: Option<Vec<u8>>,
     pub timeouts: TimeoutPlan,
     pub first_funding: Option<ObjectHash>,
+    /// The first-chain evidence was previously verified but a later current
+    /// chain view no longer contains it. The evidence remains journaled so an
+    /// already-broadcast second leg can still be tracked and refunded, while
+    /// this flag removes its authority for new funding and redemption.
+    #[serde(default)]
+    pub first_funding_revoked: bool,
     pub second_funding: Option<ObjectHash>,
     pub first_redemption: Option<ObjectHash>,
     pub second_redemption: Option<ObjectHash>,
@@ -270,6 +276,7 @@ impl SwapSession {
             accepted_shakescape_terms: None,
             timeouts,
             first_funding: None,
+            first_funding_revoked: false,
             second_funding: None,
             first_redemption: None,
             second_redemption: None,
@@ -313,6 +320,7 @@ impl SwapSession {
     pub fn can_refund_module(&self, module: ModuleId) -> bool {
         if module == self.first_module {
             self.first_funding.is_some()
+                && !self.first_funding_revoked
                 && self.first_refund.is_none()
                 && self.second_redemption.is_none()
         } else if module == self.second_module {
@@ -326,7 +334,7 @@ impl SwapSession {
 
     pub fn module_is_funded(&self, module: ModuleId) -> bool {
         if module == self.first_module {
-            self.first_funding.is_some()
+            self.first_funding.is_some() && !self.first_funding_revoked
         } else if module == self.second_module {
             self.second_funding.is_some()
         } else {
@@ -336,8 +344,9 @@ impl SwapSession {
 
     pub fn funded_module_is_settled(&self, module: ModuleId) -> bool {
         if module == self.first_module {
-            self.first_funding.is_some()
-                && (self.first_refund.is_some() || self.second_redemption.is_some())
+            self.first_funding_revoked
+                || (self.first_funding.is_some()
+                    && (self.first_refund.is_some() || self.second_redemption.is_some()))
         } else if module == self.second_module {
             self.second_funding.is_some()
                 && (self.second_refund.is_some() || self.first_redemption.is_some())
@@ -353,6 +362,7 @@ impl SwapSession {
     pub fn all_funded_legs_settled(&self) -> bool {
         let any_funded = self.first_funding.is_some() || self.second_funding.is_some();
         let first_settled = self.first_funding.is_none()
+            || self.first_funding_revoked
             || self.first_refund.is_some()
             || self.second_redemption.is_some();
         let second_settled = self.second_funding.is_none()
@@ -385,6 +395,7 @@ impl SwapSession {
                 VerifiedEvidence::FirstFundingConfirmed { evidence },
             ) => {
                 self.first_funding = Some(evidence);
+                self.first_funding_revoked = false;
                 SwapState::FirstFunded
             }
             (SwapState::Failed, VerifiedEvidence::FirstFundingConfirmed { evidence })
@@ -401,10 +412,47 @@ impl SwapSession {
                 // restoring FirstFunded is the only safe state: settlement or
                 // refund recovery must remain available for locked funds.
                 self.first_funding = Some(evidence);
+                self.first_funding_revoked = false;
                 self.failure_reason = None;
                 SwapState::FirstFunded
             }
             (SwapState::FirstFunded, VerifiedEvidence::SecondFundingReady) => {
+                SwapState::SecondFundingPending
+            }
+            (
+                state @ (SwapState::FirstFunded
+                | SwapState::SecondFundingPending
+                | SwapState::BothFunded
+                | SwapState::FirstRedeemed
+                | SwapState::SecretObserved
+                | SwapState::RefundEligible),
+                VerifiedEvidence::FirstFundingConfirmed { evidence },
+            ) if self.first_funding.is_some()
+                && (self.second_funding.is_none() || self.first_funding_revoked) =>
+            {
+                // A reorganization can replace an exact terms-bound lock with
+                // another transaction. Fresh local chain verification may
+                // update that evidence. Recovery-only states can also regain
+                // redemption authority if the exact lock becomes current.
+                self.first_funding = Some(evidence);
+                self.first_funding_revoked = false;
+                state
+            }
+            (SwapState::FirstFunded, VerifiedEvidence::FirstFundingInvalidated { evidence })
+                if self.first_funding == Some(evidence) && self.second_funding.is_none() =>
+            {
+                self.first_funding = None;
+                self.first_funding_revoked = false;
+                SwapState::FirstFundingPending
+            }
+            (
+                SwapState::SecondFundingPending,
+                VerifiedEvidence::FirstFundingInvalidated { evidence },
+            ) if self.first_funding == Some(evidence) && self.second_funding.is_none() => {
+                // SecondFundingPending may already correspond to a signed or
+                // broadcast transaction. Preserve evidence for recovery, but
+                // revoke every authority that depended on its currentness.
+                self.first_funding_revoked = true;
                 SwapState::SecondFundingPending
             }
             (
@@ -757,10 +805,23 @@ pub fn apply_locally_verified_shakescape_funding(
     // upgrades, and reorg checks. Treat already-journaled chain evidence as
     // idempotent so the coordination layer can repair or replay its locator
     // without attempting an impossible second state transition.
-    if (funding.module() == stored.state.first_module
-        && stored.state.first_funding == Some(funding_evidence))
-        || (funding.module() == stored.state.second_module
-            && stored.state.second_funding == Some(funding_evidence))
+    let refreshes_unsettled_first_funding = funding.module() == stored.state.first_module
+        && stored.state.first_funding == Some(funding_evidence)
+        && (stored.state.second_funding.is_none() || stored.state.first_funding_revoked)
+        && matches!(
+            stored.state.state,
+            SwapState::FirstFunded
+                | SwapState::SecondFundingPending
+                | SwapState::BothFunded
+                | SwapState::FirstRedeemed
+                | SwapState::SecretObserved
+                | SwapState::RefundEligible
+        );
+    if !refreshes_unsettled_first_funding
+        && ((funding.module() == stored.state.first_module
+            && stored.state.first_funding == Some(funding_evidence))
+            || (funding.module() == stored.state.second_module
+                && stored.state.second_funding == Some(funding_evidence)))
     {
         return Ok(stored.state);
     }
@@ -778,6 +839,20 @@ pub fn apply_locally_verified_shakescape_funding(
                     stored.state.failure_reason.as_deref(),
                     Some(PREFUNDING_DEADLINE_FAILURE | PREFUNDING_BITCOIN_ABSENCE_FAILURE)
                 ) =>
+        {
+            vec![VerifiedEvidence::FirstFundingConfirmed {
+                evidence: funding_evidence,
+            }]
+        }
+        SwapState::FirstFunded
+        | SwapState::SecondFundingPending
+        | SwapState::BothFunded
+        | SwapState::FirstRedeemed
+        | SwapState::SecretObserved
+        | SwapState::RefundEligible
+            if funding.module() == stored.state.first_module
+                && (stored.state.second_funding.is_none()
+                    || stored.state.first_funding_revoked) =>
         {
             vec![VerifiedEvidence::FirstFundingConfirmed {
                 evidence: funding_evidence,
@@ -811,6 +886,52 @@ pub fn apply_locally_verified_shakescape_funding(
     for evidence in evidence {
         session.apply(evidence, now_unix, &mut journal)?;
     }
+    Ok(session)
+}
+
+/// Revoke a previously confirmed first-chain observation after that chain's
+/// local verifier has reconciled the exact watch to its current checkpoint and
+/// no longer confirms the lock. Once second funding is confirmed the workflow
+/// is intentionally immutable here and must use settlement/recovery instead.
+pub fn invalidate_locally_verified_shakescape_first_funding(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    session_id: SessionId,
+    now_unix: u64,
+) -> Result<SwapSession, MarketError> {
+    let Some(mut session) = load_shakescape_execution(store, policy, session_id)? else {
+        return Err(MarketError::UnknownShakescapeDirectSwap);
+    };
+    if (session.state == SwapState::FirstFundingPending
+        && session.first_funding.is_none()
+        && session.second_funding.is_none())
+        || (session.state == SwapState::SecondFundingPending
+            && session.first_funding_revoked
+            && session.second_funding.is_none())
+    {
+        return Ok(session);
+    }
+    if !matches!(
+        session.state,
+        SwapState::FirstFunded | SwapState::SecondFundingPending
+    ) || session.second_funding.is_some()
+    {
+        return Err(MarketError::InvalidTransition);
+    }
+    let evidence = session
+        .first_funding
+        .ok_or(MarketError::InvalidTransition)?;
+    let workflow_id = shakescape_execution_workflow_id(session_id);
+    let mut journal = WalletStoreJournal {
+        store,
+        workflow_id,
+        updated_at_unix: now_unix,
+    };
+    session.apply(
+        VerifiedEvidence::FirstFundingInvalidated { evidence },
+        now_unix,
+        &mut journal,
+    )?;
     Ok(session)
 }
 
@@ -1064,6 +1185,7 @@ fn validate_shakescape_execution_record(
         || stored.state.id != session_id
         || stored.revision != stored.state.revision
         || stored.updated_at_unix != stored.state.last_verified_at_unix
+        || (stored.state.first_funding_revoked && stored.state.first_funding.is_none())
     {
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
@@ -1406,6 +1528,9 @@ pub enum VerifiedEvidence {
     RefundsValidated,
     FundingReady,
     FirstFundingConfirmed {
+        evidence: ObjectHash,
+    },
+    FirstFundingInvalidated {
         evidence: ObjectHash,
     },
     SecondFundingReady,
@@ -1814,6 +1939,106 @@ mod tests {
             ),
             Err(MarketError::InvalidTransition)
         );
+    }
+
+    #[test]
+    fn unsettled_first_funding_can_be_refreshed_and_revoked() {
+        let mut session = SwapSession::new(
+            SessionId::new([0x51; 32]),
+            ModuleId::Handshake,
+            ModuleId::Bitcoin,
+            quote(),
+            ObjectHash::new([0x52; 32]),
+            TimeoutPlan {
+                first_chain_refund_at: 500,
+                second_chain_refund_at: 300,
+                minimum_safety_margin: 100,
+            },
+            10,
+        )
+        .expect("session");
+        let mut journal = MemoryJournal::default();
+        for evidence in [
+            VerifiedEvidence::OfferAcceptanceValidated,
+            VerifiedEvidence::OfferReserved,
+            VerifiedEvidence::TermsApproved {
+                terms_id: ObjectHash::new([3; 32]),
+            },
+            VerifiedEvidence::RefundsValidated,
+            VerifiedEvidence::FundingReady,
+            VerifiedEvidence::FirstFundingConfirmed {
+                evidence: ObjectHash::new([0x53; 32]),
+            },
+        ] {
+            session
+                .apply(evidence, 20, &mut journal)
+                .expect("funding transition");
+        }
+        let mut not_yet_authorized = session.clone();
+        not_yet_authorized
+            .apply(
+                VerifiedEvidence::FirstFundingInvalidated {
+                    evidence: ObjectHash::new([0x53; 32]),
+                },
+                21,
+                &mut journal,
+            )
+            .expect("uncommitted second leg permits a full rollback");
+        assert_eq!(not_yet_authorized.state, SwapState::FirstFundingPending);
+        assert_eq!(not_yet_authorized.first_funding, None);
+
+        session
+            .apply(VerifiedEvidence::SecondFundingReady, 20, &mut journal)
+            .expect("authorize second funding");
+        assert_eq!(session.state, SwapState::SecondFundingPending);
+
+        session
+            .apply(
+                VerifiedEvidence::FirstFundingConfirmed {
+                    evidence: ObjectHash::new([0x54; 32]),
+                },
+                21,
+                &mut journal,
+            )
+            .expect("replacement lock is independently verified");
+        assert_eq!(session.first_funding, Some(ObjectHash::new([0x54; 32])));
+        assert_eq!(session.last_verified_at_unix, 21);
+        assert_eq!(
+            session.apply(
+                VerifiedEvidence::FirstFundingInvalidated {
+                    evidence: ObjectHash::new([0x53; 32]),
+                },
+                22,
+                &mut journal,
+            ),
+            Err(MarketError::InvalidTransition),
+            "stale evidence cannot revoke a replacement lock"
+        );
+
+        session
+            .apply(
+                VerifiedEvidence::FirstFundingInvalidated {
+                    evidence: ObjectHash::new([0x54; 32]),
+                },
+                23,
+                &mut journal,
+            )
+            .expect("current-chain absence revokes second-funding readiness");
+        assert_eq!(session.state, SwapState::SecondFundingPending);
+        assert_eq!(session.first_funding, Some(ObjectHash::new([0x54; 32])));
+        assert!(session.first_funding_revoked);
+        assert_eq!(session.second_funding, None);
+        session
+            .apply(
+                VerifiedEvidence::FirstFundingConfirmed {
+                    evidence: ObjectHash::new([0x54; 32]),
+                },
+                24,
+                &mut journal,
+            )
+            .expect("fresh proof restores authority without losing recovery state");
+        assert!(!session.first_funding_revoked);
+        assert_eq!(session.state, SwapState::SecondFundingPending);
     }
 
     fn accepted_terms(first_funding_chain: ChainId) -> SwapSessionHello {
