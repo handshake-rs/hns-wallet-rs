@@ -40,6 +40,15 @@ pub(crate) fn peer_object_validation_time(
 /// A full board fits into the protocol inventory bound. The wallet fails
 /// closed rather than silently dropping live offers.
 pub const MAX_SHAKESCAPE_DIRECT_OFFERS: usize = hns_marketplace_protocol::MAX_INVENTORY_ENTRIES;
+/// Signed public board objects may be relayed for at most seven days. This
+/// also bounds persisted peer data even when its encoded expiry is enormous.
+const MAX_DIRECT_PUBLICATION_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+fn bounded_publication_window(created_at: u64, expires_at: u64) -> bool {
+    expires_at
+        .checked_sub(created_at)
+        .is_some_and(|lifetime| lifetime <= MAX_DIRECT_PUBLICATION_LIFETIME_SECONDS)
+}
 
 /// The exact local network binding for direct HNS/BTC offers. This has no
 /// price-policy fields: a signed offer owns its exact amounts.
@@ -210,10 +219,17 @@ pub fn load_shakescape_direct_offers(
         .collect::<Result<Vec<_>, _>>()?;
     records.retain(|record| {
         record.offer.header.expires_at > now_unix
-            && record
-                .cancellation
-                .as_ref()
-                .is_none_or(|cancellation| cancellation.header.expires_at > now_unix)
+            && bounded_publication_window(
+                record.offer.header.created_at,
+                record.offer.header.expires_at,
+            )
+            && record.cancellation.as_ref().is_none_or(|cancellation| {
+                cancellation.header.expires_at > now_unix
+                    && bounded_publication_window(
+                        cancellation.header.created_at,
+                        cancellation.header.expires_at,
+                    )
+            })
     });
     records.sort_by_key(|record| record.offer.offer_id);
     Ok(records)
@@ -251,7 +267,18 @@ pub(crate) fn prune_expired_unreferenced_shakescape_direct_offers(
                         .expires_at
                         .max(record.offer.header.expires_at)
                 });
-        if retain_until > now_unix || protected_offer_ids.contains(&record.offer.offer_id) {
+        let bounded = bounded_publication_window(
+            record.offer.header.created_at,
+            record.offer.header.expires_at,
+        ) && record.cancellation.as_ref().is_none_or(|cancellation| {
+            bounded_publication_window(
+                cancellation.header.created_at,
+                cancellation.header.expires_at,
+            )
+        });
+        if (retain_until > now_unix && bounded)
+            || protected_offer_ids.contains(&record.offer.offer_id)
+        {
             continue;
         }
         if store.delete_entity(EntityKind::ShakescapeBoardObject, &id, revision)? {
@@ -345,6 +372,9 @@ pub fn admit_shakescape_direct_offer(
     offer
         .verify_at(policy.network(), validation_time)
         .map_err(|_| MarketError::InvalidShakescapeDirectOffer)?;
+    if !bounded_publication_window(offer.header.created_at, offer.header.expires_at) {
+        return Err(MarketError::InvalidShakescapeDirectOffer);
+    }
     let offer_id = offer.offer_id;
     if let Some(existing) = load_shakescape_direct_offer(store, policy, offer_id)? {
         if existing.offer == offer {
@@ -411,6 +441,12 @@ pub fn admit_shakescape_direct_offer_cancellation(
     cancellation
         .verify_for_offer(&record.offer, policy.network(), validation_time)
         .map_err(|_| MarketError::InvalidShakescapeDirectOffer)?;
+    if !bounded_publication_window(
+        cancellation.header.created_at,
+        cancellation.header.expires_at,
+    ) {
+        return Err(MarketError::InvalidShakescapeDirectOffer);
+    }
     if let Some(existing) = &record.cancellation {
         if existing == &cancellation {
             return Ok(ShakescapeDirectOfferCancellationAdmission::Existing(
@@ -733,6 +769,80 @@ mod tests {
             load_shakescape_direct_offer(&store, &policy, offer.offer_id)
                 .expect("pruned offer lookup")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn overlong_peer_offer_is_rejected_and_legacy_row_is_pruned_safely() {
+        let policy = ShakescapeDirectOfferBoardPolicy::new(network()).expect("board policy");
+        let mut store = WalletStore::create(":memory:", PASSPHRASE).expect("wallet store");
+        let mut offer = DirectOffer {
+            header: SignedObjectHeader {
+                expires_at: 100 + MAX_DIRECT_PUBLICATION_LIFETIME_SECONDS + 1,
+                ..header(3)
+            },
+            offer_id: [0; 32],
+            swap_session_id: [4; 32],
+            offer_setter_settlement_public_key: key(9),
+            offered_asset: AssetId::HNS,
+            offered_amount: AssetAmount::new(10_000_000),
+            received_asset: AssetId::BTC,
+            received_amount: AssetAmount::new(2_000),
+            signature: [0; 64],
+        };
+        offer.sign(&[7; 32]).expect("signed overlong offer");
+        let envelope = CrossChainMessage::DirectOffer(offer.clone())
+            .encode_envelope(1)
+            .expect("canonical envelope");
+        assert!(matches!(
+            admit_shakescape_direct_offer(&mut store, &policy, &envelope, 150),
+            Err(MarketError::InvalidShakescapeDirectOffer)
+        ));
+
+        // Simulate a row admitted by an older wallet. Keep a referenced copy
+        // for recovery, but never show it on the live board or retain an
+        // unreferenced copy until its attacker-chosen expiry.
+        store
+            .save_entity(
+                EntityKind::ShakescapeBoardObject,
+                &record_id(&policy, offer.offer_id),
+                0,
+                &PersistedDirectOffer {
+                    schema_version: DIRECT_OFFER_BOARD_SCHEMA_VERSION,
+                    policy_fingerprint: policy.fingerprint(),
+                    offer_id: ObjectHash::new(offer.offer_id),
+                    accepted_at_unix: 150,
+                    offer_hex: hex::encode(offer.encode().expect("encoded offer")),
+                    cancellation_hex: None,
+                    cancelled_at_unix: None,
+                },
+                150,
+            )
+            .expect("legacy row");
+        assert!(
+            load_shakescape_direct_offers(&store, &policy, 150)
+                .expect("live board")
+                .is_empty()
+        );
+        assert_eq!(
+            prune_expired_unreferenced_shakescape_direct_offers(
+                &mut store,
+                &policy,
+                &BTreeSet::from([offer.offer_id]),
+                150,
+            )
+            .expect("protected legacy row"),
+            0
+        );
+        assert_eq!(
+            prune_expired_unreferenced_shakescape_direct_offers(
+                &mut store,
+                &policy,
+                &BTreeSet::new(),
+                150,
+            )
+            .expect("unreferenced legacy row"),
+            1
         );
     }
 }
