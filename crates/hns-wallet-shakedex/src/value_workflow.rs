@@ -1427,7 +1427,8 @@ impl ShakedexValueWorkflow {
         if self.schema_version != SHAKEDEX_VALUE_WORKFLOW_SCHEMA_VERSION
             || self.workflow_id.as_bytes() == &[0; 16]
             || self.structural_plan_commitment != structural_plan_commitment(&self.structural_plan)?
-            || self.value_base_units.is_zero()
+            || (self.action == ShakedexValueAction::BuyerFulfillment
+                && self.value_base_units.is_zero())
             || self.fee_base_units.is_zero()
             || self.maximum_fee < self.fee_base_units
             || self
