@@ -301,6 +301,20 @@ const DIRECT_OFFER_APPROVAL_LIFETIME_SECONDS: u64 = 300;
 /// the same approval call. A short lifetime prevents an embedding from
 /// retaining a previously current first-chain authorization as a stale lease.
 const SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS: u64 = 30;
+
+fn swap_funding_authorization_expires_at(
+    hello: &SwapSessionHello,
+    now_unix: u64,
+) -> Result<u64, hns_wallet_market::MarketError> {
+    let expires_at_unix = now_unix
+        .checked_add(SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS)
+        .map(|expires| expires.min(hello.header.expires_at))
+        .ok_or(hns_wallet_market::MarketError::InvalidTransition)?;
+    if expires_at_unix <= now_unix {
+        return Err(hns_wallet_market::MarketError::InvalidTransition);
+    }
+    Ok(expires_at_unix)
+}
 /// The maker commits this much time to complete first-chain funding and let a
 /// one-confirmation Bitcoin lock become locally verified before the taker may
 /// fund the second chain. Mobile participants may be asleep, backgrounded, or
@@ -2251,13 +2265,13 @@ impl MobileShakescapeSessionController {
                 if execution.state != SwapState::FirstFundingPending {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
+                let authorization_expires_at_unix =
+                    swap_funding_authorization_expires_at(&hello, now_unix)?;
                 Ok(MobileShakescapeBitcoinFundingPermit {
                     hello,
                     side: SwapAssetSide::Offered,
                     bitcoin_fee_reserve_sats,
-                    authorization_expires_at_unix: now_unix
-                        .checked_add(SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS)
-                        .ok_or(hns_wallet_market::MarketError::InvalidTransition)?,
+                    authorization_expires_at_unix,
                 })
             })
             .map_err(MobileWalletError::from)
@@ -2322,13 +2336,13 @@ impl MobileShakescapeSessionController {
                         &mut journal,
                     )?;
                 }
+                let authorization_expires_at_unix =
+                    swap_funding_authorization_expires_at(&hello, now_unix)?;
                 Ok(MobileShakescapeBitcoinFundingPermit {
                     hello,
                     side: SwapAssetSide::Received,
                     bitcoin_fee_reserve_sats,
-                    authorization_expires_at_unix: now_unix
-                        .checked_add(SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS)
-                        .ok_or(hns_wallet_market::MarketError::InvalidTransition)?,
+                    authorization_expires_at_unix,
                 })
             })
             .map_err(MobileWalletError::from)
@@ -2975,14 +2989,14 @@ impl MobileShakescapeSessionController {
                         &mut journal,
                     )?;
                 }
+                let authorization_expires_at_unix =
+                    swap_funding_authorization_expires_at(&hello, now_unix)?;
                 Ok(MobileShakescapeHnsFundingPermit {
                     hello,
                     side: SwapAssetSide::Received,
                     settlement_key,
                     hns_fee_reserve_dollarydoos,
-                    authorization_expires_at_unix: now_unix
-                        .checked_add(SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS)
-                        .ok_or(hns_wallet_market::MarketError::InvalidTransition)?,
+                    authorization_expires_at_unix,
                 })
             })
             .map_err(MobileWalletError::from)
@@ -3053,14 +3067,14 @@ impl MobileShakescapeSessionController {
                 if execution.state != SwapState::FirstFundingPending {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
+                let authorization_expires_at_unix =
+                    swap_funding_authorization_expires_at(&hello, now_unix)?;
                 Ok(MobileShakescapeHnsFundingPermit {
                     hello,
                     side: SwapAssetSide::Offered,
                     settlement_key,
                     hns_fee_reserve_dollarydoos,
-                    authorization_expires_at_unix: now_unix
-                        .checked_add(SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS)
-                        .ok_or(hns_wallet_market::MarketError::InvalidTransition)?,
+                    authorization_expires_at_unix,
                 })
             })
             .map_err(MobileWalletError::from)

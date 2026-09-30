@@ -133,6 +133,12 @@ pub fn prune_expired_shakescape_direct_market_state(
 /// sufficient.
 pub const MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS: u64 = 60 * 60;
 
+/// Minimum time left to fund and redeem the second chain after the signed
+/// new-funding window closes. Without this independent floor, a peer can
+/// preserve the nominal refund ordering while making the second lock
+/// immediately refundable as soon as it is allowed to be funded.
+pub const MIN_SECOND_CHAIN_REDEMPTION_WINDOW_SECONDS: u64 = 60 * 60;
+
 const SHAKESCAPE_EXECUTION_WORKFLOW_DOMAIN: &[u8] =
     b"hns-wallet-rs/shakescape-execution-workflow/v1";
 const SHAKESCAPE_OBSERVED_PREIMAGE_DOMAIN: &[u8] = b"hns-wallet-rs/shakescape-observed-preimage/v1";
@@ -1381,9 +1387,15 @@ pub fn validate_shakescape_effective_refund_safety(
         shakescape_effective_refund_at(hello.offered_asset, hello.offered_refund_deadline)?;
     let second_refund =
         shakescape_effective_refund_at(hello.received_asset, hello.received_refund_deadline)?;
-    if first_refund
-        .checked_sub(second_refund)
-        .is_none_or(|margin| margin < MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS)
+    let minimum_second_refund = hello
+        .header
+        .expires_at
+        .checked_add(MIN_SECOND_CHAIN_REDEMPTION_WINDOW_SECONDS)
+        .ok_or(MarketError::UnsafeTimeouts)?;
+    if second_refund < minimum_second_refund
+        || first_refund
+            .checked_sub(second_refund)
+            .is_none_or(|margin| margin < MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS)
     {
         return Err(MarketError::UnsafeTimeouts);
     }
@@ -2136,6 +2148,29 @@ mod tests {
             effective_hns_refund + MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS;
         validate_shakescape_effective_refund_safety(&terms)
             .expect("effective one-hour margin is safe");
+    }
+
+    #[test]
+    fn effective_refund_safety_preserves_a_second_chain_redemption_window() {
+        let mut terms = accepted_terms(ChainId::HANDSHAKE);
+        terms.header.expires_at = 500;
+        terms.received_refund_deadline.value =
+            terms.header.expires_at + MIN_SECOND_CHAIN_REDEMPTION_WINDOW_SECONDS - 1;
+        terms.offered_refund_deadline.value =
+            terms.received_refund_deadline.value + MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS;
+
+        assert_eq!(
+            validate_shakescape_effective_refund_safety(&terms),
+            Err(MarketError::UnsafeTimeouts),
+            "refund ordering alone must not admit an immediately refundable second lock"
+        );
+
+        terms.received_refund_deadline.value =
+            terms.header.expires_at + MIN_SECOND_CHAIN_REDEMPTION_WINDOW_SECONDS;
+        terms.offered_refund_deadline.value =
+            terms.received_refund_deadline.value + MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS;
+        validate_shakescape_effective_refund_safety(&terms)
+            .expect("the minimum post-funding redemption window is accepted");
     }
 
     #[test]

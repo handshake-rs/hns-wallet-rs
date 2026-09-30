@@ -41,7 +41,8 @@ const MAKER_PREIMAGE_INFO: &[u8] = b"hns-wallet/direct-maker-preimage/value/v1\0
 const MAKER_PREIMAGE_RECORD_DOMAIN: &[u8] = b"hns-wallet/direct-maker-preimage/record/v1\0";
 const MAX_DERIVATION_ATTEMPTS: u32 = 256;
 const MIN_FUNDING_WINDOW_SECONDS: u64 = 10 * 60;
-const MIN_SECOND_REFUND_AFTER_SECONDS: u64 = 60 * 60;
+const MIN_SECOND_REFUND_AFTER_SECONDS: u64 =
+    MIN_FUNDING_WINDOW_SECONDS + crate::MIN_SECOND_CHAIN_REDEMPTION_WINDOW_SECONDS;
 const MIN_REFUND_SAFETY_MARGIN_SECONDS: u64 = crate::MIN_EFFECTIVE_REFUND_SAFETY_MARGIN_SECONDS;
 const MAX_SETTLEMENT_HORIZON_SECONDS: u64 = 7 * 24 * 60 * 60;
 
@@ -874,7 +875,10 @@ fn validate_maker_proposal_request(
             .contains(&request.second_refund_after_seconds)
         || !(MIN_REFUND_SAFETY_MARGIN_SECONDS..=MAX_SETTLEMENT_HORIZON_SECONDS)
             .contains(&request.refund_safety_margin_seconds)
-        || request.funding_window_seconds >= request.second_refund_after_seconds
+        || request
+            .funding_window_seconds
+            .checked_add(crate::MIN_SECOND_CHAIN_REDEMPTION_WINDOW_SECONDS)
+            .is_none_or(|minimum| request.second_refund_after_seconds < minimum)
         || request
             .second_refund_after_seconds
             .checked_add(request.refund_safety_margin_seconds)
@@ -1349,7 +1353,7 @@ mod tests {
                 session_id: created.offer.session_id,
                 now_unix: START + 20,
                 funding_window_seconds: 600,
-                second_refund_after_seconds: 3_600,
+                second_refund_after_seconds: 4_200,
                 refund_safety_margin_seconds: 3_600,
                 bitcoin_minimum_confirmations: 1,
                 hns_minimum_confirmations: 1,
@@ -1418,7 +1422,7 @@ mod tests {
                 session_id: created.offer.session_id,
                 now_unix: START + 21,
                 funding_window_seconds: 600,
-                second_refund_after_seconds: 3_600,
+                second_refund_after_seconds: 4_200,
                 refund_safety_margin_seconds: 3_600,
                 bitcoin_minimum_confirmations: 1,
                 hns_minimum_confirmations: 1,
@@ -1435,7 +1439,7 @@ mod tests {
                 session_id: created.offer.session_id,
                 now_unix: START + 700,
                 funding_window_seconds: 600,
-                second_refund_after_seconds: 3_600,
+                second_refund_after_seconds: 4_200,
                 refund_safety_margin_seconds: 3_600,
                 bitcoin_minimum_confirmations: 1,
                 hns_minimum_confirmations: 1,
