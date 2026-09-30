@@ -1806,6 +1806,7 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             .map_err(chain_failure)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_trusted_native_hns_htlc_redeem_with_broadcast_guard(
         &self,
         session_id: SessionId,

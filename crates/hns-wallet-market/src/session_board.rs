@@ -279,10 +279,10 @@ pub(crate) fn swap_has_active_obligation(
         return Ok(true);
     };
     Ok(!(execution.state == crate::SwapState::Completed
-        || (execution.state == crate::SwapState::Refunded && execution.all_funded_legs_settled()))
-        && !(execution.state == crate::SwapState::Failed
+        || (execution.state == crate::SwapState::Refunded && execution.all_funded_legs_settled())
+        || (execution.state == crate::SwapState::Failed
             && execution.first_funding.is_none()
-            && execution.second_funding.is_none()))
+            && execution.second_funding.is_none())))
 }
 
 /// Terminal execution history is intentionally retained with its chain watch

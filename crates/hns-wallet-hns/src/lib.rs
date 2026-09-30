@@ -3209,6 +3209,7 @@ impl HnsSettlementBroadcastGuard {
         Ok(guard)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_second_funding(
         session_id: SessionId,
         execution_workflow_id: WorkflowId,
@@ -6516,6 +6517,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     /// authorized it. A stale guard can never cross the irreversible
     /// broadcast checkpoint; an already checkpointed transaction remains
     /// recoverable through the ordinary rebroadcast path.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_native_htlc_redeem_with_settlement_signer_and_broadcast_guard(
         &self,
         session_id: SessionId,
@@ -6537,6 +6539,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_native_htlc_redeem_with_optional_signer(
         &self,
         session_id: SessionId,
