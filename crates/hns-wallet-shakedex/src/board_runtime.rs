@@ -13,12 +13,20 @@ use crate::board::{
     BoardOfferMutation, load_name_market_board_offers, load_name_market_board_offers_from_snapshot,
     load_name_market_board_state_from_snapshot, save_loaded_name_market_board_with_guard,
 };
+use crate::seller_offer::{
+    MAX_SELLER_LISTING_LIFETIME_SECONDS, MIN_SELLER_LISTING_LIFETIME_SECONDS,
+};
 use crate::{
     AuthenticatedFixedPriceListing, BoardOfferStatus, ShakedexError, VerifiedFixedPriceListing,
     authenticate_fixed_price_listing, decode_shakescape_authenticated_cancellation,
     decode_shakescape_authenticated_offer, verify_authenticated_fixed_price_listing,
     verify_authenticated_listing_cancellation,
 };
+
+// Public wallet surfaces serialize these timestamps through JavaScript number
+// values. Reject or hide a signed listing that cannot make that round trip,
+// rather than allowing one row to poison its entire discovery page.
+const MAX_PUBLIC_SAFE_TIMESTAMP: u64 = 9_007_199_254_740_991;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShakescapeBoardOfferAdmission {
@@ -327,6 +335,12 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakescapeBoardRuntime<'a, B, C> {
             ShakescapeRegistryVersion::V1,
             expected_hash,
         )?;
+        if !supported_public_listing_window(
+            authenticated.created_at_unix(),
+            authenticated.expires_at_unix(),
+        ) {
+            return Err(ShakedexError::InvalidListing);
+        }
         let (listing, current_lock) = self.bind_current_listing(authenticated)?;
         let listing_hash = listing.listing_hash();
         let updated_at_unix = listing.verified_at_unix();
@@ -515,6 +529,12 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakescapeBoardRuntime<'a, B, C> {
             &persisted.listing_bytes,
             persisted.listing_hash,
         )?;
+        if !supported_public_listing_window(
+            authenticated.created_at_unix(),
+            authenticated.expires_at_unix(),
+        ) {
+            return Ok(None);
+        }
         let (listing, current_lock) = self.bind_current_listing(authenticated)?;
 
         let current_lock = self.store.try_with_store(|store| {
@@ -563,6 +583,10 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakescapeBoardRuntime<'a, B, C> {
                         offer.network_magic == network.magic
                             && offer.network_genesis.as_bytes() == network.genesis.as_bytes()
                             && offer.status == BoardOfferStatus::Active
+                            && supported_public_listing_window(
+                                offer.created_at_unix,
+                                offer.expires_at_unix,
+                            )
                             && offer.created_at_unix <= now_unix
                             && now_unix < offer.expires_at_unix
                     })
@@ -607,10 +631,15 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakescapeBoardRuntime<'a, B, C> {
             if persisted.status != BoardOfferStatus::Active {
                 continue;
             }
-            authenticated.push(authenticate_fixed_price_listing(
-                &persisted.listing_bytes,
-                persisted.listing_hash,
-            )?);
+            let listing =
+                authenticate_fixed_price_listing(&persisted.listing_bytes, persisted.listing_hash)?;
+            if !supported_public_listing_window(
+                listing.created_at_unix(),
+                listing.expires_at_unix(),
+            ) {
+                continue;
+            }
+            authenticated.push(listing);
         }
         if authenticated.is_empty() {
             return Ok(CurrentShakescapeBoardOffersResolution::Absent { board_revision });
@@ -705,6 +734,17 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakescapeBoardRuntime<'a, B, C> {
     }
 }
 
+fn supported_public_listing_window(created_at_unix: u64, expires_at_unix: u64) -> bool {
+    created_at_unix <= MAX_PUBLIC_SAFE_TIMESTAMP
+        && expires_at_unix <= MAX_PUBLIC_SAFE_TIMESTAMP
+        && expires_at_unix
+            .checked_sub(created_at_unix)
+            .is_some_and(|lifetime| {
+                (MIN_SELLER_LISTING_LIFETIME_SECONDS..=MAX_SELLER_LISTING_LIFETIME_SECONDS)
+                    .contains(&lifetime)
+            })
+}
+
 fn validate_current_offer_request_hashes(
     listing_hashes: &[ObjectHash],
 ) -> Result<(), ShakedexError> {
@@ -718,4 +758,38 @@ fn validate_current_offer_request_hashes(
         return Err(ShakedexError::InvalidShakescapeEnvelope);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_PUBLIC_SAFE_TIMESTAMP, supported_public_listing_window};
+    use crate::seller_offer::{
+        MAX_SELLER_LISTING_LIFETIME_SECONDS, MIN_SELLER_LISTING_LIFETIME_SECONDS,
+    };
+
+    #[test]
+    fn public_listing_window_rejects_unsupported_signed_horizons() {
+        let created = 1_700_000_000;
+        assert!(supported_public_listing_window(
+            created,
+            created + MIN_SELLER_LISTING_LIFETIME_SECONDS,
+        ));
+        assert!(supported_public_listing_window(
+            created,
+            created + MAX_SELLER_LISTING_LIFETIME_SECONDS,
+        ));
+        assert!(!supported_public_listing_window(
+            created,
+            created + MIN_SELLER_LISTING_LIFETIME_SECONDS - 1,
+        ));
+        assert!(!supported_public_listing_window(
+            created,
+            created + MAX_SELLER_LISTING_LIFETIME_SECONDS + 1,
+        ));
+        assert!(!supported_public_listing_window(
+            MAX_PUBLIC_SAFE_TIMESTAMP,
+            MAX_PUBLIC_SAFE_TIMESTAMP + 1,
+        ));
+        assert!(!supported_public_listing_window(created, created));
+    }
 }

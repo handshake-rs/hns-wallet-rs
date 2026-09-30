@@ -7,7 +7,6 @@ use hns_wallet_types::{ApprovalId, BaseUnits, ObjectHash, WorkflowId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::board_runtime::CurrentShakescapeBoardOffersResolution;
 use crate::seller_offer::SellerOfferRuntime;
 use crate::{
     BuyerLockPlan, MAX_SHAKEDEX_FUNDING_INPUTS, PrepareSellerOffer, SellerLockPlan,
@@ -275,46 +274,42 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
                 next_cursor: None,
             });
         }
-        let current = match self.board.current_offers(&selected)? {
-            CurrentShakescapeBoardOffersResolution::Absent { board_revision } => {
-                if board_revision != inventory.board_revision() {
-                    return Err(ShakedexError::StaleRevision);
+        // A public page is discovery metadata, while purchase preparation
+        // reacquires the selected offer again. Resolve each row independently
+        // so one seller's spent or replaced lock cannot suppress unrelated
+        // current offers. Every returned row still fences the exact board
+        // revision captured above; systemic backend/store and stale-revision
+        // failures remain page failures.
+        let mut offers = Vec::with_capacity(selected.len());
+        for listing_hash in &selected {
+            let current = match self.board.current_offer(*listing_hash) {
+                Ok(Some(current)) => current,
+                Ok(None) | Err(ShakedexError::InvalidEvidence | ShakedexError::InvalidListing) => {
+                    continue;
                 }
-                return Ok(ShakedexOfferPage {
-                    board_revision,
-                    offers: Vec::new(),
-                    next_cursor: None,
-                });
+                Err(error) => return Err(error),
+            };
+            if current.board_revision() != inventory.board_revision() {
+                return Err(ShakedexError::StaleRevision);
             }
-            CurrentShakescapeBoardOffersResolution::Current(current) => current,
-        };
-        if current.board_revision() != inventory.board_revision()
-            || current.listings().len() != selected.len()
-        {
-            return Err(ShakedexError::StaleRevision);
+            let listing = current.listing();
+            offers.push(ShakedexOfferPreview {
+                listing_hash: listing.listing_hash(),
+                name: listing.name().to_vec(),
+                price: BaseUnits::new(u128::from(listing.price_base_units())),
+                marketplace_fee: BaseUnits::new(u128::from(listing.proof().fee.get())),
+                seller_payment_address: self
+                    .hns
+                    .shakedex_address_display(&listing.proof().payment_address)?,
+                created_at_unix: listing.created_at_unix(),
+                expires_at_unix: listing.expires_at_unix(),
+            });
         }
-        let offers = current
-            .listings()
-            .iter()
-            .map(|listing| {
-                Ok(ShakedexOfferPreview {
-                    listing_hash: listing.listing_hash(),
-                    name: listing.name().to_vec(),
-                    price: BaseUnits::new(u128::from(listing.price_base_units())),
-                    marketplace_fee: BaseUnits::new(u128::from(listing.proof().fee.get())),
-                    seller_payment_address: self
-                        .hns
-                        .shakedex_address_display(&listing.proof().payment_address)?,
-                    created_at_unix: listing.created_at_unix(),
-                    expires_at_unix: listing.expires_at_unix(),
-                })
-            })
-            .collect::<Result<Vec<_>, ShakedexError>>()?;
         let next_cursor = (start + selected.len() < hashes.len())
             .then(|| selected.last().copied())
             .flatten();
         Ok(ShakedexOfferPage {
-            board_revision: current.board_revision(),
+            board_revision: inventory.board_revision(),
             offers,
             next_cursor,
         })
