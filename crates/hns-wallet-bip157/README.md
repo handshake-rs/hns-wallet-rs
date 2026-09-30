@@ -20,5 +20,5 @@ fee selection, approval, and swap policy remain in the higher-level wallet
 crates.
 
 See the repository-level
-[`CHANGELOG.md`](https://github.com/handshake-rs/hns-wallet-rs/blob/v0.3.1/CHANGELOG.md)
+[`CHANGELOG.md`](https://github.com/handshake-rs/hns-wallet-rs/blob/v0.3.2/CHANGELOG.md)
 and [Bitcoin integration notes](../../docs/BITCOIN_KYOTO.md).

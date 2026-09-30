@@ -1,7 +1,7 @@
 # Bitcoin: Kyoto only
 
 Bitcoin has one synchronization implementation: direct P2P with
-`hns-wallet-bip157` 0.3.1 and `hns-wallet-bdk-kyoto` 0.3.1, derived from
+`hns-wallet-bip157` 0.3.2 and `hns-wallet-bdk-kyoto` 0.3.2, derived from
 `bip157` 0.6.3 and `bdk_kyoto` 0.17.1, feeding a BIP84 `bdk_wallet` 3.1.0
 wallet.
 There is no Esplora, Electrum, hosted indexer, or Bitcoin Core RPC production

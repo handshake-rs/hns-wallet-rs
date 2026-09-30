@@ -3,6 +3,27 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## 0.3.2 - 2026-09-29
+
+<!-- hns-wallet-release-state: 0.3.2 release -->
+Canonical account-zero wallet and atomic-swap boundary:
+
+- recover both HNS/BTC swap legs independently after redemption, refund,
+  restart, reordered peer messages, or an interrupted secret transition, while
+  continuing to monitor every funded leg until its own terminal outcome;
+- enforce effective cross-chain refund margins and require freshly verified,
+  short-lived first-chain authority both when preparing and when broadcasting
+  a second-chain lock, including durable revocation after a known reorganization;
+- reject unrelated, expired, oversized, or mobile-unrepresentable direct coin
+  market rows before they can consume durable capacity, and conservatively
+  prune legacy unowned rows without deleting funded recovery state;
+- reconcile ambiguous Shakedex broadcasts before retrying, keep valid name
+  listings available beside stale or incompatible rows, preserve zero-value
+  name-coin recovery, and refresh terminal purchase height for automatic
+  FINALIZE maturity; and
+- retain the existing public wire protocols and encrypted schema compatibility
+  while adding focused recovery and hostile-state regressions for these paths.
+
 ## 0.3.1 - 2026-09-29
 
 <!-- hns-wallet-release-state: 0.3.1 release -->
