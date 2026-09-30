@@ -2894,12 +2894,35 @@ mod tests {
         assert_eq!(session.first_funding, Some(ObjectHash::new([0x54; 32])));
         assert!(session.first_funding_revoked);
         assert_eq!(session.second_funding, None);
-        session
-            .apply(
+        assert_eq!(
+            session.apply(
                 VerifiedEvidence::FirstFundingConfirmed {
                     evidence: ObjectHash::new([0x54; 32]),
                 },
                 24,
+                &mut journal,
+            ),
+            Err(MarketError::InvalidTransition),
+            "an unversioned confirmation cannot restore revoked funding authority"
+        );
+        session
+            .apply(
+                VerifiedEvidence::FirstFundingObservationStarted {
+                    module: ModuleId::Handshake,
+                    generation: 1,
+                },
+                24,
+                &mut journal,
+            )
+            .expect("new local observation starts before a fresh proof");
+        session
+            .apply(
+                VerifiedEvidence::FirstFundingConfirmedAtGeneration {
+                    evidence: ObjectHash::new([0x54; 32]),
+                    module: ModuleId::Handshake,
+                    generation: 1,
+                },
+                25,
                 &mut journal,
             )
             .expect("fresh proof restores authority without losing recovery state");
@@ -3364,7 +3387,7 @@ mod tests {
     fn expired_authenticated_terms_can_reconstruct_a_missing_execution_baseline() {
         let terms = accepted_terms(ChainId::HANDSHAKE);
         let accepted_at = 100;
-        let recovered_at = terms.header.expires_at + 1;
+        let recovered_at = terms.received_refund_deadline.value + 1;
 
         // `open_shakescape_execution` first authenticates the persisted hello
         // at its original admission and then reconstructs the missing
@@ -3377,6 +3400,13 @@ mod tests {
         assert_eq!(recovered.state, SwapState::TermsFrozen);
         assert_eq!(recovered.revision, 1);
         assert_eq!(recovered.last_verified_at_unix, recovered_at);
-        assert!(swap_session_from_accepted_hello(&terms, recovered_at).is_err());
+        assert_eq!(
+            recovered.timeouts.second_chain_refund_at, terms.received_refund_deadline.value,
+            "recovery does not extend the signed new-funding deadline"
+        );
+        assert!(
+            swap_session_from_accepted_hello(&terms, recovered_at).is_err(),
+            "a new session cannot start after its signed funding deadline"
+        );
     }
 }

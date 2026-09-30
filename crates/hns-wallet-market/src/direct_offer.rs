@@ -1404,8 +1404,8 @@ mod tests {
         assert_eq!(terms.offered_asset, AssetId::HNS);
         assert_eq!(terms.received_asset, AssetId::BTC);
         assert_eq!(terms.first_funding_chain, ChainId::HANDSHAKE);
-        assert_eq!(terms.offered_refund_deadline.value, START + 7_220);
-        assert_eq!(terms.received_refund_deadline.value, START + 3_620);
+        assert_eq!(terms.offered_refund_deadline.value, START + 7_820);
+        assert_eq!(terms.received_refund_deadline.value, START + 4_220);
         assert_eq!(
             build_shakescape_bitcoin_htlc(terms, SwapAssetSide::Received)
                 .expect("bitcoin descriptor")
