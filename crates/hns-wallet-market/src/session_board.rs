@@ -1,12 +1,14 @@
 //! Durable admission for one direct fixed-terms HNS/BTC swap session.
 
+use std::collections::BTreeSet;
+
 use hns_marketplace_protocol::{
     AssetId, CrossChainMessage, DirectOffer, DirectOfferAcceptance, MarketPair, MarketplaceError,
     NetworkBinding, SwapFundingStatus, SwapRedeemStatus, SwapRefundStatus, SwapSessionHello,
     SwapSessionProposal, SwapWatchReady,
 };
-use hns_wallet_store::{EntityKind, StoredEntity, WalletStore};
-use hns_wallet_types::{ObjectHash, SessionId};
+use hns_wallet_store::{EntityKind, MAX_ENTITY_LIST_RESULTS, StoredEntity, WalletStore};
+use hns_wallet_types::{ObjectHash, SessionId, WalletId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -248,6 +250,73 @@ pub fn load_shakescape_direct_swaps(
         .into_iter()
         .map(|stored| decode_stored_swap(policy, stored))
         .collect()
+}
+
+/// Remove expired acceptance-only rows that have no local ownership or
+/// execution authority. Proposals, countersigned terms, peer evidence, local
+/// offers, local responses, and execution workflows are always retained.
+pub(crate) fn prune_expired_unowned_shakescape_direct_swaps(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    now_unix: u64,
+) -> Result<usize, MarketError> {
+    if now_unix == 0 {
+        return Err(MarketError::InvalidShakescapeDirectSwap);
+    }
+    let stored = store.list_entities_by_id_prefix::<PersistedShakescapeDirectSwap>(
+        EntityKind::SwapSession,
+        &record_prefix(policy),
+        MAX_ENTITY_LIST_RESULTS,
+    )?;
+    let mut removed = 0usize;
+    for row in stored {
+        let id = row.id.clone();
+        let revision = row.revision;
+        let record = decode_stored_swap(policy, row)?;
+        let session_id = SessionId::new(record.acceptance.swap_session_id);
+        let acceptance_only = record.proposal.is_none()
+            && record.hello.is_none()
+            && record.first_chain_watch_ready.is_none()
+            && record.peer_funding_statuses.is_empty();
+        if !acceptance_only || record.acceptance.header.expires_at > now_unix {
+            continue;
+        }
+        let locally_owned =
+            crate::direct_offer::load_local_offer_for_session(store, wallet_id, session_id)?
+                .is_some()
+                || crate::direct_responder::load_local_acceptance(store, wallet_id, session_id)?
+                    .is_some();
+        let has_execution = store
+            .load_workflow::<crate::SwapSession>(crate::shakescape_execution_workflow_id(
+                session_id,
+            ))?
+            .is_some();
+        if locally_owned || has_execution {
+            continue;
+        }
+        if store.delete_entity(EntityKind::SwapSession, &id, revision)? {
+            removed = removed.checked_add(1).ok_or(MarketError::Invariant)?;
+        }
+    }
+    Ok(removed)
+}
+
+pub(crate) fn referenced_direct_offer_ids(
+    store: &WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+) -> Result<BTreeSet<[u8; 32]>, MarketError> {
+    let stored = store.list_entities_by_id_prefix::<PersistedShakescapeDirectSwap>(
+        EntityKind::SwapSession,
+        &record_prefix(policy),
+        MAX_ENTITY_LIST_RESULTS,
+    )?;
+    let mut ids = BTreeSet::new();
+    for row in stored {
+        let record = decode_stored_swap(policy, row)?;
+        ids.insert(record.offer.offer_id);
+    }
+    Ok(ids)
 }
 
 /// Freeze a locally retained direct offer and the responder's signed exact

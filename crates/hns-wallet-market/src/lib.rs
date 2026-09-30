@@ -19,7 +19,7 @@ use hns_wallet_chain_api::{Preimage, VerifiedLock};
 use hns_wallet_hns::VerifiedNativeHtlcSpend;
 use hns_wallet_store::{SecretKind, StoreError, StoredWorkflow, WalletStore};
 use hns_wallet_types::{
-    Amount, ModuleId, ObjectHash, SessionId, WalletAsset, WorkflowId, WorkflowKind,
+    Amount, ModuleId, ObjectHash, SessionId, WalletAsset, WalletId, WorkflowId, WorkflowKind,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -89,6 +89,43 @@ pub const PREFUNDING_BITCOIN_ABSENCE_FAILURE: &str =
     "funding deadline expired with verified absence of a Bitcoin lock";
 
 pub const MAX_CONCURRENT_SWAP_SESSIONS: usize = 16;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ShakescapeDirectMarketPruneReport {
+    pub expired_unowned_sessions_removed: usize,
+    pub expired_unreferenced_offers_removed: usize,
+}
+
+/// Repair legacy physical-capacity rows without deleting local history or any
+/// offer referenced by a retained session. This is restart-idempotent and may
+/// be run before every board read or admission.
+pub fn prune_expired_shakescape_direct_market_state(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    now_unix: u64,
+) -> Result<ShakescapeDirectMarketPruneReport, MarketError> {
+    if wallet_id.as_bytes().iter().all(|byte| *byte == 0) || now_unix == 0 {
+        return Err(MarketError::InvalidShakescapeDirectSwap);
+    }
+    let expired_unowned_sessions_removed =
+        session_board::prune_expired_unowned_shakescape_direct_swaps(
+            store, policy, wallet_id, now_unix,
+        )?;
+    let mut protected_offer_ids = direct_offer::local_direct_offer_ids(store, wallet_id)?;
+    protected_offer_ids.extend(session_board::referenced_direct_offer_ids(store, policy)?);
+    let expired_unreferenced_offers_removed =
+        direct_board::prune_expired_unreferenced_shakescape_direct_offers(
+            store,
+            &policy.board_policy(),
+            &protected_offer_ids,
+            now_unix,
+        )?;
+    Ok(ShakescapeDirectMarketPruneReport {
+        expired_unowned_sessions_removed,
+        expired_unreferenced_offers_removed,
+    })
+}
 
 /// Product-level headroom required between the effective refund times of the
 /// first-funded and second-funded chains. Native HNS deadlines are rounded to

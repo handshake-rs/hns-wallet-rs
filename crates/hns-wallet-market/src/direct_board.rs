@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use hns_marketplace_protocol::{
     AssetId, CrossChainMessage, DirectOffer, DirectOfferCancellation, MarketPair, NetworkBinding,
 };
-use hns_wallet_store::{EntityKind, StoredEntity, WalletStore};
+use hns_wallet_store::{EntityKind, MAX_ENTITY_LIST_RESULTS, StoredEntity, WalletStore};
 use hns_wallet_types::{ObjectHash, SessionId};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -215,6 +215,48 @@ pub fn load_shakescape_direct_offers(
     });
     records.sort_by_key(|record| record.offer.offer_id);
     Ok(records)
+}
+
+/// Delete only expired physical board rows that no local intent or retained
+/// swap still references. The caller builds that protection set before this
+/// destructive maintenance boundary.
+pub(crate) fn prune_expired_unreferenced_shakescape_direct_offers(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectOfferBoardPolicy,
+    protected_offer_ids: &BTreeSet<[u8; 32]>,
+    now_unix: u64,
+) -> Result<usize, MarketError> {
+    if now_unix == 0 {
+        return Err(MarketError::InvalidShakescapeDirectOffer);
+    }
+    let stored = store.list_entities_by_id_prefix::<PersistedDirectOffer>(
+        EntityKind::ShakescapeBoardObject,
+        &record_prefix(policy),
+        MAX_ENTITY_LIST_RESULTS,
+    )?;
+    let mut removed = 0usize;
+    for row in stored {
+        let id = row.id.clone();
+        let revision = row.revision;
+        let record = decode_stored_offer(policy, row)?;
+        let retain_until =
+            record
+                .cancellation
+                .as_ref()
+                .map_or(record.offer.header.expires_at, |cancellation| {
+                    cancellation
+                        .header
+                        .expires_at
+                        .max(record.offer.header.expires_at)
+                });
+        if retain_until > now_unix || protected_offer_ids.contains(&record.offer.offer_id) {
+            continue;
+        }
+        if store.delete_entity(EntityKind::ShakescapeBoardObject, &id, revision)? {
+            removed = removed.checked_add(1).ok_or(MarketError::Invariant)?;
+        }
+    }
+    Ok(removed)
 }
 
 pub fn load_shakescape_direct_offer(
@@ -647,6 +689,35 @@ mod tests {
             live_shakescape_direct_offer_levels(&store, &policy, 151)
                 .expect("cancelled levels")
                 .is_empty()
+        );
+
+        let protected = BTreeSet::from([offer.offer_id]);
+        assert_eq!(
+            prune_expired_unreferenced_shakescape_direct_offers(
+                &mut store, &policy, &protected, 301,
+            )
+            .expect("protected expired row"),
+            0,
+        );
+        assert!(
+            load_shakescape_direct_offer(&store, &policy, offer.offer_id)
+                .expect("protected offer lookup")
+                .is_some()
+        );
+        assert_eq!(
+            prune_expired_unreferenced_shakescape_direct_offers(
+                &mut store,
+                &policy,
+                &BTreeSet::new(),
+                301,
+            )
+            .expect("unreferenced expired row"),
+            1,
+        );
+        assert!(
+            load_shakescape_direct_offer(&store, &policy, offer.offer_id)
+                .expect("pruned offer lookup")
+                .is_none()
         );
     }
 }

@@ -5,6 +5,8 @@
 //! persisted; both signing scalars are re-derived from the encrypted recovery
 //! seed when needed.
 
+use std::collections::BTreeSet;
+
 use hkdf::Hkdf;
 use hns_marketplace_protocol::{
     AssetAmount, AssetId, CrossChainMessage, DeadlineKind, DirectOffer, DirectOfferCancellation,
@@ -187,6 +189,13 @@ pub fn create_shakescape_direct_offer(
     request: ShakescapeDirectOfferRequest,
 ) -> Result<ShakescapeLocalDirectOffer, MarketError> {
     validate_direct_offer_request(request)?;
+    let swap_policy = crate::ShakescapeDirectSwapPolicy::new(*policy)?;
+    crate::prune_expired_shakescape_direct_market_state(
+        store,
+        &swap_policy,
+        request.wallet_id,
+        request.created_at_unix,
+    )?;
     let intent = offer_intent(policy, request)?;
     let session_id = offer_session_id(request.wallet_id, request.nonce, intent);
     let settlement = allocate_cross_chain_swap_key(
@@ -924,6 +933,28 @@ pub(crate) fn load_local_offer_for_session(
         }
     }
     Ok(found)
+}
+
+pub(crate) fn local_direct_offer_ids(
+    store: &WalletStore,
+    wallet_id: WalletId,
+) -> Result<BTreeSet<[u8; 32]>, MarketError> {
+    let stored = store.list_entities_by_id_prefix::<PersistedLocalDirectOffer>(
+        EntityKind::ShakescapeBoardObject,
+        &local_record_prefix(wallet_id),
+        crate::MAX_SHAKESCAPE_DIRECT_OFFERS + 1,
+    )?;
+    if stored.len() > crate::MAX_SHAKESCAPE_DIRECT_OFFERS {
+        return Err(MarketError::ShakescapeDirectOfferCapacity);
+    }
+    let mut ids = BTreeSet::new();
+    for row in stored {
+        let local = load_local_offer(store, wallet_id, row.value.offer_id.into_bytes())?;
+        if !ids.insert(local.offer_id.into_bytes()) {
+            return Err(MarketError::CorruptShakescapeDirectOfferBoard);
+        }
+    }
+    Ok(ids)
 }
 
 fn derive_maker_preimage(

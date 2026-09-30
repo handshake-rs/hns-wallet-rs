@@ -149,6 +149,12 @@ pub fn create_shakescape_direct_offer_acceptance(
     request: ShakescapeDirectOfferAcceptanceRequest,
 ) -> Result<ShakescapeLocalDirectOfferAcceptance, MarketError> {
     validate_direct_acceptance_request(request)?;
+    crate::prune_expired_shakescape_direct_market_state(
+        store,
+        policy,
+        request.wallet_id,
+        request.created_at_unix,
+    )?;
     let offer =
         load_shakescape_direct_offer(store, &policy.board_policy(), request.offer_id.into_bytes())?
             .ok_or(MarketError::UnknownShakescapeDirectOffer)?;

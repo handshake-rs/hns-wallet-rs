@@ -26,7 +26,7 @@ use hns_wallet_market::{
     list_pending_local_shakescape_direct_offer_acceptances, list_shakescape_executions,
     load_shakescape_direct_offer, load_shakescape_direct_offers, load_shakescape_direct_swap,
     load_shakescape_direct_swaps, load_shakescape_execution, open_shakescape_execution,
-    shakescape_execution_workflow_id,
+    prune_expired_shakescape_direct_market_state, shakescape_execution_workflow_id,
 };
 use hns_wallet_store::SharedWalletStore;
 use hns_wallet_types::{TransactionHash, WalletId};
@@ -791,6 +791,16 @@ impl MobileShakescapeSessionController {
         &self,
         now_unix: u64,
     ) -> Result<Vec<MobileDirectOfferSummary>, MobileWalletError> {
+        self.store
+            .try_with_store_mut(|store| {
+                prune_expired_shakescape_direct_market_state(
+                    store,
+                    &self.policy,
+                    self.wallet_id,
+                    now_unix,
+                )
+            })
+            .map_err(MobileWalletError::from)?;
         let local_ids = self
             .local_direct_offers(now_unix)?
             .into_iter()
@@ -3237,87 +3247,104 @@ impl MobileShakescapeSessionController {
             }
         }
         self.store
-            .try_with_store_mut(|store| match message {
-                CrossChainMessage::DirectOffer(_) => admit_shakescape_direct_offer(
+            .try_with_store_mut(|store| {
+                prune_expired_shakescape_direct_market_state(
                     store,
-                    &self.policy.board_policy(),
-                    envelope,
+                    &self.policy,
+                    self.wallet_id,
                     now_unix,
-                )
-                .map(|admission| Some(MobileShakescapeDirectAdmission::Offer(admission))),
-                CrossChainMessage::CancelDirectOffer(_) => {
-                    admit_shakescape_direct_offer_cancellation(
+                )?;
+                match message {
+                    CrossChainMessage::DirectOffer(_) => admit_shakescape_direct_offer(
                         store,
                         &self.policy.board_policy(),
                         envelope,
                         now_unix,
                     )
-                    .map(|admission| {
-                        Some(MobileShakescapeDirectAdmission::OfferCancellation(
-                            admission,
-                        ))
-                    })
-                }
-                CrossChainMessage::AcceptDirectOffer(acceptance) => {
-                    if !is_local_shakescape_direct_offer_setter(
-                        store,
-                        self.wallet_id,
-                        hns_wallet_types::ObjectHash::new(acceptance.offer_id),
-                    )? {
-                        return Err(hns_wallet_market::MarketError::InvalidShakescapePeerMessage);
+                    .map(|admission| Some(MobileShakescapeDirectAdmission::Offer(admission))),
+                    CrossChainMessage::CancelDirectOffer(_) => {
+                        admit_shakescape_direct_offer_cancellation(
+                            store,
+                            &self.policy.board_policy(),
+                            envelope,
+                            now_unix,
+                        )
+                        .map(|admission| {
+                            Some(MobileShakescapeDirectAdmission::OfferCancellation(
+                                admission,
+                            ))
+                        })
                     }
-                    admit_shakescape_direct_offer_acceptance(
-                        store,
-                        &self.policy,
-                        envelope,
-                        now_unix,
-                    )
-                    .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
-                }
-                CrossChainMessage::SwapSessionProposal(_) => {
-                    admit_shakescape_direct_swap_proposal(store, &self.policy, envelope, now_unix)
+                    CrossChainMessage::AcceptDirectOffer(acceptance) => {
+                        if !is_local_shakescape_direct_offer_setter(
+                            store,
+                            self.wallet_id,
+                            hns_wallet_types::ObjectHash::new(acceptance.offer_id),
+                        )? {
+                            return Err(
+                                hns_wallet_market::MarketError::InvalidShakescapePeerMessage,
+                            );
+                        }
+                        admit_shakescape_direct_offer_acceptance(
+                            store,
+                            &self.policy,
+                            envelope,
+                            now_unix,
+                        )
                         .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
+                    }
+                    CrossChainMessage::SwapSessionProposal(_) => {
+                        admit_shakescape_direct_swap_proposal(
+                            store,
+                            &self.policy,
+                            envelope,
+                            now_unix,
+                        )
+                        .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
+                    }
+                    CrossChainMessage::SwapSessionHello(hello) => {
+                        let admission = admit_shakescape_direct_swap_hello(
+                            store,
+                            &self.policy,
+                            envelope,
+                            now_unix,
+                        )?;
+                        // A countersigned hello is the bilateral execution
+                        // commitment. The taker opens its workflow while creating
+                        // that hello, but the maker only receives it through this
+                        // admission path. Open the same idempotent workflow here
+                        // so both wallets can independently recover and advance
+                        // the first-funding gate after a disconnect or restart.
+                        open_shakescape_execution(
+                            store,
+                            &self.policy,
+                            hns_wallet_types::SessionId::new(hello.swap_session_id),
+                            now_unix,
+                        )?;
+                        Ok(Some(MobileShakescapeDirectAdmission::Swap(admission)))
+                    }
+                    CrossChainMessage::SwapFundingStatus(_)
+                    | CrossChainMessage::SwapRedeemStatus(_)
+                    | CrossChainMessage::SwapRefundStatus(_) => {
+                        admit_shakescape_direct_swap_peer_status(
+                            store,
+                            &self.policy,
+                            envelope,
+                            now_unix,
+                        )
+                        .map(|_| None)
+                    }
+                    CrossChainMessage::SwapWatchReady(_) => {
+                        admit_shakescape_direct_swap_watch_ready(
+                            store,
+                            &self.policy,
+                            envelope,
+                            now_unix,
+                        )
+                        .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
+                    }
+                    _ => Err(hns_wallet_market::MarketError::InvalidShakescapePeerMessage),
                 }
-                CrossChainMessage::SwapSessionHello(hello) => {
-                    let admission = admit_shakescape_direct_swap_hello(
-                        store,
-                        &self.policy,
-                        envelope,
-                        now_unix,
-                    )?;
-                    // A countersigned hello is the bilateral execution
-                    // commitment. The taker opens its workflow while creating
-                    // that hello, but the maker only receives it through this
-                    // admission path. Open the same idempotent workflow here
-                    // so both wallets can independently recover and advance
-                    // the first-funding gate after a disconnect or restart.
-                    open_shakescape_execution(
-                        store,
-                        &self.policy,
-                        hns_wallet_types::SessionId::new(hello.swap_session_id),
-                        now_unix,
-                    )?;
-                    Ok(Some(MobileShakescapeDirectAdmission::Swap(admission)))
-                }
-                CrossChainMessage::SwapFundingStatus(_)
-                | CrossChainMessage::SwapRedeemStatus(_)
-                | CrossChainMessage::SwapRefundStatus(_) => {
-                    admit_shakescape_direct_swap_peer_status(
-                        store,
-                        &self.policy,
-                        envelope,
-                        now_unix,
-                    )
-                    .map(|_| None)
-                }
-                CrossChainMessage::SwapWatchReady(_) => admit_shakescape_direct_swap_watch_ready(
-                    store,
-                    &self.policy,
-                    envelope,
-                    now_unix,
-                )
-                .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission))),
-                _ => Err(hns_wallet_market::MarketError::InvalidShakescapePeerMessage),
             })
             .map_err(MobileWalletError::from)
     }
