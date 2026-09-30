@@ -666,9 +666,10 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
     }
 
     /// Resolve every durable value workflow before the installed service
-    /// advertises readiness. Exact signed transactions are submitted or
-    /// rebroadcast; expired unsigned plans release reservations; confirmed
-    /// outcomes release reservations only after fresh terminal evidence.
+    /// advertises readiness. Every signed transaction is reconciled against a
+    /// fresh coherent chain/mempool view before an exact-byte rebroadcast;
+    /// expired unsigned plans and freshly proven terminal outcomes release
+    /// their reservations.
     pub fn recover_startup(&self) -> Result<ShakedexStartupRecoveryReport, ShakedexError> {
         let now_unix = self.hns.shakedex_now_unix()?;
         let scope = self.hns.shakedex_funding_scope()?;
@@ -679,24 +680,27 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
                 ShakedexValueStage::Prepared if stored.workflow.expires_at_unix() <= now_unix => {
                     self.value.expire_prepared(&scope, &stored)?
                 }
-                ShakedexValueStage::Authorized => self.value.submit(&scope, &stored)?,
-                ShakedexValueStage::RequiresRebroadcast => {
-                    self.value.rebroadcast(&scope, &stored)?
-                }
-                ShakedexValueStage::Broadcast
+                ShakedexValueStage::Authorized
+                | ShakedexValueStage::RequiresRebroadcast
+                | ShakedexValueStage::Broadcast
                 | ShakedexValueStage::Mempool
                 | ShakedexValueStage::Confirming
                 | ShakedexValueStage::Confirmed
-                | ShakedexValueStage::Conflicted => self.value.reconcile(&scope, &stored)?,
+                | ShakedexValueStage::Conflicted
+                | ShakedexValueStage::ReservationsReleased => {
+                    self.value.reconcile(&scope, &stored)?
+                }
                 ShakedexValueStage::Prepared
-                | ShakedexValueStage::ReservationsReleased
                 | ShakedexValueStage::Expired
                 | ShakedexValueStage::Cancelled => stored,
             };
             if current.workflow.stage() == ShakedexValueStage::RequiresRebroadcast {
                 current = self.value.rebroadcast(&scope, &current)?;
             }
-            if current.workflow.stage() == ShakedexValueStage::Confirmed {
+            if matches!(
+                current.workflow.stage(),
+                ShakedexValueStage::Confirmed | ShakedexValueStage::Conflicted
+            ) {
                 current = self.value.release_terminal_reservations(&scope, &current)?;
             }
             let current_stage = current.workflow.stage();
@@ -723,6 +727,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
             HnsNetwork::Regtest => 10,
             HnsNetwork::Simnet => 5,
         };
+        let current_height = self.hns.backend().get_chain_snapshot()?.tip.height;
         let mut notices = Vec::new();
         for stored in self.value.list()? {
             let buyer = &stored.workflow;
@@ -759,13 +764,6 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
                         | ShakedexValueStage::Confirming
                         | ShakedexValueStage::RequiresRebroadcast
                 ) {
-                    let observation = finalize
-                        .workflow
-                        .last_chain_observation()
-                        .or_else(|| buyer.last_chain_observation());
-                    let current_height = observation
-                        .map(|observation| observation.binding.tip.height)
-                        .unwrap_or_default();
                     notices.push(ShakedexPurchaseFinalizeNotice {
                         buyer_session_id: buyer.workflow_id(),
                         name: buyer.name().to_vec(),
@@ -785,7 +783,6 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
             let Some(observation) = buyer.last_chain_observation() else {
                 continue;
             };
-            let current_height = observation.binding.tip.height;
             let (phase, finalize_eligible_height) = match observation.inclusion {
                 None => (ShakedexPurchaseFinalizePhase::TransferPending, None),
                 Some(inclusion) => {
