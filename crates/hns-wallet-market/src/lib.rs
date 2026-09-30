@@ -190,7 +190,14 @@ pub struct SwapSession {
     pub second_funding: Option<ObjectHash>,
     pub first_redemption: Option<ObjectHash>,
     pub second_redemption: Option<ObjectHash>,
+    /// Legacy aggregate refund evidence retained for backwards-compatible
+    /// workflow decoding. New settlement records use the per-funded-leg
+    /// fields below and treat this value only as migration evidence.
     pub refund: Option<ObjectHash>,
+    #[serde(default)]
+    pub first_refund: Option<ObjectHash>,
+    #[serde(default)]
+    pub second_refund: Option<ObjectHash>,
     pub last_verified_at_unix: u64,
     pub failure_reason: Option<String>,
 }
@@ -230,6 +237,8 @@ impl SwapSession {
             first_redemption: None,
             second_redemption: None,
             refund: None,
+            first_refund: None,
+            second_refund: None,
             last_verified_at_unix: now_unix,
             failure_reason: None,
         })
@@ -252,6 +261,67 @@ impl SwapSession {
 
     pub fn observe_peer_hint(&self, _hint: PeerHint) -> Result<(), MarketError> {
         Err(MarketError::PeerHintNotEvidence)
+    }
+
+    pub fn refund_for_module(&self, module: ModuleId) -> Option<ObjectHash> {
+        if module == self.first_module {
+            self.first_refund
+        } else if module == self.second_module {
+            self.second_refund
+        } else {
+            None
+        }
+    }
+
+    pub fn can_refund_module(&self, module: ModuleId) -> bool {
+        if module == self.first_module {
+            self.first_funding.is_some()
+                && self.first_refund.is_none()
+                && self.second_redemption.is_none()
+        } else if module == self.second_module {
+            self.second_funding.is_some()
+                && self.second_refund.is_none()
+                && self.first_redemption.is_none()
+        } else {
+            false
+        }
+    }
+
+    pub fn module_is_funded(&self, module: ModuleId) -> bool {
+        if module == self.first_module {
+            self.first_funding.is_some()
+        } else if module == self.second_module {
+            self.second_funding.is_some()
+        } else {
+            false
+        }
+    }
+
+    pub fn funded_module_is_settled(&self, module: ModuleId) -> bool {
+        if module == self.first_module {
+            self.first_funding.is_some()
+                && (self.first_refund.is_some() || self.second_redemption.is_some())
+        } else if module == self.second_module {
+            self.second_funding.is_some()
+                && (self.second_refund.is_some() || self.first_redemption.is_some())
+        } else {
+            false
+        }
+    }
+
+    pub fn has_confirmed_refund(&self) -> bool {
+        self.first_refund.is_some() || self.second_refund.is_some()
+    }
+
+    pub fn all_funded_legs_settled(&self) -> bool {
+        let any_funded = self.first_funding.is_some() || self.second_funding.is_some();
+        let first_settled = self.first_funding.is_none()
+            || self.first_refund.is_some()
+            || self.second_redemption.is_some();
+        let second_settled = self.second_funding.is_none()
+            || self.second_refund.is_some()
+            || self.first_redemption.is_some();
+        any_funded && first_settled && second_settled
     }
 
     fn transition(&mut self, evidence: VerifiedEvidence, now_unix: u64) -> Result<(), MarketError> {
@@ -307,14 +377,24 @@ impl SwapSession {
                 self.second_funding = Some(evidence);
                 SwapState::BothFunded
             }
-            (SwapState::BothFunded, VerifiedEvidence::FirstRedemptionConfirmed { evidence }) => {
+            (
+                SwapState::BothFunded | SwapState::RefundEligible,
+                VerifiedEvidence::FirstRedemptionConfirmed { evidence },
+            ) if self.second_funding.is_some()
+                && self.second_refund.is_none()
+                && self.first_redemption.is_none() =>
+            {
                 self.first_redemption = Some(evidence);
                 SwapState::FirstRedeemed
             }
             (SwapState::FirstRedeemed, VerifiedEvidence::SecretExtracted { hashlock })
                 if hashlock == self.hashlock =>
             {
-                SwapState::SecretObserved
+                if self.all_funded_legs_settled() {
+                    SwapState::Refunded
+                } else {
+                    SwapState::SecretObserved
+                }
             }
             (
                 SwapState::SecretObserved,
@@ -327,22 +407,46 @@ impl SwapSession {
                 SwapState::Completed
             }
             (
-                SwapState::FirstFundingPending
-                | SwapState::FirstFunded
-                | SwapState::SecondFundingPending
-                | SwapState::BothFunded
-                | SwapState::FirstRedeemed
-                | SwapState::SecretObserved,
+                SwapState::FirstFunded | SwapState::SecondFundingPending,
                 VerifiedEvidence::RefundEligibilityValidated,
-            ) => SwapState::RefundEligible,
+            ) if self.first_funding.is_some() && self.second_funding.is_none() => {
+                SwapState::RefundEligible
+            }
             (SwapState::RefundEligible, VerifiedEvidence::RefundBroadcast { evidence }) => {
                 self.refund = Some(evidence);
                 SwapState::RefundBroadcast
             }
             (SwapState::RefundBroadcast, VerifiedEvidence::RefundConfirmed { evidence })
-                if self.refund == Some(evidence) =>
+                if self.refund == Some(evidence)
+                    && self.first_funding.is_some()
+                    && self.second_funding.is_none() =>
             {
+                self.first_refund = Some(evidence);
                 SwapState::Refunded
+            }
+            (
+                SwapState::FirstFunded
+                | SwapState::SecondFundingPending
+                | SwapState::BothFunded
+                | SwapState::FirstRedeemed
+                | SwapState::SecretObserved
+                | SwapState::RefundEligible
+                | SwapState::RefundBroadcast
+                | SwapState::Failed
+                | SwapState::Refunded,
+                VerifiedEvidence::ChainRefundConfirmed { module, evidence },
+            ) if self.can_refund_module(module) => {
+                if module == self.first_module {
+                    self.first_refund = Some(evidence);
+                } else {
+                    self.second_refund = Some(evidence);
+                }
+                self.refund = Some(evidence);
+                if self.all_funded_legs_settled() {
+                    SwapState::Refunded
+                } else {
+                    SwapState::RefundEligible
+                }
             }
             (state, VerifiedEvidence::TerminalFailure { reason })
                 if !matches!(state, SwapState::Completed | SwapState::Refunded) =>
@@ -691,9 +795,13 @@ pub fn apply_locally_verified_shakescape_first_redemption(
         load_shakescape_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
     if !matches!(
         stored.state.state,
-        SwapState::BothFunded | SwapState::FirstRedeemed | SwapState::SecretObserved
+        SwapState::BothFunded
+            | SwapState::FirstRedeemed
+            | SwapState::SecretObserved
+            | SwapState::RefundEligible
     ) || spend.module() != stored.state.second_module
         || spend.confirmation_count() == 0
+        || stored.state.second_refund.is_some()
     {
         return Err(MarketError::InvalidTransition);
     }
@@ -717,16 +825,25 @@ pub fn apply_locally_verified_shakescape_first_redemption(
             return Err(MarketError::InvalidEvidence);
         }
         Some(_) => {}
-        None if stored.state.state == SwapState::BothFunded => store.put_secret(
-            &preimage_id,
-            SecretKind::HtlcPreimage,
-            preimage.expose_for_settlement(),
-            now_unix,
-        )?,
+        None if matches!(
+            stored.state.state,
+            SwapState::BothFunded | SwapState::RefundEligible
+        ) =>
+        {
+            store.put_secret(
+                &preimage_id,
+                SecretKind::HtlcPreimage,
+                preimage.expose_for_settlement(),
+                now_unix,
+            )?
+        }
         None => return Err(MarketError::InvalidEvidence),
     }
     let mut session = stored.state;
-    if session.state == SwapState::SecretObserved {
+    if matches!(
+        session.state,
+        SwapState::SecretObserved | SwapState::Refunded
+    ) {
         return Ok(session);
     }
     let mut journal = WalletStoreJournal {
@@ -734,7 +851,10 @@ pub fn apply_locally_verified_shakescape_first_redemption(
         workflow_id,
         updated_at_unix: now_unix,
     };
-    if session.state == SwapState::BothFunded {
+    if matches!(
+        session.state,
+        SwapState::BothFunded | SwapState::RefundEligible
+    ) {
         session.apply(
             VerifiedEvidence::FirstRedemptionConfirmed { evidence },
             now_unix,
@@ -827,25 +947,26 @@ pub fn apply_locally_verified_shakescape_refund(
     {
         return Err(MarketError::InvalidEvidence);
     }
+    let module = spend.module();
     let evidence = spend_evidence_id(&spend);
     let mut session = stored.state;
+    if let Some(existing) = session.refund_for_module(module) {
+        return if existing == evidence {
+            Ok(session)
+        } else {
+            Err(MarketError::InvalidEvidence)
+        };
+    }
+    if !session.can_refund_module(module) {
+        return Err(MarketError::InvalidTransition);
+    }
     let mut journal = WalletStoreJournal {
         store,
         workflow_id,
         updated_at_unix: now_unix,
     };
     session.apply(
-        VerifiedEvidence::RefundEligibilityValidated,
-        now_unix,
-        &mut journal,
-    )?;
-    session.apply(
-        VerifiedEvidence::RefundBroadcast { evidence },
-        now_unix,
-        &mut journal,
-    )?;
-    session.apply(
-        VerifiedEvidence::RefundConfirmed { evidence },
+        VerifiedEvidence::ChainRefundConfirmed { module, evidence },
         now_unix,
         &mut journal,
     )?;
@@ -1242,20 +1363,42 @@ fn other_chain(chain: ChainId) -> Result<ChainId, MarketError> {
 pub enum VerifiedEvidence {
     OfferAcceptanceValidated,
     OfferReserved,
-    TermsApproved { terms_id: ObjectHash },
+    TermsApproved {
+        terms_id: ObjectHash,
+    },
     RefundsValidated,
     FundingReady,
-    FirstFundingConfirmed { evidence: ObjectHash },
+    FirstFundingConfirmed {
+        evidence: ObjectHash,
+    },
     SecondFundingReady,
-    SecondFundingConfirmed { evidence: ObjectHash },
-    FirstRedemptionConfirmed { evidence: ObjectHash },
-    SecretExtracted { hashlock: ObjectHash },
-    SecondRedemptionConfirmed { evidence: ObjectHash },
+    SecondFundingConfirmed {
+        evidence: ObjectHash,
+    },
+    FirstRedemptionConfirmed {
+        evidence: ObjectHash,
+    },
+    SecretExtracted {
+        hashlock: ObjectHash,
+    },
+    SecondRedemptionConfirmed {
+        evidence: ObjectHash,
+    },
     CompletionValidated,
     RefundEligibilityValidated,
-    RefundBroadcast { evidence: ObjectHash },
-    RefundConfirmed { evidence: ObjectHash },
-    TerminalFailure { reason: String },
+    RefundBroadcast {
+        evidence: ObjectHash,
+    },
+    RefundConfirmed {
+        evidence: ObjectHash,
+    },
+    ChainRefundConfirmed {
+        module: ModuleId,
+        evidence: ObjectHash,
+    },
+    TerminalFailure {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1291,6 +1434,7 @@ impl SwapJournal for WalletStoreJournal<'_> {
                     | SwapState::FirstRedeemed
                     | SwapState::SecretObserved
                     | SwapState::SecondRedeemed
+                    | SwapState::RefundEligible
                     | SwapState::RefundBroadcast
             ),
             self.updated_at_unix,
@@ -1509,6 +1653,74 @@ mod tests {
                 .expect("transition");
         }
         assert_eq!(session.state, SwapState::Refunded);
+        assert_eq!(session.first_refund, Some(ObjectHash::new([13; 32])));
+        assert!(session.all_funded_legs_settled());
+    }
+
+    #[test]
+    fn both_funded_legs_must_settle_before_refund_is_terminal() {
+        let mut session = SwapSession::new(
+            SessionId::new([0x21; 32]),
+            ModuleId::Handshake,
+            ModuleId::Bitcoin,
+            quote(),
+            ObjectHash::new([0x22; 32]),
+            TimeoutPlan {
+                first_chain_refund_at: 500,
+                second_chain_refund_at: 300,
+                minimum_safety_margin: 100,
+            },
+            10,
+        )
+        .expect("session");
+        let mut journal = MemoryJournal::default();
+        for evidence in [
+            VerifiedEvidence::OfferAcceptanceValidated,
+            VerifiedEvidence::OfferReserved,
+            VerifiedEvidence::TermsApproved {
+                terms_id: ObjectHash::new([3; 32]),
+            },
+            VerifiedEvidence::RefundsValidated,
+            VerifiedEvidence::FundingReady,
+            VerifiedEvidence::FirstFundingConfirmed {
+                evidence: ObjectHash::new([0x23; 32]),
+            },
+            VerifiedEvidence::SecondFundingReady,
+            VerifiedEvidence::SecondFundingConfirmed {
+                evidence: ObjectHash::new([0x24; 32]),
+            },
+        ] {
+            session
+                .apply(evidence, 20, &mut journal)
+                .expect("fund both legs");
+        }
+
+        session
+            .apply(
+                VerifiedEvidence::ChainRefundConfirmed {
+                    module: ModuleId::Handshake,
+                    evidence: ObjectHash::new([0x25; 32]),
+                },
+                30,
+                &mut journal,
+            )
+            .expect("first leg refund");
+        assert_eq!(session.state, SwapState::RefundEligible);
+        assert!(!session.all_funded_legs_settled());
+        assert!(session.can_refund_module(ModuleId::Bitcoin));
+
+        session
+            .apply(
+                VerifiedEvidence::ChainRefundConfirmed {
+                    module: ModuleId::Bitcoin,
+                    evidence: ObjectHash::new([0x26; 32]),
+                },
+                31,
+                &mut journal,
+            )
+            .expect("second leg refund");
+        assert_eq!(session.state, SwapState::Refunded);
+        assert!(session.all_funded_legs_settled());
     }
 
     #[test]

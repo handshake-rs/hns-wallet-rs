@@ -1163,7 +1163,8 @@ impl MobileShakescapeSessionController {
             .try_with_store(|store| {
                 let mut descriptors = Vec::new();
                 for execution in list_shakescape_executions(store, &policy)? {
-                    if matches!(execution.state, SwapState::Completed | SwapState::Refunded)
+                    if execution.state == SwapState::Completed
+                        || execution.all_funded_legs_settled()
                         || (execution.first_module != hns_wallet_types::ModuleId::Handshake
                             && execution.second_module != hns_wallet_types::ModuleId::Handshake)
                     {
@@ -1983,16 +1984,9 @@ impl MobileShakescapeSessionController {
                 list_shakescape_executions(store, &policy)?
                     .into_iter()
                     .filter(|session| {
-                        (session.first_module == hns_wallet_types::ModuleId::Handshake
-                            || session.second_module == hns_wallet_types::ModuleId::Handshake)
-                            && matches!(
-                                session.state,
-                                SwapState::BothFunded
-                                    | SwapState::FirstRedeemed
-                                    | SwapState::SecretObserved
-                                    | SwapState::RefundEligible
-                                    | SwapState::RefundBroadcast
-                            )
+                        session.module_is_funded(hns_wallet_types::ModuleId::Handshake)
+                            && !session
+                                .funded_module_is_settled(hns_wallet_types::ModuleId::Handshake)
                     })
                     .map(|session| {
                         load_shakescape_direct_swap(store, &policy, session.id)?
@@ -2037,16 +2031,9 @@ impl MobileShakescapeSessionController {
                 sessions
                     .into_iter()
                     .filter(|session| {
-                        (session.first_module == hns_wallet_types::ModuleId::Bitcoin
-                            || session.second_module == hns_wallet_types::ModuleId::Bitcoin)
-                            && matches!(
-                                session.state,
-                                SwapState::BothFunded
-                                    | SwapState::FirstRedeemed
-                                    | SwapState::SecretObserved
-                                    | SwapState::RefundEligible
-                                    | SwapState::RefundBroadcast
-                            )
+                        session.module_is_funded(hns_wallet_types::ModuleId::Bitcoin)
+                            && !session
+                                .funded_module_is_settled(hns_wallet_types::ModuleId::Bitcoin)
                     })
                     .map(|session| session.id)
                     .collect()
@@ -2997,19 +2984,7 @@ impl MobileShakescapeSessionController {
                 } else {
                     return Err(hns_wallet_market::MarketError::InvalidPair);
                 };
-                let hns_module_is_first =
-                    execution.first_module == hns_wallet_types::ModuleId::Handshake;
-                if (hns_module_is_first
-                    && !matches!(
-                        execution.state,
-                        SwapState::FirstFunded
-                            | SwapState::SecondFundingPending
-                            | SwapState::BothFunded
-                            | SwapState::FirstRedeemed
-                            | SwapState::SecretObserved
-                    ))
-                    || (!hns_module_is_first && execution.state != SwapState::BothFunded)
-                {
+                if !execution.can_refund_module(hns_wallet_types::ModuleId::Handshake) {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
                 let (key, fee_reserve) = match side {
@@ -3162,19 +3137,7 @@ impl MobileShakescapeSessionController {
                 } else {
                     return Err(hns_wallet_market::MarketError::InvalidPair);
                 };
-                let bitcoin_module_is_first =
-                    execution.first_module == hns_wallet_types::ModuleId::Bitcoin;
-                if (bitcoin_module_is_first
-                    && !matches!(
-                        execution.state,
-                        SwapState::FirstFunded
-                            | SwapState::SecondFundingPending
-                            | SwapState::BothFunded
-                            | SwapState::FirstRedeemed
-                            | SwapState::SecretObserved
-                    ))
-                    || (!bitcoin_module_is_first && execution.state != SwapState::BothFunded)
-                {
+                if !execution.can_refund_module(hns_wallet_types::ModuleId::Bitcoin) {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
                 let (key, fee_reserve) = match side {
@@ -3547,6 +3510,8 @@ impl MobileShakescapeSessionController {
                             || (execution.state == SwapState::Failed
                                 && (execution.first_funding.is_some()
                                     || execution.second_funding.is_some()))
+                            || (execution.state == SwapState::Refunded
+                                && !execution.all_funded_legs_settled())
                     });
                     if now_unix > hello.header.expires_at && !recovery_in_progress {
                         continue;
@@ -3952,7 +3917,7 @@ fn execution_summary(
         second_funding_confirmed: session.second_funding.is_some(),
         first_redemption_confirmed: session.first_redemption.is_some(),
         second_redemption_confirmed: session.second_redemption.is_some(),
-        refund_confirmed: matches!(session.state, SwapState::Refunded),
+        refund_confirmed: session.has_confirmed_refund() && session.all_funded_legs_settled(),
         last_verified_at_unix: session.last_verified_at_unix,
         failure_reason: session.failure_reason,
     })
