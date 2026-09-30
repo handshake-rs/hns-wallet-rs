@@ -421,7 +421,7 @@ impl EmbeddedHnsBackend {
         self.lock()?
             .authority
             .begin_header_round(peers, now_unix)
-            .map_err(map_authority_error)
+            .map_err(map_header_round_error)
     }
 
     /// Release an authority round whose connection-local coordinator metadata
@@ -2632,6 +2632,9 @@ fn map_authority_error(error: impl std::fmt::Display) -> HnsWalletError {
 /// later independent peer round succeeds.
 fn map_header_round_error(error: crate::HnsLightError) -> HnsWalletError {
     match error {
+        crate::HnsLightError::Sync(SyncError::InsufficientPeers) => {
+            HnsWalletError::HeaderRoundInsufficientPeers
+        }
         crate::HnsLightError::Sync(SyncError::InsufficientResponses) => {
             HnsWalletError::HeaderRoundInsufficientResponses
         }
@@ -2689,6 +2692,10 @@ mod tests {
 
     #[test]
     fn header_round_peer_agreement_failure_remains_typed() {
+        assert!(matches!(
+            map_header_round_error(crate::HnsLightError::Sync(SyncError::InsufficientPeers)),
+            HnsWalletError::HeaderRoundInsufficientPeers
+        ));
         assert!(matches!(
             map_header_round_error(crate::HnsLightError::Sync(SyncError::InsufficientAgreement)),
             HnsWalletError::HeaderRoundInsufficientAgreement

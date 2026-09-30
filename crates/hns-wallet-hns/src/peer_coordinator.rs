@@ -2522,7 +2522,7 @@ impl HnsDirectPeerCoordinator {
     ) -> Result<Vec<ConnectedHnsPeer>, HnsDirectPeerError> {
         let dns_error = self.pool.discover_dns().err();
         let mut candidates = self.pool.candidate_addresses()?;
-        if candidates.is_empty() && self.pool.peer_count()? == 0 {
+        if candidates.is_empty() && self.pool.peer_count()? < self.config.minimum_block_views {
             // Every address may have failed during an earlier network outage.
             // Begin a new bounded DNS generation only after the old one is
             // exhausted; the host controls the delay before this call.
@@ -2608,7 +2608,15 @@ impl HnsDirectPeerCoordinator {
         if self.pool.peer_count()? >= self.config.minimum_block_views {
             return Ok(Vec::new());
         }
-        self.connect_available(now_unix)
+        let connected = self.connect_available(now_unix)?;
+        let actual = self.pool.peer_count()?;
+        if actual < self.config.minimum_block_views {
+            return Err(HnsDirectPeerError::InsufficientBlockViews {
+                required: self.config.minimum_block_views,
+                actual,
+            });
+        }
+        Ok(connected)
     }
 
     /// Ask connected standard peers for address gossip and retain only bounded,
@@ -3553,6 +3561,12 @@ impl HnsDirectPeerCoordinator {
     fn header_round_handles(&self) -> Result<Vec<(PeerId, PeerHandle)>, HnsDirectPeerError> {
         let handles = self.pool.ready_handles()?;
         let quorum = self.pool.config.minimum_block_views;
+        if handles.len() < quorum {
+            return Err(HnsDirectPeerError::InsufficientBlockViews {
+                required: quorum,
+                actual: handles.len(),
+            });
+        }
         self.rotating_peer_quorum_handles(handles, quorum, &self.next_header_peer_offset)
     }
 
@@ -5099,7 +5113,8 @@ impl HnsDirectPeerError {
         matches!(
             self,
             Self::Wallet(
-                HnsWalletError::HeaderRoundInsufficientResponses
+                HnsWalletError::HeaderRoundInsufficientPeers
+                    | HnsWalletError::HeaderRoundInsufficientResponses
                     | HnsWalletError::HeaderRoundInsufficientAgreement
             )
         )
@@ -5171,6 +5186,10 @@ mod tests {
 
     #[test]
     fn temporary_header_agreement_failures_remain_distinguishable_from_wallet_faults() {
+        assert!(
+            HnsDirectPeerError::Wallet(HnsWalletError::HeaderRoundInsufficientPeers)
+                .is_temporary_header_agreement_unavailable()
+        );
         assert!(
             HnsDirectPeerError::Wallet(HnsWalletError::HeaderRoundInsufficientResponses)
                 .is_temporary_header_agreement_unavailable()
@@ -5570,6 +5589,10 @@ mod tests {
         let peer_address = listener.local_addr().unwrap();
         let mut peer_config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
         peer_config.static_peers.push(peer_address);
+        // A retained session is useful, but one peer must not masquerade as
+        // the two independent views required for a wallet header round.
+        peer_config.minimum_block_views = 2;
+        peer_config.target_peers = 2;
         let coordinator = open_wallet_direct_hns_peer_coordinator(
             store.clone(),
             &config,
@@ -5631,12 +5654,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reopened.pool().peer_count().unwrap(), 1);
-        assert!(
-            reopened
-                .connect_sync_quorum_available(now + 1)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(matches!(
+            reopened.connect_sync_quorum_available(now + 1),
+            Err(HnsDirectPeerError::InsufficientBlockViews {
+                required: 2,
+                actual: 1
+            })
+        ));
         release_server.send(()).unwrap();
         server.join().unwrap();
     }
