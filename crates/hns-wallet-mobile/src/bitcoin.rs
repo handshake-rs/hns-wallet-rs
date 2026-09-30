@@ -301,6 +301,7 @@ struct PendingMobileBitcoinSend {
 struct PendingMobileBitcoinHtlcFunding {
     action_token: [u8; MOBILE_ACTION_TOKEN_BYTES],
     session_id: SessionId,
+    side: hns_marketplace_protocol::SwapAssetSide,
     prepared: PreparedBitcoinHtlcFunding,
     maximum_fee_sats: u64,
     refund_at_unix: u64,
@@ -1103,6 +1104,7 @@ impl MobileBitcoinValueController {
         self.pending_htlc_funding = Some(PendingMobileBitcoinHtlcFunding {
             action_token,
             session_id,
+            side,
             prepared,
             maximum_fee_sats,
             refund_at_unix: match side {
@@ -1161,14 +1163,29 @@ impl MobileBitcoinValueController {
     }
 
     /// Persist the exact signed HTLC funding bytes before handing their txid
-    /// to Kyoto. Chain-confirmed swap state is advanced separately by the
-    /// local compact-filter verifier, never by this submission receipt.
+    /// to Kyoto. `reauthorization` is a fresh Rust-only capability for the
+    /// same session and side, so a displayed approval cannot outlive revoked
+    /// first-chain evidence. Chain-confirmed swap state is advanced separately
+    /// by the local compact-filter verifier, never by this submission receipt.
     pub fn approve_shakescape_htlc_funding(
         &mut self,
         action_token: &str,
+        reauthorization: MobileShakescapeBitcoinFundingPermit,
     ) -> Result<MobileBitcoinHtlcFundingReceipt, MobileWalletError> {
         self.require_pending_htlc_funding_token(action_token)?;
         let now_unix = now_unix()?;
+        let pending = self
+            .pending_htlc_funding
+            .as_ref()
+            .ok_or(MobileWalletError::NoPendingBitcoinAction)?;
+        if !reauthorization.authorizes_pending_funding(
+            pending.session_id,
+            pending.side,
+            pending.maximum_fee_sats,
+            now_unix,
+        ) {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
         if self
             .pending_htlc_funding
             .as_ref()

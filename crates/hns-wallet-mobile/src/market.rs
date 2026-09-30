@@ -78,6 +78,7 @@ pub struct MobileShakescapeBitcoinFundingPermit {
     hello: SwapSessionHello,
     side: SwapAssetSide,
     bitcoin_fee_reserve_sats: u64,
+    authorization_expires_at_unix: u64,
 }
 
 pub struct MobileShakescapeHnsFundingPermit {
@@ -85,6 +86,7 @@ pub struct MobileShakescapeHnsFundingPermit {
     side: SwapAssetSide,
     settlement_key: hns_wallet_market::CrossChainSwapKey,
     hns_fee_reserve_dollarydoos: u64,
+    authorization_expires_at_unix: u64,
 }
 
 pub struct MobileShakescapeBitcoinWatchPermit {
@@ -235,6 +237,23 @@ impl MobileShakescapeHnsFundingPermit {
     pub(crate) const fn hns_fee_reserve_dollarydoos(&self) -> u64 {
         self.hns_fee_reserve_dollarydoos
     }
+
+    pub(crate) fn authorizes_pending_funding(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+        side: SwapAssetSide,
+        maximum_fee_dollarydoos: u128,
+        now_unix: u64,
+    ) -> bool {
+        self.session_id() == session_id
+            && self.side == side
+            && maximum_fee_dollarydoos <= self.hns_fee_reserve_dollarydoos as u128
+            && now_unix < self.authorization_expires_at_unix
+    }
+
+    const fn session_id(&self) -> hns_wallet_types::SessionId {
+        hns_wallet_types::SessionId::new(self.hello.swap_session_id)
+    }
 }
 
 impl MobileShakescapeBitcoinFundingPermit {
@@ -247,6 +266,23 @@ impl MobileShakescapeBitcoinFundingPermit {
 
     pub(crate) const fn bitcoin_fee_reserve_sats(&self) -> u64 {
         self.bitcoin_fee_reserve_sats
+    }
+
+    pub(crate) fn authorizes_pending_funding(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+        side: SwapAssetSide,
+        maximum_fee_sats: u64,
+        now_unix: u64,
+    ) -> bool {
+        self.session_id() == session_id
+            && self.side == side
+            && maximum_fee_sats <= self.bitcoin_fee_reserve_sats
+            && now_unix < self.authorization_expires_at_unix
+    }
+
+    const fn session_id(&self) -> hns_wallet_types::SessionId {
+        hns_wallet_types::SessionId::new(self.hello.swap_session_id)
     }
 }
 
@@ -261,6 +297,10 @@ impl MobileShakescapeBitcoinAbsencePermit {
 }
 
 const DIRECT_OFFER_APPROVAL_LIFETIME_SECONDS: u64 = 300;
+/// Funding permits cross an in-process controller boundary and are consumed in
+/// the same approval call. A short lifetime prevents an embedding from
+/// retaining a previously current first-chain authorization as a stale lease.
+const SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS: u64 = 30;
 /// The maker commits this much time to complete first-chain funding and let a
 /// one-confirmation Bitcoin lock become locally verified before the taker may
 /// fund the second chain. Mobile participants may be asleep, backgrounded, or
@@ -2215,6 +2255,9 @@ impl MobileShakescapeSessionController {
                     hello,
                     side: SwapAssetSide::Offered,
                     bitcoin_fee_reserve_sats,
+                    authorization_expires_at_unix: now_unix
+                        .checked_add(SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS)
+                        .ok_or(hns_wallet_market::MarketError::InvalidTransition)?,
                 })
             })
             .map_err(MobileWalletError::from)
@@ -2283,6 +2326,9 @@ impl MobileShakescapeSessionController {
                     hello,
                     side: SwapAssetSide::Received,
                     bitcoin_fee_reserve_sats,
+                    authorization_expires_at_unix: now_unix
+                        .checked_add(SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS)
+                        .ok_or(hns_wallet_market::MarketError::InvalidTransition)?,
                 })
             })
             .map_err(MobileWalletError::from)
@@ -2934,6 +2980,9 @@ impl MobileShakescapeSessionController {
                     side: SwapAssetSide::Received,
                     settlement_key,
                     hns_fee_reserve_dollarydoos,
+                    authorization_expires_at_unix: now_unix
+                        .checked_add(SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS)
+                        .ok_or(hns_wallet_market::MarketError::InvalidTransition)?,
                 })
             })
             .map_err(MobileWalletError::from)
@@ -3009,6 +3058,9 @@ impl MobileShakescapeSessionController {
                     side: SwapAssetSide::Offered,
                     settlement_key,
                     hns_fee_reserve_dollarydoos,
+                    authorization_expires_at_unix: now_unix
+                        .checked_add(SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS)
+                        .ok_or(hns_wallet_market::MarketError::InvalidTransition)?,
                 })
             })
             .map_err(MobileWalletError::from)
@@ -5197,6 +5249,36 @@ mod tests {
             permit.hello().swap_session_id,
             offer.offer.session_id.into_bytes()
         );
+        assert!(permit.authorizes_pending_funding(
+            offer.offer.session_id,
+            hns_marketplace_protocol::SwapAssetSide::Offered,
+            1_000,
+            START + 40,
+        ));
+        assert!(!permit.authorizes_pending_funding(
+            hns_wallet_types::SessionId::new([0x44; 32]),
+            hns_marketplace_protocol::SwapAssetSide::Offered,
+            1_000,
+            START + 40,
+        ));
+        assert!(!permit.authorizes_pending_funding(
+            offer.offer.session_id,
+            hns_marketplace_protocol::SwapAssetSide::Received,
+            1_000,
+            START + 40,
+        ));
+        assert!(!permit.authorizes_pending_funding(
+            offer.offer.session_id,
+            hns_marketplace_protocol::SwapAssetSide::Offered,
+            1_001,
+            START + 40,
+        ));
+        assert!(!permit.authorizes_pending_funding(
+            offer.offer.session_id,
+            hns_marketplace_protocol::SwapAssetSide::Offered,
+            1_000,
+            START + 40 + SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS,
+        ));
         assert!(
             verify_first_funding_headroom(
                 permit.hello(),
@@ -5374,6 +5456,36 @@ mod tests {
             offer.offer.session_id.into_bytes()
         );
         assert_eq!(hns_permit.hns_fee_reserve_dollarydoos(), 10_000);
+        assert!(hns_permit.authorizes_pending_funding(
+            offer.offer.session_id,
+            hns_marketplace_protocol::SwapAssetSide::Received,
+            10_000,
+            START + 51,
+        ));
+        assert!(!hns_permit.authorizes_pending_funding(
+            hns_wallet_types::SessionId::new([0x55; 32]),
+            hns_marketplace_protocol::SwapAssetSide::Received,
+            10_000,
+            START + 51,
+        ));
+        assert!(!hns_permit.authorizes_pending_funding(
+            offer.offer.session_id,
+            hns_marketplace_protocol::SwapAssetSide::Offered,
+            10_000,
+            START + 51,
+        ));
+        assert!(!hns_permit.authorizes_pending_funding(
+            offer.offer.session_id,
+            hns_marketplace_protocol::SwapAssetSide::Received,
+            10_001,
+            START + 51,
+        ));
+        assert!(!hns_permit.authorizes_pending_funding(
+            offer.offer.session_id,
+            hns_marketplace_protocol::SwapAssetSide::Received,
+            10_000,
+            START + 51 + SWAP_FUNDING_REAUTHORIZATION_LIFETIME_SECONDS,
+        ));
         assert_eq!(
             taker_controller
                 .durable_executions()

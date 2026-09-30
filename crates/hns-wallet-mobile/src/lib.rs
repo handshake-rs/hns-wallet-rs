@@ -465,6 +465,7 @@ pub struct MobileHnsValueApproval {
 struct PendingMobileShakescapeHnsFunding {
     action_token: [u8; 32],
     session_id: hns_wallet_types::SessionId,
+    side: hns_marketplace_protocol::SwapAssetSide,
     prepared: PreparedSettlementLock,
     maximum_fee: BaseUnits,
 }
@@ -2198,16 +2199,39 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
         self.pending_shakescape_hns_funding = Some(PendingMobileShakescapeHnsFunding {
             action_token,
             session_id,
+            side,
             prepared,
             maximum_fee,
         });
         Ok(approval)
     }
 
+    /// Consume one prepared HNS lock only with a freshly minted Rust-only
+    /// funding capability for the same session, side, and fee authorization.
+    /// This prevents a displayed approval from surviving first-chain evidence
+    /// revocation between preparation and broadcast.
     pub fn approve_shakescape_hns_funding(
         &mut self,
         action_token: &str,
+        reauthorization: MobileShakescapeHnsFundingPermit,
     ) -> Result<MobileShakescapeHnsFundingReceipt, MobileWalletError> {
+        let now_unix = self
+            .session
+            .service
+            .trusted_native_hns_value_now_unix()
+            .map_err(mobile_service_failure)?;
+        let pending = self
+            .pending_shakescape_hns_funding
+            .as_ref()
+            .ok_or(MobileWalletError::NoPendingValueAction)?;
+        if !reauthorization.authorizes_pending_funding(
+            pending.session_id,
+            pending.side,
+            pending.maximum_fee.get(),
+            now_unix,
+        ) {
+            return Err(MobileWalletError::InvalidValueAction);
+        }
         let pending = self
             .pending_shakescape_hns_funding
             .take()
