@@ -75,7 +75,6 @@ pub struct MobileShakescapeSessionController {
 /// the Bitcoin controller. Its fields remain private so Kotlin/Swift cannot
 /// replace signed terms, the session identifier, or the reserved fee cap.
 pub struct MobileShakescapeBitcoinFundingPermit {
-    policy: ShakescapeDirectSwapPolicy,
     hello: SwapSessionHello,
     side: SwapAssetSide,
     bitcoin_fee_reserve_sats: u64,
@@ -132,7 +131,6 @@ impl MobileShakescapeFirstFundingObservation {
 }
 
 pub struct MobileShakescapeBitcoinWatchPermit {
-    policy: ShakescapeDirectSwapPolicy,
     hello: SwapSessionHello,
     side: SwapAssetSide,
     settlement_key: hns_wallet_market::CrossChainSwapKey,
@@ -271,9 +269,6 @@ impl MobileShakescapeHnsVerificationPermit {
 }
 
 impl MobileShakescapeBitcoinWatchPermit {
-    pub(crate) const fn policy(&self) -> ShakescapeDirectSwapPolicy {
-        self.policy
-    }
     pub(crate) const fn hello(&self) -> &SwapSessionHello {
         &self.hello
     }
@@ -336,9 +331,6 @@ impl MobileShakescapeHnsFundingPermit {
 }
 
 impl MobileShakescapeBitcoinFundingPermit {
-    pub(crate) const fn policy(&self) -> ShakescapeDirectSwapPolicy {
-        self.policy
-    }
     pub(crate) const fn hello(&self) -> &SwapSessionHello {
         &self.hello
     }
@@ -1524,7 +1516,7 @@ impl MobileShakescapeSessionController {
         }
         let policy = self.policy;
         self.store
-            .try_with_store_mut(|store| {
+            .try_with_store_mut(|store| -> Result<usize, hns_wallet_market::MarketError> {
                 // Older clients admitted the countersigned hello but did not
                 // open the maker's execution workflow. Once the maker retires
                 // the consumed public offer, a stateless rendezvous cannot
@@ -2426,7 +2418,6 @@ impl MobileShakescapeSessionController {
                 let authorization_expires_at_unix =
                     swap_funding_authorization_expires_at(&hello, now_unix)?;
                 Ok(MobileShakescapeBitcoinFundingPermit {
-                    policy,
                     hello,
                     side: SwapAssetSide::Offered,
                     bitcoin_fee_reserve_sats,
@@ -2525,7 +2516,6 @@ impl MobileShakescapeSessionController {
                     now_unix,
                 )?;
                 Ok(MobileShakescapeBitcoinFundingPermit {
-                    policy,
                     hello,
                     side: SwapAssetSide::Received,
                     bitcoin_fee_reserve_sats,
@@ -2599,7 +2589,6 @@ impl MobileShakescapeSessionController {
                     return Err(hns_wallet_market::MarketError::InvalidTransition);
                 }
                 Ok(MobileShakescapeBitcoinWatchPermit {
-                    policy,
                     hello,
                     side: SwapAssetSide::Offered,
                     settlement_key: taker_key,
@@ -2982,8 +2971,8 @@ impl MobileShakescapeSessionController {
         now_unix: u64,
     ) -> Result<bool, MobileWalletError> {
         let policy = self.policy;
-        self.store
-            .try_with_store_mut(|store| {
+        self.store.try_with_store_mut(
+            |store| -> Result<bool, hns_wallet_market::MarketError> {
                 let execution =
                     hns_wallet_market::load_shakescape_execution(store, &policy, session_id)?
                         .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
@@ -3014,7 +3003,8 @@ impl MobileShakescapeSessionController {
                     now_unix,
                 )?;
                 Ok(true)
-            })
+            },
+        )
             .map_err(MobileWalletError::from)
     }
 
@@ -5984,7 +5974,7 @@ mod tests {
                 .try_with_store(|store| {
                     hns_wallet_market::shakescape_second_funding_broadcast_guard(
                         store,
-                        &policy(),
+                        &policy,
                         offer.offer.session_id,
                         ModuleId::Handshake,
                         hns_permit
@@ -6036,7 +6026,7 @@ mod tests {
                 .try_with_store(|store| {
                     hns_wallet_market::shakescape_second_funding_broadcast_guard(
                         store,
-                        &policy(),
+                        &policy,
                         offer.offer.session_id,
                         ModuleId::Handshake,
                         retried_hns_permit

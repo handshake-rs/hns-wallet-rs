@@ -517,7 +517,7 @@ fn encode_v0_address(network: HnsNetwork, program: &[u8]) -> Result<String, HnsW
     segwit::encode_v0(hrp, program).map_err(|_| HnsWalletError::Address)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WalletCoin {
     pub outpoint: HnsOutpoint,
     pub value: BaseUnits,

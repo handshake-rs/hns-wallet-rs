@@ -2392,8 +2392,9 @@ impl HnsDirectPeerCoordinator {
             .collect::<BTreeSet<_>>();
         scripts.extend(base.scripts);
         scripts.extend(authenticated_scripts.iter().cloned());
-        let watch_set = crate::HnsLightWatchSet::new(scripts, installed.name_hashes)
-            .map_err(|_| HnsDirectPeerError::Wallet(HnsWalletError::InvalidEvidence))?;
+        let watch_set =
+            crate::HnsLightWatchSet::new(scripts.into_iter().collect(), installed.name_hashes)
+                .map_err(|_| HnsDirectPeerError::Wallet(HnsWalletError::InvalidEvidence))?;
         let changed = self
             .backend
             .install_watch_set(watch_set, now_unix)
