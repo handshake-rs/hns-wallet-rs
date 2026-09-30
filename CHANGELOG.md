@@ -3,7 +3,7 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
-## 0.4.0 - 2026-09-29
+## 0.4.0 - 2026-09-30
 
 <!-- hns-wallet-release-state: 0.4.0 release -->
 Canonical account-zero wallet and atomic-swap boundary:
@@ -17,8 +17,12 @@ Canonical account-zero wallet and atomic-swap boundary:
   this replaces the public second-funding authorization signatures so Rust
   consumers must supply the new generation-bound observation and verified lock;
 - reject unrelated, expired, oversized, or mobile-unrepresentable direct coin
-  market rows before they can consume durable capacity, and conservatively
-  prune legacy unowned rows without deleting funded recovery state;
+  market rows and seven-day-exceeding public offers before they can consume
+  durable capacity, and conservatively prune legacy unowned rows without
+  deleting funded recovery state;
+- keep HNS wallet synchronization in verified catch-up when fewer than two
+  independent header peers are available, recycle exhausted seed candidates
+  below quorum, and retry instead of failing at the birthday checkpoint;
 - reconcile ambiguous Shakedex broadcasts before retrying, keep valid name
   listings available beside stale or incompatible rows, preserve zero-value
   name-coin recovery, and refresh terminal purchase height for automatic
