@@ -3,9 +3,9 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
-## 0.3.2 - 2026-09-29
+## 0.4.0 - 2026-09-29
 
-<!-- hns-wallet-release-state: 0.3.2 release -->
+<!-- hns-wallet-release-state: 0.4.0 release -->
 Canonical account-zero wallet and atomic-swap boundary:
 
 - recover both HNS/BTC swap legs independently after redemption, refund,
@@ -14,6 +14,8 @@ Canonical account-zero wallet and atomic-swap boundary:
 - enforce effective cross-chain refund margins and require freshly verified,
   short-lived first-chain authority both when preparing and when broadcasting
   a second-chain lock, including durable revocation after a known reorganization;
+  this replaces the public second-funding authorization signatures so Rust
+  consumers must supply the new generation-bound observation and verified lock;
 - reject unrelated, expired, oversized, or mobile-unrepresentable direct coin
   market rows before they can consume durable capacity, and conservatively
   prune legacy unowned rows without deleting funded recovery state;

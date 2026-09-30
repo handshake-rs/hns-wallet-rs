@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-chain-api"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "hns-wallet-types",
  "serde",
@@ -722,7 +722,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-ffi"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "hns-covenants",
  "hns-wallet-types",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-hns"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "bech32",
  "bip32",
@@ -772,7 +772,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-provider"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "hns-wallet-store",
  "hns-wallet-types",
@@ -785,7 +785,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-service"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "getrandom 0.3.4",
  "hns-covenants",
@@ -807,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-shakedex"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "hex",
  "hns-covenants",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-store"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -846,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-types"
-version = "0.3.2"
+version = "0.4.0"
 dependencies = [
  "hex",
  "serde",
