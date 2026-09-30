@@ -1995,6 +1995,18 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexValueRuntime<'a, B, C> {
         self.store.try_with_store(list_shakedex_value_workflows)
     }
 
+    pub(crate) fn workflow_ids(&self) -> Result<Vec<WorkflowId>, ShakedexError> {
+        self.require_store_authority()?;
+        self.store.try_with_store(|store| {
+            store
+                .list_workflow_ids_complete(
+                    WorkflowKind::ShakedexValue,
+                    MAX_SHAKEDEX_VALUE_WORKFLOWS,
+                )
+                .map_err(ShakedexError::from)
+        })
+    }
+
     pub fn save_prepared(
         &self,
         scope: &HnsShakedexFundingScope,

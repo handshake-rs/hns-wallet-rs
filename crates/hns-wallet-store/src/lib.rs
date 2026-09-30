@@ -2657,6 +2657,41 @@ impl WalletStore {
         Ok(workflows)
     }
 
+    /// Enumerate every workflow identity of one kind within an explicit
+    /// capacity without decrypting its state. Recovery coordinators can then
+    /// load and isolate each authenticated row independently so one damaged
+    /// workflow does not hide unrelated recoverable work.
+    pub fn list_workflow_ids_complete(
+        &self,
+        kind: WorkflowKind,
+        limit: usize,
+    ) -> Result<Vec<WorkflowId>, StoreError> {
+        if limit == 0 || limit > MAX_ENTITY_LIST_RESULTS {
+            return Err(StoreError::InvalidListLimit);
+        }
+        let _key = self.key.as_ref().ok_or(StoreError::Locked)?;
+        let query_limit = limit
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or(StoreError::InvalidListLimit)?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT id FROM workflows WHERE kind=?1 ORDER BY id LIMIT ?2")?;
+        let rows = statement.query_map(params![workflow_kind(kind), query_limit], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(WorkflowId::new(
+                row?.try_into().map_err(|_| StoreError::CorruptMetadata)?,
+            ));
+        }
+        if ids.len() > limit {
+            return Err(StoreError::ListCapacity);
+        }
+        Ok(ids)
+    }
+
     pub fn put_provider_permission(
         &mut self,
         origin: &str,

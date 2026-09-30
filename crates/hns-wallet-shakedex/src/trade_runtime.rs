@@ -149,10 +149,35 @@ pub struct ShakedexStartupRecoveryEntry {
     pub requires_manual_recovery: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShakedexStartupRecoveryOperation {
+    Load,
+    ExpirePrepared,
+    Reconcile,
+    Rebroadcast,
+    ReleaseReservations,
+}
+
+/// A workflow-local recovery failure. Error strings stay inside the native
+/// boundary; this bounded classification keeps the workflow visible without
+/// letting one bad row suppress unrelated marketplace recovery.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShakedexStartupRecoveryFailure {
+    pub workflow_id: WorkflowId,
+    pub previous_stage: Option<ShakedexValueStage>,
+    pub current_stage: Option<ShakedexValueStage>,
+    pub operation: ShakedexStartupRecoveryOperation,
+    pub requires_manual_recovery: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShakedexStartupRecoveryReport {
     pub workflows: Vec<ShakedexStartupRecoveryEntry>,
+    #[serde(default)]
+    pub failures: Vec<ShakedexStartupRecoveryFailure>,
 }
 
 /// One same-store product controller for buyer fulfillment, seller recovery,
@@ -639,11 +664,26 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
             .value
             .load(workflow_id)?
             .ok_or(ShakedexError::InvalidTransition)?;
-        let submitted = match stored.workflow.stage() {
+        let mut submitted = match stored.workflow.stage() {
             ShakedexValueStage::Authorized => self.value.submit(&scope, &stored)?,
-            ShakedexValueStage::RequiresRebroadcast => self.value.rebroadcast(&scope, &stored)?,
+            ShakedexValueStage::RequiresRebroadcast => {
+                let reconciled = self.value.reconcile(&scope, &stored)?;
+                if reconciled.workflow.stage() == ShakedexValueStage::RequiresRebroadcast {
+                    self.value.rebroadcast(&scope, &reconciled)?
+                } else {
+                    reconciled
+                }
+            }
             _ => return Err(ShakedexError::InvalidTransition),
         };
+        if matches!(
+            submitted.workflow.stage(),
+            ShakedexValueStage::Confirmed | ShakedexValueStage::Conflicted
+        ) {
+            submitted = self
+                .value
+                .release_terminal_reservations(&scope, &submitted)?;
+        }
         ShakedexTradePreview::from_stored(self.hns, &submitted)
     }
 
@@ -669,12 +709,36 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         let now_unix = self.hns.shakedex_now_unix()?;
         let scope = self.hns.shakedex_funding_scope()?;
         let mut report = ShakedexStartupRecoveryReport::default();
-        for stored in self.value.list()? {
-            let previous_stage = stored.workflow.stage();
-            let mut current = match previous_stage {
-                ShakedexValueStage::Prepared if stored.workflow.expires_at_unix() <= now_unix => {
-                    self.value.expire_prepared(&scope, &stored)?
+        for workflow_id in self.value.workflow_ids()? {
+            let stored = match self.value.load(workflow_id) {
+                Ok(Some(stored)) => stored,
+                Ok(None) => {
+                    report.failures.push(ShakedexStartupRecoveryFailure {
+                        workflow_id,
+                        previous_stage: None,
+                        current_stage: None,
+                        operation: ShakedexStartupRecoveryOperation::Load,
+                        requires_manual_recovery: true,
+                    });
+                    continue;
                 }
+                Err(error) => {
+                    report.failures.push(ShakedexStartupRecoveryFailure {
+                        workflow_id,
+                        previous_stage: None,
+                        current_stage: None,
+                        operation: ShakedexStartupRecoveryOperation::Load,
+                        requires_manual_recovery: recovery_error_requires_manual(&error),
+                    });
+                    continue;
+                }
+            };
+            let previous_stage = stored.workflow.stage();
+            let (initial, initial_operation) = match previous_stage {
+                ShakedexValueStage::Prepared if stored.workflow.expires_at_unix() <= now_unix => (
+                    self.value.expire_prepared(&scope, &stored),
+                    Some(ShakedexStartupRecoveryOperation::ExpirePrepared),
+                ),
                 ShakedexValueStage::Authorized
                 | ShakedexValueStage::RequiresRebroadcast
                 | ShakedexValueStage::Broadcast
@@ -682,21 +746,60 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
                 | ShakedexValueStage::Confirming
                 | ShakedexValueStage::Confirmed
                 | ShakedexValueStage::Conflicted
-                | ShakedexValueStage::ReservationsReleased => {
-                    self.value.reconcile(&scope, &stored)?
-                }
+                | ShakedexValueStage::ReservationsReleased => (
+                    self.value.reconcile(&scope, &stored),
+                    Some(ShakedexStartupRecoveryOperation::Reconcile),
+                ),
                 ShakedexValueStage::Prepared
                 | ShakedexValueStage::Expired
-                | ShakedexValueStage::Cancelled => stored,
+                | ShakedexValueStage::Cancelled => (Ok(stored), None),
+            };
+            let mut current = match initial {
+                Ok(current) => current,
+                Err(error) => {
+                    report.failures.push(ShakedexStartupRecoveryFailure {
+                        workflow_id,
+                        previous_stage: Some(previous_stage),
+                        current_stage: Some(previous_stage),
+                        operation: initial_operation
+                            .unwrap_or(ShakedexStartupRecoveryOperation::Load),
+                        requires_manual_recovery: recovery_error_requires_manual(&error),
+                    });
+                    continue;
+                }
             };
             if current.workflow.stage() == ShakedexValueStage::RequiresRebroadcast {
-                current = self.value.rebroadcast(&scope, &current)?;
+                current = match self.value.rebroadcast(&scope, &current) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        report.failures.push(ShakedexStartupRecoveryFailure {
+                            workflow_id,
+                            previous_stage: Some(previous_stage),
+                            current_stage: Some(current.workflow.stage()),
+                            operation: ShakedexStartupRecoveryOperation::Rebroadcast,
+                            requires_manual_recovery: recovery_error_requires_manual(&error),
+                        });
+                        continue;
+                    }
+                };
             }
             if matches!(
                 current.workflow.stage(),
                 ShakedexValueStage::Confirmed | ShakedexValueStage::Conflicted
             ) {
-                current = self.value.release_terminal_reservations(&scope, &current)?;
+                current = match self.value.release_terminal_reservations(&scope, &current) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        report.failures.push(ShakedexStartupRecoveryFailure {
+                            workflow_id,
+                            previous_stage: Some(previous_stage),
+                            current_stage: Some(current.workflow.stage()),
+                            operation: ShakedexStartupRecoveryOperation::ReleaseReservations,
+                            requires_manual_recovery: recovery_error_requires_manual(&error),
+                        });
+                        continue;
+                    }
+                };
             }
             let current_stage = current.workflow.stage();
             report.workflows.push(ShakedexStartupRecoveryEntry {
@@ -857,6 +960,15 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
         }
         Ok(submitted)
     }
+}
+
+fn recovery_error_requires_manual(error: &ShakedexError) -> bool {
+    !matches!(
+        error,
+        ShakedexError::HnsBackend(_)
+            | ShakedexError::HnsIntegration(_)
+            | ShakedexError::StaleRevision
+    )
 }
 
 fn automatic_finalize_approval_id(workflow_id: WorkflowId, revision: u64) -> ApprovalId {
