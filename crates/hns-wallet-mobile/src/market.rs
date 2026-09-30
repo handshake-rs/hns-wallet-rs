@@ -2034,7 +2034,9 @@ impl MobileShakescapeSessionController {
                             || session.second_module == hns_wallet_types::ModuleId::Bitcoin)
                             && matches!(
                                 session.state,
-                                SwapState::SecretObserved
+                                SwapState::BothFunded
+                                    | SwapState::FirstRedeemed
+                                    | SwapState::SecretObserved
                                     | SwapState::RefundEligible
                                     | SwapState::RefundBroadcast
                             )

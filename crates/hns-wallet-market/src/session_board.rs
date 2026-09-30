@@ -117,15 +117,20 @@ impl ShakescapeDirectSwapRecord {
             hashlock: terms.map(|terms| ObjectHash::new(terms.hashlock)),
             offered_refund_at_unix: terms.map(|terms| terms.offered_refund_deadline.value),
             received_refund_at_unix: terms.map(|terms| terms.received_refund_deadline.value),
-            last_accepted_at_unix: self
-                .peer_funding_statuses
-                .iter()
-                .map(|status| status.accepted_at_unix)
-                .max()
-                .or(self.watch_ready_accepted_at_unix)
-                .or(self.hello_accepted_at_unix)
-                .or(self.proposal_accepted_at_unix)
-                .unwrap_or(self.acceptance_received_at_unix),
+            last_accepted_at_unix: [
+                Some(self.acceptance_received_at_unix),
+                self.proposal_accepted_at_unix,
+                self.hello_accepted_at_unix,
+                self.watch_ready_accepted_at_unix,
+                self.peer_funding_statuses
+                    .iter()
+                    .map(|status| status.accepted_at_unix)
+                    .max(),
+            ]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(self.acceptance_received_at_unix),
         }
     }
 }

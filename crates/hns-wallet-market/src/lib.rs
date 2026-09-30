@@ -679,8 +679,10 @@ pub fn apply_locally_verified_shakescape_first_redemption(
     let workflow_id = shakescape_execution_workflow_id(session_id);
     let stored =
         load_shakescape_execution_for_local_evidence(store, policy, session_id, workflow_id)?;
-    if stored.state.state != SwapState::BothFunded
-        || spend.module() != stored.state.second_module
+    if !matches!(
+        stored.state.state,
+        SwapState::BothFunded | SwapState::FirstRedeemed | SwapState::SecretObserved
+    ) || spend.module() != stored.state.second_module
         || spend.confirmation_count() == 0
     {
         return Err(MarketError::InvalidTransition);
@@ -691,24 +693,44 @@ pub fn apply_locally_verified_shakescape_first_redemption(
     {
         return Err(MarketError::InvalidEvidence);
     }
-    store.put_secret(
-        &shakescape_observed_preimage_id(session_id),
-        SecretKind::HtlcPreimage,
-        preimage.expose_for_settlement(),
-        now_unix,
-    )?;
     let evidence = spend_evidence_id(&spend);
+    if matches!(
+        stored.state.state,
+        SwapState::FirstRedeemed | SwapState::SecretObserved
+    ) && stored.state.first_redemption != Some(evidence)
+    {
+        return Err(MarketError::InvalidEvidence);
+    }
+    let preimage_id = shakescape_observed_preimage_id(session_id);
+    match store.get_secret(&preimage_id, SecretKind::HtlcPreimage)? {
+        Some(persisted) if persisted.as_slice() != preimage.expose_for_settlement().as_slice() => {
+            return Err(MarketError::InvalidEvidence);
+        }
+        Some(_) => {}
+        None if stored.state.state == SwapState::BothFunded => store.put_secret(
+            &preimage_id,
+            SecretKind::HtlcPreimage,
+            preimage.expose_for_settlement(),
+            now_unix,
+        )?,
+        None => return Err(MarketError::InvalidEvidence),
+    }
     let mut session = stored.state;
+    if session.state == SwapState::SecretObserved {
+        return Ok(session);
+    }
     let mut journal = WalletStoreJournal {
         store,
         workflow_id,
         updated_at_unix: now_unix,
     };
-    session.apply(
-        VerifiedEvidence::FirstRedemptionConfirmed { evidence },
-        now_unix,
-        &mut journal,
-    )?;
+    if session.state == SwapState::BothFunded {
+        session.apply(
+            VerifiedEvidence::FirstRedemptionConfirmed { evidence },
+            now_unix,
+            &mut journal,
+        )?;
+    }
     session.apply(
         VerifiedEvidence::SecretExtracted {
             hashlock: session.hashlock,
