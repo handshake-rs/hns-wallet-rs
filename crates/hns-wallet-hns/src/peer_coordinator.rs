@@ -2597,10 +2597,9 @@ impl HnsDirectPeerCoordinator {
     /// exact header/block quorum so the unlocked runtime has warm failover
     /// sessions. Re-filling that entire reserve between consecutive header
     /// batches can nevertheless put dead-address connection deadlines on the
-    /// foreground critical path even while enough independent peers remain to
-    /// verify the next batch. Preserve the existing pool in that case. If the
-    /// quorum has actually fallen below policy, use the ordinary bounded
-    /// connection/discovery path so recovery behavior is unchanged.
+    /// foreground critical path. Connect only the missing quorum here; the
+    /// ordinary maintenance path may fill the reserve later. Address gossip
+    /// also stays off this latency-sensitive path.
     pub fn connect_sync_quorum_available(
         &self,
         now_unix: u64,
@@ -2608,15 +2607,63 @@ impl HnsDirectPeerCoordinator {
         if self.pool.peer_count()? >= self.config.minimum_block_views {
             return Ok(Vec::new());
         }
-        let connected = self.connect_available(now_unix)?;
-        let actual = self.pool.peer_count()?;
-        if actual < self.config.minimum_block_views {
-            return Err(HnsDirectPeerError::InsufficientBlockViews {
-                required: self.config.minimum_block_views,
-                actual,
-            });
+        let mut candidates = self.pool.candidate_addresses()?;
+        let missing = self
+            .config
+            .minimum_block_views
+            .saturating_sub(self.pool.peer_count()?);
+        if candidates.len() < missing {
+            let _ = self.pool.discover_dns();
+            candidates = self.pool.candidate_addresses()?;
         }
-        Ok(connected)
+        if candidates.is_empty() {
+            // Failed addresses are quarantined until the known set is
+            // exhausted. A later foreground attempt may start a fresh DNS
+            // generation, but it must still connect only the missing quorum.
+            let _ = self.pool.recycle_retired_dns();
+            candidates = self.pool.candidate_addresses()?;
+        }
+        let mut connected = Vec::new();
+        let mut next_candidate = 0;
+        while next_candidate < candidates.len() {
+            let needed = self
+                .config
+                .minimum_block_views
+                .saturating_sub(self.pool.peer_count()?);
+            if needed == 0 {
+                return Ok(connected);
+            }
+            let batch_end = next_candidate.saturating_add(needed).min(candidates.len());
+            let batch = &candidates[next_candidate..batch_end];
+            next_candidate = batch_end;
+            let attempts = std::thread::scope(|scope| {
+                let tasks = batch
+                    .iter()
+                    .copied()
+                    .map(|address| {
+                        scope.spawn(move || (address, self.connect_peer(address, now_unix)))
+                    })
+                    .collect::<Vec<_>>();
+                tasks
+                    .into_iter()
+                    .map(|task| task.join())
+                    .collect::<Vec<_>>()
+            });
+            for attempt in attempts {
+                match attempt {
+                    Ok((_, Ok(peer))) => connected.push(peer),
+                    Ok((address, Err(_))) => self.pool.retire_address(address)?,
+                    Err(_) => return Err(HnsDirectPeerError::WorkerPanicked),
+                }
+            }
+            if self.pool.peer_count()? >= self.config.minimum_block_views {
+                return Ok(connected);
+            }
+        }
+        Err(HnsDirectPeerError::InsufficientBlockViews {
+            required: self.config.minimum_block_views,
+            actual: self.pool.peer_count()?,
+        })
     }
 
     /// Ask connected standard peers for address gossip and retain only bounded,
@@ -5663,6 +5710,96 @@ mod tests {
         ));
         release_server.send(()).unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn foreground_sync_connects_quorum_without_opening_reserve_socket() {
+        let config = direct_wallet_config();
+        let mut wallet =
+            WalletStore::create(":memory:", "foreground quorum test passphrase").unwrap();
+        wallet
+            .put_secret(
+                config.wallet_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[85; 64],
+                1,
+            )
+            .unwrap();
+        let account = crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap();
+        wallet
+            .save_wallet_account(&crate::account_entity_id(&config), 0, &account, 1)
+            .unwrap();
+        let store = hns_wallet_store::SharedWalletStore::new(wallet);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut listeners = (0..3)
+            .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+            .collect::<Vec<_>>();
+        listeners.sort_by_key(|listener| listener.local_addr().unwrap());
+        let reserve = listeners.pop().unwrap();
+        let mut peer_config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
+        peer_config.minimum_block_views = 2;
+        peer_config.target_peers = 3;
+        peer_config.connect_timeout = Duration::from_secs(2);
+        peer_config.static_peers = listeners
+            .iter()
+            .chain(std::iter::once(&reserve))
+            .map(|listener| listener.local_addr().unwrap())
+            .collect();
+        let coordinator =
+            open_wallet_direct_hns_peer_coordinator(store, &config, peer_config, now).unwrap();
+        let servers = listeners
+            .into_iter()
+            .map(|listener| {
+                thread::spawn(move || {
+                    let (mut stream, remote) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut version = light_wallet_version(remote, [86; 8], 0, now);
+                    version.services = SERVICE_NETWORK | SERVICE_BLOOM;
+                    let version_frame = Frame::from_packet(&Packet::Version(version))
+                        .unwrap()
+                        .encode(NetworkMagic::Regtest)
+                        .unwrap();
+                    let verack_frame = Frame::from_packet(&Packet::Verack)
+                        .unwrap()
+                        .encode(NetworkMagic::Regtest)
+                        .unwrap();
+                    let mut decoder = FrameDecoder::new(NetworkMagic::Regtest);
+                    let mut buffer = [0_u8; 8 * 1_024];
+                    loop {
+                        let read = stream.read(&mut buffer).unwrap();
+                        assert_ne!(read, 0, "wallet peer closed before VERSION");
+                        if decoder.push(&buffer[..read]).unwrap().iter().any(|frame| {
+                            matches!(frame.decode_packet().unwrap(), Packet::Version(_))
+                        }) {
+                            stream.write_all(&version_frame).unwrap();
+                            stream.write_all(&verack_frame).unwrap();
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            coordinator
+                .connect_sync_quorum_available(now)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(coordinator.pool().peer_count().unwrap(), 2);
+        reserve.set_nonblocking(true).unwrap();
+        assert_eq!(
+            reserve.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        for server in servers {
+            server.join().unwrap();
+        }
     }
 
     #[test]
