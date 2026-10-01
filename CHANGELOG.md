@@ -3,6 +3,17 @@
 All notable changes to the `hns-wallet-rs` workspace are documented in this
 file. The public crates use a shared version and follow Semantic Versioning.
 
+## 0.4.1 - 2026-10-01
+
+<!-- hns-wallet-release-state: 0.4.1 release -->
+Canonical account-zero wallet and atomic-swap boundary:
+
+- let foreground HNS synchronization connect only the missing independent
+  verification peers, leaving reserve connections and address gossip off the
+  user-visible path; and
+- add a local peer regression that proves a third reserve socket is not opened
+  after the two-peer quorum is established.
+
 ## 0.4.0 - 2026-09-30
 
 <!-- hns-wallet-release-state: 0.4.0 release -->
