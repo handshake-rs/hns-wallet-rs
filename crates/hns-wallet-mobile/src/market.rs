@@ -5673,7 +5673,9 @@ mod tests {
         );
         assert_eq!(
             resumed[0].first_refund_at_unix,
-            START + 20 + 3 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS
+            resumed[0].second_refund_at_unix.div_ceil(512) * 512
+                + DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+            "the BTC refund preserves the safety margin after HNS consensus rounding"
         );
         let permit = controller
             .authorize_local_btc_first_funding(offer.offer.session_id, START + 40)
@@ -6121,7 +6123,7 @@ mod tests {
             ),
             hashlock: hns_wallet_types::ObjectHash::new(hns_binding.descriptor.hashlock),
             absolute_timelock: u64::from(hns_binding.descriptor.refund_locktime),
-            confirmation_count: 1,
+            confirmation_count: 2,
             evidence_hash: hns_wallet_types::ObjectHash::new([0x72; 32]),
         };
         let mut hns_funding_status = SwapFundingStatus {

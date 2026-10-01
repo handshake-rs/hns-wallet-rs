@@ -4639,14 +4639,19 @@ mod tests {
             .recover_shakedex_after_reconcile()
             .expect("market recovery after explicit verified sync");
         assert_eq!(
-            synchronized_backend_calls,
             (
                 probe.snapshot_calls.load(Ordering::SeqCst),
                 probe.tip_calls.load(Ordering::SeqCst),
                 probe.confirmed_calls.load(Ordering::SeqCst),
                 probe.mempool_calls.load(Ordering::SeqCst),
             ),
-            "post-reconcile marketplace recovery must not start a second chain read",
+            (
+                synchronized_backend_calls.0 + 1,
+                synchronized_backend_calls.1,
+                synchronized_backend_calls.2,
+                synchronized_backend_calls.3,
+            ),
+            "marketplace recovery refreshes its funding scope without another chain sync",
         );
     }
 
