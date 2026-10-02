@@ -1179,13 +1179,11 @@ mod tests {
             .insert("bitcoin_fee_reserve_sats".to_owned(), reserve);
 
         assert_eq!(
-            serde_json::from_value::<PersistedLocalDirectOffer>(legacy)
-                .expect("legacy record"),
+            serde_json::from_value::<PersistedLocalDirectOffer>(legacy).expect("legacy record"),
             record
         );
         assert_eq!(
-            serde_json::from_value::<PersistedLocalDirectOffer>(current)
-                .expect("current record"),
+            serde_json::from_value::<PersistedLocalDirectOffer>(current).expect("current record"),
             record
         );
     }
