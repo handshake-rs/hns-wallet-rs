@@ -1,8 +1,16 @@
 # Changelog
 
-This crate uses the shared `hns-wallet-rs` workspace version. Complete release
-notes for every public crate are maintained in the repository-level
+This crate is versioned independently. New release notes belong to this
+package; historical coordinated releases are recorded in the repository-level
 `CHANGELOG.md`.
+
+## 0.4.2 - unreleased
+
+<!-- hns-wallet-release-state: 0.4.2 candidate -->
+This heading describes the current unpublished release candidate, not an
+existing crates.io package, Git tag, or GitHub release.
+
+- Read pre-refactor ShakeScape offer records without losing compatibility with existing mobile wallets.
 
 ## 0.4.1 - 2026-10-01
 

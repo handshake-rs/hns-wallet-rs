@@ -228,7 +228,7 @@ def verify_release_document(repo: Path, order: list[str], version: str) -> None:
     if documented != order:
         fail("docs/releasing.md does not match release/public-crates.txt")
 
-    execute_command = f"./scripts/publish.sh --execute --confirm-publish {version}"
+    execute_command = f"./scripts/publish.sh --execute hns-wallet-hns --confirm-publish {version}"
     if document.count(execute_command) != 2:
         fail("docs/releasing.md does not use the current version in execute examples")
 
@@ -318,7 +318,9 @@ def verify_release_workflows(repo: Path) -> None:
         if re.search(rf"^  {automatic_event}:\s*", workflow, re.MULTILINE):
             fail(f"release preflight workflow must not run on {automatic_event}")
     if workflow.count("run: ./scripts/publish.sh --dry-run") != 1:
-        fail("release preflight workflow must run one complete publish dry-run")
+        fail("release preflight workflow must run one selected publish dry-run")
+    if 'RELEASE_PACKAGE: ${{ inputs.package }}' not in workflow or '--dry-run "$RELEASE_PACKAGE"' not in workflow:
+        fail("release preflight must select one package via a quoted environment variable")
     if "--execute" in workflow:
         fail("release preflight workflow must never execute publication")
     required_exact_commit_fragments = (
@@ -434,6 +436,8 @@ def verify_publish_script_safety(repo: Path) -> None:
             "prerequisite cohorts and path-specific wallet archive checks must precede "
             "resume verification and execute upload"
         )
+    if 'for package in "$requested_package"' not in execute or 'for package in $public_crates' in execute:
+        fail("execution must select exactly one public package")
     classification = execute[classification_position:new_package_position]
     if re.search(
         r'\n\s+\*\)\n\s+echo "error: crates\.io returned HTTP '
@@ -633,6 +637,35 @@ def verify_release_artifacts(repo: Path) -> None:
         fail("Ethereum deployed bytecode length differs from runtimeLength")
 
 
+def internal_requirement_accepts(requirement: str, version: str) -> bool:
+    """Keep compatible patch updates from forcing downstream releases."""
+    def parse(value: str) -> tuple[int, int, int] | None:
+        if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", value) is None:
+            return None
+        return tuple(map(int, value.split(".")))
+
+    lower = parse(requirement.removeprefix("^")) if requirement.startswith("^") else None
+    actual = parse(version)
+    if lower is None or actual is None:
+        return False
+    major, minor, patch = lower
+    upper = (major + 1, 0, 0) if major else ((0, minor + 1, 0) if minor else (0, 0, patch + 1))
+    return lower <= actual < upper
+
+
+def package_release_state(repo: Path, package: dict) -> tuple[str, str]:
+    path = Path(package["manifest_path"]).parent / "CHANGELOG.md"
+    document = path.read_text(encoding="utf-8")
+    version = package["version"]
+    headings = re.findall(rf"^## {re.escape(version)} - (unreleased|\d{{4}}-\d{{2}}-\d{{2}})$", document, re.MULTILINE)
+    if len(headings) != 1:
+        fail(f"{package['name']} must have one changelog heading for {version}")
+    label = headings[0]
+    if label != "unreleased":
+        date.fromisoformat(label)
+    return label, changelog_release_state(document, str(path.relative_to(repo)), version, CRATE_RELEASE_STATE_WORDING)
+
+
 def verify_workspace(
     repo: Path, metadata: dict, order: list[str]
 ) -> tuple[str, str, str]:
@@ -704,8 +737,9 @@ def verify_workspace(
         expected_root = (repo / "crates" / name).resolve()
         if package_root != expected_root:
             fail(f"{name} manifest is outside crates/{name}")
-        if package["version"] != version:
-            fail(f"{name} version {package['version']} differs from workspace {version}")
+        manifest = tomllib.loads((package_root / "Cargo.toml").read_text())
+        if not isinstance(manifest["package"].get("version"), str):
+            fail(f"{name} must declare an independent package version")
         if package.get("publish") != expected_publish:
             fail(f"{name} must publish only to crates-io")
 
@@ -750,8 +784,7 @@ def verify_workspace(
             workspace_license = (repo / license_name).read_bytes()
             if package_license != workspace_license:
                 fail(f"{name} {license_name} differs from the workspace license")
-        if (package_root / "CHANGELOG.md").read_bytes() != template:
-            fail(f"{name} CHANGELOG.md differs from release/CRATE-CHANGELOG.md")
+        package_release_state(repo, package)
 
         for dependency in package["dependencies"]:
             dependency_name = dependency["name"]
@@ -761,8 +794,8 @@ def verify_workspace(
                         f"public package {name} depends on non-allowlisted "
                         f"workspace package {dependency_name}"
                     )
-                expected_requirement = f"^{version}"
-                if dependency["req"] != expected_requirement:
+                expected_requirement = f"a compatible caret range for {packages[dependency_name]['version']}"
+                if not internal_requirement_accepts(dependency["req"], packages[dependency_name]["version"]):
                     fail(
                         f"{name} requires internal {dependency_name} at "
                         f"{dependency['req']}, expected {expected_requirement}"
@@ -831,28 +864,37 @@ def main() -> None:
     parser.add_argument("--toolchain", default="1.89.0")
     parser.add_argument("--require-clean", action="store_true")
     parser.add_argument("--expected-version")
+    parser.add_argument("--package")
     args = parser.parse_args()
 
     repo = Path(__file__).resolve().parent.parent
     order = release_order(repo)
-    version, release_label, release_state = verify_workspace(
-        repo, cargo_metadata(repo, args.toolchain), order
-    )
+    metadata = cargo_metadata(repo, args.toolchain)
+    version, release_label, release_state = verify_workspace(repo, metadata, order)
     verify_protocol_source(repo)
     verify_release_artifacts(repo)
-    verify_release_document(repo, order, version)
+    example_version = next(p["version"] for p in metadata["packages"] if p["name"] == "hns-wallet-hns")
+    verify_release_document(repo, order, example_version)
     verify_release_workflows(repo)
     verify_publish_script_safety(repo)
+    if args.package is not None:
+        if args.package not in order:
+            fail(f"{args.package} is not in the public package allowlist")
+        package = next(p for p in metadata["packages"] if p["name"] == args.package)
+        version = package["version"]
+        release_label, release_state = package_release_state(repo, package)
     if args.expected_version is not None and args.expected_version != version:
         fail(
-            f"confirmed version {args.expected_version} differs from workspace version {version}"
+            f"confirmed version {args.expected_version} differs from selected package version {version}"
         )
     if args.require_clean:
+        if args.package is None:
+            fail("execution requires exactly one --package")
         if release_label == "unreleased":
             fail("execution requires a dated release heading, not 'unreleased'")
         require_execution_release_state(release_state)
         verify_clean_source(repo)
-    print(f"release metadata valid for {len(order)} public crates at version {version}")
+    print(f"release metadata valid for {len(order)} independently versioned public crates")
 
 
 if __name__ == "__main__":

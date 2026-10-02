@@ -8,6 +8,11 @@ on:
         required: true
         type: string
 
+      package:
+        description: One changed public wallet package
+        required: true
+        type: string
+
 permissions:
   contents: read
 
@@ -43,5 +48,7 @@ jobs:
       - name: Install declared Rust toolchain
         run: rustup toolchain install 1.89.0 --profile minimal
 
-      - name: Verify every normalized crates.io package
-        run: ./scripts/publish.sh --dry-run
+      - name: Verify the selected normalized crates.io package
+        env:
+          RELEASE_PACKAGE: ${{ inputs.package }}
+        run: ./scripts/publish.sh --dry-run "$RELEASE_PACKAGE"

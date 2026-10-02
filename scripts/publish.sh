@@ -9,7 +9,8 @@ publish_new_interval_seconds=${PUBLISH_NEW_INTERVAL_SECONDS-605}
 publish_update_interval_seconds=${PUBLISH_UPDATE_INTERVAL_SECONDS-65}
 mode=${1:---dry-run}
 requested_package=${2:-}
-confirmed_version=${3:-}
+confirmation_flag=${3:-}
+confirmed_version=${4:-}
 argument_count=$#
 release_commit=$(git rev-parse HEAD)
 release_tmp=
@@ -41,7 +42,7 @@ cleanup_release_tmp() {
 trap cleanup_release_tmp EXIT HUP INT TERM
 
 usage() {
-    echo "usage: $0 [--archive-only [PUBLIC-PACKAGE]|--dry-run [PUBLIC-PACKAGE]|--execute --confirm-publish VERSION]" >&2
+    echo "usage: $0 [--archive-only [PUBLIC-PACKAGE]|--dry-run [PUBLIC-PACKAGE]|--execute PUBLIC-PACKAGE --confirm-publish VERSION]" >&2
 }
 
 ensure_release_tmp() {
@@ -718,13 +719,16 @@ case "$mode" in
         fi
         ;;
     --execute)
-        if [ "$argument_count" -ne 3 ] ||
-            [ "$requested_package" != "--confirm-publish" ] ||
+        if [ "$argument_count" -ne 4 ] ||
+            [ "$confirmation_flag" != "--confirm-publish" ] ||
             [ -z "$confirmed_version" ]
         then
-            echo "error: irreversible publication requires --confirm-publish VERSION" >&2
+            echo "error: irreversible publication requires PUBLIC-PACKAGE --confirm-publish VERSION" >&2
             exit 2
         fi
+        require_public_crate "$requested_package"
+        # Execution selects exactly one crate; unchanged crates are never uploaded.
+        last_public_crate=$requested_package
         case "$publish_new_interval_seconds" in
             *[!0-9]*|'')
                 echo "error: PUBLISH_NEW_INTERVAL_SECONDS must be a non-negative integer" >&2
@@ -740,6 +744,7 @@ case "$mode" in
         python3 scripts/verify-release.py \
             --toolchain "$rust_toolchain" \
             --require-clean \
+            --package "$requested_package" \
             --expected-version "$confirmed_version"
         require_clean_archive_vcs=yes
         verify_protocol_packages_published
@@ -754,7 +759,7 @@ case "$mode" in
             exit 1
         fi
 
-        for package in $public_crates
+        for package in "$requested_package"
         do
             verify_release_source_unchanged
             version=$(package_version "$package")

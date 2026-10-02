@@ -1,7 +1,7 @@
 # Changelog
 
-This crate uses the shared `hns-wallet-rs` workspace version. Complete release
-notes for every public crate are maintained in the repository-level
+This crate is versioned independently. New release notes belong to this
+package; historical coordinated releases are recorded in the repository-level
 `CHANGELOG.md`.
 
 ## 0.4.1 - 2026-10-01

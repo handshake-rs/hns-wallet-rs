@@ -2216,4 +2216,82 @@ mod tests {
         );
         assert!(reopened.name_proof(name_hash, [1; 32]).unwrap().is_none());
     }
+    #[test]
+    fn reopened_wallet_resumes_completed_scan_without_preexpansion_or_peer_fetch() {
+        let mut config = crate::HnsRuntimeConfig::default_non_value(
+            hns_wallet_types::WalletId::new([93; 16]),
+            AccountId::new([94; 16]),
+            crate::HnsBootstrapPolicy::new(HnsNetwork::Regtest, 1),
+        )
+        .unwrap();
+        config.restore_lookahead = 1;
+        config.minimum_confirmations = 1;
+        let store = store();
+        store
+            .with_store_mut(|wallet| {
+                wallet.put_secret(
+                    config.wallet_id.as_bytes(),
+                    hns_wallet_store::SecretKind::RecoverySeed,
+                    &[95; 64],
+                    1,
+                )?;
+                wallet.save_wallet_account(
+                    &crate::account_entity_id(&config),
+                    0,
+                    &crate::HnsAccountRecord::initial_non_value(config.clone()).unwrap(),
+                    1,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let now = Network::Regtest.parameters().genesis_time.get() + 100;
+        let mut peer_config = crate::HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
+        peer_config.target_peers = 2;
+        let coordinator = crate::open_wallet_direct_hns_peer_coordinator(
+            store.clone(),
+            &config,
+            peer_config.clone(),
+            now,
+        )
+        .unwrap();
+        let watched = coordinator.backend().light_watch_set().unwrap();
+        let (block, header) = verified_block(&watched.scripts[0].hash);
+        let ids = [
+            hns_light_sync::PeerId::new([96; 32]),
+            hns_light_sync::PeerId::new([97; 32]),
+        ];
+        for id in ids {
+            coordinator.backend().add_header_peer(id, 1).unwrap();
+        }
+        for headers in [vec![header], Vec::new()] {
+            let request = coordinator.backend().begin_header_round(&ids, now).unwrap();
+            for id in ids {
+                coordinator
+                    .backend()
+                    .submit_header_response(request.generation, id, headers.clone(), now)
+                    .unwrap();
+            }
+            coordinator.backend().finish_header_round(now).unwrap();
+        }
+        coordinator
+            .backend()
+            .apply_verified_blocks(&[block], now)
+            .unwrap();
+        let before = coordinator.backend().light_scan_status().unwrap();
+        assert_eq!(before.scanned_height, Some(1));
+        drop(coordinator);
+        let reopened =
+            crate::open_wallet_direct_hns_peer_coordinator(store, &config, peer_config, now + 1)
+                .unwrap();
+        assert!(!reopened.prepare_wallet_restore_watch_set(now + 1).unwrap());
+        assert_eq!(reopened.backend().light_watch_set().unwrap(), watched);
+        assert_eq!(reopened.backend().light_scan_status().unwrap(), before);
+        let progress = reopened.scan_wallet_blocks(64, now + 1).unwrap();
+        assert_eq!(progress.blocks_applied, 0);
+        assert_eq!(progress.peer_views_verified, 0);
+        assert_ne!(
+            reopened.backend().header_sync_status().unwrap().state,
+            SyncState::HeaderCurrent
+        );
+    }
 }

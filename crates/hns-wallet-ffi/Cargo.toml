@@ -1,7 +1,7 @@
 [package]
 name = "hns-wallet-ffi"
 description = "Versioned private wallet-service ABI for Android, iOS, and Chromium hosts"
-version.workspace = true
+version = "0.4.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

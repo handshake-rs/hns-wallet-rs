@@ -127,8 +127,10 @@ The dependency-ordered public list is maintained in
 
 ## Version and dependency policy
 
-All sixteen wallet crates use one shared release version. The `0.4.1` source
-uses one canonical hsd/Bob-compatible HNS account
+Wallet crates are versioned and published independently. Compatible dependency
+patches do not require new versions of unchanged consumers. The current source
+prepares `hns-wallet-hns` and `hns-wallet-market` 0.4.2; the other fourteen
+packages remain at 0.4.1. The wallet uses one canonical hsd/Bob-compatible HNS account
 for payments and name ownership, responder-as-maker direct swaps, and
 protocol-specific ShakeDex and atomic-swap keys.
 

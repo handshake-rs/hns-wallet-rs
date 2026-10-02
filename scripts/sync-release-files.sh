@@ -13,7 +13,8 @@ for package in $public_crates
 do
     cp -- LICENSE-APACHE "crates/$package/LICENSE-APACHE"
     cp -- LICENSE-MIT "crates/$package/LICENSE-MIT"
-    cp -- release/CRATE-CHANGELOG.md "crates/$package/CHANGELOG.md"
+    # Package changelogs are maintained independently; never overwrite them.
+    test -s "crates/$package/CHANGELOG.md"
 done
 
 mkdir -p crates/hns-wallet-ffi/abi

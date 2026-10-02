@@ -1,7 +1,7 @@
 [package]
 name = "hns-wallet-bdk-kyoto"
 description = "BDK integration for the reviewed hns-wallet-rs BIP157 transport"
-version.workspace = true
+version = "0.4.1"
 edition = "2021"
 rust-version.workspace = true
 license.workspace = true

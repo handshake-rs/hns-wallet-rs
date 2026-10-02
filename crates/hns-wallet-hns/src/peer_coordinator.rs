@@ -8,8 +8,8 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{
-    Arc, Mutex, MutexGuard,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc, Mutex, MutexGuard, Weak,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1321,12 +1321,132 @@ pub struct NativeHnsPeerPool {
     peers: Mutex<HashMap<PeerId, PeerHandle>>,
     known_addresses: Mutex<HashSet<SocketAddr>>,
     retired_addresses: Mutex<HashSet<SocketAddr>>,
+    disconnected_peers: Mutex<HashSet<PeerId>>,
+    maintenance_started: AtomicBool,
     shakescape_candidates: Arc<Mutex<HnsShakescapeCandidateCache>>,
     last_shakescape_getaddr: Mutex<Option<u64>>,
     shakescape_advertisement: Mutex<Option<HnsShakescapeAdvertisement>>,
     direct_connection_attempts: AtomicU64,
     direct_tcp_connections: AtomicU64,
     last_direct_failure: Mutex<Option<HnsShakescapeDirectFailure>>,
+}
+
+/// Public-header access to the same live sockets used by the wallet. This
+/// weak handle exposes neither filters, store access nor signing authority.
+/// Every consumer must independently validate the returned untrusted headers.
+#[derive(Clone)]
+pub struct HnsPublicHeaderTransport {
+    pool: Weak<NativeHnsPeerPool>,
+    peers_by_address: Arc<Mutex<HashMap<SocketAddr, PeerId>>>,
+}
+
+impl HnsPublicHeaderTransport {
+    /// Network of the live transport, or None after its owner has retired.
+    #[must_use]
+    pub fn network(&self) -> Option<HnsNetwork> {
+        self.pool.upgrade().map(|pool| pool.config.network)
+    }
+
+    /// Keep the public reserve available without changing wallet filters.
+    pub fn connect_reserve(&self, local_height: u32, now: u64) -> Result<(), HnsDirectPeerError> {
+        let pool = self
+            .pool
+            .upgrade()
+            .ok_or(HnsDirectPeerError::NoReadyPeers)?;
+        if pool.peer_count()? >= pool.config.target_peers {
+            return Ok(());
+        }
+        if pool.candidate_addresses()?.is_empty() {
+            let _ = pool.discover_dns();
+        }
+        for address in pool.candidate_addresses()? {
+            if pool.peer_count()? >= pool.config.target_peers {
+                break;
+            }
+            if pool.connect(address, local_height, now).is_err() {
+                pool.retire_address(address)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Addresses are locators, never proof of chain currency.
+    pub fn peer_addresses(&self) -> Result<Vec<SocketAddr>, HnsDirectPeerError> {
+        let pool = self
+            .pool
+            .upgrade()
+            .ok_or(HnsDirectPeerError::NoReadyPeers)?;
+        let snapshot = pool
+            .ready_handles()?
+            .into_iter()
+            .map(|(id, peer)| {
+                peer.lock()
+                    .map(|peer| (peer.address, id))
+                    .map_err(|_| HnsDirectPeerError::RuntimePoisoned)
+            })
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        let addresses = snapshot.keys().copied().collect();
+        *self
+            .peers_by_address
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)? = snapshot;
+        Ok(addresses)
+    }
+
+    /// Fetch public headers on an existing connection, serialized with that
+    /// peer's wallet requests. The handle cannot install a wallet Bloom filter.
+    pub fn request_headers(
+        &self,
+        address: SocketAddr,
+        locator: Vec<[u8; 32]>,
+        stop: [u8; 32],
+        now: u64,
+    ) -> Result<Vec<Header>, HnsDirectPeerError> {
+        let pool = self
+            .pool
+            .upgrade()
+            .ok_or(HnsDirectPeerError::NoReadyPeers)?;
+        // Bind the address before fan-out. Looking through every peer mutex
+        // here would serialize unrelated requests behind the slowest socket.
+        let mut id = self
+            .peers_by_address
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .get(&address)
+            .copied();
+        if id.is_none() {
+            self.peer_addresses()?;
+            id = self
+                .peers_by_address
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                .get(&address)
+                .copied();
+        }
+        let id = id.ok_or(HnsDirectPeerError::NoReadyPeers)?;
+        let handle = pool
+            .lock_peers()?
+            .get(&id)
+            .cloned()
+            .ok_or(HnsDirectPeerError::NoReadyPeers)?;
+        let mut peer = handle
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        let response = peer.request_headers(
+            locator.into_iter().map(BlockHash::new).collect(),
+            BlockHash::new(stop),
+            now,
+        );
+        drop(peer);
+        if response.is_err() {
+            pool.disconnect(id)?;
+            pool.disconnected_peers
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                .insert(id);
+        }
+        response
+    }
 }
 
 /// Wallet-detached standard HSD transport sessions that contain no signing
@@ -1377,6 +1497,8 @@ impl NativeHnsPeerPool {
             peers: Mutex::new(HashMap::new()),
             known_addresses: Mutex::new(known_addresses),
             retired_addresses: Mutex::new(HashSet::new()),
+            disconnected_peers: Mutex::new(HashSet::new()),
+            maintenance_started: AtomicBool::new(false),
             shakescape_candidates: Arc::new(Mutex::new(HnsShakescapeCandidateCache::default())),
             last_shakescape_getaddr: Mutex::new(None),
             shakescape_advertisement: Mutex::new(None),
@@ -1384,6 +1506,49 @@ impl NativeHnsPeerPool {
             direct_tcp_connections: AtomicU64::new(0),
             last_direct_failure: Mutex::new(None),
         })
+    }
+
+    // The worker owns only a Weak transport pool. It cannot keep an unlocked
+    // wallet/store alive, and also services sanitized sessions between opens.
+    fn start_maintenance(self: &Arc<Self>) -> Result<(), HnsDirectPeerError> {
+        if self.maintenance_started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let pool = Arc::downgrade(self);
+        if let Err(error) = std::thread::Builder::new()
+            .name("hns-peer-maintenance".to_owned())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    let Some(pool) = pool.upgrade() else { break };
+                    let _ = pool.service_idle_peers(now_unix_or(0));
+                }
+            })
+        {
+            self.maintenance_started.store(false, Ordering::Release);
+            return Err(HnsDirectPeerError::Io(error.kind()));
+        }
+        Ok(())
+    }
+
+    fn service_idle_peers(&self, now_unix: u64) -> Result<(), HnsDirectPeerError> {
+        for (id, handle) in self.ready_handles()? {
+            let failed = match handle.try_lock() {
+                Ok(mut peer) => peer.service_idle(now_unix).is_err(),
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+                Err(std::sync::TryLockError::Poisoned(_)) => true,
+            };
+            if failed {
+                // A closed idle socket is eligible for reconnection; protocol
+                // incompatibility quarantine belongs to the proof/request path.
+                self.disconnect(id)?;
+                self.disconnected_peers
+                    .lock()
+                    .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                    .insert(id);
+            }
+        }
+        Ok(())
     }
 
     /// Immutable direct-peer policy.
@@ -1832,7 +1997,17 @@ impl NativeHnsPeerPool {
             .copied()
             .filter(|address| !connected.contains(address))
             .collect::<Vec<_>>();
-        candidates.sort_unstable();
+        let connected_groups = connected
+            .iter()
+            .copied()
+            .map(address_group)
+            .collect::<HashSet<_>>();
+        candidates.sort_unstable_by_key(|address| {
+            (
+                connected_groups.contains(&address_group(*address)),
+                *address,
+            )
+        });
         Ok(select_diverse_addresses(candidates, target))
     }
 
@@ -2055,6 +2230,7 @@ impl HnsDirectPeerCoordinator {
                 .advertised_height;
             coordinator.backend.add_header_peer(id, advertised_height)?;
         }
+        coordinator.pool.start_maintenance()?;
         Ok(coordinator)
     }
 
@@ -2243,6 +2419,19 @@ impl HnsDirectPeerCoordinator {
         result.map(Some)
     }
 
+    /// Prepare a first or explicitly rewound recovery scan. An authenticated
+    /// persisted frontier resumes as-is; only an actual missing-watch error
+    /// should request another restoration expansion after that point.
+    pub fn prepare_wallet_restore_watch_set(
+        &self,
+        now_unix: u64,
+    ) -> Result<bool, HnsDirectPeerError> {
+        if self.backend.light_scan_status()?.scanned_height.is_some() {
+            return Ok(false);
+        }
+        self.extend_wallet_restore_watch_set(now_unix)
+    }
+
     /// Extend the wallet-owned direct watch set to the largest bounded restore
     /// frontier and atomically rewind the filtered-block index if it changed.
     ///
@@ -2277,19 +2466,16 @@ impl HnsDirectPeerCoordinator {
             .store
             .try_with_store(|wallet| derive_hns_light_watch_set(wallet, &account))
             .map_err(HnsDirectPeerError::Wallet)?;
-        let mut largest_candidate = None;
-        for extension in 1..=MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS {
-            let candidate = source
-                .store
-                .try_with_store(|wallet| {
-                    derive_hns_light_watch_set_with_restore_extension(wallet, &account, extension)
-                })
-                .map_err(HnsDirectPeerError::Wallet)?;
-            largest_candidate = Some(candidate);
-        }
-        let candidate = largest_candidate.ok_or(HnsDirectPeerError::Wallet(
-            HnsWalletError::ScanCapacityExhausted,
-        ))?;
+        let candidate = source
+            .store
+            .try_with_store(|wallet| {
+                derive_hns_light_watch_set_with_restore_extension(
+                    wallet,
+                    &account,
+                    MAX_WALLET_WATCH_SET_RESTORE_EXTENSIONS,
+                )
+            })
+            .map_err(HnsDirectPeerError::Wallet)?;
         let overlay = self
             .shakescape_hns_htlc_watch_scripts
             .lock()
@@ -2488,6 +2674,15 @@ impl HnsDirectPeerCoordinator {
             .map_err(HnsDirectPeerError::Wallet)
     }
 
+    /// Borrow the public header transport for the browser's chain synchronizer.
+    #[must_use]
+    pub fn public_header_transport(&self) -> HnsPublicHeaderTransport {
+        HnsPublicHeaderTransport {
+            pool: Arc::downgrade(&self.pool),
+            peers_by_address: Arc::default(),
+        }
+    }
+
     /// Shared native peer pool used by the host/mobile runtime.
     #[must_use]
     pub const fn pool(&self) -> &Arc<NativeHnsPeerPool> {
@@ -2513,6 +2708,27 @@ impl HnsDirectPeerCoordinator {
         Ok(connected)
     }
 
+    fn reap_disconnected_peers(&self) -> Result<(), HnsDirectPeerError> {
+        let disconnected = std::mem::take(
+            &mut *self
+                .pool
+                .disconnected_peers
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?,
+        );
+        for id in disconnected {
+            self.disconnect_peer(id)?;
+        }
+        for (id, peer) in self.pool.ready_handles()? {
+            let height = peer
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                .advertised_height;
+            self.backend.add_header_peer(id, height)?;
+        }
+        Ok(())
+    }
+
     /// Resolve DNS seeds and fill the configured persistent outbound target.
     /// Connection attempts run concurrently so one dead address cannot impose
     /// serial timeout latency.
@@ -2520,6 +2736,7 @@ impl HnsDirectPeerCoordinator {
         &self,
         now_unix: u64,
     ) -> Result<Vec<ConnectedHnsPeer>, HnsDirectPeerError> {
+        self.reap_disconnected_peers()?;
         let dns_error = self.pool.discover_dns().err();
         let mut candidates = self.pool.candidate_addresses()?;
         if candidates.is_empty() && self.pool.peer_count()? < self.config.minimum_block_views {
@@ -2604,6 +2821,7 @@ impl HnsDirectPeerCoordinator {
         &self,
         now_unix: u64,
     ) -> Result<Vec<ConnectedHnsPeer>, HnsDirectPeerError> {
+        self.reap_disconnected_peers()?;
         if self.pool.peer_count()? >= self.config.minimum_block_views {
             return Ok(Vec::new());
         }
@@ -4264,6 +4482,44 @@ fn deterministic_watch_set_covers(
 }
 
 impl NativePeer {
+    fn service_idle(&mut self, now_unix: u64) -> Result<(), HnsDirectPeerError> {
+        // Keep writes blocking: a nonblocking partial Pong write would corrupt
+        // framing. Only reads get a short timeout, with partial input retained
+        // in PeerConnection's decoder. A request owns this same peer mutex for
+        // its whole exchange, so maintenance cannot steal its response.
+        let timeout = self
+            .connection
+            .transport_mut()
+            .read_timeout()
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        self.connection
+            .transport_mut()
+            .set_read_timeout(Some(Duration::from_millis(1)))
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        let result = (|| {
+            for _ in 0..32 {
+                match self.receive_peer_event(now_unix) {
+                    Ok(PeerEvent::Rejected(reject)) => {
+                        return Err(HnsDirectPeerError::PeerRejected(format!("{reject:?}")));
+                    }
+                    // Idle inventory is only a hint. Mempool synchronization
+                    // explicitly requests fresh evidence after filter install.
+                    Ok(_) => {}
+                    Err(HnsDirectPeerError::Io(
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut,
+                    )) => break,
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        })();
+        self.connection
+            .transport_mut()
+            .set_read_timeout(timeout)
+            .map_err(|error| HnsDirectPeerError::Io(error.kind()))?;
+        result
+    }
+
     fn receive_peer_event(&mut self, now_unix: u64) -> Result<PeerEvent, HnsDirectPeerError> {
         let event = self.connection.receive_event(now_unix)?;
         if let PeerEvent::Addresses(addresses) = &event {
@@ -4379,7 +4635,8 @@ impl NativePeer {
         stop: BlockHash,
         now_unix: u64,
     ) -> Result<Vec<Header>, HnsDirectPeerError> {
-        self.connection.request_headers(locator, stop, now_unix)?;
+        self.connection
+            .request_headers(locator, stop, now_unix_or(now_unix))?;
         for _ in 0..MAX_RESPONSE_EVENTS {
             match self.receive_peer_event(now_unix_or(now_unix))? {
                 PeerEvent::Headers(headers) => return Ok(headers),
@@ -6903,5 +7160,131 @@ mod tests {
         let filter = wallet_bloom_filter(&elements).unwrap();
         assert!(elements.iter().all(|element| filter.contains(element)));
         assert_eq!(filter.update(), BloomUpdate::All);
+    }
+    #[test]
+    fn idle_public_peer_answers_ping_and_closed_socket_leaves_quorum() {
+        let now = now_unix_or(1);
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sent, ping_sent) = mpsc::channel();
+        let (pong_seen, received_pong) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, remote) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut version = light_wallet_version(remote, [91; 8], 0, now);
+            version.services = SERVICE_NETWORK | SERVICE_BLOOM;
+            let mut decoder = FrameDecoder::new(NetworkMagic::Regtest);
+            let mut buffer = [0; 8192];
+            loop {
+                let read = stream.read(&mut buffer).unwrap();
+                assert_ne!(read, 0);
+                for frame in decoder.push(&buffer[..read]).unwrap() {
+                    match frame.decode_packet().unwrap() {
+                        Packet::Version(_) => {
+                            for packet in [Packet::Version(version.clone()), Packet::Verack] {
+                                stream
+                                    .write_all(
+                                        &Frame::from_packet(&packet)
+                                            .unwrap()
+                                            .encode(NetworkMagic::Regtest)
+                                            .unwrap(),
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                        Packet::Verack => {
+                            stream
+                                .write_all(
+                                    &Frame::from_packet(&Packet::Ping([92; 8]))
+                                        .unwrap()
+                                        .encode(NetworkMagic::Regtest)
+                                        .unwrap(),
+                                )
+                                .unwrap();
+                            sent.send(()).unwrap();
+                        }
+                        Packet::Pong(nonce) => {
+                            assert_eq!(nonce, [92; 8]);
+                            pong_seen.send(()).unwrap();
+                        }
+                        Packet::GetHeaders(_) => {
+                            let headers = vec![Network::Regtest.parameters().genesis_header()];
+                            stream
+                                .write_all(
+                                    &Frame::from_packet(&Packet::Headers(headers))
+                                        .unwrap()
+                                        .encode(NetworkMagic::Regtest)
+                                        .unwrap(),
+                                )
+                                .unwrap();
+                            wait_release.recv_timeout(Duration::from_secs(3)).unwrap();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+        let mut config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
+        config.static_peers.push(address);
+        let pool = Arc::new(NativeHnsPeerPool::new(config).unwrap());
+        let connected = pool.connect(address, 0, now).unwrap();
+        ping_sent.recv_timeout(Duration::from_secs(3)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            pool.service_idle_peers(now).unwrap();
+            if received_pong.try_recv().is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "idle Ping was not answered"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(pool.peer_count().unwrap(), 1);
+        let transport = HnsPublicHeaderTransport {
+            pool: Arc::downgrade(&pool),
+            peers_by_address: Arc::default(),
+        };
+        assert_eq!(transport.peer_addresses().unwrap(), vec![address]);
+        let headers = transport
+            .request_headers(
+                address,
+                vec![Network::Regtest.parameters().genesis_hash.into_bytes()],
+                [0; 32],
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            headers,
+            vec![Network::Regtest.parameters().genesis_header()]
+        );
+        assert_eq!(
+            pool.peer_count().unwrap(),
+            1,
+            "browser reused the wallet handshake"
+        );
+        release.send(()).unwrap();
+        server.join().unwrap();
+        pool.service_idle_peers(now + 1).unwrap();
+        assert_eq!(pool.peer_count().unwrap(), 0);
+        assert!(pool.known_addresses.lock().unwrap().contains(&address));
+        assert!(!pool.retired_addresses.lock().unwrap().contains(&address));
+        assert!(
+            pool.disconnected_peers
+                .lock()
+                .unwrap()
+                .contains(&connected.id)
+        );
+        drop(pool);
+        assert_eq!(
+            transport.network(),
+            None,
+            "browser cannot keep the pool alive"
+        );
     }
 }

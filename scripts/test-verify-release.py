@@ -10,7 +10,7 @@ from typing import Callable
 
 
 REPO = Path(__file__).resolve().parent.parent
-CURRENT_RELEASE_VERSION = "0.4.1"
+CURRENT_RELEASE_VERSION = "0.4.2"
 VALIDATOR = runpy.run_path(str(REPO / "scripts/verify-release.py"))
 verify_state = VALIDATOR["verify_changelog_release_state"]
 require_execution_state = VALIDATOR["require_execution_release_state"]
@@ -236,3 +236,15 @@ expect_publish_script_mutation(
 )
 
 print("release validator mutation regressions passed")
+
+accepts = VALIDATOR["internal_requirement_accepts"]
+assert accepts("^0.4.1", "0.4.2")
+assert accepts("^0.4.1", "0.4.1")
+assert not accepts("^0.4.2", "0.4.1")
+assert not accepts("^0.4.1", "0.5.0")
+assert not accepts("^0.0.1", "0.0.2")
+expect_publish_script_mutation(
+    "execution must select exactly one public package",
+    'for package in "$requested_package"',
+    'for package in $public_crates',
+)

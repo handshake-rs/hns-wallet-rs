@@ -384,6 +384,12 @@ impl EmbeddedHnsBackend {
         advertised_height: u32,
     ) -> Result<(), HnsWalletError> {
         let mut state = self.lock()?;
+        if state.connected_peers.contains(&id) {
+            return state
+                .authority
+                .update_peer_height(id, advertised_height)
+                .map_err(map_authority_error);
+        }
         state
             .authority
             .add_peer(id, advertised_height)

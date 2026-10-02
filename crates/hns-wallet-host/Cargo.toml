@@ -1,7 +1,7 @@
 [package]
 name = "hns-wallet-host"
 description = "Fail-closed ABI-v2 host state machine for wallet browser and mobile adapters"
-version.workspace = true
+version = "0.4.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

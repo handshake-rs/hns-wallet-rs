@@ -1,13 +1,17 @@
 # Releasing
 
-The `hns-wallet-rs` crates use one shared version and are configured for
-dependency-ordered publication to crates.io. A dated source candidate, dry-run,
+The `hns-wallet-rs` crates are versioned and released independently. Publish
+only packages with changes that need distribution. A compatible dependency
+patch does not require a new release of its consumers. The October 1 peer
+quorum fix changed only `hns-wallet-hns`; publishing all 16 crates for it was
+unnecessary. Existing published versions remain historical records. A dated source candidate, dry-run,
 or Git commit is not proof that any package or tag exists. Crates.io releases
 are permanent: an uploaded version cannot be overwritten or deleted.
 
 ## Public package allowlist
 
-The release script publishes only these packages, in dependency order:
+The release script accepts one of these packages per execution. When multiple
+packages actually change, use this dependency order:
 
 1. `hns-wallet-types`
 2. `hns-wallet-store`
@@ -30,11 +34,13 @@ The release script publishes only these packages, in dependency order:
 The cheap release validator fails if this document, the workspace package set,
 the crates.io publish allowlists, or the dependency order diverges from it.
 
-Every internal dependency has both a workspace path and the shared crates.io
-version. Cargo removes the path when it creates a normalized source package.
+Every internal dependency has both a workspace path and a compatible crates.io
+version requirement. Each package declares its own version in its manifest.
+Keep existing consumer requirements when they already accept the new version. Cargo removes the path when it creates a normalized source package.
 Every package carries a README, exact workspace license copies, and a
-package-local changelog that references the canonical shared release notes.
-`scripts/verify-release.py` checks those files, the shared version, required
+package-local changelog. The root notes record historical coordinated releases;
+new package notes belong only to the changed package.
+`scripts/verify-release.py` checks those files, individual package versions, required
 crates.io metadata, internal version requirements, immutable protocol source,
 dependency order, ABI release copies, and Ethereum contract artifact without
 compiling Rust or Solidity.
@@ -42,9 +48,11 @@ Normalized archive inspection materializes complete tar listings and selected
 files before comparison so a successful match cannot hide an upstream tar read
 failure or emit a benign broken-pipe warning.
 
-## 0.4.1 release source
+## Historical 0.4.1 release source
 
-Version `0.4.1` is the current prepared `hns-wallet-rs` release source. The
+Version `0.4.1` records the last coordinated `hns-wallet-rs` release source.
+The current patches prepare only `hns-wallet-hns` and `hns-wallet-market`
+`0.4.2`; the other fourteen package versions remain `0.4.1`. The
 canonical feature inventory is in `CHANGELOG.md`; source packaging, publication,
 or test success does not enable provider, value, settlement, or marketplace
 product gates. Registry and tag state are external facts and must be checked at
@@ -99,22 +107,18 @@ document and verify boundaries; they grant no runtime or deployment authority.
 
 ## Release procedure
 
-1. Update the shared version in the root `Cargo.toml`, every internal dependency
-   version in `[workspace.dependencies]`, `CHANGELOG.md`, and
-   `release/CRATE-CHANGELOG.md`. Use one version-specific `unreleased` heading
-   while developing; do not add a generic `## Unreleased` section outside the
-   selected shared version. Before an upload, date that heading, set the root
-   and package-template canonical release declarations, and synchronize the
-   package copies:
+1. Compare the intended source to its last released commit. Increment only the
+   changed package's explicit `[package].version`, and add its own versioned
+   changelog entry. Retain existing dependency requirements when they accept
+   that version; raise a minimum only when the consumer needs a new API or fix.
+   Update the lockfile and inspect the resulting package/dependency changes.
+   Never increment `[workspace.package].version` to release a single fix: it
+   records the historical coordinated release, not a publication instruction.
+   `sync-release-files.sh` copies common licenses and ABI files without
+   overwriting package changelogs.
 
-   ```bash
-   ./scripts/sync-release-files.sh
-   ```
-
-   The validator rejects an execution attempt whose version heading remains
-   `unreleased`, whose root changelog retains a generic Unreleased section, or
-   whose canonical root/template release-state marker is absent, malformed,
-   mismatched, candidate, or separated from its exact wording.
+   The selected package requires a dated heading and canonical `release`
+   declaration before execution. Other packages may remain on older versions.
 
 2. Run the cheap metadata, argument, and archive-inventory checks while
    preparing the release source. Archive-only mode uses `cargo package
@@ -141,16 +145,17 @@ document and verify boundaries; they grant no runtime or deployment authority.
 
 5. After routine CI succeeds for the exact release source, manually dispatch
    [`.github/workflows/release-preflight.yml`](../.github/workflows/release-preflight.yml)
-   and supply that qualified 40-character commit as `expected_commit`. The
+   and supply that qualified 40-character commit as `expected_commit` and the
+   package name as `package`. The
    workflow checks out and verifies that exact immutable commit. This isolated
-   workflow performs the 16 real normalized publish dry-runs and never receives
+   workflow performs the selected package's normalized publish dry-run and never receives
    credentials or executes publication. The equivalent local command is:
 
    ```bash
-   ./scripts/publish.sh --dry-run
+   ./scripts/publish.sh --dry-run hns-wallet-hns
    ```
 
-   This performs Cargo's real publish dry-run for every package against local
+   This performs Cargo's real publish dry-run for the selected package against local
    dependency patches, then checks each `.crate` archive for the
    common README/license/changelog/manifest inventory, removal of dependency
    source selectors, and exact source-commit metadata. FFI and Ethereum receive
@@ -161,7 +166,8 @@ document and verify boundaries; they grant no runtime or deployment authority.
    ./scripts/publish.sh --dry-run hns-wallet-ffi
    ```
 
-   Partial selection is deliberately unavailable in execution mode.
+   Execution requires exactly one package. The old workspace-wide execute
+   command is rejected before Cargo or registry access.
 
 6. Reconfirm that all current `hns-rs` prerequisites are published and
    provenance-verified, then stop and obtain
@@ -175,10 +181,10 @@ document and verify boundaries; they grant no runtime or deployment authority.
    ```
 
 7. Check the version again and perform the explicitly confirmed upload. The
-   confirmation must equal the workspace version:
+   confirmation must equal the selected package's version:
 
    ```bash
-   ./scripts/publish.sh --execute --confirm-publish 0.4.1
+   ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.2
    ```
 
 Execution mode first downloads all nineteen `hns-rs` `0.5.0` crates, all 20
@@ -212,15 +218,14 @@ limit:
 ```bash
 PUBLISH_NEW_INTERVAL_SECONDS=605 \
 PUBLISH_UPDATE_INTERVAL_SECONDS=65 \
-  ./scripts/publish.sh --execute --confirm-publish 0.4.1
+  ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.2
 ```
 
 After each applicable cooldown, the script downloads the new archive and
-requires the same exact checksum and source-commit identity before attempting
-the next dependent package. If propagation is incomplete, it exits safely;
+requires the same exact checksum and source-commit identity before returning success for the selected package. If propagation is incomplete, it exits safely;
 rerun after the registry API exposes the package so the registry-backed resume
-archive can be verified and the sequence resumed without republishing.
+archive can be verified and the selected upload verified without republishing.
 
-After publication, push an annotated `vX.Y.Z` tag and confirm every package
-page and docs.rs build. Publication cannot be rolled back: yanking can
+After publication, use a package-specific annotated tag such as
+`hns-wallet-hns-vX.Y.Z` and confirm that package's registry page and docs.rs build. Publication cannot be rolled back: yanking can
 discourage new resolution, but cannot delete or replace an uploaded version.

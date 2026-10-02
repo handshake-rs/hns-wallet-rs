@@ -28,35 +28,35 @@ assert_rejected() {
 }
 
 assert_rejected \
-    "irreversible publication requires --confirm-publish VERSION" \
+    "irreversible publication requires PUBLIC-PACKAGE --confirm-publish VERSION" \
     ./scripts/publish.sh --execute
 assert_rejected \
-    "irreversible publication requires --confirm-publish VERSION" \
-    ./scripts/publish.sh --execute --confirm-publish CONFIRMED-VERSION extra
+    "irreversible publication requires PUBLIC-PACKAGE --confirm-publish VERSION" \
+    ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish CONFIRMED-VERSION extra
 assert_rejected \
     "PUBLISH_NEW_INTERVAL_SECONDS must be a non-negative integer" \
     env PUBLISH_NEW_INTERVAL_SECONDS=invalid \
-    ./scripts/publish.sh --execute --confirm-publish CONFIRMED-VERSION
+    ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish CONFIRMED-VERSION
 assert_rejected \
     "PUBLISH_NEW_INTERVAL_SECONDS must be a non-negative integer" \
     env PUBLISH_NEW_INTERVAL_SECONDS=-1 \
-    ./scripts/publish.sh --execute --confirm-publish CONFIRMED-VERSION
+    ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish CONFIRMED-VERSION
 assert_rejected \
     "PUBLISH_NEW_INTERVAL_SECONDS must be a non-negative integer" \
     env PUBLISH_NEW_INTERVAL_SECONDS= \
-    ./scripts/publish.sh --execute --confirm-publish CONFIRMED-VERSION
+    ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish CONFIRMED-VERSION
 assert_rejected \
     "PUBLISH_UPDATE_INTERVAL_SECONDS must be a non-negative integer" \
     env PUBLISH_UPDATE_INTERVAL_SECONDS=invalid \
-    ./scripts/publish.sh --execute --confirm-publish CONFIRMED-VERSION
+    ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish CONFIRMED-VERSION
 assert_rejected \
     "PUBLISH_UPDATE_INTERVAL_SECONDS must be a non-negative integer" \
     env PUBLISH_UPDATE_INTERVAL_SECONDS=-1 \
-    ./scripts/publish.sh --execute --confirm-publish CONFIRMED-VERSION
+    ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish CONFIRMED-VERSION
 assert_rejected \
     "PUBLISH_UPDATE_INTERVAL_SECONDS must be a non-negative integer" \
     env PUBLISH_UPDATE_INTERVAL_SECONDS= \
-    ./scripts/publish.sh --execute --confirm-publish CONFIRMED-VERSION
+    ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish CONFIRMED-VERSION
 assert_rejected \
     "usage:" \
     ./scripts/publish.sh --dry-run hns-wallet-types extra
@@ -68,3 +68,10 @@ assert_rejected \
     ./scripts/publish.sh --archive-only not-a-wallet-package
 
 echo "publish argument validation passed"
+
+assert_rejected \
+    "irreversible publication requires PUBLIC-PACKAGE --confirm-publish VERSION" \
+    ./scripts/publish.sh --execute --confirm-publish 0.4.1
+assert_rejected \
+    "is not in the public package allowlist" \
+    ./scripts/publish.sh --execute --all --confirm-publish 0.4.1
