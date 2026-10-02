@@ -107,6 +107,9 @@ pub(crate) struct PersistedLocalDirectOffer {
     pub(crate) offer_id: ObjectHash,
     pub(crate) session_id: SessionId,
     pub(crate) intent_id: ObjectHash,
+    // Existing v1 records used this name for the reserve in the offered
+    // asset's base unit, including HNS offers. Keep reading those records.
+    #[serde(alias = "bitcoin_fee_reserve_sats")]
     pub(crate) offered_fee_reserve: u64,
     pub(crate) created_at_unix: u64,
 }
@@ -1150,6 +1153,41 @@ mod tests {
             )
             .expect("seed");
         store
+    }
+
+    #[test]
+    fn reads_pre_refactor_local_offer_reserve_without_discarding_it() {
+        let record = PersistedLocalDirectOffer {
+            storage_version: STORAGE_VERSION,
+            wallet_id: WalletId::new([9; 16]),
+            offer_id: ObjectHash::new([7; 32]),
+            session_id: SessionId::new([8; 32]),
+            intent_id: ObjectHash::new([6; 32]),
+            offered_fee_reserve: 1_500,
+            created_at_unix: 100,
+        };
+        let current = serde_json::to_value(&record).expect("serialize current record");
+        let mut legacy = current.clone();
+        let reserve = legacy
+            .as_object_mut()
+            .expect("record object")
+            .remove("offered_fee_reserve")
+            .expect("current reserve");
+        legacy
+            .as_object_mut()
+            .expect("record object")
+            .insert("bitcoin_fee_reserve_sats".to_owned(), reserve);
+
+        assert_eq!(
+            serde_json::from_value::<PersistedLocalDirectOffer>(legacy)
+                .expect("legacy record"),
+            record
+        );
+        assert_eq!(
+            serde_json::from_value::<PersistedLocalDirectOffer>(current)
+                .expect("current record"),
+            record
+        );
     }
 
     #[test]
