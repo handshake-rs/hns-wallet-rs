@@ -139,8 +139,6 @@ The `0.4.1` source pins the exact `hns-rs 0.5.0` protocol cohort and the
 archive checksums and source revisions are recorded in `release/`; the release
 gate reads them back before any wallet upload. See
 [`docs/releasing.md`](docs/releasing.md) for the version and source policy.
-The previous published wallet cohort and release notes are available at
-[`v0.4.0`](https://github.com/handshake-rs/hns-wallet-rs/releases/tag/v0.4.0).
 
 ## Build and qualification
 
@@ -175,7 +173,6 @@ and store-submission qualification.
 - [ShakeDex and market state](docs/SHAKEDEX_AND_MARKET.md)
 - [Provider API](docs/PROVIDER_API.md)
 - [Wallet service ABI](docs/ABI.md)
-- [Implementation status](docs/IMPLEMENTATION_STATUS.md)
 - [Qualification matrix](docs/QUALIFICATION.md)
 - [Release procedure](docs/releasing.md)
 

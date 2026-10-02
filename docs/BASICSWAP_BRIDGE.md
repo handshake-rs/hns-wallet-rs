@@ -161,8 +161,7 @@ delivers a real HNS/BTC offer and bid to BasicSwap handlers and all three exact
 trade envelopes over SMSG v2. The BasicSwap HNS wallet page now reviews
 ordinary sends through this bridge. The funded app route can use either a
 mock SMSG transport or two real Particl regtest nodes; with Particl, both
-trade directions have passed through HSD, HSRD, Bitcoin Core, and SMSG v2
-in one test. The offer row is seeded in that combined test; the separate
+trade directions are covered through HSD, HSRD, Bitcoin Core, and SMSG v2. The offer row is seeded in that combined test; the separate
 Particl test delivers the offer into BasicSwap's handler. The store and process
 tests also cover a wrong old passphrase, atomic rollback on a corrupt late row,
 and the same wallet identity after passphrase rotation and reopening. A rare

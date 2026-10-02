@@ -1,7 +1,7 @@
 # Bitcoin: Kyoto only
 
 Bitcoin has one synchronization implementation: direct P2P with
-`hns-wallet-bip157` 0.4.0 and `hns-wallet-bdk-kyoto` 0.4.0, derived from
+`hns-wallet-bip157` and `hns-wallet-bdk-kyoto`, derived from
 `bip157` 0.6.3 and `bdk_kyoto` 0.17.1, feeding a BIP84 `bdk_wallet` 3.1.0
 wallet.
 There is no Esplora, Electrum, hosted indexer, or Bitcoin Core RPC production
@@ -78,7 +78,7 @@ One protected `bitcoin_wallet_state` snapshot plus account-bound
 `bitcoin_wallet_changeset` journal durably own BDK's public descriptors,
 revealed derivations, local-chain checkpoints, relevant transactions, and
 wallet outputs. New writes use strict snapshot format v2 and authenticated,
-monotonic delta records; legacy format-v1 snapshots remain readable. Each
+monotonic delta records. Each
 ordinary persistence operation atomically advances an authenticated monotonic
 journal head and encrypts only its staged delta. After 32 active deltas, the
 persister commits an authoritative aggregate snapshot before pruning the
@@ -271,15 +271,8 @@ state, and independently verified spend observations.
 
 ## Qualification and benchmarks
 
-On 2026-08-03, the targeted allocation filter passed from a disposable NVMe
-checkout and NVMe target directory: `cargo test --locked -p
-hns-wallet-bitcoin-kyoto swap_key_store::tests -- --test-threads=1` reported 10
-passed, 0 failed, and 8 filtered out. No standalone build/check, full workspace
-gate, optimized RocksDB compilation, network test, or benchmark was run in that
-historical event. The allocation, encrypted BDK persistence, and ahead-tip
-crash regressions are now also covered by exact `2229be8` complete workspace CI.
-Those historical results predate the connected value-runtime candidate and do
-not qualify the current source revision.
+Run the source and installed-product checks in [QUALIFICATION.md](QUALIFICATION.md).
+Measure these scenarios against the exact candidate:
 
 | Scenario | Disk | Bandwidth | Usable balance | Full scan | Peak mobile memory |
 | --- | ---: | ---: | ---: | ---: | ---: |

@@ -31,7 +31,7 @@ Handshake:
 The method vocabulary is stable even when a capability is unavailable. The HNS
 runtime now persists split proof/current canonical summaries, exact current
 resource bytes, and account-bound ownership/transfer direction after fresh
-reconciliation; legacy rows stay explicitly watch-only. A library-only service
+reconciliation; unauthenticated rows stay explicitly watch-only. A library-only service
 composition now dispatches the non-value account, balance, transaction,
 receive-target, and scoped known-name methods from fresh synchronized wallet
 state. It is not selected by the checked-in executable or an installed browser
@@ -104,7 +104,7 @@ connection. The service reads the current generation from that store; it never
 accepts one from a request. The first grant is
 generation one and every later grant/revocation is exactly the stored generation
 plus one. An Accounts grant also retains a bounded exact set of approved
-wallet-local account IDs. A legacy or generic grant that claims Accounts
+wallet-local account IDs. A grant that claims Accounts
 without that set fails closed. Every approved permission change carries the
 generation authenticated by its prompt into the persisted compare-and-swap;
 if another grant or revocation wins first, the old approval is stale and cannot
@@ -265,6 +265,5 @@ stale approval, locked wallet, and unavailable module/backend are distinct
 errors. Errors minimize account and policy disclosure.
 
 The provider/ABI/service/host account-join, synchronized-runtime,
-scoped-permission, and public-projection regressions are included in the exact
-CI evidence recorded in `QUALIFICATION.md`. Installed-browser and product
-chain-runtime qualification remain pending.
+scoped-permission, and public-projection regressions must be exercised through the gates in [qualification](QUALIFICATION.md).
+Installed-browser and product chain-runtime behavior require their own checks.

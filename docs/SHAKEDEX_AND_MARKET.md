@@ -31,7 +31,7 @@ without pretending those bytes prove current ownership. Shakescape offer and
 cancellation decoders return typed protocol results rather than
 unauthenticated wire objects.
 
-The dormant value-planning boundary now has typed canonical adapters for the
+The value-planning boundary has typed canonical adapters for the
 three script-controlled transaction shapes needed after a name reaches its
 Shakedex lock. Buyer fulfillment is reconstructed through the signed proof's
 canonical fulfillment builder, with the seller input and payment kept in their
@@ -103,7 +103,7 @@ source and ordered funding coins, recipient, value, fee and fee maximum,
 confirmation policy, expiry, prepared bytes, signed bytes, final fee quote,
 submission fence, and chain observations. Loading the row re-decodes and
 revalidates those relationships; persisted fee-quote bindings remain
-authenticated historical evidence and do not claim that a snapshot is still
+authenticated persisted evidence and do not claim that a snapshot is still
 current.
 
 Preparation atomically saves that child with protected `ShakedexSource` and
@@ -249,13 +249,13 @@ before later use, verifies the persisted canonical listing against that exact
 coin/network/time, and finally fences the unchanged board revision and row.
 Both board projections use the targeted path above when the hash hits; a
 missing index uses the full semantic fallback.
-Its non-serializable result is evidence for an enclosing, still-gated value
+Its non-serializable result is evidence for an enclosing value
 workflow, not permission to sign or broadcast. This join performs no Shakescape
 transport or relay I/O. The HRM draft supplies the current manifest root and
 HNSA is an HRM `hns.named-service/v1` profile; neither an HRM/HNSA lineage nor
 an endpoint-signed relay receipt substitutes for current HNS locking-coin
-authority. Every canonical Shakescape and Shakedex value product gate remains
-`false`.
+authority. Source gates are enabled; native value operations additionally require current
+chain evidence and an exact approval.
 
 The board also accepts exactly one canonical V2 `GetOffer` envelope through a
 closed read boundary. Shakescape requires a nonzero correlation ID for both this
@@ -406,13 +406,10 @@ seller-key allocation, purpose-bound signing, current/unspent lock acquisition,
 active-chain NameState/renewal evidence, parent-MTP authority, exact protected
 reservations, final-byte approval and fee evidence, persist-before-broadcast,
 and chain-state reconciliation are present in source for buyer fulfillment,
-seller recovery, and seller-script FINALIZE. The fixed release gates remain
-`false`. Product-owned coin selection, product/startup orchestration, live
-Shakescape/provider/trusted-UI integration, and complete
-regtest/restart/reorg/product qualification are still required before any gate
-can change. The current regressions are covered by the exact CI evidence in
-`QUALIFICATION.md`; focused historical runs do not replace product or network
-qualification. Reverse Dutch is deferred.
+seller recovery, and seller-script FINALIZE. Source gates are enabled. Native
+mobile controllers supply coin selection and approvals; the exact shipping
+product requires regtest, restart/reorg, and signed-device qualification. The required regression and product qualification procedures are described in
+`QUALIFICATION.md`. Reverse Dutch is deferred.
 
 `ShakedexValueRuntime` is now the only public orchestration surface for those
 aggregate value transitions. It proves literal shared-store identity at

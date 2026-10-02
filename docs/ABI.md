@@ -1,9 +1,8 @@
 # Private wallet service ABI v2
 
-ABI v2 is a deliberate replacement for the unreleased v1 value decoder. There
-is no v1 compatibility decoder and no byte-vector origin context. Existing
-browser manifests that require v1 must continue to report the provider
-unavailable until a coordinated released v2 artifact is installed.
+Private wallet service clients negotiate ABI version 2. Unknown ABI versions
+fail closed. The browser provider remains unavailable until its independently
+qualified artifact and authority integration are installed.
 
 Every frame is exactly one four-byte big-endian payload length followed by one
 strict JSON object. Unknown fields, empty frames, trailing bytes, partial
@@ -189,11 +188,10 @@ reads and writes v2 frames on inherited standard streams. The database path is
 trusted launcher configuration, never a website request; the passphrase is
 accepted only as the ABI-owned zeroizing unlock secret. A production Chromium
 launcher must supply private child pipes and a separately released signed
-artifact. The downstream Shakescape Android/iOS `1.0.4` source drives published
-wallet `0.2.1` through separately maintained JNI/C wrappers and a wallet-owned
-direct-peer backend. Those wrappers are a trusted-native product surface, not
-a website provider, and their store/installed-device evidence does not qualify
-this ABI package. Filesystem paths, process commands, raw signing,
+artifact. Shakescape's Android and iOS consumers use separately maintained native wrappers
+and direct peer controllers. Their trusted-native surface does not expose a
+website provider or qualify this private service ABI.
+Filesystem paths, process commands, raw signing,
 recovery output, private keys, database keys, preimages, and arbitrary contract
 calls are absent from the protocol.
 
@@ -253,8 +251,5 @@ signature verification, durable rollback state, artifact hashing, and the
 release gate are not implemented here, so artifact/runtime availability stays
 false.
 
-The host and contract regressions passed exact `2229be8` workspace CI;
-the earlier `ba9f013` result remains a historical baseline. Exact run records
-are in [`QUALIFICATION.md`](QUALIFICATION.md). Installed browser/mobile-provider
-adoption and artifact-authenticity evidence belongs to downstream products and
-does not change this private ABI or any fixed availability gate.
+Qualify the selected source with [the current procedure](QUALIFICATION.md).
+Installed product adoption and artifact authentication remain product-owned.

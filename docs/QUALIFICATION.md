@@ -1,316 +1,50 @@
-# Qualification matrix
+# Qualification
 
-Historical snapshot: 2026-09-02. Release-cohort review: 2026-09-28. This file records source-scoped evidence and the durable
-qualification procedure, not transient workflow or registry state. Unit
-coverage, source packaging, or publication never authorizes mainnet value.
-Evidence is attached to exact commits and is not inherited automatically by
-later source.
+Qualify the exact source commit being delivered. A test, package archive,
+registry entry, or successful workflow does not independently authorize a
+wallet operation. Runtime evidence and native approval remain mandatory.
 
-The complete
-[`CI` run `31420628974`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31420628974),
-[`CodeQL` run `31420627924`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31420627924),
-and manually dispatched
-[`14-crate release preflight` run `31424201574`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31424201574)
-all succeeded for exact qualified implementation source
-`2229be849557d58a8eb723bcc03349f0f2df9796` on 2026-08-10. The locked gate
-includes atomic native bootstrap, synchronized mobile HNS reads, script-free
-initial chain binding and wrong-network rejection, approval-v3 provider framing,
-Shakedex purpose separation, encrypted BDK persistence, and deterministic
-Ethereum contract checks. The isolated preflight normalized and verified all 14
-publishable crates without credentials or upload authority.
+## Source checks
 
-Exact implementation commit `ba9f013a098679fe8e3d812a7e09020803e27d53`
-also passed historical
-[`CI` run `31383987461`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31383987461)
-and
-[`CodeQL` run `31383987478`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31383987478).
-That baseline predates the final mobile script-free binding order and is retained
-only as historical evidence.
+Use Rust 1.89.0 with the committed lockfile:
 
-Exact historical qualified implementation source
-`bc5901f794450d29fa9f5630bab4fbf91e37bedf` passed complete locked
-[`CI` run `31812028843`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31812028843),
-including Wallet qualification and RustSec, and
-[`CodeQL` run `31812028405`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/31812028405)
-for Actions, JavaScript/TypeScript, Rust, and Python on 2026-08-14. This records
-the wallet source with its current dependency pin, HNWR-v2 name-target, and
-trusted exact-name-import tranche. Later implementation or release-source
-commits must receive
-their own exact workflow records before upload. No source workflow result
-supplies product, network, value, or release-gate authority.
-
-Published `hns-rs` `0.4.1` release source
-`73611a0d83778e157b35f28ca2197d068e83fc61` passed its complete
-[`CI run`](https://github.com/handshake-rs/hns-rs/actions/runs/33492052293),
-[`CodeQL run`](https://github.com/handshake-rs/hns-rs/actions/runs/33492052309),
-and [`19-package release preflight`](https://github.com/handshake-rs/hns-rs/actions/runs/33492499333).
-All 19 archive checksums are recorded in `release/hns-rs-0.4.1-crates.sha256`.
-Published `hns-dane-engine` `0.2.2` release source
-`b7fdf8826c81b77650a0f740d1f05314b74969f9` passed its complete
-[`CI run`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/32643678964),
-[`CodeQL run`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/32643677191),
-and [`20-package release preflight`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/32643680641).
-All 20 archive checksums are recorded in
-`release/hns-dane-engine-0.2.2-crates.sha256`. The compatible engine
-light-client `0.2.3` patch source
-`87d2346c13ade4987801e0f1367bd604fd77c9f0` passed its complete
-[`CI run`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/33498122962),
-[`CodeQL run`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/33498122737),
-and
-[`four-package release preflight`](https://github.com/handshake-rs/hns-dane-engine/actions/runs/33499010562).
-Its four archive checksums are recorded in
-`release/hns-dane-engine-light-client-0.2.3-crates.sha256`. These are historical
-upstream and wallet-source records. The current `0.4.0` release graph uses
-`hns-rs 0.5.0` from source `60eb912d615243a6bfb9741b17f16833c5a9181a`
-and the engine light-client `0.2.6` cohort from source
-`90a5dfeb5b7c00e8fea010e79f82076de4263fd6`, with archive checksums in
-`release/hns-rs-0.5.0-crates.sha256` and
-`release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256`. Unchanged engine
-contracts still use the published `0.2.2` cohort. Exact wallet-source
-qualification requires its own locked CI, CodeQL, and normalized preflight.
-
-Exact `0.3.0` wallet release source
-`a76e9bad20bb0089f1eb8b8fb6429431e2b3955e` passed its complete locked
-[`CI` run `36521685055`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36521685055),
-[`CodeQL` run `36521684714`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36521684714),
-and all 16 normalized packages in
-[`release preflight` run `36522116509`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36522116509).
-All 16 published archives were downloaded again and checked against crates.io
-API checksums and the exact source commit; their SHA-256 values are recorded in
-`release/hns-wallet-rs-0.3.0-crates.sha256`.
-These source and archive checks do not qualify an installed Android or iOS
-product or an unattended mainnet value operation.
-
-Exact `0.3.1` wallet release source
-`780514d8e3cf4c393885a422b457e1bc5ff7f5da` passed its complete locked
-[`CI` run `36606752756`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36606752756),
-[`CodeQL` run `36606752055`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36606752055),
-and all 16 normalized packages in
-[`release preflight` run `36608632564`](https://github.com/handshake-rs/hns-wallet-rs/actions/runs/36608632564).
-All 16 published archives were downloaded again and checked against crates.io
-API checksums and the exact source commit; their SHA-256 values are recorded in
-`release/hns-wallet-rs-0.3.1-crates.sha256`.
-These source and archive checks do not qualify an installed Android or iOS
-product or an unattended mainnet value operation.
-
-| Area | Exact source evidence | Persistence/restart and reorg | Product/network evidence | Release status |
-| --- | --- | --- | --- | --- |
-| Types and chain traits | complete locked workspace CI passed at `2229be8` | n/a | no product dependency | exact source recorded; API review remains |
-| Encrypted store/schema v3 | exact `2229be8` CI passed, including atomic bootstrap, rollback, migrations, encrypted CRUD/CAS, and Unix filesystem regressions | source reopen/restart tests; no installed Android/iOS secure-store runtime evidence in this package boundary | Shakescape `1.0.4` contains Keystore/Keychain wrapping, but device filesystem/runtime qualification remains external | platform qualification remains product-owned |
-| HNS wallet and names | exact historical `bc5901f` CI passed, including bootstrap, synchronized reads, script-free initial binding, purpose separation, dedicated name targets, trusted exact-text import, name workflows, and fail-closed value-evidence checks | source restart/reorg paths; no multi-process regtest | the current `0.4.0` release graph uses published `hns-rs 0.5.0`, engine light-client `0.2.6`, and unchanged engine contracts at `0.2.2`; wallet `0.4.0` exact-source CI, preflight, and archive readback are release gates; installed-product and live-chain evidence remains product-owned | HNS funding, value, and fee source gates enabled; exact wallet hosted qualification and live product qualification remain pending |
-| Provider core | exact `2229be8` CI passed, including account binding, scoped reads, exact Names consent, and unavailable-method ordering | grants persist; pending approval/UI authority remains process-local | no installed-browser wallet consent or backend E2E | browser and value exposure unavailable |
-| Fixed-price Shakedex | exact `2229be8` CI passed, including canonical listing, FINALIZE, reservation, terminal-release, and release-gate tests | source reopen/conflict/reorg/finality tests; no multi-process regtest | no live Shakescape, provider, trusted UI, or product coin selection | Shakedex and dependent HNS value source gates enabled; live product integration pending |
-| Market sessions | exact `2229be8` workspace CI passed | CAS journal source; recovery evidence incomplete | no pair E2E, rendezvous, or relay transport | unavailable |
-| Bitcoin Kyoto | historical `2229be8` CI plus current candidate coverage for encrypted BDK persistence, allocation, bilateral HTLC funding/settlement, restart resumption, and conflicting-input exclusion | exact source restart resume and reorg tests; no installed multi-process rollback run | Android/iOS product wiring present; installed live P2P swap not recorded here | send and atomic settlement enabled through the private trusted-mobile permit; normalized or chunked backend remains future capacity work |
-| Ethereum | exact `2229be8` CI and deterministic contract check passed | offline derivation and dormant primitives only | no embedded Helios/local-chain run; no contract audit | synchronization, history, send, signing, settlement, and mainnet unavailable |
-| ABI, service, and host | exact `2229be8` CI passed, including canonical framed projections, approval-v3, session handling, and host retention | private process session/authority state; no installed restart E2E | downstream browser/future-mobile-provider adoption and rendering pending; trusted-native reads are a separate non-provider surface | private control only; browser/value unavailable |
-| Mobile controller | exact historical `bc5901f` CI passed the lifecycle, synchronized-read, same-authority, fresh-read, script-free snapshot, zero-script-query wrong-network, trusted import, and failure-lock/retry regressions; published `0.2.1` adds the coherent protocol graph and abandoned-header-round recovery | atomic seed/account bootstrap and source reopen coverage; installed platform restart evidence remains downstream | Shakescape Android/iOS `1.0.4` consumes the exact published cohort through JNI/C/Kotlin/Swift trusted UI, direct HNS peers, exact-text import, HNS value/name actions, and guarded Bitcoin value; live-network, resource, store, and physical-device conclusions remain product-owned | native controller/value composition is published; provider exposure remains unavailable and installed cross-chain settlement evidence remains open |
-| Browser products | separate repositories | mobile integration is present; Chromium provider integration remains pending | current mobile store submissions do not qualify this package, and no installed Chromium wallet E2E exists | trusted native mobile only; website-provider wallet/value access unavailable |
-
-The later native-HNS-read profile/bootstrap tranche adds local source regressions
-for encrypted-at-rest provisioning, closed nested schema, locked and partial
-bootstrap denial, exact-account matching, concurrent CAS, timestamp rollback,
-restart persistence, deletion-protected revocation tombstones,
-revoke/re-provision ABA prevention, unknown-schema revocation, and public
-non-Serde/non-Clone secret containment. The process-local bootstrap tests add
-wrong-secret/absent/revoked/stale/value-profile failure locking, exact
-unlock-load-lock-construct-internal-unlock-revalidation, closed six-request
-service admission, live profile rotation/revocation invalidation, and drop-time
-locking. This is not installed-browser or desktop-broker evidence. Persisted
-credentials additionally reject JSON escape bytes to avoid non-zeroizing
-parser scratch allocations. This does not qualify a live node credential,
-exclusive cross-process lease, one-shot secret transport, or read operation,
-and changes no provider, browser, value, or publication gate.
-
-The historical-flag recovery tranche adds focused local source regressions for
-mainnet/testnet value and settlement identity, ordinary/full-constructor
-rejection, exact account/profile/revision matching, restart, chain/mempool and
-live-revocation fences, an exact capability set without provider dispatch or
-persistent permissions, and a real protected Shakedex anchor/high-water pair
-whose authenticated recovery read leaves bytes and revisions unchanged while
-missing/corrupt pairs fail closed. This evidence does not qualify installed
-transport, provider exposure, signing, settlement, value, or any release gate.
-
-The later operation-level read tranche adds local source regressions for the
-closed `hnsReadOperationsV1` wire marker, its required `walletOperations`
-dependency, the dedicated six-request host admission path, and strict
-non-settlement/HNS-only response correlation. Only the full synchronized HNS
-read runtime advertises the marker; the account-only runtime and checked-in
-control executable do not. This is contract/source evidence, not a native
-launcher, installed extension, signed artifact, live node, or availability
-qualification. Closed-enum ABI-v2 consumers must adopt the marker in lockstep.
-
-Exact historical source commit `77d891cf320f83ecb580e378d1987b3048c5c9ad`
-added the former Shakescape relay-acceptance persistence. Its 24 Shakedex library
-tests passed again from an isolated clean checkout with the concurrent wallet
-publisher files absent; focused warning-denied Clippy and rustdoc also passed.
-That evidence covers canonical endpoint signatures, exact receipt replay and
-conflict, the then-current migration denial, and restart self-validation only. It
-was not hosted CI or CodeQL at that intermediate commit; the code is included
-in exact descendant `bc5901f`, whose qualified CI and CodeQL passed. Neither
-record supplies live relay/HRM/HNSA authority, board currentness,
-installed-product, or value-gate qualification.
-
-The board-cancellation tranche adds focused local source regressions for the
-signature/content-authenticated lookup phase, selected-account network/time and
-full-selector revision fence, zero-backend-call admission after lock spend,
-wrong registry/family/signature/network/seller/time rejection, monotonic
-tombstone sequences, zero request ID at the offline board boundary, restart
-watermark preservation, cross-network exact-retry rejection, and exact no-write
-retry after signed expiry. This was local rather than exact-commit CI at the
-intermediate tranche. The source regressions are included in exact descendant
-`bc5901f`'s passed gate; live transport/product/value qualification remains
-absent and no release gate changes.
-
-The closed single-offer board-read tranche adds focused source regressions for
-canonical V2 singular `GetOffer`/`Offer` correlation, mandatory nonzero request
-IDs, wrong registry and every other request/response family, malformed and
-trailing input, typed missing/cancelled absence without node queries, exact
-read-only repeat, restart reacquisition, spent/expired/wrong-network/stale
-chain and mempool evidence, and deterministic board replacement during the
-current-lock query. A selected-account mutation during runtime clock
-observation is also fenced after the clock returns. The opaque plan retains no
-response bytes and exposes no listing, lock, transport, provider, or value
-capability. These regressions are included in exact descendant `bc5901f`'s
-passed CI and CodeQL; that changes no product or release gate.
-
-The closed board-inventory tranche adds focused source regressions for exact
-canonical V2 `GetOfferInventory`/`OfferInventory` correlation, mandatory
-nonzero request IDs, valid empty inventory, wrong registry and every other
-request/response family, malformed and trailing input, and rejection before
-account clock or backend access. Read-only repeat and encrypted restart retain
-the board revision; cancellation, not-yet-active, expired, and wrong-current-
-network rows are omitted with zero node calls. A selected-account mutation
-during trusted clock observation fails closed. The opaque plan retains current
-hashes and account context privately but exposes neither hashes nor response
-bytes and exposes no listing, lock, transport, provider, or value capability.
-These regressions passed exact-commit CI/CodeQL at `9649098` and change no
-release gate.
-
-The HNSA/HRM network-magic correction adds a public-boundary signed-receipt
-regression with an exact zero-valued configured magic and nonzero genesis. It
-persists and reopens the terminal receipt, preserves exact idempotent replay,
-and rejects an otherwise valid receipt whose configured magic is one without
-mutating the prepared row. Zero is therefore neither a sentinel nor a
-wildcard; policy fingerprints, receipt signatures, and handoff comparison
-continue to bind its exact four-byte little-endian encoding. No release gate
-changes. Exact descendant `2061a27e0358c7f00fcc70497ef97f9b89d569da`
-passed complete locked CI `31818578772` and four-language CodeQL
-`31818578297`; the correction remains source evidence only.
-
-The closed batch-offer board-read tranche adds focused local source
-regressions for canonical V2 `GetOffers`, the wallet/type-5 limit of 64 before
-store/backend/clock access despite the protocol's larger request bound, typed
-all-absent board identity without an invalid empty response, exact sorted
-request ordering, missing/cancelled subset behavior, aggregate response-shape
-preflight, and one coherent current-lock batch across three returned offers.
-It also covers shared seller-script deduplication, duplicate underlying names
-failing before backend/clock access, unchanged-board read behavior, exact full
-requested-row and revision races, listing expiry, and unchanged false gates.
-The opaque public projection contains only request ID, board revision, and
-requested/returned counts. Exact source
-`3f52586c8befd85d21df5bb89a7ceb0097a0f2bb` passed complete locked CI
-`31837067925`, including Wallet qualification and RustSec, and four-language
-CodeQL `31837067848`. This supplies no transport, provider, publication,
-signing, or value qualification.
-
-The settled normalized-board persistence and query-scale working-tree tranche
-contains focused source regressions for coherent read snapshots; bounded,
-sorted, never-authoritative prefix metadata; ciphertext-fingerprinted lease
-refresh; exact-prefix-set insertion, revision, capacity, and same-metadata ABA
-races; cross-kind guard rollback; compare-only assertions; and invalid assertion
-or lease shape. Board regressions cover compact `Head` selectors that
-bind row identity/revision/time/value commitment/listing hash, exact derived
-listing-index ID sets, all-hit targeted selection, miss-triggered full semantic
-fallback, selected-row ciphertext ABA, selector permutation/remapping,
-commitment and bijection checks, missing/extra/substituted/torn state, strict
-nested schemas, monotonic identity lineage, unchanged-row physical revision
-retention, per-record head/row bounds, and a cryptographically real 32-row
-roundtrip. Aggregate and pre-index formats are now rejected rather than migrated.
-Runtime regressions cover selected-wallet account lease
-capture before external work, refresh in the same account-plus-board snapshot,
-the second ciphertext-fingerprinted write guard, and the read-only/non-atomic
-unchanged-account diagnostic distinction.
-
-Local final-source runs passed 40 Store library tests, 73 HNS library tests, 44
-Shakedex library tests with one ignored, and 26 Shakescape board-runtime integration
-tests. The focused normalized-storage cohort contains 16 tests with the same one
-ignored; it is an overlapping subset, not 16 additional independent
-tests. The ignored case was then run explicitly in optimized release mode: the
-4,096-row persistence qualification passed 1/1 in 16.31 seconds of test time.
-
-These are local working-tree results, not exact-commit hosted evidence. No
-exact-commit CI or CodeQL record, database or broader resource benchmark,
-multi-process network test, installed-product evidence, or live transport
-evidence has yet been recorded for this tranche. It changes no release gate and
-must not inherit any earlier commit's evidence.
-
-`3f52586`, `b8c430d`, `2061a27`, `9649098`, `bc5901f`, `2229be8`, and
-`ba9f013` remain exact historical green CI/CodeQL baselines.
-This repository records no independent security audit, database or resource
-benchmark, multi-process network test, installed-device run, or installed-
-browser wallet run for the package boundary. Downstream candidate source does
-not enable these fixed gates.
-
-## Qualification commands
-
-The routine workspace gate is:
-
-```bash
+```sh
+cargo +1.89.0 fmt --all --check
+cargo +1.89.0 clippy --workspace --all-targets --locked -- -D warnings
+cargo +1.89.0 test --workspace --all-targets --locked
 ./scripts/check.sh
 ```
 
-It performs release metadata and archive-inventory validation, formatting, a
-locked all-target check, warning-denied Clippy, tests, warning-denied docs,
-dependency/source-policy checks, deterministic Solidity artifact comparison,
-and the npm high-severity audit. Its archive pass uses `cargo package
---no-verify`; it does not repeat package compilation.
+The complete gate includes release metadata, argument validation, ABI
+contracts and vectors, deterministic contract artifacts, and package inventory.
+For publication, run the selected normalized package preflight described in
+[releasing.md](releasing.md). CI, security review, and preflight must qualify
+the same immutable source commit.
 
-The 14 real normalized `cargo publish --dry-run` checks are intentionally
-separate. After routine CI succeeds for the exact candidate, manually dispatch
-`.github/workflows/release-preflight.yml` with that qualified 40-character SHA
-as `expected_commit`. The workflow verifies the exact checkout, has no
-publication credentials, and cannot execute an upload.
+## Runtime qualification
 
-## Fixed release gates
+| Boundary | Required checks |
+| --- | --- |
+| Encrypted store | Atomic bootstrap, authenticated schema and CAS, restart, rollback, lock authority, private filesystem policy, and platform key wrapping |
+| HNS scan | Multi-peer header agreement, Merkle and Urkel verification, saved scan resume, watch-set expansion, reorg, stale evidence, and peer replacement |
+| Names and sends | Exact selected account and network, active Coin and covenant, fees from final bytes, approval fences, persist-before-broadcast, and mempool conflicts |
+| Provider | Exact origin and generation, bounded vocabulary and consent, revocation, replay, and unavailable-method rejection |
+| ShakeDex and market | Signed terms and exact reservations, bilateral identity, funding and settlement evidence, cancellation, restart, refunds, and terminal-release safety |
+| Bitcoin Kyoto | Compact-filter scans, encrypted BDK state, recovery-start selection, approved sends, bilateral HTLCs, reorg, and conflicting-input exclusion |
+| Ethereum | Offline derivation and deterministic contract checks; synchronization, value, and settlement remain unavailable |
+| ABI and hosts | Closed schemas, bounded frames, panic containment, allocator pairing, stale handles, and process lifecycle |
+| Mobile | Android and iOS source gates, signed artifacts, installed-device restart and scan resume, current UI, and native review |
 
-Every Ethereum synchronization, value, settlement, and mainnet gate remains
-`false`. The Bitcoin value-runtime gate is enabled in the current candidate
-after connecting the durable product coordinator, bilateral funding watches,
-redeem/refund recovery, exact approved-broadcast resumption, and committed-input
-exclusion. Publication and installed-product qualification remain separate
-release evidence; enabling this source gate does not claim either one occurred.
+Do not reset a wallet or erase device diagnostics to make qualification pass.
+Capture existing logs before filtering them. Verify on-device behavior against
+its exact binary and source identity. Simulator and host tests do not establish
+physical-device behavior or store acceptance.
 
-The HNS value, HNS fee-quote, HNS Shakedex-funding, and three Shakedex source
-gates are enabled. Their live operation remains conditional on the applicable
-wallet configuration and its exact chain, mempool, ownership, fee, approval,
-and persistence evidence. Product and installed-runtime qualification are
-separate deliverables, not reasons to retain an intentionally disabled HNS
-value path.
+## Capability gates
 
-Changing any gate requires new exact-commit evidence for its complete adapter,
-persistence, restart/reorg, negative, installed-product, resource, and review
-boundary. Neither a package version increment nor successful publication is a
-gate-change authorization.
-
-## Publication prerequisites
-
-As a historical record, all 17 required hns-rs 0.2.0 archives were published to
-crates.io and provenance-verified on 2026-08-14 at exact source commit
-`b24b66c382de53330ec21dd3137e056a2bea3e2d`. That superseded record does not
-satisfy the current release prerequisite.
-
-Before any wallet upload, execute mode rechecks all 19 published `hns-rs`
-`0.5.0` archives against `release/hns-rs-0.5.0-crates.sha256` and source
-`60eb912d615243a6bfb9741b17f16833c5a9181a`, and all 20 published
-`hns-dane-engine` `0.2.2` archives against
-`release/hns-dane-engine-0.2.2-crates.sha256` and source
-`b7fdf8826c81b77650a0f740d1f05314b74969f9`.
-The compatible light-client `0.2.6` cohort is additionally bound to engine
-source `90a5dfeb5b7c00e8fea010e79f82076de4263fd6` by
-`release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256`. Execute mode verifies
-crates.io API checksums/non-yanked status, archive SHA-256, and clean
-`crates/<package>` VCS identity for all four patch packages before it constructs
-or uploads a wallet archive. Any missing or different upstream provenance
-aborts execution. Actual publication remains a separate, explicitly authorized
-human action. No runtime gate changes.
+Inspect the immutable source gates and authenticated runtime configuration
+before declaring a capability available. HNS value and fees require their
+native account, current verified evidence, and approval paths. Bitcoin send
+and settlement require the trusted-mobile Kyoto permit. Website-provider
+wallet/value exposure is unavailable. Ethereum synchronization, history,
+signing, value, settlement, and chain ID 1 remain unavailable.

@@ -5,13 +5,9 @@ authenticated `hns-node-rs` wallet RPC v1 contract, including its additive
 script-free chain-snapshot and pruning-safe name-action-context-v2 calls. It
 implements `HnsBackend`; the node supplies
 canonical chain evidence and broadcast admission while the wallet alone derives
-keys, signs, approves, and persists workflows. The node never signs. Exact
-wallet/node commit pairing remains required qualification evidence. The
-script-free call was introduced at node source
-`2b267ffe7fc6f9929063a18986a83b566d02ae6d`; selected qualified node main
-`4275b4e06a07ae3a4afe2db72bdd7c58d2fb1661` contains that unchanged API plus
-the additive pruning-safe action context. This records compatibility evidence
-and does not make the node a wallet dependency.
+keys, signs, approves, and persists workflows. The node never signs. Qualify the selected wallet and node sources together before relying on the
+contract. The adapter remains a separate evidence source rather than an
+embedded node dependency.
 
 ## Trusted configuration and transport
 
@@ -76,19 +72,18 @@ tip. Confirmed cursors are opaque bytes tied to the exact sorted ScriptId set.
 Mempool pages add a nonzero process-instance nonce and generation; both remain
 exact across all continuations, gap-limit expansion, transaction/parent reads,
 and workflow reconciliation. Any difference discards the partial snapshot.
-`get_chain_tip` remains available for legacy/value workflows that have not been
+`get_chain_tip` remains available for workflows that have not been
 admitted to the product read composition.
 
-This ordering removes the earlier pre-script privacy blocker. It does not widen
-transport eligibility: `HnsNodeRpcConfig` remains authenticated loopback-only,
+This ordering protects wallet script privacy before network identity is verified.
+Transport eligibility remains bounded: `HnsNodeRpcConfig` remains authenticated loopback-only,
 and production Android/iOS transport, lifecycle, resource, and installed-network
 qualification remain external product gates.
 
 Every current tip also carries the HSD-compatible median time past computed by
 the node from that tip and up to ten ancestors inside the same immutable read.
-The wallet wire field is mandatory. Legacy persisted bindings decode with zero
-only for compatibility and cannot authorize Shakedex execution until a fresh
-node snapshot replaces them.
+The wallet wire field is mandatory. A persisted binding without authenticated
+median-time evidence cannot authorize execution; reacquire a fresh node snapshot.
 
 The canonical account-zero external/change branches and the `HnsShakedex`
 32-byte lock branch use separate bounded script queries. Each later query is
@@ -144,7 +139,7 @@ projecting the quote into wallet state. The wallet supplies the exact ordered
 input coins reconstructed from persisted inclusion/address/covenant evidence;
 the adapter and final workflow validator independently recompute weight,
 sigops, sigop-adjusted policy virtual size, minimum fee, and actual fee with the
-pinned `hns-script` implementation. Legacy rows without that evidence and any
+pinned `hns-script` implementation. Rows without that evidence and any
 outpoint/covenant/name-lock mismatch are unusable as inputs.
 
 The send and exposed settlement signing paths are wired to sign first and quote
@@ -227,11 +222,10 @@ sources, an invented transaction position, or a zero process nonce fail closed.
 
 Wallet-owned TRANSFER and direct-FINALIZE preparation and every later authority
 reacquisition select version 2. The Coin address must match exactly one
-persisted `HnsName` derivation before the ephemeral result can feed a dormant
+persisted `HnsName` derivation before the ephemeral result can feed an approved
 signing workflow. New persisted plans retain canonical serializable Coin
-evidence; legacy v1 plans remain decodable, but a later v2 reacquisition does
-not silently upgrade their approval and instead requires replacement through
-the existing reapproval path. Shakedex descriptor-linked verification retains
+evidence. Reacquisition must match the persisted authority binding; a changed
+binding requires replacement through the explicit reapproval path. Shakedex descriptor-linked verification retains
 version 1 because it also proves that the TRANSFER transaction spent a specific
 locking outpoint; v2 does not return that previous input and the wallet does not
 invent it.

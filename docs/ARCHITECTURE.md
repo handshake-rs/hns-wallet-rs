@@ -26,7 +26,7 @@ recorded in `release/hns-rs-0.5.0-crates.sha256`. The direct light-wallet
 dependencies use the published `hns-dane-engine` `0.2.6` source
 `90a5dfeb5b7c00e8fea010e79f82076de4263fd6`, recorded in
 `release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256`. Unchanged engine
-contracts remain pinned to the earlier `0.2.2` cohort. The wallet owns protocol
+contracts remain pinned to the `0.2.2` foundation packages. The wallet owns protocol
 verification, encrypted replay/tombstone board state, direct-offer cancellation
 state, and a direct-session journal.
 Node indexes
@@ -37,6 +37,20 @@ semantics, approvals, typed canonical transaction planning, and recoverable
 application workflows. The wallet owns an encrypted direct-offer board and
 direct-session journal. Neither a board row nor its live-level aggregation owns
 relay, live-chain, quote, value, or release-gate authority.
+
+## Native peer synchronization
+
+The direct HNS controller retains negotiated peer sessions across wallet work.
+A weak maintenance worker services idle protocol traffic and permits clean
+reconnection when a socket closes. Browser consumers can register a weak public
+header transport and reuse those sockets while independently validating and
+publishing their own chain state. The transport grants no signing authority and
+does not retain an unlocked wallet.
+
+Wallet reopen continues authenticated saved scan coverage. Initial restoration
+prepares the derivation window once; explicit discovery or newly added watch
+interests may require replay. Persisted coverage never substitutes for fresh
+header agreement, mempool evidence, or per-operation approval.
 
 ## Crate boundaries
 
@@ -94,8 +108,8 @@ through a script-free chain snapshot. It verifies the configured network's
 exact genesis at height zero under that binding before deriving or transmitting
 any ScriptId, then requires the same tip and explicit epoch on the first
 confirmed query. Wrong-network results therefore trigger zero confirmed or
-mempool script queries. This removes the earlier protocol-ordering privacy
-blocker, but does not provide production transport: the concrete adapter remains
+mempool script queries. This protects script privacy before network identity is verified, and requires
+separate production transport qualification: the concrete adapter remains
 authenticated loopback-only, and product device/remote transport requires its
 own security and installed-network qualification. Fresh history also requires
 raw transaction bytes unless the authenticated wallet already cached them, so
@@ -127,7 +141,7 @@ trailing scan gap only for exact wallet-owned, incoming-transfer, or
 outgoing-transfer account-zero derivations. WalletAccount and KnownName use one
 atomic CAS batch; watch-only/non-wallet imports never advance derivation state.
 
-Historical persisted accounts with a value or settlement bit set have one
+Persisted accounts with a value or settlement bit set have one
 explicit recovery-only opening path. Structural validation is separated from
 ordinary authority validation, but the bits remain authenticated identity and
 never become capability. The public core wrapper exposes only exact account
@@ -156,13 +170,6 @@ adopt that versioned shape. Native mobile known-name display is separate from
 provider consent and can only minimize already-persisted names; it adds no name
 import or provider path.
 
-The earlier value-capable `HnsWalletRuntime` still owns a private
-`Mutex<WalletStore>` and its legacy full reconciliation holds that mutex across
-backend work. The synchronized provider read composition does not use that
-path. Removing the legacy lock span remains required before any future value or
-product composition may select it; the new read runtime does not change either
-false HNS value gate.
-
 HNS preparation authenticates the current account, workflow, and reservation
 revisions before atomically committing change-index advancement, the prepared
 workflow, and every input reservation. The cache changes only after commit.
@@ -182,7 +189,7 @@ the ordered reconstructed consensus coins: published registry `hns-script`
 `0.5.0` source `60eb912d615243a6bfb9741b17f16833c5a9181a` computes sigops,
 policy virtual size, minimum fee, and standard weight/sigop bounds, while exact
 input/output sums independently reproduce actual fee.
-Legacy or mismatched evidence fails closed. The source gate
+Missing or mismatched evidence fails closed. The source gate
 `HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED` is enabled: the wallet uses the
 reviewed immutable `hns-script` implementation and never a local copy of the
 node formula. Multi-process, installed-product, resource, and independent
@@ -201,7 +208,7 @@ name covenant and typed TRANSFER/FINALIZE shape, and accepts current resource
 bytes only from the decoded state. Current control is attributed only when the
 owner address exactly matches a persisted account-zero external program; incoming and
 outgoing transfers are distinguished. Reconciliation replaces this encrypted
-cache across restart/reorg, while legacy rows stay explicitly watch-only until
+cache across restart/reorg, while unauthenticated rows stay explicitly watch-only until
 fresh evidence succeeds. Cache state cannot authorize an action: the runtime
 must reacquire a non-serializable authority at the exact current snapshot.
 
@@ -240,7 +247,7 @@ changes, exact signed witnesses, fee algebra, and state-transition invariants.
 The FINALIZE structural variant additionally fixes the exact signed
 buyer-fulfillment or seller-recovery parent action/bytes/hash, TRANSFER
 transaction and output-zero coin, current NameState and owner inclusion,
-historical snapshot/mempool binding, and renewal evidence. These serialized
+recorded snapshot/mempool binding, and renewal evidence. These serialized
 facts never reconstruct the ephemeral current-TRANSFER authority. Fresh
 authority may carry advanced binding tokens only when the stable descriptor,
 transaction/coin, owner inclusion, NameState, and renewal identity is exact.
@@ -262,11 +269,8 @@ or an authenticated competing spender reaches that threshold under the same
 snapshot binding. The terminal workflow evidence and deletion of every
 protected row commit in one CAS transaction. Later reconciliation audits that
 terminal evidence without recreating reservations or rolling the workflow back;
-loss or change of terminal finality returns a recovery-required error. Source
-FINALIZE regressions passed the exact `bc5901f` workspace gate; product/startup,
-live-node, and multi-process restart/reorg qualification remain pending, and
-that pending product evidence does not disable the enabled HNS/Shakedex source
-gates.
+loss or change of terminal finality returns a recovery-required error. Product and network qualification must cover restart, reorg, finality, and
+concurrent writers against the exact selected source.
 
 Approval bytes encode the exact prepared aggregate and CAS revision. The HNS
 runtime owns time. Buyer fulfillment and seller recovery can enter only the
@@ -275,7 +279,7 @@ can enter only with a freshly reacquired exact current TRANSFER. Save and
 authorization reacquire that authority, while submission reacquires it for the
 quote and again immediately before the broadcast fence. The runtime
 requires exact live current/reacquired binding equality within each of those
-immediate HNS operations; it does not compare a fresh binding to the historical
+immediate HNS operations; it does not compare a fresh binding to the persisted
 construction tokens.
 It authenticates the unchanged pending approval, preserves script input zero, and
 signs only the ordinary funding suffix. It returns the approval unconsumed so
@@ -291,10 +295,9 @@ one runtime-owned chain snapshot. The aggregate derives mempool, confirming,
 confirmed, conflicted, and same-byte rebroadcast states; disappearance after a
 confirmation rolls back to `RequiresRebroadcast`, and an `Authorized` row can
 recover if its exact bytes were observed outside the recorded submit path.
-Persisted quote bindings are historical evidence only, and no caller-authored
-clock or chain status restores authority after restart. Product coin selection,
-live Shakescape/provider/trusted-UI integration, and full
-restart/reorg/regtest qualification remain pending. All Shakedex and dependent
+Persisted quote bindings are recorded evidence only, and no caller-authored
+clock or chain status restores authority after restart. Native mobile controllers supply product coin selection and approvals. Their
+signed-device and network qualification remains a separate release requirement. All Shakedex and dependent
 HNS Shakedex-funding/value/fee source gates are enabled. Preparation,
 authorization, and submission still require their complete fresh-evidence,
 approval, persistence, and product-integration boundaries.
@@ -310,9 +313,8 @@ neither the trusted-node UTXO projection nor contextual eligibility asserts
 wallet ownership. TRANSFER preserves the name value at canonical input/output
 zero. Direct FINALIZE derives its destination from the authenticated TRANSFER
 covenant and is signed by the outgoing owner's `HnsName` key;
-incoming-recipient classification is not signing authority. Legacy persisted
-version-1 plans remain decodable but cannot silently inherit version-2
-authority and require reapproval. Shakedex descriptor-linked TRANSFER
+incoming-recipient classification is not signing authority. Reacquisition must
+match the prepared authority binding; a changed binding requires reapproval. Shakedex descriptor-linked TRANSFER
 verification retains version 1 because it separately binds the owner
 transaction's previous input; the Coin-only v2 projection must not invent that
 linkage.
@@ -331,21 +333,14 @@ wallet reacquires again against the final fee quote's exact snapshot before it
 persists or submits signed bytes; changed source or FINALIZE renewal terms move
 the workflow to `ReapprovalRequired` for explicit cancellation and replacement.
 
-The concrete synchronous HNS adapter speaks the authenticated loopback
-`hns-node-rs` wallet RPC v1 boundary whose script-free `chain_snapshot` source
-was introduced at exact node commit
-`2b267ffe7fc6f9929063a18986a83b566d02ae6d`. Selected qualified node main
-`4275b4e06a07ae3a4afe2db72bdd7c58d2fb1661` contains that unchanged API plus
-the additive pruning-safe `name_action_context_v2` method. This is
-an exact compatibility pairing, not a Cargo dependency or claim that a node is
-embedded in the wallet. The adapter derives canonical ScriptIds, enforces full
-chain/mempool bindings, and validates HTTP, JSON, transaction, spender, name,
-and HSD median-time evidence without giving the node signing authority. Source
-CI passed for both counterparts; the complete enclosing product runtime and
-network qualification remain pending. `HNS_VALUE_RUNTIME_RELEASE_QUALIFIED`
-therefore remains false and HNS value capabilities are not advertised. See
-[HNS_NODE_RPC.md](HNS_NODE_RPC.md) and
-[IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md).
+The synchronous HNS adapter implements the authenticated loopback wallet RPC
+boundary and pruning-safe `name_action_context_v2`. It validates chain/mempool
+bindings, HTTP/JSON, transactions, spenders, names, and median-time evidence
+without giving the node signing authority. The direct peer controller offers a
+separate locally verified evidence source for mobile. HNS value and fee gates
+are enabled; operations require current evidence, exact approvals, and durable
+journaling. See [HNS node RPC](HNS_NODE_RPC.md) and
+[qualification](QUALIFICATION.md).
 
 ## Bitcoin supervisor boundary
 

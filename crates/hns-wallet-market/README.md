@@ -42,9 +42,8 @@ A signed acceptance binds a locally retained active offer to its fixed session
 and the responder-maker's settlement key. The responder's maker proposal and
 the offer setter's countersigned session hello are stored separately. Funding,
 redeem, and refund status is peer coordination metadata only; execution still
-requires independently verified local chain evidence. Source-compatible
-`take` API aliases remain for older callers, but current protocol objects,
-storage namespaces, and new APIs use the accurate acceptance terminology.
+requires independently verified local chain evidence. Protocol objects, storage namespaces, and APIs distinguish acceptance from
+executable maker admission.
 
 TCP, QUIC, WebSocket, WebRTC, HNSA/HRM rendezvous, or a native companion may
 carry the canonical Shakescape frames; none is pricing, market, or chain authority.

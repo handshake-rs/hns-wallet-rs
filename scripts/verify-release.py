@@ -95,13 +95,6 @@ ENGINE_PACKAGES = {
     "hns-light-sync",
     "hns-light-wallet",
 }
-ROOT_RELEASE_STATE_WORDING = {
-    "candidate": (
-        "Unpublished initial release candidate for the independent Handshake wallet\n"
-        "boundary:"
-    ),
-    "release": "Canonical account-zero wallet and atomic-swap boundary:",
-}
 CRATE_RELEASE_STATE_WORDING = {
     "candidate": (
         "This heading describes the current unpublished release candidate, not an\n"
@@ -160,26 +153,9 @@ def changelog_release_state(
     return state
 
 
-def verify_changelog_release_state(
-    root_changelog: str, crate_changelog: str, version: str
-) -> str:
-    root_state = changelog_release_state(
-        root_changelog, "CHANGELOG.md", version, ROOT_RELEASE_STATE_WORDING
-    )
-    crate_state = changelog_release_state(
-        crate_changelog,
-        "release/CRATE-CHANGELOG.md",
-        version,
-        CRATE_RELEASE_STATE_WORDING,
-    )
-    if root_state != crate_state:
-        fail("root and package changelogs have different release-state markers")
-    return root_state
-
-
 def require_execution_release_state(release_state: str) -> None:
     if release_state != "release":
-        fail("execution requires canonical release-state wording in all changelogs")
+        fail("execution requires canonical release-state wording for the selected package")
 
 
 def cargo_metadata(repo: Path, toolchain: str) -> dict:
@@ -282,14 +258,14 @@ def verify_release_document(repo: Path, order: list[str], version: str) -> None:
     for required in required_release_text:
         if required not in document:
             fail(f"docs/releasing.md omits {required!r}")
-    if "coherent nineteen-crate `hns-rs` `0.5.0` cohort" not in document:
-        fail("docs/releasing.md omits the current published protocol prerequisite record")
+    if "nineteen-crate `hns-rs` `0.5.0` prerequisite" not in document:
+        fail("docs/releasing.md omits the current protocol prerequisites")
     if re.search(
-        r"all 20\s+required\s+`hns-dane-engine` `0\.2\.2` archives were published",
+        r"20\s+required\s+`hns-dane-engine` `0\.2\.2` archives",
         document,
         flags=re.IGNORECASE,
     ) is None:
-        fail("docs/releasing.md omits the current published engine prerequisite record")
+        fail("docs/releasing.md omits the current engine prerequisites")
 
     self_expiring_claims = (
         "packages are unpublished",
@@ -671,7 +647,6 @@ def verify_workspace(
 ) -> tuple[str, str, str]:
     root_manifest = tomllib.loads((repo / "Cargo.toml").read_text(encoding="utf-8"))
     workspace_package = root_manifest["workspace"]["package"]
-    version = workspace_package["version"]
     expected_publish = ["crates-io"]
 
     packages = {package["name"]: package for package in metadata["packages"]}
@@ -694,38 +669,6 @@ def verify_workspace(
             "workspace package set differs from the 16-crate release set: "
             f"workspace={sorted(packages)}, allowlist={sorted(order)}"
         )
-
-    changelog = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
-    if "packages are unpublished" in changelog:
-        fail("CHANGELOG.md contains a self-expiring registry-status claim")
-    if re.search(r"^## Unreleased$", changelog, re.MULTILINE):
-        fail("CHANGELOG.md must use the selected shared version for unreleased notes")
-    headings = re.findall(
-        rf"^## {re.escape(version)} - (unreleased|\d{{4}}-\d{{2}}-\d{{2}})$",
-        changelog,
-        re.MULTILINE,
-    )
-    if len(headings) != 1:
-        fail(
-            f"CHANGELOG.md must contain exactly one {version} unreleased or dated heading"
-        )
-    release_label = headings[0]
-    if release_label != "unreleased":
-        try:
-            date.fromisoformat(release_label)
-        except ValueError:
-            fail(f"CHANGELOG.md has an invalid release date {release_label!r}")
-    expected_heading = f"## {version} - {release_label}"
-
-    template = (repo / "release/CRATE-CHANGELOG.md").read_bytes()
-    template_text = template.decode("utf-8")
-    release_state = verify_changelog_release_state(changelog, template_text, version)
-    if expected_heading not in template_text:
-        fail("release/CRATE-CHANGELOG.md does not match the workspace release heading")
-    if "`CHANGELOG.md`" not in template_text:
-        fail("release/CRATE-CHANGELOG.md must name the canonical changelog")
-    if re.search(r"\[[^]]*CHANGELOG\.md[^]]*\]\(", template_text):
-        fail("release/CRATE-CHANGELOG.md must not link a tag before it exists")
 
     positions = {package: index for index, package in enumerate(order)}
     observed_protocol_dependencies: set[str] = set()
@@ -838,7 +781,9 @@ def verify_workspace(
             f"observed={sorted(observed_engine_dependencies)}"
         )
 
-    return version, release_label, release_state
+    selected = packages["hns-wallet-hns"]
+    release_label, release_state = package_release_state(repo, selected)
+    return selected["version"], release_label, release_state
 
 
 def verify_clean_source(repo: Path) -> None:

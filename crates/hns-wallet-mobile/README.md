@@ -6,16 +6,15 @@ service in-process. Creation and restoration use the typed store bootstrap;
 every subsequent lifecycle control crosses the canonical wallet ABI v2 framing
 and session checks.
 
-`MobileWalletController` remains the lifecycle-only first slice: trusted native
-status, unlock, lock, and single-account controls. Its existing API is
-unchanged. It has no WebView/provider entry point or release-gate authority.
+`MobileWalletController` owns trusted-native lifecycle status, unlock, lock,
+and single-account controls. It has no WebView/provider entry point or release-gate authority.
 It can be consumed into a native HNS value controller backed by an injected
 backend, or into a full wallet-owned direct-peer value composition. Android
 Keystore and iOS Keychain integration remain responsibilities of the embedding
 applications; raw database keys must never enter website content.
 
-The optional `MobileHnsReadController<B, C>` is the next architecture-neutral
-source tranche. A lifecycle controller can be consumed with `into_hns_reads`
+The optional `MobileHnsReadController<B, C>` supplies architecture-neutral
+synchronized reads. A lifecycle controller can be consumed with `into_hns_reads`
 so the selector, `HnsAccountReadRuntime`, `PersistentHnsReadRuntime`, service,
 and provider persistence all retain clones of the literal same
 `SharedWalletStore` authority. An existing wallet can instead be opened
@@ -50,11 +49,10 @@ qualify that Rust API explicitly. This crate also does not ship a production
 device backend: the existing
 `HnsNodeRpcBackend` and `HnsNodeRpcConfig` are re-exported here for downstream
 composition, but remain an authenticated loopback node adapter rather than an
-Android or iOS wallet-index integration. The downstream Shakescape Android/iOS
-`1.0.4` source consumes published `hns-wallet-mobile 0.2.1` and supplies JNI/C
-projection, native recovery/read/value/name screens, Keystore/Keychain
-wrapping, off-UI-thread calls, and its wallet-owned direct-peer backend. Those
-wrappers and that backend are not shipped by this crate. Each product must
+Android or iOS wallet-index integration. Shakescape's Android and iOS consumers supply JNI/C projections, native
+recovery/read/value/name screens, Keystore/Keychain wrapping, and off-UI-thread
+calls. Those platform wrappers are owned by the product repository.
+Each product must
 still qualify its exact installed network/runtime before exposing synchronized
 results or authorizing value.
 
@@ -63,8 +61,8 @@ script-free `chain_snapshot` backend call, validates height-zero block evidence
 against the selected account network under that exact binding, and only then
 derives and transmits wallet ScriptIds. The first confirmed page requires that
 same tip and `Some(chain_epoch)`. A wrong-network backend therefore receives no
-confirmed or mempool script query. This removes the earlier protocol-ordering
-privacy blocker; it does not supply or qualify production mobile transport. A
+confirmed or mempool script query. This ordering protects wallet script privacy before network identity is verified.
+Production mobile transport requires separate qualification. A
 pruned node is also not a general fresh-restore source: transaction history
 reconciliation requires raw transaction bytes when they are not already
 retained in authenticated wallet state. Production must use an archive-capable
@@ -91,4 +89,4 @@ the same direct value controller. Binding a listener does not unlock the
 wallet, and the host must drop it when its native I/O worker stops.
 
 See the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)
-for generated-binding progress, target qualification, and release status.
+for current architecture, target qualification, and release procedures.

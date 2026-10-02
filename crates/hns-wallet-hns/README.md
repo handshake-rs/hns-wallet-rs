@@ -14,6 +14,17 @@ mempool intake, fee observations, address discovery, and transaction
 broadcast. Peers and DNS seeds supply bytes and addresses only; none can replace
 the wallet's header, Merkle, watch-set, or Urkel verification authority.
 
+The coordinator keeps healthy peer sessions available between requests. A weak
+maintenance worker services idle protocol traffic; disconnected sockets are
+eligible for reconnection. A public-header transport handle lets browser
+consumers reuse negotiated sessions without acquiring wallet keys or keeping an
+unlocked controller alive. Each consumer validates its own returned headers.
+
+An authenticated saved scan frontier permits continuation after wallet reopen.
+Initial restoration prepares its bounded derivation window once. Explicit
+watch expansion and newly added settlement interests retain their required
+replay paths, and fresh header agreement is required before spend authority.
+
 `HnsNodeRpcBackend` remains an optional compatibility adapter for existing
 desktop/node deployments. It is not a prerequisite for the mobile, browser,
 extension, Shakescape, or Shakedex architecture.
@@ -35,7 +46,7 @@ authority is ephemeral and non-serializable; this path exposes no signing,
 broadcast, settlement, or gate-changing operation.
 
 `HnsPersistedRecoveryReadOnlyRuntime` is a separate, deliberately smaller
-opening path for an exact already-persisted account whose historical
+opening path for an exact already-persisted account whose persisted
 configuration has `value_operations_enabled` or `settlement_enabled` set. It
 validates inert structure and exact persisted identity without treating either
 bit as authority. The wrapper exposes only exact selection and synchronized
@@ -79,7 +90,7 @@ non-wallet evidence persists without advancing. The existing full-runtime raw
 Fresh synchronization also consumes the node's versioned incoming-TRANSFER
 projection as discovery evidence for derived account-zero external scripts.
 Such evidence may advance only the external receive high-water: the stale
-old-owner TRANSFER output
+outgoing-owner TRANSFER output
 never enters wallet balance, transaction, coin, or current ownership state. A
 wallet-script FINALIZE becomes a new or refreshed `KnownName` only after the
 node's exact-tip active-owner projection matches the exact name and canonical
@@ -93,10 +104,8 @@ decodes the canonical NameState, reconstructs the exact active owner Coin,
 checks its covenant/outpoint/value/inclusion and fixed policy result, and then
 requires its address to match one exact persisted `HnsName` derivation. The
 Coin projection and node eligibility result confer no signing authority by
-themselves. New encrypted plans retain canonical Coin evidence; a legacy v1
-plan must be reapproved rather than silently upgraded. Shakedex's
-descriptor-linked TRANSFER path remains on v1 because it needs the previous
-input from the retained transaction, which v2 intentionally omits.
+themselves. Encrypted plans retain canonical Coin evidence. Authority reacquisition must
+match that persisted binding; a changed binding requires explicit reapproval.
 
 Its value and settlement configurations remain fail-closed until the embedding
 product completes the documented adapter and runtime qualification. See the

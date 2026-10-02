@@ -297,12 +297,6 @@ then fails unless authenticated wallet state already retained those bytes, so
 production restore requires archive history or a durable wallet-relevant
 raw-transaction index.
 
-This boundary reuses the canonical HNS scanner and reconciliation helpers. The
-legacy value runtime's full reconciliation still spans backend work while its
-private store mutex is held, so it is not an eligible provider/product read
-composition. The HNS value source gates are enabled, but this legacy runtime is
-not the product composition that may exercise them.
-
 This is authenticated record encryption, not whole-file encryption. Table
 names, row counts, indexes, selected authenticated metadata, filenames, SQLite
 journals, and access patterns may be visible. On Linux, Android, and iOS,
@@ -363,9 +357,8 @@ session and exact authority handle/revision. Production UI must display asset,
 exact amount given and received, recipient, fee maximum, chain, finality policy,
 and refund timeout. Free-form approval display lines are rejected.
 
-The library supplies the policy and state boundary; the current browser UI does
-not yet provide every approval screen. No mainnet enablement may infer approval
-from a unit test.
+The library supplies the policy and state boundary. Native mobile screens
+collect exact approvals; website-provider value methods remain unavailable.
 
 For ordinary HNS sends, the persisted workflow approval is authenticated
 without consumption before signing. Only after the exact final signed bytes
@@ -373,9 +366,8 @@ receive a bound fee quote does one immediate transaction re-authenticate and
 consume the unchanged approval, persist those bytes and quote, and activate the
 matching reservations. Submission re-quotes the persisted bytes and records
 `RequiresRebroadcast` before the node call. Canonical sigop-adjusted fee
-algebra and exact input evidence are integrated in source, but their explicit
-qualification gate remains false and prevents this wiring from authorizing
-value.
+algebra and exact input evidence are enabled in source. Current verified input
+evidence, a valid approval, and durable persistence remain mandatory.
 
 Name actions bind the trusted approval to the exact encrypted prepared plan,
 including its recipient, fee maximum, canonical source, and unsigned
@@ -400,7 +392,7 @@ canonical parent plan, exact lock or TRANSFER source, ordered funding coins,
 recipient, value, exact fee and maximum, confirmation policy, expiry, and
 prepared bytes. FINALIZE also commits the exact signed parent action/bytes/hash,
 TRANSFER transaction/output-zero coin, NameState, owner inclusion,
-historical snapshot/mempool binding, and renewal evidence. The runtime owns the clock.
+recorded snapshot/mempool binding, and renewal evidence. The runtime owns the clock.
 Lock spends accept only current-lock authority and their two existing purposes;
 FINALIZE uses a new purpose and APIs that accept only current-TRANSFER
 authority. The runtime reacquires that authority before signing and signs only
@@ -408,8 +400,9 @@ ordinary suffix inputs while preserving the script-authorized first input. It
 consumes the unchanged approval only in the transaction that persists the
 verified signed bytes and their exact final-byte fee quote and activates every
 protected reservation.
-All related Shakedex and HNS Shakedex-funding/value/fee release gates remain
-`false`, so this source boundary cannot currently authorize value.
+Shakedex and HNS funding/value/fee source gates are enabled. The runtime
+authorizes an operation only when all current-evidence and approval predicates
+pass.
 
 ## Provider defenses
 
@@ -427,7 +420,7 @@ approvals, replay/rate state, request IDs, and event cursors while permissions
 survive.
 Accounts permission is valid only with one exact HNS account ID in the same
 encrypted permission generation. Generic permission requests cannot mint
-Accounts authority, and legacy capability-only records fail closed. The
+Accounts authority, and unbound capability-only records fail closed. The
 account result is validated and bounded before the scoped grant is persisted
 against the exact generation authenticated by the approval; a generation
 mismatch fails stale. Every `hns_accounts` call re-authenticates the current
@@ -534,8 +527,8 @@ through pruning-safe context version 2: the active owner Coin must be canonical,
 must exactly match the NameState owner/value/name covenant and inclusion, and
 its address must match one exact persisted `HnsName` derivation. The trusted
 node projection is not a transaction proof or wallet-ownership assertion.
-Legacy version-1 prepared sources cannot inherit a version-2 reacquisition and
-must be replaced through reapproval. Descriptor-linked Shakedex verification
+Reacquired authority must match the prepared source; a changed source requires
+explicit reapproval. Descriptor-linked Shakedex verification
 continues to require version 1 because the owner transaction's previous input
 is part of that authority and is absent from v2. Persisted action context is
 audit/recovery evidence only.
@@ -583,7 +576,7 @@ witnesses must be empty; authorization preserves input zero byte-for-byte, signs
 with exact P2PKH `SIGHASH_ALL` witnesses, and revalidates the canonical signed
 transaction. Persisted quote validation recomputes ordered input/output fee
 algebra after restart but does not treat the quote's old snapshot as current.
-Persisted construction bindings are likewise historical: harmless tip,
+Persisted construction bindings are recorded evidence: harmless tip,
 mempool-generation, or node-instance advances are accepted only when the exact
 descriptor, transaction/coin, owner inclusion, NameState, and renewal identity
 remain stable. Within an immediate bind/sign/submit operation, the HNS runtime
@@ -611,9 +604,8 @@ transaction release requires matching spender evidence for every exact input
 position; a sufficiently final authenticated competitor on any exact input may
 release the now-unspendable competing transaction. Released rows are never
 recreated, and later finality disagreement remains read-only
-`RecoveryRequired`. Product coin selection, live Shakescape/provider/trusted-UI
-integration, and complete restart/reorg/regtest product qualification remain
-pending. The focused FINALIZE tests are included in exact `2229be8` source CI.
+`RecoveryRequired`. Signed-device qualification must cover the complete native
+approval and restart/reorg path.
 `SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED`,
 `SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED`,
 `SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED`,
@@ -660,15 +652,13 @@ compares both seed commitment and public key before exposing the zeroizing,
 non-serializable handle. Raw derivation is crate-private; the role-aware HTLC
 constructor requires that handle rather than a public record.
 
-The allocator cannot prove that its caller's opaque commitment covers complete
-canonical settlement terms, and it is not yet wired into the settlement
-supervisor. A whole database rollback is not detectable from inside that
-database; session-bound derivation prevents cross-session secret reuse, but
-active-swap recovery still requires current encrypted allocation records and
-non-recycled session IDs. This separation and persistence do not enable
-settlement: signed-spend supervision and the complete qualification boundary
-are still absent, and no Bitcoin signing or value permit is exposed by this key
-slice.
+The allocator authenticates persisted key bindings, but cannot prove that an
+opaque caller commitment covers complete settlement terms. The mobile market
+controller reconstructs and validates those terms before funding admission.
+A whole-database rollback requires an external rollback floor; current encrypted
+allocation records and non-recycled session IDs remain required for recovery.
+Signing and broadcast require the trusted-mobile supervisor's value permit,
+current chain evidence, and exact approval.
 
 Bitcoin's supervisor does not authorize from a peer status field. A completed
 Kyoto wallet update is committed to the strict versioned encrypted BDK
@@ -676,14 +666,12 @@ delta journal before encrypted transaction and output mirrors advance; the
 authenticated scan record becomes ready only after all bounded reconciliation
 chunks commit. An aggregate snapshot is written before each 32-delta compaction
 prunes redundant records, while an authenticated monotonic head remains to
-prevent stale-writer sequence reuse; legacy snapshot format v1 remains
-loadable. The BDK records and scan journal share the exact same non-debuggable store/key
+prevent stale-writer sequence reuse. The BDK records and scan journal share the exact same non-debuggable store/key
 authority. Exact local-chain hash-membership queries identify a
 retained reorg ancestor. Missing ancestry, the BDK entity's 1 MiB capacity,
 timeout of the non-cancel-safe update, or BDK/journal rollback mismatch fails
-closed and requires a new supervisor/recovery scan. A standalone legacy BDK
-SQLite database is never opened or silently discarded; migration tooling is
-still absent.
+closed and requires a new supervisor/recovery scan. Unrecognized database
+files are preserved and rejected rather than opened or overwritten.
 
 The active trusted-mobile broadcast path resolves every input as an unspent wallet output,
 uses BDK's exact fee calculation, and verifies a domain-separated approval over

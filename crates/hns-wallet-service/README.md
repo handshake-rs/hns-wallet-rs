@@ -83,7 +83,7 @@ responsibilities.
 An explicit
 `WalletService::new_recovery_read_only_profile_backed_native_hns_reads`
 constructor can reopen only an exact already-persisted schema-v1 profile and
-account whose historical configuration contains at least one value/settlement
+account whose persisted configuration contains at least one value/settlement
 flag. There is no typed native-read-profile provisioning API for such a
 profile, and the recovery constructor never provisions. Direct generic
 low-level store mutation is privileged out-of-band state construction, not

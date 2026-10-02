@@ -19,7 +19,7 @@ An HNS Accounts permission generation persists the exact nonzero singleton
 account ID selected for that origin and namespace. The service validates and
 encodes the minimized `hns_requestAccounts` result before the scoped
 permission write; after restart, `hns_accounts` re-authenticates the current runtime selection
-and requires it to equal that persisted singleton. Legacy or generic records
+and requires it to equal that persisted singleton. Records
 that claim Accounts without an account binding are rejected, not migrated into
 broader authority. The write must compare equal to the
 generation authenticated by the approval, so a concurrent grant or revocation
@@ -82,8 +82,7 @@ seed-only state, account-only state, encryption error, or injected failure
 rolls the transaction back, so neither record can survive alone. Reopen
 validation authenticates the selected seed, requires its plaintext length to
 equal `RECOVERY_SEED_BYTES` (64), and still requires exactly one recovery-seed
-row. This is intentionally distinct from the compatible legacy seed-only
-`create_wallet` and `restore_wallet` APIs.
+row. The native bootstrap requires both seed and account to commit atomically.
 
 The HNS bootstrap helper generates or parses exactly 24 normalized English
 BIP-39 words. New profiles retain the established random `WalletId`; restored
@@ -96,7 +95,7 @@ remains in a zeroizing mnemonic until it is consumed into the dedicated
 high-risk display wrapper.
 
 HNS Shakedex seller keys have a dedicated deletion-protected encrypted entity
-namespace. A legacy-defaulted WalletAccount gate starts as scan-required. The
+namespace. An uninitialized WalletAccount gate starts as scan-required. The
 runtime CAS-saves a durable scanning fence before the first 32-byte script
 query and clears it only when the complete bounded scan commits; a later scan
 can take over a crashed fence by advancing the account revision. New key
@@ -271,12 +270,12 @@ can be resumed.
 The additive tagged FINALIZE structural variant stores the exact signed
 buyer-fulfillment or seller-recovery parent action, canonical bytes and hash;
 the TRANSFER transaction and output-zero coin; current NameState and owner
-inclusion; historical snapshot/mempool binding; and renewal height/hash. These
+inclusion; recorded snapshot/mempool binding; and renewal height/hash. These
 facts are immutable restart evidence. They do not serialize or recreate
 `VerifiedCurrentShakedexTransfer`, and CAS cannot replace them with another
 parent, transfer, purpose, owner, state, or renewal commitment.
 On resume, fresh snapshot/mempool tokens may advance without changing this
-historical record. Authority reacquisition compares the stable descriptor,
+persisted record. Authority reacquisition compares the stable descriptor,
 transaction/coin, owner inclusion, NameState, and renewal identity exactly;
 the HNS runtime separately enforces exact live bindings within each immediate
 bind/sign/submit fence.
@@ -340,15 +339,11 @@ persisted bytes reached the node outside the recorded submit path. It never
 restores ephemeral current-lock/current-TRANSFER authority or treats persisted
 snapshot bindings as current authority.
 
-Script-controlled FINALIZE is durable in source, including atomic workflow plus
-source/funding reservation persistence and the shared evidence-backed terminal
-release path. Its HNS purpose-separation and FINALIZE restart/reopen/CAS/
-replacement/binding-advance/reorg/finality regressions are included in the
-exact CI evidence recorded in `QUALIFICATION.md`. All
-Shakedex value authorization and submission entrypoints remain unreachable
-while the fixed Shakedex and HNS Shakedex-funding/value/fee release gates are
-`false`; live Shakescape/provider/UI
-integration and restart/reorg/regtest qualification are also pending.
+Script-controlled FINALIZE atomically persists its workflow and source/funding
+reservations and uses the shared evidence-backed terminal release path. Shakedex
+and HNS funding/value/fee source gates are enabled. Runtime operations still
+require current evidence and exact approval; use [qualification](QUALIFICATION.md)
+for the product and network release matrix.
 
 HNS authorization can authenticate and return a pending approval without
 consuming it. After exact signed-byte fee quoting succeeds, a bounded immediate
@@ -369,15 +364,11 @@ cancellation, or conflict releases them atomically. A formerly confirmed action
 that disappears becomes `ReapprovalRequired`; replacing an explicitly
 abandoned record requires a fresh request nonce and approval.
 
-New wallet-owned name plans persist context-version-2 active owner Coin
-evidence in a canonical serializable form and leave the legacy retained-owner-
-transaction field empty. Reload reconstructs the exact consensus Coin and
-rejects mixed v1/v2 sources, a non-null invented transaction position,
-outpoint/state/inclusion disagreement, or a noncanonical covenant. Historical
-v1 JSON remains decodable because the new Coin field is optional and omitted
-from v1 serialization, but a subsequent v2 reacquisition does not match that
-historical source and therefore requires explicit reapproval. This is a safe
-authority transition, not a migration that reuses an old approval.
+Wallet-owned name plans persist context-version-2 active owner Coin evidence in
+canonical serializable form. Reload reconstructs the exact consensus Coin and
+rejects mixed sources, invented transaction positions, outpoint/state/inclusion
+disagreement, and noncanonical covenants. Reacquisition must authenticate the
+same authority binding; a changed binding requires explicit reapproval.
 
 ## HNS change derivations
 
@@ -403,14 +394,7 @@ next-index, scan-end, and last-used state, while ShakeDex script allocation
 remains protocol-separated. A complete reconciliation persists the combined
 account/address state only after all bounded queries prove the same chain
 epoch/tip and mempool instance/generation.
-The legacy value runtime reloads the full authoritative account and its CAS
-revision after taking its private store mutex, rejects derivation high-water
-rollback, and holds that ordering through cache installation; a concurrently
-prepared send or settlement cannot be overwritten by a stale scan clone. That
-legacy reconciliation still spans backend work and is not selected by the
-provider read composition.
-
-`HnsAccountReadRuntime` instead writes an authenticated durable discovery fence
+`HnsAccountReadRuntime` writes an authenticated durable discovery fence
 inside a short shared-store closure, copies the exact account/recovery/coin/
 transaction/name corpus and revisions, releases the mutex, and only then calls
 the node. Address derivation re-enters short closures that verify the same
@@ -435,7 +419,7 @@ changing its configuration, create or replace bounded authenticated
 derived-address, coin, transaction, name, and recovery-cache rows scoped to the
 exact existing account, and write or clear the durable discovery fence. It
 cannot create an account/profile/allocation/signer/workflow or value authority
-or rewrite configuration; the historical value/settlement bits remain
+or rewrite configuration; the persisted value/settlement bits remain
 unchanged and confer no authority.
 
 External scan advancement is monotonic and bounded across restart and reorg.
@@ -500,7 +484,7 @@ The product runtime must:
    validated evidence;
 8. restore the bounded coin, name-role, and 32-byte Shakedex-lock scans under
    one exact chain/mempool binding; advance separated counters without rollback;
-   revalidate split committed-proof/current name views; replace legacy watch-
+   revalidate split committed-proof/current name views; replace watch-
    only rows with exact canonical summaries; and reacquire rather than restore
    any ephemeral ownership or Shakedex spend authority;
 9. reload and revalidate direct offers, cancellations, accepted sessions,
@@ -558,7 +542,7 @@ entities. Loading requires an unlocked store and authenticates the account
 again, but supplies no chain freshness and performs no node call.
 
 A separate recovery loader accepts only an already-persisted active profile
-whose exact authenticated account has at least one historical value/settlement
+whose exact authenticated account has at least one persisted value/settlement
 bit. It preserves schema v1 and exposes no typed profile provisioning or
 rotation path for a flagged record; generic low-level store mutation remains a
 privileged out-of-band operation. The profile-backed recovery constructor
@@ -604,10 +588,9 @@ reads in one reconciliation;
 they are intentionally reacquired after process restart rather than persisted
 as timeless authority. Exact final-signed fee quotes are wired and persisted
 for HNS value and the release-gated Shakedex aggregate;
-canonical fee-policy integration is implemented in source, but its explicit
-qualification gate remains false. The complete multi-chain product supervisor
-and current qualification evidence are not integrated, so HNS value operations
-remain release-gated.
+canonical fee policy and HNS/Shakedex value gates are enabled. Native controllers
+require current chain evidence, exact approval, and persist-before-broadcast
+journals before an operation may proceed.
 
 No Ethereum synchronization, history, or recovery checkpoint exists to resume
 in this revision. Ethereum account and receive-target derivation is offline;
@@ -619,7 +602,7 @@ The Bitcoin module uses one shared encrypted store authority with ordered
 record boundaries. A deletion-protected, strict v2 `bitcoin_wallet_state`
 snapshot and account-bound `bitcoin_wallet_changeset` journal contain the
 aggregate BDK-3.1.0 public descriptor/local-chain/transaction/output state.
-Legacy strict-v1 snapshots remain readable. Ordinary persistence atomically
+Ordinary persistence atomically
 advances an authenticated monotonic head and appends only the staged encrypted
 delta; after 32 active records, compaction writes the aggregate snapshot first
 and only then deletes redundant deltas while retaining the head. The head
@@ -674,18 +657,16 @@ The compacted aggregate BDK snapshot has the same 1 MiB cleartext limit as
 every generic encrypted entity, and its persistent script cache is disabled.
 Delta journaling avoids rewriting that aggregate for each ordinary change, but
 oversize compacted state still fails closed; a fully normalized backend remains
-the long-term capacity path. Standalone BDK SQLite databases from the
-older source boundary are left untouched and are not imported. No migration
-tool exists yet, so callers must retain such files and must not interpret a
-missing encrypted entity as authorization to create over legacy state.
+the long-term capacity path. Unrecognized database files are preserved and
+rejected. A missing encrypted entity never authorizes overwriting existing state.
 
 Broadcast preparation resolves every input through the same BDK wallet,
 calculates the exact fee, verifies the approved maximum, and persists raw bytes
 plus a network/txid/wtxid/fee/maximum/expiry commitment before Kyoto receives
 them. A timeout after `submission_started` is restart-safe and retryable. This
 retry observes the same rebroadcast interval as a known submission; approval
-expiry is exclusive. Native-send signing and broadcast are dormant because the
-Bitcoin value permit is release-gated.
+expiry is exclusive. Native signing and broadcast require the enabled Bitcoin
+value gate and the trusted-mobile supervisor permit.
 
 Execution rejects a clock value behind the durable preparation or latest
 attempt timestamp. A production release still requires a reviewed source of
@@ -706,7 +687,7 @@ production-scale.
 ## Migrations and backups
 
 Opening first uses a read-only, no-follow, query-only connection to recognize
-nonzero current-or-legacy wallet schema anchors and all four structurally exact
+nonzero supported wallet schema anchors and all four structurally exact
 initialization metadata rows. A non-wallet SQLite database or an incomplete
 schema-v1 wallet returns
 `NotInitialized` before WAL configuration or migration. After the same file is
@@ -717,19 +698,13 @@ unlock records a checkpoint, truncates the WAL, clears the marker, and
 truncates again; an interrupted checkpoint is retried on the next unlock before
 state is returned.
 
-The encrypted `ShakedexValue` payload keeps its internal schema version at v1
-and adds script FINALIZE as a new tagged structural-plan variant. The new
-reader still decodes and revalidates legacy v1 buyer/seller rows. An older
-binary does not know the new tag and cannot decode a wallet after such a row is
-written; downgrade is therefore unsupported and unqualified. This is only
-forward compatibility for old rows in the new binary, not a downgrade-safety
-claim.
+The encrypted `ShakedexValue` payload uses a versioned tagged structural plan.
+An unsupported variant fails closed. Downgrading a database to a binary that
+does not recognize its persisted variants is unsupported.
 
-Legacy schema-v1 provider grants and replay records have deterministic migration
-paths. Legacy pending approvals are discarded because their creation time and
-authority binding were not authenticated. Populated legacy funds-bearing entity
-tables fail closed with `LegacyEntityMigrationRequired`; a dedicated import tool
-must map them without ambiguity before unlock.
+Pending approvals require authenticated creation times and authority bindings.
+Funds-bearing rows that cannot be authenticated require an explicit reviewed
+import before unlock; the opener does not infer or invent missing authority.
 
 The Unix source, including Linux, Android, and iOS targets, requires a dedicated
 directory owned by the process effective UID with exact mode `0700`. An
