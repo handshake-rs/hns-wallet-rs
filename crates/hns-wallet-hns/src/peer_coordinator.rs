@@ -1359,12 +1359,32 @@ impl HnsPublicHeaderTransport {
         if pool.candidate_addresses()?.is_empty() {
             let _ = pool.discover_dns();
         }
-        for address in pool.candidate_addresses()? {
-            if pool.peer_count()? >= pool.config.target_peers {
-                break;
-            }
-            if pool.connect(address, local_height, now).is_err() {
-                pool.retire_address(address)?;
+        // Reserve maintenance is on the browser's header-sync path. Bound the
+        // batch by the missing reserve and negotiate concurrently so a stalled
+        // handshake cannot delay every other candidate in sequence.
+        let candidates = pool.candidate_addresses()?;
+        let attempts = std::thread::scope(|scope| {
+            candidates
+                .into_iter()
+                .map(|address| {
+                    let pool = &pool;
+                    scope.spawn(move || (address, pool.connect(address, local_height, now)))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|task| task.join())
+                .collect::<Vec<_>>()
+        });
+        for attempt in attempts {
+            match attempt {
+                // A simultaneous wallet refill may have already connected
+                // this candidate or filled the reserve. Neither is a failed
+                // endpoint and must not quarantine a healthy address.
+                Ok((_, Ok(_)))
+                | Ok((_, Err(HnsDirectPeerError::DuplicatePeer | HnsDirectPeerError::PeerLimit))) =>
+                    {}
+                Ok((address, Err(_))) => pool.retire_address(address)?,
+                Err(_) => return Err(HnsDirectPeerError::WorkerPanicked),
             }
         }
         Ok(())
@@ -6745,6 +6765,75 @@ mod tests {
                 .snapshot(now + SHAKESCAPE_ADDR_FRESHNESS_SECONDS + 3)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn browser_reserve_negotiates_peers_concurrently() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (accepted, connections) = std::sync::mpsc::channel();
+        let mut addresses = Vec::new();
+        let mut releases = Vec::new();
+        let mut finishes = Vec::new();
+        let mut servers = Vec::new();
+        for nonce in [31, 32] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            addresses.push(listener.local_addr().unwrap());
+            let accepted = accepted.clone();
+            let (release, ready) = std::sync::mpsc::channel();
+            let (finish, done) = std::sync::mpsc::channel();
+            releases.push(release);
+            finishes.push(finish);
+            servers.push(thread::spawn(move || {
+                let (mut stream, remote) = listener.accept().unwrap();
+                accepted.send(()).unwrap();
+                ready.recv_timeout(Duration::from_secs(30)).unwrap();
+                let mut version = light_wallet_version(remote, [nonce; 8], 42, now);
+                version.services = SERVICE_NETWORK | SERVICE_BLOOM;
+                // A wallet advertises no full-node services. The fixture is
+                // an HSD server, so it accepts that client and advertises the
+                // NETWORK/BLOOM services required by the wallet.
+                for packet in [Packet::Version(version), Packet::Verack] {
+                    stream
+                        .write_all(
+                            &Frame::from_packet(&packet)
+                                .unwrap()
+                                .encode(NetworkMagic::Regtest)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                }
+                done.recv_timeout(Duration::from_secs(30)).unwrap();
+            }));
+        }
+        let mut config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
+        config.static_peers = addresses;
+        config.target_peers = 2;
+        let pool = Arc::new(NativeHnsPeerPool::new(config).unwrap());
+        let transport = HnsPublicHeaderTransport {
+            pool: Arc::downgrade(&pool),
+            peers_by_address: Arc::default(),
+        };
+        let worker = thread::spawn(move || transport.connect_reserve(0, now));
+        // Both TCP connections must start before either handshake is released.
+        // This checks latency isolation without measuring scheduler timings.
+        connections.recv_timeout(Duration::from_secs(5)).unwrap();
+        let both_started = connections.recv_timeout(Duration::from_secs(5)).is_ok();
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        worker.join().unwrap().unwrap();
+        let connected = pool.peer_count().unwrap();
+        for finish in finishes {
+            finish.send(()).unwrap();
+        }
+        for server in servers {
+            server.join().unwrap();
+        }
+        assert!(both_started, "one stalled handshake blocked the next peer");
+        assert_eq!(connected, 2);
     }
 
     #[test]
