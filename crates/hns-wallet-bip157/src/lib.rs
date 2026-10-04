@@ -59,6 +59,8 @@ pub mod error;
 pub mod messages;
 /// The structure that communicates with the Bitcoin P2P network and collects data.
 pub mod node;
+/// Authenticated wallet-owned synchronization cache interface.
+pub mod sync_cache;
 
 use bitcoin::OutPoint;
 use chain::Filter;
@@ -383,6 +385,7 @@ struct Config {
     peer_timeout_config: PeerTimeoutConfig,
     filter_type: FilterType,
     block_type: BlockType,
+    sync_cache: Option<std::sync::Arc<dyn sync_cache::VerifiedSyncCache>>,
 }
 
 impl Default for Config {
@@ -397,6 +400,7 @@ impl Default for Config {
             peer_timeout_config: PeerTimeoutConfig::default(),
             filter_type: FilterType::default(),
             block_type: BlockType::default(),
+            sync_cache: None,
         }
     }
 }

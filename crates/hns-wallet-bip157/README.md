@@ -19,6 +19,14 @@ This is infrastructure, not a standalone wallet. Consensus, key management,
 fee selection, approval, and swap policy remain in the higher-level wallet
 crates.
 
+Version 0.4.2 adds an optional authenticated `VerifiedSyncCache` provider.
+Headers are persisted after verification, compact-filter headers after peer
+quorum agreement, and raw filters in bounded batches. Restart revalidates
+headers and filter commitments, replays only canonical filters, and requires
+fresh compact-filter peers before declaring synchronization complete. Cached
+filter matching decisions are never reused. Applications must provide an
+authenticated store; the `data_dir` option alone does not persist this evidence.
+
 See the repository-level
 [`CHANGELOG.md`](https://github.com/handshake-rs/hns-wallet-rs/blob/main/CHANGELOG.md)
 and [Bitcoin integration notes](../../docs/BITCOIN_KYOTO.md).

@@ -13,6 +13,7 @@ use super::{
     CFHeaderBatch, CFHeaderChanges, ChainState, Filter, FilterCheck, FilterHeaderRequest,
     FilterRequest, FilterRequestState, HeaderSyncEffect, HeaderValidationExt, PeerId,
 };
+use crate::HashCheckpoint;
 use crate::{chain::BlockHeaderChanges, messages::Event, Dialog, Info, Progress};
 use crate::{FilterType, IndexedFilter};
 
@@ -26,6 +27,8 @@ pub(crate) struct Chain {
     network: Network,
     dialog: Arc<Dialog>,
     filter_type: FilterType,
+    checkpoint: HashCheckpoint,
+    filter_cursor: u32,
 }
 
 impl Chain {
@@ -36,6 +39,13 @@ impl Chain {
         quorum_required: u8,
         filter_type: FilterType,
     ) -> Self {
+        let checkpoint = match &chain_state {
+            ChainState::Checkpoint(checkpoint) => *checkpoint,
+            ChainState::Snapshot(headers) => headers.first().map_or_else(
+                || HashCheckpoint::from_genesis(network),
+                |header| HashCheckpoint::new(header.height, header.block_hash()),
+            ),
+        };
         let header_chain = match chain_state {
             ChainState::Snapshot(headers) => {
                 let mut header_iter = headers.into_iter();
@@ -58,7 +68,74 @@ impl Chain {
             network,
             dialog,
             filter_type,
+            checkpoint,
+            filter_cursor: 0,
         }
+    }
+
+    pub(crate) fn checkpoint(&self) -> HashCheckpoint {
+        self.checkpoint
+    }
+
+    /// Restore only a previously quorum-admitted, authenticated response.
+    /// Walk its own branch so a later reorganization cannot attach old
+    /// commitments to new canonical headers at the same heights.
+    pub(crate) fn restore_filter_headers(&mut self, packet: CFHeaders) -> Result<(), String> {
+        if packet.filter_type != u8::from(self.filter_type)
+            || packet.filter_hashes.is_empty()
+            || packet.filter_hashes.len() > 2_000
+        {
+            return Err("invalid cached filter-header batch".into());
+        }
+        let mut batch = CFHeaderBatch::from(packet);
+        let previous = *batch.prev_header();
+        let mut current = batch.stop_hash();
+        let mut restored = Vec::with_capacity(batch.len() as usize);
+        for commitment in batch.take_inner().into_iter().rev() {
+            let header = self
+                .header_chain
+                .header_at_hash(current)
+                .ok_or("cached filter header has no verified block header")?;
+            if let Some(existing) = self.header_chain.filter_commitment(current) {
+                if existing.header != commitment.header
+                    || existing.filter_hash != commitment.filter_hash
+                {
+                    return Err("cached filter-header commitments conflict".into());
+                }
+            }
+            restored.push((current, commitment));
+            current = header.prev_blockhash;
+        }
+        let includes_anchor = restored
+            .last()
+            .is_some_and(|(hash, _)| *hash == self.checkpoint.hash);
+        if current != self.checkpoint.hash && !includes_anchor {
+            let parent = self
+                .header_chain
+                .filter_commitment(current)
+                .ok_or("cached filter-header history has a gap")?;
+            if parent.header != previous {
+                return Err("cached filter-header ancestry mismatch".into());
+            }
+        }
+        for (hash, commitment) in restored {
+            self.header_chain.set_commitment(commitment, hash);
+        }
+        Ok(())
+    }
+
+    /// Replay raw filters for the latest canonical chain. Old-branch filters
+    /// remain saved evidence but cannot select blocks for the current wallet.
+    pub(crate) fn restore_filter(&mut self, packet: CFilter) -> Result<(), CFilterSyncError> {
+        if self
+            .header_chain
+            .height_of_hash_canonical_only(packet.block_hash)
+            .is_none()
+            || self.header_chain.is_filter_checked(&packet.block_hash)
+        {
+            return Ok(());
+        }
+        self.apply_filter(packet)
     }
 
     // The last ten heights and headers in the chain
@@ -164,6 +241,9 @@ impl Chain {
         peer_id: PeerId,
         cf_headers: CFHeaders,
     ) -> Result<CFHeaderChanges, CFHeaderSyncError> {
+        if cf_headers.filter_type != u8::from(self.filter_type) {
+            return Err(CFHeaderSyncError::WrongFilterType);
+        }
         let batch: CFHeaderBatch = cf_headers.into();
         let request = self
             .request_state
@@ -308,15 +388,28 @@ impl Chain {
         &mut self,
         filter_message: CFilter,
     ) -> Result<FilterCheck, CFilterSyncError> {
-        let filter = Filter::new(filter_message.filter, filter_message.block_hash);
+        if self.request_state.last_filter_request.is_none() {
+            return Err(CFilterSyncError::UnrequestedStophash);
+        }
         if self
             .header_chain
             .is_filter_checked(&filter_message.block_hash)
         {
             return Ok(FilterCheck {
-                was_last_in_batch: false,
+                was_last_in_batch: self.requested_filter_batch_complete(),
             });
         }
+        self.apply_filter(filter_message)?;
+        Ok(FilterCheck {
+            was_last_in_batch: self.requested_filter_batch_complete(),
+        })
+    }
+
+    fn apply_filter(&mut self, filter_message: CFilter) -> Result<(), CFilterSyncError> {
+        if filter_message.filter_type != u8::from(self.filter_type) {
+            return Err(CFilterSyncError::WrongFilterType);
+        }
+        let filter = Filter::new(filter_message.filter, filter_message.block_hash);
         let expected_filter_hash = self
             .header_chain
             .filter_commitment(filter_message.block_hash);
@@ -342,28 +435,59 @@ impl Chain {
         let indexed_filter = IndexedFilter::new(height, header, filter);
         self.dialog.send_event(Event::IndexedFilter(indexed_filter));
         self.header_chain.check_filter(filter_message.block_hash);
-        let stop_hash = self
-            .request_state
-            .last_filter_request
-            .ok_or(CFilterSyncError::UnrequestedStophash)?
-            .stop_hash;
-        let was_last_in_batch = filter_message.block_hash.eq(&stop_hash);
-        Ok(FilterCheck { was_last_in_batch })
+        Ok(())
+    }
+
+    fn requested_filter_batch_complete(&mut self) -> bool {
+        let Some(request) = self.request_state.last_filter_request else {
+            return false;
+        };
+        let Some(stop) = self
+            .header_chain
+            .height_of_hash_canonical_only(request.stop_hash)
+        else {
+            return false;
+        };
+        while self.filter_cursor <= stop {
+            let checked = self
+                .header_chain
+                .block_hash_at_height(self.filter_cursor)
+                .is_some_and(|hash| self.header_chain.is_filter_checked(&hash));
+            if !checked {
+                return false;
+            }
+            let Some(next) = self.filter_cursor.checked_add(1) else {
+                return true;
+            };
+            self.filter_cursor = next;
+        }
+        true
     }
 
     // Next filter message, if there is one
     pub(crate) fn next_filter_message(&mut self) -> GetCFilters {
-        let mut last_unchecked_filter = self.header_chain.height();
-        for block_data in self.header_chain.iter_data() {
-            if block_data.height.eq(&0) {
+        // A process may stop in the middle of an out-of-order response batch.
+        // Fill its first hole without redownloading the already checked tail.
+        let last_unchecked_filter = self
+            .header_chain
+            .iter_data()
+            .filter(|node| !node.filter_checked)
+            .map(|node| node.height)
+            .min()
+            .unwrap_or(self.header_chain.height());
+        let mut stop_hash_index = last_unchecked_filter
+            .saturating_add(FILTER_BATCH_SIZE)
+            .min(self.header_chain.height());
+        for height in last_unchecked_filter.saturating_add(1)..=stop_hash_index {
+            if self
+                .header_chain
+                .block_hash_at_height(height)
+                .is_some_and(|hash| self.header_chain.is_filter_checked(&hash))
+            {
+                stop_hash_index = height - 1;
                 break;
             }
-            if block_data.filter_checked {
-                break;
-            }
-            last_unchecked_filter = block_data.height;
         }
-        let stop_hash_index = last_unchecked_filter + FILTER_BATCH_SIZE;
         let stop_hash = self
             .header_chain
             .block_hash_at_height(stop_hash_index)
@@ -372,6 +496,7 @@ impl Chain {
             stop_hash,
             start_height: last_unchecked_filter,
         });
+        self.filter_cursor = last_unchecked_filter;
         GetCFilters {
             filter_type: self.filter_type.into(),
             start_height: last_unchecked_filter,

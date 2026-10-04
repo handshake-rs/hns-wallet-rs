@@ -1117,6 +1117,7 @@ fn select_earlier_scan_checkpoint(
 }
 
 struct KyotoWalletSwapScan {
+    account_id: Vec<u8>,
     scan_type: ScanType,
     checkpoint_lookback: u32,
     active_swap_rescan_checkpoint: Option<HashCheckpoint>,
@@ -1146,6 +1147,16 @@ fn build_wallet_swap_client(
     // cheap; only matching blocks are downloaded. Once the spend is retained,
     // the watch no longer contributes this floor.
     let start = select_earlier_scan_checkpoint(ordinary_start, scan.active_swap_rescan_checkpoint)?;
+    let cache = Arc::new(crate::sync_cache::EncryptedSyncCache::new(
+        scan.store.clone(),
+        &scan.account_id,
+        bip157::sync_cache::SyncCacheContext {
+            network: config.network,
+            checkpoint: start,
+            required_peers: config.required_peers,
+            filter_type: 0,
+        },
+    ));
     let mut builder = Builder::new(config.network)
         // BDK needs witnesses for its own SegWit transactions, and the swap
         // observer additionally extracts the HTLC redeem preimage from them.
@@ -1153,6 +1164,7 @@ fn build_wallet_swap_client(
         .data_dir(config.data_dir)
         .required_peers(config.required_peers)
         .response_timeout(config.response_timeout)
+        .verified_sync_cache(cache)
         .chain_state(ChainState::Checkpoint(start));
     if !config.trusted_peers.is_empty() {
         builder = builder.add_peers(config.trusted_peers);
@@ -1800,6 +1812,7 @@ impl KyotoSupervisor {
             wallet,
             config,
             KyotoWalletSwapScan {
+                account_id: wallet.account_id().to_vec(),
                 scan_type,
                 checkpoint_lookback,
                 active_swap_rescan_checkpoint,

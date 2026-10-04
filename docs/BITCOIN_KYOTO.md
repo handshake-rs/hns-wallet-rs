@@ -287,3 +287,28 @@ controller. Full header/filter database persistence remains an optimization,
 not a requirement for wallet-owned light-client authority. Installed-product,
 resource, and live-network results must still be recorded separately from
 source-level qualification.
+
+## Interrupted initial synchronization
+
+The 0.4.2 transport and wallet adapter retain verified public synchronization
+bytes in the existing encrypted WalletStore. The cache namespace binds the
+wallet account, Bitcoin network, starting checkpoint, compact-filter type and
+required peer quorum. Atomic commits save a contiguous batch index, its digest
+and all bounded payload chunks together. Missing, malformed, locked or rebound
+records fail closed and are preserved.
+
+Only headers accepted by the header graph and filter headers admitted by the
+configured live peer quorum enter the cache. On restart, header validation runs
+again; agreed commitments attach to their own branch; raw filters are checked
+against those commitments and matched against current wallet and HTLC scripts.
+Old-branch filters do not select canonical blocks. A recovery gap-window rescan
+replays cached bytes with the enlarged script set. Fresh compact-filter peers
+are required before completion can be reported.
+
+This preserves transport progress without advancing the wallet birthday or
+claiming a completed wallet scan prematurely. Full matching blocks may be
+requested again until the wallet update commits. An abrupt process death can
+lose the most recent uncommitted raw-filter batch (at most 63 filters); orderly
+shutdown flushes it. Headers and agreed filter headers commit per response.
+Bytes downloaded by an older build before this cache existed cannot be
+recovered from its discarded in-memory graph.

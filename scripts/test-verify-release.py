@@ -97,18 +97,22 @@ expect_publish_script_mutation(
     "registry-backed resume package construction omits '--dry-run'",
     """create_registry_source_package() {
     package=$1
+    prepare_publish_archive \"$package\"
     cargo +\"$rust_toolchain\" publish \\
         --locked \\
         --dry-run \\
         -p \"$package\"
+    finish_publish_archive
     verify_source_package \"$package\"
 }""",
     """create_registry_source_package() {
     package=$1
+    prepare_publish_archive \"$package\"
     cargo +\"$rust_toolchain\" publish \\
         --locked \\
         --no-verify \\
         -p \"$package\"
+    finish_publish_archive
     verify_source_package \"$package\"
 }""",
 )

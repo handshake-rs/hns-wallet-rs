@@ -7,6 +7,9 @@ use crate::impl_sourceless_error;
 pub enum NodeError {
     /// The node has exhausted all possible options for peers.
     NoReachablePeers,
+    /// The wallet-owned synchronization cache could not be authenticated,
+    /// replayed, or durably appended.
+    SyncCache(String),
 }
 
 impl core::fmt::Display for NodeError {
@@ -14,6 +17,9 @@ impl core::fmt::Display for NodeError {
         match self {
             NodeError::NoReachablePeers => {
                 write!(f, "the node has exhausted all possible options for peers")
+            }
+            NodeError::SyncCache(error) => {
+                write!(f, "verified synchronization cache failed: {error}")
             }
         }
     }

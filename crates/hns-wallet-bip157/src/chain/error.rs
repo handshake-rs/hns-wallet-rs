@@ -47,6 +47,7 @@ impl_sourceless_error!(HeaderSyncError);
 
 #[derive(Debug)]
 pub enum CFHeaderSyncError {
+    WrongFilterType,
     EmptyMessage,
     UnknownStophash,
     StopHashMismatch,
@@ -60,6 +61,10 @@ pub enum CFHeaderSyncError {
 impl core::fmt::Display for CFHeaderSyncError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            CFHeaderSyncError::WrongFilterType => write!(
+                f,
+                "the compact filter-header type does not match the request."
+            ),
             CFHeaderSyncError::EmptyMessage => write!(f, "empty headers message."),
             CFHeaderSyncError::UnknownStophash => {
                 write!(f, "a stop hash received was not found in our chain.")
@@ -91,6 +96,7 @@ impl_sourceless_error!(CFHeaderSyncError);
 
 #[derive(Debug)]
 pub enum CFilterSyncError {
+    WrongFilterType,
     UnknownStophash,
     UnrequestedStophash,
     UnknownFilterHash,
@@ -100,6 +106,9 @@ pub enum CFilterSyncError {
 impl core::fmt::Display for CFilterSyncError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            CFilterSyncError::WrongFilterType => {
+                write!(f, "the compact filter type does not match the request.")
+            }
             CFilterSyncError::UnknownStophash => {
                 write!(f, "a stop hash recevied was not found in our chain.")
             }

@@ -5,6 +5,7 @@ mod persistence;
 mod runtime;
 mod swap_key_store;
 mod swap_watch;
+mod sync_cache;
 
 pub use persistence::*;
 pub use runtime::*;

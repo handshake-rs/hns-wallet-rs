@@ -35,6 +35,18 @@ pub struct Builder {
 }
 
 impl Builder {
+    /// Reuse verified synchronization bytes from an authenticated,
+    /// wallet-owned cache. The provider must obey [`VerifiedSyncCache`](crate::sync_cache::VerifiedSyncCache)'s
+    /// contract; raw filters are replayed through ordinary verification and
+    /// wallet matching, and fresh live peer sessions still establish currentness.
+    pub fn verified_sync_cache(
+        mut self,
+        cache: std::sync::Arc<dyn crate::sync_cache::VerifiedSyncCache>,
+    ) -> Self {
+        self.config.sync_cache = Some(cache);
+        self
+    }
+
     /// Create a new [`Builder`].
     pub fn new(network: Network) -> Self {
         Self {

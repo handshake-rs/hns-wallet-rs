@@ -76,6 +76,30 @@ require_public_crate() {
     exit 2
 }
 
+prepare_publish_archive() {
+    archive_package=$1
+    archive_version=$(package_version "$archive_package")
+    archive_target=$(package_target_dir)
+    publish_temp_archive="$archive_target/package/tmp-crate/$archive_package-$archive_version.crate"
+    if [ -f "$publish_temp_archive" ]
+    then
+        ensure_release_tmp
+        # Set aside stale temporary build archives so only this Cargo
+        # invocation can supply the archive inspected below.
+        mv -- "$publish_temp_archive" "$(mktemp "$release_tmp/previous-publish-archive.XXXXXX")"
+    fi
+}
+
+finish_publish_archive() {
+    # Recent Cargo retains publish archives under package/tmp-crate; older
+    # Cargo writes directly to package/. Inspect the actual fresh upload
+    # artifact in either case, including registry-backed dependency metadata.
+    if [ -f "$publish_temp_archive" ]
+    then
+        cp -- "$publish_temp_archive" "$archive_target/package/$archive_package-$archive_version.crate"
+    fi
+}
+
 dry_run_package() {
     package=$1
     shift
@@ -88,12 +112,14 @@ dry_run_package() {
             -p "$package" \
             "$@"
     else
+        prepare_publish_archive "$package"
         cargo +"$rust_toolchain" publish \
             --locked \
             --dry-run \
             --allow-dirty \
             -p "$package" \
             "$@"
+        finish_publish_archive
     fi
 }
 
@@ -402,10 +428,12 @@ create_source_package() {
 
 create_registry_source_package() {
     package=$1
+    prepare_publish_archive "$package"
     cargo +"$rust_toolchain" publish \
         --locked \
         --dry-run \
         -p "$package"
+    finish_publish_archive
     verify_source_package "$package"
 }
 
@@ -795,7 +823,9 @@ case "$mode" in
                     # the registry-backed archive used for exact verification.
                     create_source_package "$package" no
                     verify_release_source_unchanged
+                    prepare_publish_archive "$package"
                     cargo +"$rust_toolchain" publish --locked -p "$package"
+                    finish_publish_archive
                     verify_new_upload \
                         "$package" \
                         "$version" \

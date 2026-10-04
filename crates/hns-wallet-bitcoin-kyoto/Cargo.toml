@@ -1,7 +1,7 @@
 [package]
 name = "hns-wallet-bitcoin-kyoto"
 description = "Kyoto-only Bitcoin descriptor wallet and native HTLC settlement adapter"
-version = "0.4.1"
+version = "0.4.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,9 +13,10 @@ readme = "README.md"
 publish = ["crates-io"]
 
 [dependencies]
+base64.workspace = true
 bdk_kyoto.workspace = true
 bdk_wallet.workspace = true
-bip157.workspace = true
+bip157 = { package = "hns-wallet-bip157", version = "0.4.2", path = "../hns-wallet-bip157" }
 bip39.workspace = true
 bitcoin.workspace = true
 hkdf.workspace = true

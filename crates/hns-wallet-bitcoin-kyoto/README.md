@@ -6,6 +6,9 @@ the HNS/BTC swap path:
 - direct Bitcoin P2P header and BIP157 synchronization through Kyoto, with
   safe mainnet start checkpoints, cached successful peers, bounded concurrent
   matched-block requests, and recovery gap-window extension;
+- atomic encrypted caches of verified headers, quorum-admitted filter headers,
+  and raw filters, so an interrupted first sync resumes without repeating its
+  committed network downloads; local matching reruns from the genuine birthday;
 - BDK descriptor-wallet receive, history, coin selection, and signing;
 - encrypted, compare-and-swap persisted wallet state using incremental BDK
   changeset deltas, an atomic monotonic journal head, and crash-safe aggregate

@@ -44,6 +44,7 @@ hns-wallet-service = { version = "0.4.1", path = "crates/hns-wallet-service" }
 hns-wallet-host = { version = "0.4.1", path = "crates/hns-wallet-host" }
 
 argon2 = "0.5.3"
+base64 = "0.22.1"
 bech32 = "0.11.0"
 blake2 = "0.10.6"
 bip32 = { version = "0.5.3", default-features = false, features = ["secp256k1", "std"] }
