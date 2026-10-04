@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::{
-    Arc, Mutex, MutexGuard, Weak,
+    Arc, Condvar, Mutex, MutexGuard, Weak,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -325,7 +325,16 @@ impl HnsShakescapeCandidateCache {
         candidates
     }
 
+    #[cfg(test)]
     fn begin_attempt(&mut self, now_unix: u64) -> Option<HnsShakescapeCandidate> {
+        self.begin_attempt_excluding(now_unix, &[])
+    }
+
+    fn begin_attempt_excluding(
+        &mut self,
+        now_unix: u64,
+        connected: &[SocketAddr],
+    ) -> Option<HnsShakescapeCandidate> {
         self.expire(now_unix);
         let address = self
             .candidates
@@ -333,12 +342,21 @@ impl HnsShakescapeCandidateCache {
             .filter(|candidate| {
                 candidate.attempts < SHAKESCAPE_MAX_ATTEMPTS_PER_OBSERVATION
                     && candidate.next_attempt_at <= now_unix
+                    && !connected.contains(&candidate.address)
             })
             .min_by_key(|candidate| (candidate.next_attempt_at, candidate.address))?
             .address;
         let candidate = self.candidates.get_mut(&address)?;
         candidate.attempts = candidate.attempts.saturating_add(1);
         Some(candidate.clone())
+    }
+
+    fn retain_successful_attempt(&mut self, address: SocketAddr, now_unix: u64) {
+        if let Some(candidate) = self.candidates.get_mut(&address) {
+            candidate.attempts = 0;
+            candidate.last_failure_at = None;
+            candidate.next_attempt_at = now_unix.saturating_add(SHAKESCAPE_RETRY_BASE_SECONDS);
+        }
     }
 
     fn finish_attempt(&mut self, address: SocketAddr, now_unix: u64, succeeded: bool) {
@@ -1314,8 +1332,13 @@ impl ScanPeerLatency {
     }
 }
 
-/// Persistent native standard-peer pool. This is also the embedded backend's
-/// transaction broadcast boundary.
+#[derive(Default)]
+struct PeerDialState {
+    addresses: HashSet<SocketAddr>,
+    worker_failed: bool,
+}
+
+/// Persistent native standard-peer pool and transaction broadcast boundary.
 pub struct NativeHnsPeerPool {
     config: HnsDirectPeerConfig,
     peers: Mutex<HashMap<PeerId, PeerHandle>>,
@@ -1323,6 +1346,8 @@ pub struct NativeHnsPeerPool {
     retired_addresses: Mutex<HashSet<SocketAddr>>,
     disconnected_peers: Mutex<HashSet<PeerId>>,
     maintenance_started: AtomicBool,
+    dialing: Mutex<PeerDialState>,
+    dial_changed: Condvar,
     shakescape_candidates: Arc<Mutex<HnsShakescapeCandidateCache>>,
     last_shakescape_getaddr: Mutex<Option<u64>>,
     shakescape_advertisement: Mutex<Option<HnsShakescapeAdvertisement>>,
@@ -1359,33 +1384,11 @@ impl HnsPublicHeaderTransport {
         if pool.candidate_addresses()?.is_empty() {
             let _ = pool.discover_dns();
         }
-        // Reserve maintenance is on the browser's header-sync path. Bound the
-        // batch by the missing reserve and negotiate concurrently so a stalled
-        // handshake cannot delay every other candidate in sequence.
-        let candidates = pool.candidate_addresses()?;
-        let attempts = std::thread::scope(|scope| {
-            candidates
-                .into_iter()
-                .map(|address| {
-                    let pool = &pool;
-                    scope.spawn(move || (address, pool.connect(address, local_height, now)))
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .map(|task| task.join())
-                .collect::<Vec<_>>()
-        });
-        for attempt in attempts {
-            match attempt {
-                // A simultaneous wallet refill may have already connected
-                // this candidate or filled the reserve. Neither is a failed
-                // endpoint and must not quarantine a healthy address.
-                Ok((_, Ok(_)))
-                | Ok((_, Err(HnsDirectPeerError::DuplicatePeer | HnsDirectPeerError::PeerLimit))) =>
-                    {}
-                Ok((address, Err(_))) => pool.retire_address(address)?,
-                Err(_) => return Err(HnsDirectPeerError::WorkerPanicked),
-            }
+        // Fill the reserve without making public header reads wait for its
+        // slowest handshake. The pool deduplicates wallet/browser attempts.
+        pool.start_connections(local_height, now)?;
+        if pool.peer_count()? < pool.config.minimum_block_views {
+            pool.wait_for_connections(pool.config.minimum_block_views)?;
         }
         Ok(())
     }
@@ -1519,6 +1522,8 @@ impl NativeHnsPeerPool {
             retired_addresses: Mutex::new(HashSet::new()),
             disconnected_peers: Mutex::new(HashSet::new()),
             maintenance_started: AtomicBool::new(false),
+            dialing: Mutex::new(PeerDialState::default()),
+            dial_changed: Condvar::new(),
             shakescape_candidates: Arc::new(Mutex::new(HnsShakescapeCandidateCache::default())),
             last_shakescape_getaddr: Mutex::new(None),
             shakescape_advertisement: Mutex::new(None),
@@ -1897,6 +1902,28 @@ impl NativeHnsPeerPool {
                 return Err(HnsDirectPeerError::DuplicatePeer);
             }
         }
+        let (connected, peer) = Self::establish_connection(
+            &self.config,
+            Arc::clone(&self.shakescape_candidates),
+            address,
+            local_height,
+            now_unix,
+        )?;
+        self.install_connection(connected, peer)
+    }
+
+    // Only public network state crosses into an outstanding dial. Neither an
+    // authority nor a wallet/store/derivation source is retained by workers.
+    fn establish_connection(
+        config: &HnsDirectPeerConfig,
+        shakescape_candidates: Arc<Mutex<HnsShakescapeCandidateCache>>,
+        address: SocketAddr,
+        local_height: u32,
+        now_unix: u64,
+    ) -> Result<(ConnectedHnsPeer, PeerHandle), HnsDirectPeerError> {
+        if !direct_address_allowed(config, address, config.static_peers.contains(&address)) {
+            return Err(HnsDirectPeerError::AddressNotAllowed);
+        }
         let mut nonce = [0_u8; 8];
         getrandom::fill(&mut nonce).map_err(|_| HnsDirectPeerError::Randomness)?;
         if nonce == [0; 8] {
@@ -1905,13 +1932,13 @@ impl NativeHnsPeerPool {
         let local_version = light_wallet_version(address, nonce, local_height, now_unix);
         let mut connection = PeerConnection::connect(
             address,
-            PeerConfig::for_wallet_network(network_magic(self.config.network)),
+            PeerConfig::for_wallet_network(network_magic(config.network)),
             &local_version,
             now_unix,
-            self.config.connect_timeout,
+            config.connect_timeout,
         )?;
         let metadata = connection.complete_handshake(|| now_unix_or(now_unix))?;
-        let id = connection_peer_id(self.config.network, address, nonce, &metadata);
+        let id = connection_peer_id(config.network, address, nonce, &metadata);
         let connected = ConnectedHnsPeer {
             id,
             address,
@@ -1923,9 +1950,19 @@ impl NativeHnsPeerPool {
             connection,
             deferred_wallet: VecDeque::new(),
             address_gossip_requested: false,
-            shakescape_candidates: Arc::clone(&self.shakescape_candidates),
-            allow_private_addresses: self.config.allow_private_addresses,
+            shakescape_candidates,
+            allow_private_addresses: config.allow_private_addresses,
         }));
+        Ok((connected, peer))
+    }
+
+    fn install_connection(
+        &self,
+        connected: ConnectedHnsPeer,
+        peer: PeerHandle,
+    ) -> Result<ConnectedHnsPeer, HnsDirectPeerError> {
+        let id = connected.id;
+        let address = connected.address;
         let mut peers = self.lock_peers()?;
         if peers.len() >= self.config.target_peers {
             return Err(HnsDirectPeerError::PeerLimit);
@@ -1947,6 +1984,101 @@ impl NativeHnsPeerPool {
             .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
             .insert(address);
         Ok(connected)
+    }
+
+    fn start_connections(
+        self: &Arc<Self>,
+        local_height: u32,
+        now: u64,
+    ) -> Result<(), HnsDirectPeerError> {
+        let candidates = self.candidate_addresses()?;
+        let mut dialing = self
+            .dialing
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        let mut slots = self
+            .config
+            .target_peers
+            .saturating_sub(self.peer_count()?.saturating_add(dialing.addresses.len()));
+        for address in candidates {
+            if slots == 0 {
+                break;
+            }
+            if !dialing.addresses.insert(address) {
+                continue;
+            }
+            slots -= 1;
+            let owner = Arc::downgrade(self);
+            let config = self.config.clone();
+            let cache = Arc::clone(&self.shakescape_candidates);
+            let spawned = std::thread::Builder::new()
+                .name("hns-peer-connect".to_owned())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Self::establish_connection(&config, cache, address, local_height, now)
+                    }));
+                    // A closed owner cannot be resurrected by a completed dial.
+                    let Some(pool) = owner.upgrade() else {
+                        return;
+                    };
+                    let Ok(mut dialing) = pool.dialing.lock() else {
+                        return;
+                    };
+                    match result {
+                        Ok(result) => {
+                            let result = result.and_then(|(connected, peer)| {
+                                pool.install_connection(connected, peer)
+                            });
+                            match result {
+                                Ok(_)
+                                | Err(
+                                    HnsDirectPeerError::DuplicatePeer
+                                    | HnsDirectPeerError::PeerLimit,
+                                ) => {}
+                                Err(_) => {
+                                    let _ = pool.retire_address(address);
+                                }
+                            }
+                        }
+                        Err(_) => dialing.worker_failed = true,
+                    }
+                    dialing.addresses.remove(&address);
+                    pool.dial_changed.notify_all();
+                });
+            if let Err(error) = spawned {
+                dialing.addresses.remove(&address);
+                self.dial_changed.notify_all();
+                return Err(HnsDirectPeerError::Io(error.kind()));
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_connections(&self, minimum: usize) -> Result<(), HnsDirectPeerError> {
+        let mut dialing = self
+            .dialing
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        loop {
+            let actual = self.peer_count()?;
+            if actual >= minimum {
+                return Ok(());
+            }
+            if dialing.worker_failed {
+                dialing.worker_failed = false;
+                return Err(HnsDirectPeerError::WorkerPanicked);
+            }
+            if dialing.addresses.is_empty() {
+                return Err(HnsDirectPeerError::InsufficientBlockViews {
+                    required: minimum,
+                    actual,
+                });
+            }
+            dialing = self
+                .dial_changed
+                .wait(dialing)
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        }
     }
 
     /// Remove and transport-shutdown one connection.
@@ -2008,14 +2140,23 @@ impl NativeHnsPeerPool {
             .into_iter()
             .filter_map(|(_, peer)| peer.lock().ok().map(|peer| peer.address))
             .collect::<HashSet<_>>();
-        let target = self.config.target_peers.saturating_sub(connected.len());
+        let dialing = self
+            .dialing
+            .lock()
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+            .addresses
+            .clone();
+        let target = self
+            .config
+            .target_peers
+            .saturating_sub(connected.len().saturating_add(dialing.len()));
         let mut candidates = self
             .known_addresses
             .lock()
             .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
             .iter()
             .copied()
-            .filter(|address| !connected.contains(address))
+            .filter(|address| !connected.contains(address) && !dialing.contains(address))
             .collect::<Vec<_>>();
         let connected_groups = connected
             .iter()
@@ -2407,6 +2548,27 @@ impl HnsDirectPeerCoordinator {
         local_height: u32,
         now_unix: u64,
     ) -> Result<Option<HnsDirectShakescapePeer>, HnsDirectPeerError> {
+        let peer =
+            self.connect_next_discovered_shakescape_peer_excluding(local_height, now_unix, &[])?;
+        if let Some(peer) = &peer {
+            self.pool
+                .shakescape_candidates
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                .remove(peer.address());
+        }
+        Ok(peer)
+    }
+
+    /// Automatically connect a due discovered endpoint, excluding live sessions.
+    /// Retain successful locators so a disconnected session can be retried;
+    /// fresh advertisements still cannot bypass endpoint failure backoff.
+    pub fn connect_next_discovered_shakescape_peer_excluding(
+        &self,
+        local_height: u32,
+        now_unix: u64,
+        connected: &[SocketAddr],
+    ) -> Result<Option<HnsDirectShakescapePeer>, HnsDirectPeerError> {
         if let Some(advertisement) = self
             .pool
             .shakescape_advertisement
@@ -2426,16 +2588,21 @@ impl HnsDirectPeerCoordinator {
             .shakescape_candidates
             .lock()
             .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
-            .begin_attempt(now_unix);
+            .begin_attempt_excluding(now_unix, connected);
         let Some(candidate) = candidate else {
             return Ok(None);
         };
         let result = self.connect_shakescape_peer(candidate.address, local_height, now_unix);
-        self.pool
+        let mut cache = self
+            .pool
             .shakescape_candidates
             .lock()
-            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
-            .finish_attempt(candidate.address, now_unix, result.is_ok());
+            .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+        if result.is_ok() {
+            cache.retain_successful_attempt(candidate.address, now_unix);
+        } else {
+            cache.finish_attempt(candidate.address, now_unix, false);
+        }
         result.map(Some)
     }
 
@@ -2785,6 +2952,8 @@ impl HnsDirectPeerCoordinator {
         for attempt in attempts {
             match attempt {
                 Ok((_, Ok(peer))) => connected.push(peer),
+                Ok((_, Err(HnsDirectPeerError::DuplicatePeer | HnsDirectPeerError::PeerLimit))) => {
+                }
                 Ok((address, Err(error))) => {
                     // A failed candidate remains in the bounded known set.
                     // Without session quarantine deterministic address
@@ -2830,78 +2999,55 @@ impl HnsDirectPeerCoordinator {
     /// Ensure the verification quorum needed by the latency-sensitive wallet
     /// synchronization path is present.
     ///
-    /// The configured peer target may deliberately be much wider than the
-    /// exact header/block quorum so the unlocked runtime has warm failover
-    /// sessions. Re-filling that entire reserve between consecutive header
-    /// batches can nevertheless put dead-address connection deadlines on the
-    /// foreground critical path. Connect only the missing quorum here; the
-    /// ordinary maintenance path may fill the reserve later. Address gossip
-    /// also stays off this latency-sensitive path.
+    /// Race the entire bounded reserve and return when the exact quorum is
+    /// ready. Outstanding public-only dials fill warm failover slots without
+    /// holding this call or retaining an unlocked wallet. Address gossip stays
+    /// off the foreground path.
     pub fn connect_sync_quorum_available(
         &self,
         now_unix: u64,
     ) -> Result<Vec<ConnectedHnsPeer>, HnsDirectPeerError> {
         self.reap_disconnected_peers()?;
-        if self.pool.peer_count()? >= self.config.minimum_block_views {
-            return Ok(Vec::new());
-        }
-        let mut candidates = self.pool.candidate_addresses()?;
-        let missing = self
-            .config
-            .minimum_block_views
-            .saturating_sub(self.pool.peer_count()?);
-        if candidates.len() < missing {
+        let existing = self
+            .pool
+            .ready_handles()?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect::<HashSet<_>>();
+        if self.pool.peer_count()? < self.config.minimum_block_views
+            && self.pool.candidate_addresses()?.is_empty()
+        {
             let _ = self.pool.discover_dns();
-            candidates = self.pool.candidate_addresses()?;
-        }
-        if candidates.is_empty() {
-            // Failed addresses are quarantined until the known set is
-            // exhausted. A later foreground attempt may start a fresh DNS
-            // generation, but it must still connect only the missing quorum.
-            let _ = self.pool.recycle_retired_dns();
-            candidates = self.pool.candidate_addresses()?;
-        }
-        let mut connected = Vec::new();
-        let mut next_candidate = 0;
-        while next_candidate < candidates.len() {
-            let needed = self
-                .config
-                .minimum_block_views
-                .saturating_sub(self.pool.peer_count()?);
-            if needed == 0 {
-                return Ok(connected);
-            }
-            let batch_end = next_candidate.saturating_add(needed).min(candidates.len());
-            let batch = &candidates[next_candidate..batch_end];
-            next_candidate = batch_end;
-            let attempts = std::thread::scope(|scope| {
-                let tasks = batch
-                    .iter()
-                    .copied()
-                    .map(|address| {
-                        scope.spawn(move || (address, self.connect_peer(address, now_unix)))
-                    })
-                    .collect::<Vec<_>>();
-                tasks
-                    .into_iter()
-                    .map(|task| task.join())
-                    .collect::<Vec<_>>()
-            });
-            for attempt in attempts {
-                match attempt {
-                    Ok((_, Ok(peer))) => connected.push(peer),
-                    Ok((address, Err(_))) => self.pool.retire_address(address)?,
-                    Err(_) => return Err(HnsDirectPeerError::WorkerPanicked),
-                }
-            }
-            if self.pool.peer_count()? >= self.config.minimum_block_views {
-                return Ok(connected);
+            if self.pool.candidate_addresses()?.is_empty() {
+                let _ = self.pool.recycle_retired_dns();
             }
         }
-        Err(HnsDirectPeerError::InsufficientBlockViews {
-            required: self.config.minimum_block_views,
-            actual: self.pool.peer_count()?,
-        })
+        let local_height = self.backend.header_sync_status()?.tip.height().get();
+        self.pool.start_connections(local_height, now_unix)?;
+        self.pool
+            .wait_for_connections(self.config.minimum_block_views)?;
+        self.reap_disconnected_peers()?;
+        self.pool
+            .ready_handles()?
+            .into_iter()
+            .filter(|(id, _)| !existing.contains(id))
+            .map(|(id, peer)| {
+                let peer = peer
+                    .lock()
+                    .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?;
+                let metadata = peer
+                    .connection
+                    .session()
+                    .metadata()
+                    .cloned()
+                    .ok_or(HnsDirectPeerError::NoReadyPeers)?;
+                Ok(ConnectedHnsPeer {
+                    id,
+                    address: peer.address,
+                    metadata,
+                })
+            })
+            .collect()
     }
 
     /// Ask connected standard peers for address gossip and retain only bounded,
@@ -3851,6 +3997,13 @@ impl HnsDirectPeerCoordinator {
                 required: quorum,
                 actual: handles.len(),
             });
+        }
+        for (id, peer) in &handles {
+            let height = peer
+                .lock()
+                .map_err(|_| HnsDirectPeerError::RuntimePoisoned)?
+                .advertised_height;
+            self.backend.add_header_peer(*id, height)?;
         }
         self.rotating_peer_quorum_handles(handles, quorum, &self.next_header_peer_offset)
     }
@@ -5990,7 +6143,7 @@ mod tests {
     }
 
     #[test]
-    fn foreground_sync_connects_quorum_without_opening_reserve_socket() {
+    fn foreground_sync_races_eight_peers_and_returns_before_stalled_handshakes() {
         let config = direct_wallet_config();
         let mut wallet =
             WalletStore::create(":memory:", "foreground quorum test passphrase").unwrap();
@@ -6011,30 +6164,44 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let mut listeners = (0..3)
+        let mut listeners = (0..8)
             .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
             .collect::<Vec<_>>();
         listeners.sort_by_key(|listener| listener.local_addr().unwrap());
-        let reserve = listeners.pop().unwrap();
+        let addresses = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect::<Vec<_>>();
         let mut peer_config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
         peer_config.minimum_block_views = 2;
-        peer_config.target_peers = 3;
+        peer_config.target_peers = 8;
         peer_config.connect_timeout = Duration::from_secs(2);
-        peer_config.static_peers = listeners
-            .iter()
-            .chain(std::iter::once(&reserve))
-            .map(|listener| listener.local_addr().unwrap())
-            .collect();
+        peer_config.static_peers = addresses;
         let coordinator =
             open_wallet_direct_hns_peer_coordinator(store, &config, peer_config, now).unwrap();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        let mut release_handshakes = Vec::new();
+        let mut release_servers = Vec::new();
         let servers = listeners
             .into_iter()
-            .map(|listener| {
+            .enumerate()
+            .map(|(index, listener)| {
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let (close_tx, close_rx) = std::sync::mpsc::channel();
+                release_handshakes.push(release_tx);
+                release_servers.push(close_tx);
+                let accepted = accepted_tx.clone();
                 thread::spawn(move || {
                     let (mut stream, remote) = listener.accept().unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
+                    accepted.send(index).unwrap();
+                    // The first candidate and five reserve candidates stall. Only
+                    // the second and third candidates respond immediately.
+                    if index != 1 && index != 2 {
+                        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    }
                     let mut version = light_wallet_version(remote, [86; 8], 0, now);
                     version.services = SERVICE_NETWORK | SERVICE_BLOOM;
                     let version_frame = Frame::from_packet(&Packet::Version(version))
@@ -6058,25 +6225,73 @@ mod tests {
                             break;
                         }
                     }
+                    close_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                 })
             })
             .collect::<Vec<_>>();
-        assert_eq!(
+        let began = Instant::now();
+        let connected = coordinator.connect_sync_quorum_available(now).unwrap();
+        assert_eq!(connected.len(), 2);
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "a stalled candidate held up the quorum"
+        );
+        assert_eq!(coordinator.pool().peer_count().unwrap(), 2);
+        let accepted = (0..8)
+            .map(|_| accepted_rx.recv_timeout(Duration::from_secs(2)).unwrap())
+            .collect::<HashSet<_>>();
+        assert_eq!(accepted.len(), 8, "all eight candidates must race");
+        // Repeated foreground calls reuse those six in-flight attempts.
+        assert!(
             coordinator
                 .connect_sync_quorum_available(now)
                 .unwrap()
-                .len(),
-            2
+                .is_empty()
         );
-        assert_eq!(coordinator.pool().peer_count().unwrap(), 2);
-        reserve.set_nonblocking(true).unwrap();
-        assert_eq!(
-            reserve.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+        assert_eq!(coordinator.pool.dialing.lock().unwrap().addresses.len(), 6);
+        for (index, release) in release_handshakes.into_iter().enumerate() {
+            if index != 1 && index != 2 {
+                release.send(()).unwrap();
+            }
+        }
+        coordinator.pool.wait_for_connections(8).unwrap();
+        assert_eq!(coordinator.pool().peer_count().unwrap(), 8);
+        // Retire both initial connections: the next round must use late arrivals.
+        for peer in connected {
+            coordinator.disconnect_peer(peer.id).unwrap();
+        }
+        let late = coordinator.header_round_handles().unwrap();
+        assert_eq!(late.len(), 2);
+        let ids = late.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        coordinator.backend.begin_header_round(&ids, now).unwrap();
+        coordinator
+            .backend
+            .abandon_uncommitted_header_round()
+            .unwrap();
+        for release in release_servers {
+            release.send(()).unwrap();
+        }
         for server in servers {
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn outstanding_public_dial_does_not_retain_its_owner() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
+        config.static_peers.push(listener.local_addr().unwrap());
+        let pool = Arc::new(NativeHnsPeerPool::new(config).unwrap());
+        let owner = Arc::downgrade(&pool);
+        pool.start_connections(0, 1).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        assert_eq!(pool.dialing.lock().unwrap().addresses.len(), 1);
+        drop(pool);
+        assert!(
+            owner.upgrade().is_none(),
+            "a dial must not keep a retired pool alive"
+        );
+        drop(stream);
     }
 
     #[test]
@@ -6768,6 +6983,46 @@ mod tests {
     }
 
     #[test]
+    fn automatic_swap_discovery_retries_disconnected_peers_without_duplicate_live_dials() {
+        let now = 100_000;
+        let services = SERVICE_NETWORK | SHAKESCAPE_EXTENSION_SERVICE.value();
+        let address: SocketAddr = "8.8.8.8:20000".parse().unwrap();
+        let mut cache = HnsShakescapeCandidateCache::default();
+        cache.observe(
+            &[NetAddress::from_socket_addr(address, now, services)],
+            now,
+            false,
+        );
+        let attempt = cache.begin_attempt_excluding(now, &[]).unwrap();
+        cache.retain_successful_attempt(attempt.address, now);
+        assert_eq!(
+            cache.snapshot(now).len(),
+            1,
+            "a successful locator must survive for reconnect"
+        );
+        let retry_at = now + SHAKESCAPE_RETRY_BASE_SECONDS;
+        assert!(
+            cache
+                .begin_attempt_excluding(retry_at, &[address])
+                .is_none()
+        );
+        let retry = cache.begin_attempt_excluding(retry_at, &[]).unwrap();
+        assert_eq!(retry.address, address);
+        cache.finish_attempt(address, retry_at, false);
+        // A refreshed gossip timestamp cannot force tight connection retries.
+        cache.observe(
+            &[NetAddress::from_socket_addr(
+                address,
+                retry_at + 1,
+                services,
+            )],
+            retry_at + 1,
+            false,
+        );
+        assert!(cache.begin_attempt_excluding(retry_at + 1, &[]).is_none());
+    }
+
+    #[test]
     fn browser_reserve_negotiates_peers_concurrently() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6811,6 +7066,7 @@ mod tests {
         let mut config = HnsDirectPeerConfig::for_network(HnsNetwork::Regtest);
         config.static_peers = addresses;
         config.target_peers = 2;
+        config.minimum_block_views = 2;
         let pool = Arc::new(NativeHnsPeerPool::new(config).unwrap());
         let transport = HnsPublicHeaderTransport {
             pool: Arc::downgrade(&pool),
