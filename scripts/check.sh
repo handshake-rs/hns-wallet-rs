@@ -9,16 +9,8 @@ python3 scripts/test-verify-release.py
 ./scripts/check-publish-arguments.sh
 ./scripts/publish.sh --archive-only
 
-if rg -n 'path\s*=\s*"\.\./' --glob Cargo.toml \
-    --glob '!integrations/basicswap-bridge/Cargo.toml' .; then
-  echo "sibling path dependency is forbidden" >&2
-  exit 1
-fi
-if rg -n 'path\s*=' integrations/basicswap-bridge/Cargo.toml \
-    | rg -v 'path\s*=\s*"\.\./\.\./crates/hns-wallet-[a-z-]+"'; then
-  echo "BasicSwap bridge path dependency must remain inside wallet crates" >&2
-  exit 1
-fi
+python3 scripts/verify-local-dependencies.py
+python3 scripts/test-local-dependencies.py
 
 if rg -n 'name = "(electrum-client|esplora-client|bitcoincore-rpc)"' Cargo.lock; then
   echo "alternate Bitcoin production backend found" >&2
