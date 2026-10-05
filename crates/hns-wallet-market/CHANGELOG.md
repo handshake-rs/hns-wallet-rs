@@ -1,12 +1,11 @@
 # hns-wallet-market
 
-## 0.5.0 - unreleased
+## 0.5.0 - 2026-10-04
 
-<!-- hns-wallet-release-state: 0.5.0 candidate -->
-This heading describes the current unpublished release candidate, not an
-existing crates.io package, Git tag, or GitHub release.
+<!-- hns-wallet-release-state: 0.5.0 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
 
-Remove private offer identifiers and device-local profile IDs from settlement-key derivation. Reproduce signing authority, board identity and maker preimages from the same recovery seed and public context in a fresh profile. This is a breaking beta format change; no compatibility reader is added. Automatic recovery of contract terms remains a release blocker.
+Remove private offer identifiers and device-local profile IDs from settlement-key derivation. Reproduce signing authority, board identity and maker preimages from the same recovery seed and public context in a fresh profile. This is a breaking beta format change; no compatibility reader is added. Automatic recovery of contract terms after local database loss remains incomplete; this release does not claim seed-only contract discovery.
 
 ## 0.4.2 - 2026-10-03
 

@@ -1,7 +1,9 @@
 # Swap seed recovery audit, 2026-10-04
 
-The new 0.5.0 market, mobile-controller and testkit packages are **unpublished
-candidates**. Store delivery remains on hold. No recovery-file export,
+The owner subsequently authorized incrementing and submitting both mobile apps
+on 2026-10-04, superseding the earlier release hold. Market and mobile-controller
+0.5.0 are prepared for that delivery; testkit remains an unpublished candidate.
+Automatic contract discovery remains incomplete. No recovery-file export,
 file-confirmation step, compatibility reader or migration adapter is included.
 
 ## Defect and current change
@@ -44,7 +46,7 @@ The former private-intent derivation cannot be corrected retroactively for an
 already funded output when its original derivation context is gone. This
 candidate does not claim to recover that historical test output.
 
-## Required before publishing or store delivery
+## Required to establish complete seed-only swap recovery
 
 An automatic recovery path must rediscover the authenticated public contract
 terms and public key context after restoring only the wallet seed. It must not
@@ -61,10 +63,10 @@ changed script commitments and refunds before independently verified maturity.
 Qualification must cover the shared core and both native app paths. Signing and
 broadcasting real test-account funds remains a separate owner action.
 
-The canonical candidate markers keep the existing publish execution path from
-uploading these packages before qualification. Mobile dependency pins still
-point to the previously published 0.4.2 runtime; no new device install or store
-submission was performed for this candidate.
+The earlier candidate markers and store hold were superseded by the owner's
+subsequent release instruction. Market and mobile-controller releases must pass
+the existing build, package and registry verification gates before distribution.
+These releases must not be described as complete seed-only swap recovery.
 
 ## Validation
 
@@ -91,5 +93,5 @@ submission was performed for this candidate.
 These tests supply an authenticated public agreement to the fresh wallet; they
 verify keys and canonical contract bindings. They do not discover that agreement
 from the chains, sign a funded refund transaction, test maturity on-device, or
-establish automatic end-to-end refund recovery. Those remain release blockers.
+establish automatic end-to-end refund recovery. Those remain incomplete recovery work.
 No real account seed or funding transaction was used in these tests.

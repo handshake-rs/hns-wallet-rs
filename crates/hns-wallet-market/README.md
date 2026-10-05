@@ -50,13 +50,14 @@ carry the canonical Shakescape frames; none is pricing, market, or chain authori
 The crate supplies no discovery service or product UI. Release gates for real
 value execution remain owned by the application layer.
 
-## Recovery status of the 0.5.0 candidate
+## Recovery status of 0.5.0
 
 Signing authority and maker preimages are reproducible from the wallet recovery
 seed and authenticated public context, independently of the original profile
 ID or private offer intent. This does not make a funded contract discoverable
 from the seed alone: its public terms still need an automatic recovery path.
-This candidate is unpublished and blocked from product release until a fresh
-seed restore rediscovers those terms and refunds on both chains without a
-manual recovery file or cooperation from an online counterparty. See the
+The owner authorized store delivery with this remaining limitation disclosed.
+Automatic contract discovery after losing the local database is incomplete;
+this release does not claim that restoring the seed alone recovers every funded
+swap. No separate recovery-file workflow is required. See the
 [recovery audit](../../docs/swap-seed-recovery-audit-2026-10-04.md).

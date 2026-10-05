@@ -1,12 +1,11 @@
 # hns-wallet-mobile
 
-## 0.5.0 - unreleased
+## 0.5.0 - 2026-10-04
 
-<!-- hns-wallet-release-state: 0.5.0 candidate -->
-This heading describes the current unpublished release candidate, not an
-existing crates.io package, Git tag, or GitHub release.
+<!-- hns-wallet-release-state: 0.5.0 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
 
-Use the new seed-derived swap authority format. This candidate is held until a seed restore automatically rediscovers the refund contract and both platform refund flows are qualified.
+Use the new seed-derived swap authority format. The owner authorized store delivery after disclosure that automatic discovery of contract terms after local database loss remains incomplete. This release fixes authority derivation, not seed-only contract discovery.
 
 ## 0.4.2 - 2026-10-04
 
