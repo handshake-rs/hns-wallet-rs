@@ -184,7 +184,6 @@ pub fn create_shakescape_direct_offer_acceptance(
             session_id,
             participant: SwapParticipant::Maker,
             network: policy.network(),
-            intent_id: request.offer_id,
         },
         request.created_at_unix,
     )
@@ -262,7 +261,6 @@ pub fn accept_shakescape_direct_maker_proposal(
     if local.session_id != session_id || local.offer_id != ObjectHash::new(record.offer.offer_id) {
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
-    let intent_id = local.intent_id;
     let expected_taker_key = record.offer.offer_setter_settlement_public_key;
     if let Some(hello) = record.hello {
         let execution = open_shakescape_execution(store, policy, session_id, now_unix)?;
@@ -292,7 +290,6 @@ pub fn accept_shakescape_direct_maker_proposal(
             session_id,
             participant: SwapParticipant::Taker,
             network: policy.network(),
-            intent_id,
         },
     )
     .map_err(|_| MarketError::Persistence)?;
@@ -473,7 +470,6 @@ pub fn derive_local_direct_taker_key(
     if local.session_id != session_id {
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
-    let intent_id = local.intent_id;
     let fee_reserve = local.offered_fee_reserve;
     let expected_key = record.offer.offer_setter_settlement_public_key;
     if record.hello.as_ref().is_none_or(|hello| {
@@ -492,7 +488,6 @@ pub fn derive_local_direct_taker_key(
             session_id,
             participant: SwapParticipant::Taker,
             network: policy.network(),
-            intent_id,
         },
     )
     .map_err(|_| MarketError::Persistence)?;
@@ -778,6 +773,119 @@ mod tests {
         store
     }
 
+    fn assert_seed_restore_retains_both_contract_authorities(
+        hello: &SwapSessionHello,
+        maker_seed: u8,
+        taker_seed: u8,
+    ) {
+        use hns_marketplace_protocol::SwapAssetSide;
+        use hns_wallet_chain_api::SettlementSigner;
+        use k256::ecdsa::signature::hazmat::PrehashVerifier;
+        use k256::ecdsa::{Signature, VerifyingKey};
+
+        hello
+            .verify_agreement(policy().network())
+            .expect("authenticated public terms");
+        let (btc_side, hns_side, hns_receiver, hns_refund) = if hello.offered_asset == AssetId::BTC
+        {
+            (
+                SwapAssetSide::Offered,
+                SwapAssetSide::Received,
+                hello.maker_settlement_public_key,
+                hello.taker_settlement_public_key,
+            )
+        } else {
+            (
+                SwapAssetSide::Received,
+                SwapAssetSide::Offered,
+                hello.taker_settlement_public_key,
+                hello.maker_settlement_public_key,
+            )
+        };
+        let bitcoin = hns_wallet_bitcoin_kyoto::build_shakescape_bitcoin_htlc(hello, btc_side)
+            .expect("canonical Bitcoin contract");
+        let hns = hello
+            .build_hns_htlc(hns_side, hns_receiver, hns_refund)
+            .expect("canonical HNS contract");
+        let (bitcoin_commitment, hns_commitment) = if hello.offered_asset == AssetId::BTC {
+            (
+                hello.offered_lock_commitment,
+                hello.received_lock_commitment,
+            )
+        } else {
+            (
+                hello.received_lock_commitment,
+                hello.offered_lock_commitment,
+            )
+        };
+        assert_eq!(bitcoin.commitment.into_bytes(), bitcoin_commitment);
+        assert_eq!(hns.descriptor_hash, hns_commitment);
+
+        for (participant, seed, profile, expected_key, funding_asset) in [
+            (
+                SwapParticipant::Maker,
+                maker_seed,
+                91,
+                hello.maker_settlement_public_key,
+                hello.offered_asset,
+            ),
+            (
+                SwapParticipant::Taker,
+                taker_seed,
+                92,
+                hello.taker_settlement_public_key,
+                hello.received_asset,
+            ),
+        ] {
+            // Restore only the seed under a different profile. The authenticated
+            // public agreement is supplied by this test, not discovered here.
+            let wallet_id = WalletId::new([profile; 16]);
+            let mut restored = store(wallet_id, seed);
+            let request = CrossChainSwapKeyRequest {
+                wallet_id,
+                session_id: SessionId::new(hello.swap_session_id),
+                participant,
+                network: hello.header.network,
+            };
+            assert!(
+                crate::load_cross_chain_swap_key_allocation(
+                    &restored,
+                    wallet_id,
+                    request.session_id,
+                    participant,
+                )
+                .expect("fresh allocation lookup")
+                .is_none()
+            );
+            allocate_cross_chain_swap_key(&mut restored, request, START + 40)
+                .expect("reconstructed allocation");
+            let key = derive_cross_chain_swap_key_from_store(&restored, request)
+                .expect("restored signing authority");
+            assert_eq!(key.public_key(), expected_key);
+            if funding_asset == AssetId::BTC {
+                assert_eq!(bitcoin.htlc.refund_public_key.as_slice(), key.public_key());
+                assert_eq!(hns.descriptor.receiver_public_key, key.public_key());
+            } else {
+                assert_eq!(hns.descriptor.refund_public_key, key.public_key());
+                assert_eq!(
+                    bitcoin.htlc.receiver_public_key.as_slice(),
+                    key.public_key()
+                );
+            }
+            // Verify ownership of the authorities in both canonical contracts.
+            // These are digest signatures, not funded transaction broadcasts.
+            let verifier = VerifyingKey::from_sec1_bytes(&expected_key).expect("public authority");
+            for digest in [bitcoin_commitment, hns_commitment] {
+                let signature =
+                    Signature::from_slice(&key.sign_digest(digest).expect("restored signature"))
+                        .expect("compact signature");
+                verifier
+                    .verify_prehash(&digest, &signature)
+                    .expect("valid restored signature");
+            }
+        }
+    }
+
     #[test]
     fn two_wallets_reach_the_same_countersigned_restart_safe_execution() {
         let policy = policy();
@@ -901,6 +1009,7 @@ mod tests {
             START + 30,
         )
         .expect("maker execution");
+        assert_seed_restore_retains_both_contract_authorities(&accepted.hello, 0x41, 0x31);
         assert_eq!(accepted.execution, maker_execution);
         assert_eq!(accepted.execution.state, crate::SwapState::TermsFrozen);
         assert_eq!(
@@ -1071,6 +1180,7 @@ mod tests {
             START + 30,
         )
         .expect("maker execution");
+        assert_seed_restore_retains_both_contract_authorities(&accepted.hello, 0x61, 0x51);
         assert_eq!(accepted.execution, maker_execution);
         assert_eq!(accepted.execution.state, crate::SwapState::TermsFrozen);
         assert_eq!(acceptance.offered_asset, AssetId::HNS);

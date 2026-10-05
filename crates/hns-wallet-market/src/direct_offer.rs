@@ -32,15 +32,15 @@ use crate::{
     load_shakescape_direct_swap,
 };
 
-const STORAGE_VERSION: u16 = 1;
+const STORAGE_VERSION: u16 = 2;
 const RECORD_PREFIX: &[u8] = b"local-direct-offer/v1/";
 const INTENT_DOMAIN: &[u8] = b"hns-wallet/direct-offer-intent/v2\0";
 const SESSION_DOMAIN: &[u8] = b"hns-wallet/direct-offer-session/v2\0";
-const IDENTITY_SALT: &[u8] = b"hns-wallet/direct-board-identity/hkdf-sha256/v1\0";
-const IDENTITY_INFO: &[u8] = b"hns-wallet/direct-board-identity/scalar/v1\0";
-const MAKER_PREIMAGE_SALT: &[u8] = b"hns-wallet/direct-maker-preimage/hkdf-sha256/v1\0";
-const MAKER_PREIMAGE_INFO: &[u8] = b"hns-wallet/direct-maker-preimage/value/v1\0";
-const MAKER_PREIMAGE_RECORD_DOMAIN: &[u8] = b"hns-wallet/direct-maker-preimage/record/v1\0";
+const IDENTITY_SALT: &[u8] = b"hns-wallet/direct-board-identity/hkdf-sha256/v2\0";
+const IDENTITY_INFO: &[u8] = b"hns-wallet/direct-board-identity/scalar/v2\0";
+const MAKER_PREIMAGE_SALT: &[u8] = b"hns-wallet/direct-maker-preimage/hkdf-sha256/v2\0";
+const MAKER_PREIMAGE_INFO: &[u8] = b"hns-wallet/direct-maker-preimage/value/v2\0";
+const MAKER_PREIMAGE_RECORD_DOMAIN: &[u8] = b"hns-wallet/direct-maker-preimage/record/v2\0";
 const MAX_DERIVATION_ATTEMPTS: u32 = 256;
 const MIN_FUNDING_WINDOW_SECONDS: u64 = 10 * 60;
 const MIN_SECOND_REFUND_AFTER_SECONDS: u64 =
@@ -106,10 +106,6 @@ pub(crate) struct PersistedLocalDirectOffer {
     pub(crate) wallet_id: WalletId,
     pub(crate) offer_id: ObjectHash,
     pub(crate) session_id: SessionId,
-    pub(crate) intent_id: ObjectHash,
-    // Existing v1 records used this name for the reserve in the offered
-    // asset's base unit, including HNS offers. Keep reading those records.
-    #[serde(alias = "bitcoin_fee_reserve_sats")]
     pub(crate) offered_fee_reserve: u64,
     pub(crate) created_at_unix: u64,
 }
@@ -211,7 +207,6 @@ pub fn create_shakescape_direct_offer(
             session_id,
             participant: SwapParticipant::Taker,
             network: policy.network(),
-            intent_id: intent,
         },
         request.created_at_unix,
     )
@@ -254,7 +249,6 @@ pub fn create_shakescape_direct_offer(
         wallet_id: request.wallet_id,
         offer_id,
         session_id,
-        intent_id: intent,
         offered_fee_reserve: request.offered_fee_reserve,
         created_at_unix: request.created_at_unix,
     };
@@ -313,7 +307,6 @@ pub fn create_shakescape_direct_maker_proposal(
     {
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
-    let intent_id = local.offer_id;
     if let Some(proposal) = record.proposal.as_ref() {
         match proposal.verify_at(policy.network(), request.now_unix) {
             Ok(()) => {
@@ -373,7 +366,6 @@ pub fn create_shakescape_direct_maker_proposal(
         store,
         request.wallet_id,
         request.session_id,
-        intent_id,
         record.offer.offer_id,
     )?;
     store.put_secret(
@@ -390,7 +382,6 @@ pub fn create_shakescape_direct_maker_proposal(
             session_id: request.session_id,
             participant: SwapParticipant::Maker,
             network: policy.network(),
-            intent_id,
         },
     )
     .map_err(|_| MarketError::Persistence)?;
@@ -528,7 +519,6 @@ pub fn derive_local_direct_maker_key(
     {
         return Err(MarketError::ShakescapeDirectSwapConflict);
     }
-    let intent_id = local.offer_id;
     let fee_reserve = local.received_fee_reserve;
     let expected_key = record.acceptance.responding_maker_settlement_public_key;
     if record.offer.swap_session_id != session_id.into_bytes()
@@ -543,7 +533,6 @@ pub fn derive_local_direct_maker_key(
             session_id,
             participant: SwapParticipant::Maker,
             network: policy.network(),
-            intent_id,
         },
     )
     .map_err(|_| MarketError::Persistence)?;
@@ -673,12 +662,6 @@ pub fn cancel_shakescape_local_direct_offer(
             .as_bytes()
             .iter()
             .all(|byte| *byte == 0)
-        || local
-            .value
-            .intent_id
-            .as_bytes()
-            .iter()
-            .all(|byte| *byte == 0)
     {
         return Err(MarketError::CorruptShakescapeDirectOfferBoard);
     }
@@ -737,7 +720,6 @@ pub fn list_local_shakescape_direct_offers(
         if stored.revision != 1
             || record.storage_version != STORAGE_VERSION
             || record.wallet_id != wallet_id
-            || record.intent_id.as_bytes().iter().all(|byte| *byte == 0)
             || record.created_at_unix != stored.updated_at_unix
         {
             return Err(MarketError::CorruptShakescapeDirectOfferBoard);
@@ -782,7 +764,6 @@ pub fn list_local_shakescape_direct_offer_cancellations(
         if stored.revision != 1
             || record.storage_version != STORAGE_VERSION
             || record.wallet_id != wallet_id
-            || record.intent_id.as_bytes().iter().all(|byte| *byte == 0)
             || record.created_at_unix != stored.updated_at_unix
         {
             return Err(MarketError::CorruptShakescapeDirectOfferBoard);
@@ -913,7 +894,6 @@ pub(crate) fn load_local_offer(
         || record.wallet_id != wallet_id
         || record.offer_id != ObjectHash::new(offer_id)
         || record.session_id.as_bytes().iter().all(|byte| *byte == 0)
-        || record.intent_id.as_bytes().iter().all(|byte| *byte == 0)
         || record.created_at_unix != stored.updated_at_unix
     {
         return Err(MarketError::CorruptShakescapeDirectOfferBoard);
@@ -986,7 +966,6 @@ fn derive_maker_preimage(
     store: &WalletStore,
     wallet_id: WalletId,
     session_id: SessionId,
-    intent_id: ObjectHash,
     offer_id: [u8; 32],
 ) -> Result<Preimage, MarketError> {
     let seed = store
@@ -996,10 +975,9 @@ fn derive_maker_preimage(
         return Err(MarketError::Invariant);
     }
     let hkdf = Hkdf::<Sha256>::new(Some(MAKER_PREIMAGE_SALT), &seed);
-    let mut info = Vec::with_capacity(MAKER_PREIMAGE_INFO.len() + 32 + 32 + 32);
+    let mut info = Vec::with_capacity(MAKER_PREIMAGE_INFO.len() + 32 + 32);
     info.extend_from_slice(MAKER_PREIMAGE_INFO);
     info.extend_from_slice(session_id.as_bytes());
-    info.extend_from_slice(intent_id.as_bytes());
     info.extend_from_slice(&offer_id);
     let mut preimage = Zeroizing::new([0_u8; Preimage::LENGTH]);
     hkdf.expand(&info, &mut *preimage)
@@ -1034,9 +1012,8 @@ pub(crate) fn derive_board_identity(
         .map_err(|_| MarketError::InvalidShakescapeDirectOfferPolicy)?;
     let hkdf = Hkdf::<Sha256>::new(Some(IDENTITY_SALT), &seed);
     for attempt in 0..MAX_DERIVATION_ATTEMPTS {
-        let mut info = Vec::with_capacity(IDENTITY_INFO.len() + 32 + network.len() + 4);
+        let mut info = Vec::with_capacity(IDENTITY_INFO.len() + network.len() + 4);
         info.extend_from_slice(IDENTITY_INFO);
-        info.extend_from_slice(wallet_id.as_bytes());
         info.extend_from_slice(&network);
         info.extend_from_slice(&attempt.to_be_bytes());
         let mut secret = Zeroizing::new([0_u8; 32]);
@@ -1148,7 +1125,7 @@ mod tests {
             .put_secret(
                 wallet_id.as_bytes(),
                 SecretKind::RecoverySeed,
-                &[0x31; RECOVERY_SEED_BYTES],
+                &[wallet_id.as_bytes()[0]; RECOVERY_SEED_BYTES],
                 1,
             )
             .expect("seed");
@@ -1156,35 +1133,45 @@ mod tests {
     }
 
     #[test]
-    fn reads_pre_refactor_local_offer_reserve_without_discarding_it() {
-        let record = PersistedLocalDirectOffer {
-            storage_version: STORAGE_VERSION,
-            wallet_id: WalletId::new([9; 16]),
-            offer_id: ObjectHash::new([7; 32]),
-            session_id: SessionId::new([8; 32]),
-            intent_id: ObjectHash::new([6; 32]),
-            offered_fee_reserve: 1_500,
-            created_at_unix: 100,
-        };
-        let current = serde_json::to_value(&record).expect("serialize current record");
-        let mut legacy = current.clone();
-        let reserve = legacy
-            .as_object_mut()
-            .expect("record object")
-            .remove("offered_fee_reserve")
-            .expect("current reserve");
-        legacy
-            .as_object_mut()
-            .expect("record object")
-            .insert("bitcoin_fee_reserve_sats".to_owned(), reserve);
-
+    fn restored_profile_reproduces_public_identity_and_maker_preimage() {
+        let original_id = WalletId::new([9; 16]);
+        let restored_id = WalletId::new([10; 16]);
+        let original = seeded_store(original_id);
+        let mut restored = WalletStore::create(":memory:", PASSPHRASE).expect("restored store");
+        restored
+            .put_secret(
+                restored_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[original_id.as_bytes()[0]; RECOVERY_SEED_BYTES],
+                1,
+            )
+            .expect("restored seed");
+        let session_id = SessionId::new([8; 32]);
+        let offer_id = [7; 32];
         assert_eq!(
-            serde_json::from_value::<PersistedLocalDirectOffer>(legacy).expect("legacy record"),
-            record
+            *derive_board_identity(&original, original_id, &policy()).expect("original identity"),
+            *derive_board_identity(&restored, restored_id, &policy()).expect("restored identity"),
         );
+        let preimage = derive_maker_preimage(&original, original_id, session_id, offer_id)
+            .expect("original preimage");
+        let restored_preimage = derive_maker_preimage(&restored, restored_id, session_id, offer_id)
+            .expect("restored preimage");
         assert_eq!(
-            serde_json::from_value::<PersistedLocalDirectOffer>(current).expect("current record"),
-            record
+            preimage.expose_for_settlement(),
+            restored_preimage.expose_for_settlement(),
+        );
+        let different_session =
+            derive_maker_preimage(&restored, restored_id, SessionId::new([11; 32]), offer_id)
+                .expect("different session");
+        assert_ne!(
+            preimage.expose_for_settlement(),
+            different_session.expose_for_settlement()
+        );
+        let different_offer = derive_maker_preimage(&restored, restored_id, session_id, [12; 32])
+            .expect("different offer");
+        assert_ne!(
+            preimage.expose_for_settlement(),
+            different_offer.expose_for_settlement()
         );
     }
 

@@ -22,13 +22,13 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-const STORAGE_VERSION: u16 = 1;
-const RECORD_ID_DOMAIN: &[u8] = b"hns-wallet/cross-chain-swap-key/record/v1\0";
-const CONTEXT_DOMAIN: &[u8] = b"hns-wallet/cross-chain-swap-key/context/v1\0";
+const STORAGE_VERSION: u16 = 2;
+const RECORD_ID_DOMAIN: &[u8] = b"hns-wallet/cross-chain-swap-key/record/v2\0";
+const CONTEXT_DOMAIN: &[u8] = b"hns-wallet/cross-chain-swap-key/context/v2\0";
 const RECOVERY_SEED_COMMITMENT_DOMAIN: &[u8] =
-    b"hns-wallet/cross-chain-swap-key/recovery-seed/v1\0";
-const DERIVATION_SALT: &[u8] = b"hns-wallet/cross-chain-swap-key/hkdf-sha256/v1\0";
-const DERIVATION_INFO_DOMAIN: &[u8] = b"hns-wallet/cross-chain-swap-key/scalar/v1\0";
+    b"hns-wallet/cross-chain-swap-key/recovery-seed/v2\0";
+const DERIVATION_SALT: &[u8] = b"hns-wallet/cross-chain-swap-key/hkdf-sha256/v2\0";
+const DERIVATION_INFO_DOMAIN: &[u8] = b"hns-wallet/cross-chain-swap-key/scalar/v2\0";
 const MAX_DERIVATION_ATTEMPTS: u32 = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -93,24 +93,21 @@ impl SwapParticipant {
 
 /// Immutable context used to allocate and recover a participant's key.
 ///
-/// The record identity is wallet/session/participant. `network` and
-/// `intent_id` are immutable binding data: retrying that identity with either
-/// changed fails instead of silently reusing the key in another market.
+/// The record identity is wallet/session/participant. The local wallet ID is
+/// only a store locator. Signing authority is derived from the recovery seed,
+/// public session ID, participant role and network. A fresh seed restore can
+/// reproduce it without the original profile ID or private offer metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CrossChainSwapKeyRequest {
     pub wallet_id: WalletId,
     pub session_id: SessionId,
     pub participant: SwapParticipant,
     pub network: NetworkBinding,
-    pub intent_id: ObjectHash,
 }
 
 impl CrossChainSwapKeyRequest {
     fn validate(self) -> Result<Vec<u8>, CrossChainSwapKeyError> {
-        if is_zero(self.wallet_id.as_bytes())
-            || is_zero(self.session_id.as_bytes())
-            || is_zero(self.intent_id.as_bytes())
-        {
+        if is_zero(self.wallet_id.as_bytes()) || is_zero(self.session_id.as_bytes()) {
             return Err(CrossChainSwapKeyError::InvalidRequest);
         }
         self.network
@@ -131,7 +128,6 @@ pub struct CrossChainSwapKeyAllocation {
     session_id: SessionId,
     participant: SwapParticipant,
     network_encoding: Vec<u8>,
-    intent_id: ObjectHash,
     context_commitment: ObjectHash,
     compressed_public_key: PersistedCompressedPublicKey,
     recovery_seed_commitment: [u8; 32],
@@ -149,10 +145,6 @@ impl CrossChainSwapKeyAllocation {
 
     pub const fn participant(&self) -> SwapParticipant {
         self.participant
-    }
-
-    pub const fn intent_id(&self) -> ObjectHash {
-        self.intent_id
     }
 
     pub const fn context_commitment(&self) -> ObjectHash {
@@ -178,7 +170,6 @@ impl CrossChainSwapKeyAllocation {
             session_id: self.session_id,
             participant: self.participant,
             network: self.network()?,
-            intent_id: self.intent_id,
         })
     }
 
@@ -207,7 +198,6 @@ impl CrossChainSwapKeyAllocation {
             && self.session_id == request.session_id
             && self.participant == request.participant
             && self.network_encoding == network_encoding
-            && self.intent_id == request.intent_id
             && self.context_commitment == context_commitment(request, network_encoding)
     }
 }
@@ -439,7 +429,6 @@ pub fn allocate_cross_chain_swap_key(
         session_id: request.session_id,
         participant: request.participant,
         network_encoding,
-        intent_id: request.intent_id,
         context_commitment: context_commitment(request, &request.network.encode()?),
         compressed_public_key: PersistedCompressedPublicKey(key.public_key()),
         recovery_seed_commitment,
@@ -567,7 +556,7 @@ fn derive_key_from_store(
     if seed.len() != RECOVERY_SEED_BYTES {
         return Err(CrossChainSwapKeyError::DerivationFailed);
     }
-    let seed_commitment = recovery_seed_commitment_from_cleartext(request.wallet_id, &seed);
+    let seed_commitment = recovery_seed_commitment_from_cleartext(&seed);
     let context = context_commitment(request, network_encoding);
     let hkdf = Hkdf::<Sha256>::new(Some(DERIVATION_SALT), &seed);
     for attempt in 0..MAX_DERIVATION_ATTEMPTS {
@@ -608,13 +597,12 @@ fn recovery_seed_commitment(
     if seed.len() != RECOVERY_SEED_BYTES {
         return Err(CrossChainSwapKeyError::DerivationFailed);
     }
-    Ok(recovery_seed_commitment_from_cleartext(wallet_id, &seed))
+    Ok(recovery_seed_commitment_from_cleartext(&seed))
 }
 
-fn recovery_seed_commitment_from_cleartext(wallet_id: WalletId, seed: &[u8]) -> [u8; 32] {
+fn recovery_seed_commitment_from_cleartext(seed: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(RECOVERY_SEED_COMMITMENT_DOMAIN);
-    hasher.update(wallet_id.as_bytes());
     hasher.update(seed);
     hasher.finalize().into()
 }
@@ -623,10 +611,8 @@ fn context_commitment(request: CrossChainSwapKeyRequest, network_encoding: &[u8]
     let mut hasher = Sha256::new();
     hasher.update(CONTEXT_DOMAIN);
     hasher.update(STORAGE_VERSION.to_be_bytes());
-    hasher.update(request.wallet_id.as_bytes());
     hasher.update(request.session_id.as_bytes());
     hasher.update([request.participant.code()]);
-    hasher.update(request.intent_id.as_bytes());
     hasher.update(network_encoding);
     ObjectHash::new(hasher.finalize().into())
 }
@@ -680,7 +666,6 @@ mod tests {
             session_id: SessionId::new([12; 32]),
             participant,
             network: network(),
-            intent_id: ObjectHash::new([11; 32]),
         }
     }
 
@@ -738,7 +723,10 @@ mod tests {
         ));
 
         let conflicting = CrossChainSwapKeyRequest {
-            intent_id: ObjectHash::new([99; 32]),
+            network: NetworkBinding {
+                counterchain_network: 2,
+                ..request.network
+            },
             ..request
         };
         assert!(matches!(
@@ -749,6 +737,90 @@ mod tests {
             allocate_cross_chain_swap_key(&mut store, request, 9),
             Err(CrossChainSwapKeyError::ClockRollback)
         ));
+    }
+
+    #[test]
+    fn seed_restore_reproduces_swap_authority_without_original_profile_or_allocation() {
+        let original_request = request(3, SwapParticipant::Maker);
+        let restored_request = CrossChainSwapKeyRequest {
+            wallet_id: WalletId::new([99; 16]),
+            ..original_request
+        };
+        let mut original = store_with_seed(original_request, 21);
+        let original_binding = allocate_cross_chain_swap_key(&mut original, original_request, 10)
+            .expect("original allocation");
+        let original_key = derive_cross_chain_swap_key_from_store(&original, original_request)
+            .expect("original authority");
+
+        // Only the seed and public session/role/network are copied. No original
+        // allocation, offer, private nonce, intent, or profile ID survives.
+        let mut restored = store_with_seed(restored_request, 21);
+        assert!(
+            load_cross_chain_swap_key_allocation(
+                &restored,
+                restored_request.wallet_id,
+                restored_request.session_id,
+                restored_request.participant,
+            )
+            .expect("empty restored store")
+            .is_none()
+        );
+        let restored_binding = allocate_cross_chain_swap_key(&mut restored, restored_request, 20)
+            .expect("recreated allocation");
+        let restored_key = derive_cross_chain_swap_key_from_store(&restored, restored_request)
+            .expect("restored authority");
+        assert_eq!(
+            original_binding.compressed_public_key(),
+            restored_binding.compressed_public_key()
+        );
+        assert_eq!(
+            original_key
+                .sign_digest([42; 32])
+                .expect("original signature"),
+            restored_key
+                .sign_digest([42; 32])
+                .expect("restored signature")
+        );
+    }
+
+    #[test]
+    fn restored_swap_keys_remain_separated_by_seed_session_role_and_network() {
+        let base = request(3, SwapParticipant::Maker);
+        let variants = [
+            (base, 21),
+            (base, 22),
+            (
+                CrossChainSwapKeyRequest {
+                    session_id: SessionId::new([42; 32]),
+                    ..base
+                },
+                21,
+            ),
+            (
+                CrossChainSwapKeyRequest {
+                    participant: SwapParticipant::Taker,
+                    ..base
+                },
+                21,
+            ),
+            (
+                CrossChainSwapKeyRequest {
+                    network: NetworkBinding {
+                        counterchain_network: 2,
+                        ..base.network
+                    },
+                    ..base
+                },
+                21,
+            ),
+        ];
+        let mut public_keys = std::collections::BTreeSet::new();
+        for (context, seed) in variants {
+            let mut store = store_with_seed(context, seed);
+            let binding = allocate_cross_chain_swap_key(&mut store, context, 10)
+                .expect("separated allocation");
+            assert!(public_keys.insert(binding.compressed_public_key()));
+        }
     }
 
     #[test]
