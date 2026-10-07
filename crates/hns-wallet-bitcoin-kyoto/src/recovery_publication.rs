@@ -52,12 +52,55 @@ pub fn persist_bitcoin_recoverable_funding(
     expires_at_unix: u64,
     guard: Option<BitcoinBroadcastAuthorizationGuard>,
 ) -> Result<Vec<PreparedBitcoinBroadcast>, BitcoinWalletError> {
-    if package.aggregate_fee_sats > maximum_fee_sats || now_unix >= expires_at_unix {
+    persist_bitcoin_recoverable_funding_before(
+        wallet,
+        store,
+        package,
+        maximum_fee_sats,
+        now_unix,
+        expires_at_unix,
+        expires_at_unix,
+        guard,
+    )
+}
+
+/// Commit a recoverable funding package while independently bounding the final
+/// HTLC by the caller's current funding authorization. Publication parents use
+/// the displayed approval lifetime because they remain ordinary wallet funds.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "explicit approval, fee, time and cross-chain authority boundary"
+)]
+pub fn persist_bitcoin_recoverable_funding_before(
+    wallet: &Wallet,
+    store: &mut hns_wallet_store::WalletStore,
+    package: &PreparedBitcoinRecoverableFunding,
+    maximum_fee_sats: u64,
+    now_unix: u64,
+    expires_at_unix: u64,
+    funding_expires_at_unix: u64,
+    guard: Option<BitcoinBroadcastAuthorizationGuard>,
+) -> Result<Vec<PreparedBitcoinBroadcast>, BitcoinWalletError> {
+    if package.aggregate_fee_sats > maximum_fee_sats
+        || now_unix >= expires_at_unix
+        || now_unix >= funding_expires_at_unix
+    {
         return Err(BitcoinWalletError::InvalidBroadcastApproval);
     }
-    let funding_expiry = guard.as_ref().map_or(expires_at_unix, |guard| {
-        expires_at_unix.min(guard.expires_at_unix())
-    });
+    // Parent publications hold only ordinary seed-owned outputs and retain the
+    // displayed approval lifetime. The final HTLC must also remain inside the
+    // fresh funding authorization for both first- and second-chain funding.
+    let funding_expiry =
+        guard
+            .as_ref()
+            .map_or(expires_at_unix.min(funding_expires_at_unix), |guard| {
+                expires_at_unix
+                    .min(funding_expires_at_unix)
+                    .min(guard.expires_at_unix())
+            });
+    if now_unix >= funding_expiry {
+        return Err(BitcoinWalletError::InvalidBroadcastApproval);
+    }
     let mut plan = planning_wallet(wallet)?;
     let raws = package
         .publication_transactions
@@ -745,10 +788,32 @@ mod tests {
                     .unwrap()
                     .is_empty()
             );
+            let mut expired_store =
+                hns_wallet_store::WalletStore::create(":memory:", "expired-recovery-package-test")
+                    .unwrap();
+            assert!(matches!(
+                persist_bitcoin_recoverable_funding_before(
+                    &wallet,
+                    &mut expired_store,
+                    &package,
+                    1_000,
+                    61,
+                    300,
+                    61,
+                    None,
+                ),
+                Err(BitcoinWalletError::InvalidBroadcastApproval)
+            ));
+            assert!(
+                expired_store
+                    .bitcoin_transactions::<BitcoinTransactionRecord>(1)
+                    .unwrap()
+                    .is_empty()
+            );
             let mut store =
                 hns_wallet_store::WalletStore::create(":memory:", "recovery-package-test").unwrap();
-            let committed = persist_bitcoin_recoverable_funding(
-                &wallet, &mut store, &package, 1_000, 1, 300, None,
+            let committed = persist_bitcoin_recoverable_funding_before(
+                &wallet, &mut store, &package, 1_000, 1, 300, 61, None,
             )
             .unwrap();
             assert_eq!(committed.len(), 4);
@@ -771,7 +836,16 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .expires_at_unix,
-                300
+                61
+            );
+            assert!(
+                records
+                    .iter()
+                    .filter(|record| record.txid != package.funding.txid.into_bytes())
+                    .all(|record| record
+                        .broadcast
+                        .as_ref()
+                        .is_some_and(|intent| intent.expires_at_unix == 300))
             );
             records.reverse();
             let resumed = crate::runtime::approved_broadcast_order(&records).unwrap();

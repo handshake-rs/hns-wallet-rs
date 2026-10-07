@@ -5,7 +5,10 @@
 <!-- hns-wallet-release-state: 0.5.2 release -->
 This crate changelog describes the prepared `hns-wallet-rs` release source.
 
-Read fresh time for each approved publication transaction rather than reuse package-start time. Consume the corrected native funding cutoff and restart boundaries.
+Read fresh time for each approved publication transaction rather than reuse
+package-start time. Carry the short-lived funding authorization independently
+of the second-funding guard, and consume the corrected native cutoff and restart
+boundaries.
 
 
 ## 0.5.1 - 2026-10-07

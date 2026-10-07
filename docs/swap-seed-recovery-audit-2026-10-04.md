@@ -165,10 +165,12 @@ The first recovery cohort was published from `ce222cb` but the app delivery was
 stopped before upload when the funding-resume audit found that an approved
 publication package could reveal its final HTLC after its live funding window.
 The correction is Bitcoin 0.4.4, Handshake 0.4.5 and mobile 0.5.2. Bitcoin
-commits the stricter funding cutoff through its existing authenticated approval
-expiry and consumes the funding guard in the same write. Handshake persists the
-original funding cutoff and checkpoints whether the final contract was exposed.
-Both re-read time at final submission and reject expired funding/rebroadcast.
+commits the minimum of the displayed approval and fresh funding authorization
+into the final transaction's authenticated approval for both first- and
+second-chain funding; a second-funding guard is consumed in the same write when
+present. Handshake persists the original funding cutoff and checkpoints whether
+the final contract was exposed. Both re-read time at final submission and reject
+expired funding or rebroadcast.
 An unexposed expired contract releases ordinary funds; an attempted contract
 retains its journal because the signed bytes may already have reached a peer.
 Ordinary wallet-send restart behavior remains unchanged.

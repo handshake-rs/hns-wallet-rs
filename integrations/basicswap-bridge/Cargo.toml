@@ -12,11 +12,11 @@ publish = false
 getrandom = "0.3.3"
 hex = "0.4.3"
 hns-swap = "=0.5.0"
-hns-wallet-chain-api = { version = "=0.4.1", path = "../../crates/hns-wallet-chain-api" }
+hns-wallet-chain-api = { version = "=0.4.2", path = "../../crates/hns-wallet-chain-api" }
 hns-wallet-ffi = { version = "=0.4.1", path = "../../crates/hns-wallet-ffi" }
 hns-wallet-hns = { version = "^0.4.1", path = "../../crates/hns-wallet-hns" }
 hns-wallet-provider = { version = "=0.4.1", path = "../../crates/hns-wallet-provider" }
-hns-wallet-service = { version = "=0.4.1", path = "../../crates/hns-wallet-service" }
+hns-wallet-service = { version = "=0.4.2", path = "../../crates/hns-wallet-service" }
 hns-wallet-store = { version = "=0.4.1", path = "../../crates/hns-wallet-store" }
 hns-wallet-types = { version = "=0.4.1", path = "../../crates/hns-wallet-types" }
 rustix = { version = "1.1.4", features = ["fs", "process"] }

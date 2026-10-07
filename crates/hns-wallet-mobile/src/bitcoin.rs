@@ -27,7 +27,7 @@ use hns_wallet_bitcoin_kyoto::{
     build_shakescape_bitcoin_htlc, create_persisted_descriptor_wallet_from_seed,
     initialize_pristine_wallet_at_creation_tip, initialize_pristine_wallet_at_recovery_checkpoint,
     load_bitcoin_htlc_watch, load_cached_bitcoin_peers, load_persisted_descriptor_wallet_from_seed,
-    monitor_kyoto_sync_progress, persist_bitcoin_recoverable_funding,
+    monitor_kyoto_sync_progress, persist_bitcoin_recoverable_funding_before,
     persist_prepared_bitcoin_broadcast, persist_prepared_bitcoin_htlc_spend_broadcast,
     prepare_bitcoin_recoverable_htlc_funding, prepare_native_send_excluding,
     recommended_initialization_checkpoint, sign_bitcoin_htlc_redeem_with_wallet_fee_sponsor,
@@ -1352,13 +1352,14 @@ impl MobileBitcoinValueController {
                             )
                         })
                         .transpose()?;
-                    let prepared = persist_bitcoin_recoverable_funding(
+                    let prepared = persist_bitcoin_recoverable_funding_before(
                         wallet,
                         store,
                         &pending.prepared,
                         pending.maximum_fee_sats,
                         checkpoint_now_unix,
                         pending.expires_at_unix,
+                        funding_authorization_expires_at_unix,
                         guard,
                     )?;
                     Ok(prepared)
