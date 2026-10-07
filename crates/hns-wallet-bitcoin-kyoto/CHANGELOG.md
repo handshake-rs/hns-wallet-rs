@@ -9,7 +9,9 @@ Check the independent live funding authorization at final HTLC submission for
 both first- and second-chain funding, after publication parents and during
 restart. Abandon unexposed expired contracts without locking ordinary
 seed-owned funds; retain already attempted submissions and prevent late
-rebroadcast.
+rebroadcast. Apply that authorization to every untouched publication ancestor
+as well as the final HTLC, and atomically abandon the untouched package suffix
+on restart after expiry.
 
 
 ## 0.4.3 - 2026-10-07

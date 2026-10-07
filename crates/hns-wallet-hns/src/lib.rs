@@ -4592,6 +4592,34 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             ) {
                 return Err(HnsWalletError::InvalidWorkflow);
             }
+            // A recovery package can reach RequiresRebroadcast after only an
+            // ancestor submission failed. That checkpoint does not authorize
+            // more network work once the separately persisted fresh funding
+            // deadline has elapsed: the contract transaction was never
+            // attempted, so expire locally before retransmitting even one
+            // public ancestor.
+            if stored
+                .state
+                .recovery_publication
+                .as_ref()
+                .is_some_and(|package| package.final_submission_started_at_unix.is_none())
+                && now >= recovery_funding_submission_limit(&stored.state)
+            {
+                stored.state.stage = HnsSettlementStage::Expired;
+                let deletes = reservation_deletes(&store, &config, stored.id)?;
+                store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+                    stored.id,
+                    kind,
+                    stored.revision,
+                    &stored.state,
+                    false,
+                    now,
+                    EntityKind::InputReservation,
+                    &[],
+                    &deletes,
+                )?;
+                return Err(HnsWalletError::PreparedArtifactExpired);
+            }
             let prior_quote = stored
                 .state
                 .fee_quote

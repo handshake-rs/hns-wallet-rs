@@ -64,9 +64,11 @@ pub fn persist_bitcoin_recoverable_funding(
     )
 }
 
-/// Commit a recoverable funding package while independently bounding the final
-/// HTLC by the caller's current funding authorization. Publication parents use
-/// the displayed approval lifetime because they remain ordinary wallet funds.
+/// Commit a recoverable funding package while independently bounding every
+/// not-yet-submitted package transaction by the caller's current funding
+/// authorization. Already attempted ordinary parents remain recoverable, but
+/// a restart must not spend more publication fees after the package can no
+/// longer reveal its contract.
 #[allow(
     clippy::too_many_arguments,
     reason = "explicit approval, fee, time and cross-chain authority boundary"
@@ -87,9 +89,10 @@ pub fn persist_bitcoin_recoverable_funding_before(
     {
         return Err(BitcoinWalletError::InvalidBroadcastApproval);
     }
-    // Parent publications hold only ordinary seed-owned outputs and retain the
-    // displayed approval lifetime. The final HTLC must also remain inside the
-    // fresh funding authorization for both first- and second-chain funding.
+    // Bind every package member to the fresh authorization. Runtime expiry
+    // abandons the still-unattempted dependency chain atomically enough to
+    // release its derived reservations, while retaining any member whose
+    // submission may already have reached a peer.
     let funding_expiry =
         guard
             .as_ref()
@@ -110,13 +113,9 @@ pub fn persist_bitcoin_recoverable_funding_before(
     // Check the entire sequence and aggregate accounting before any write.
     let mut bindings = Vec::new();
     let mut total = 0u64;
-    for (index, raw) in raws.enumerate() {
-        let expiry = if index == package.publication_transactions.len() {
-            funding_expiry
-        } else {
-            expires_at_unix
-        };
-        let approval = derive_bitcoin_broadcast_approval(&plan, raw, maximum_fee_sats, expiry)?;
+    for raw in raws {
+        let approval =
+            derive_bitcoin_broadcast_approval(&plan, raw, maximum_fee_sats, funding_expiry)?;
         total = total
             .checked_add(approval.fee_sats)
             .ok_or(BitcoinWalletError::FeeLimit)?;
@@ -430,6 +429,19 @@ pub(crate) fn is_recoverable_funding_transaction(tx: &Transaction) -> bool {
     })
 }
 
+pub(crate) fn is_recovery_publication_transaction(tx: &Transaction) -> bool {
+    transaction_data(tx).is_ok_and(|data| {
+        (data.len() == hns_wallet_chain_api::SWAP_RECOVERY_MARKER_BYTES
+            && data.starts_with(b"SRF1"))
+            || (data.len() > 4
+                && data.len() <= 80
+                && data.starts_with(b"SR")
+                && data[2] < data[3]
+                && data[3] != 0
+                && usize::from(data[3]) <= hns_wallet_chain_api::MAX_SWAP_RECOVERY_FRAMES)
+    })
+}
+
 /// Extract exactly one canonical standard zero-valued OP_RETURN output.
 fn transaction_data(tx: &Transaction) -> Result<Vec<u8>, BitcoinWalletError> {
     use bdk_wallet::bitcoin::script::Instruction;
@@ -634,6 +646,7 @@ pub fn discover_bitcoin_recovery_contracts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::abandon_expired_unattempted_recovery_packages;
     use bdk_wallet::chain::{BlockId, ConfirmationBlockTime, TxUpdate};
 
     fn public_key(byte: u8) -> [u8; 33] {
@@ -838,14 +851,24 @@ mod tests {
                     .expires_at_unix,
                 61
             );
+            assert!(records.iter().all(|record| {
+                record
+                    .broadcast
+                    .as_ref()
+                    .is_some_and(|intent| intent.expires_at_unix == 61)
+            }));
+            assert_eq!(
+                abandon_expired_unattempted_recovery_packages(&mut store, Network::Regtest, 61,)
+                    .unwrap(),
+                4,
+            );
             assert!(
-                records
+                store
+                    .bitcoin_transactions::<BitcoinTransactionRecord>(100)
+                    .unwrap()
                     .iter()
-                    .filter(|record| record.txid != package.funding.txid.into_bytes())
-                    .all(|record| record
-                        .broadcast
-                        .as_ref()
-                        .is_some_and(|intent| intent.expires_at_unix == 300))
+                    .all(|record| record.value.raw_transaction.is_none()
+                        && record.value.broadcast.is_none())
             );
             records.reverse();
             let resumed = crate::runtime::approved_broadcast_order(&records).unwrap();
@@ -855,6 +878,62 @@ mod tests {
                     .iter()
                     .map(|prepared| prepared.txid)
                     .collect::<Vec<_>>()
+            );
+            let mut interrupted_store = hns_wallet_store::WalletStore::create(
+                ":memory:",
+                "interrupted-recovery-package-test",
+            )
+            .unwrap();
+            let interrupted = persist_bitcoin_recoverable_funding_before(
+                &wallet,
+                &mut interrupted_store,
+                &package,
+                1_000,
+                1,
+                300,
+                61,
+                None,
+            )
+            .unwrap();
+            let attempted_txid = interrupted[0].txid;
+            let attempted = interrupted_store
+                .bitcoin_transaction::<BitcoinTransactionRecord>(&attempted_txid)
+                .unwrap()
+                .unwrap();
+            let mut attempted_record = attempted.value;
+            let attempted_intent = attempted_record.broadcast.as_mut().unwrap();
+            attempted_intent.phase = BitcoinBroadcastPhase::SubmissionStarted;
+            attempted_intent.attempt_count = 1;
+            attempted_intent.last_submission_started_at_unix = Some(60);
+            attempted_record.last_changed_at_unix = 60;
+            interrupted_store
+                .save_bitcoin_transaction(
+                    &attempted_txid,
+                    attempted.revision,
+                    &attempted_record,
+                    60,
+                )
+                .unwrap();
+            assert_eq!(
+                abandon_expired_unattempted_recovery_packages(
+                    &mut interrupted_store,
+                    Network::Regtest,
+                    61,
+                )
+                .unwrap(),
+                3,
+            );
+            let interrupted_records = interrupted_store
+                .bitcoin_transactions::<BitcoinTransactionRecord>(100)
+                .unwrap();
+            assert_eq!(
+                interrupted_records
+                    .iter()
+                    .filter(|record| record.value.raw_transaction.is_some()
+                        && record.value.broadcast.is_some())
+                    .map(|record| record.value.txid)
+                    .collect::<Vec<_>>(),
+                vec![attempted_txid]
             );
             // Every interrupted prefix holds only ordinary wallet outputs;
             // importing its chain transactions into a seed-only wallet finds

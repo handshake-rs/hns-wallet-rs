@@ -2624,7 +2624,12 @@ impl KyotoSupervisor {
         permit: &BitcoinValueRuntimePermit,
         now_unix: u64,
     ) -> Result<Vec<BitcoinBroadcastReceipt>, BitcoinWalletError> {
-        let txids = self.store.try_with_store(|store| {
+        let txids = self.store.try_with_store_mut(|store| {
+            abandon_expired_unattempted_recovery_packages(
+                store,
+                self.durable.state.network,
+                now_unix,
+            )?;
             let records = store.bitcoin_transactions::<BitcoinTransactionRecord>(
                 MAX_TRACKED_BITCOIN_TRANSACTIONS + 1,
             )?;
@@ -2666,6 +2671,129 @@ impl KyotoSupervisor {
 /// Restore approved packages in dependency order rather than arbitrary txid
 /// order. A parent's retry cooldown also defers its children for that pass.
 type ApprovedBroadcastDependencies = Vec<([u8; 32], Vec<[u8; 32]>)>;
+
+/// Drop the still-unattempted suffix of an expired recovery publication.
+///
+/// A package is persisted before its first network call. If the process stops
+/// between ancestor submissions, the restart path must not make the first
+/// submission of another package member after the fresh funding deadline.
+/// Records whose submission had already started remain authenticated and
+/// reserved because the peer may have accepted them despite a local error.
+pub(crate) fn abandon_expired_unattempted_recovery_packages(
+    store: &mut WalletStore,
+    network: Network,
+    now_unix: u64,
+) -> Result<usize, BitcoinWalletError> {
+    let records = store
+        .bitcoin_transactions::<BitcoinTransactionRecord>(MAX_TRACKED_BITCOIN_TRANSACTIONS + 1)?;
+    if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
+        return Err(BitcoinWalletError::BitcoinTransactionCapacity);
+    }
+    let mut by_txid = BTreeMap::new();
+    for stored in records {
+        stored.value.validate()?;
+        if stored.id.as_slice() != stored.value.txid
+            || by_txid.insert(stored.value.txid, stored).is_some()
+        {
+            return Err(BitcoinWalletError::CorruptRuntimeState);
+        }
+    }
+
+    let mut expired_finals = Vec::new();
+    for (txid, stored) in &by_txid {
+        let record = &stored.value;
+        let Some(intent) = record.broadcast.as_ref() else {
+            continue;
+        };
+        if intent.network != network {
+            return Err(BitcoinWalletError::NetworkMismatch);
+        }
+        if intent.attempt_count != 0
+            || now_unix < intent.expires_at_unix
+            || !matches!(
+                record.observation,
+                BitcoinChainObservation::AbsentFromCanonicalWalletView
+            )
+        {
+            continue;
+        }
+        let Some(raw) = record.raw_transaction.as_ref() else {
+            return Err(BitcoinWalletError::CorruptRuntimeState);
+        };
+        let transaction: Transaction =
+            deserialize(raw).map_err(|_| BitcoinWalletError::CorruptRuntimeState)?;
+        if transaction.compute_txid().to_byte_array() != *txid {
+            return Err(BitcoinWalletError::CorruptRuntimeState);
+        }
+        if crate::recovery_publication::is_recoverable_funding_transaction(&transaction) {
+            expired_finals.push(*txid);
+        }
+    }
+
+    let mut abandon = BTreeSet::new();
+    let mut pending = VecDeque::from(expired_finals);
+    while let Some(txid) = pending.pop_front() {
+        if abandon.contains(&txid) {
+            continue;
+        }
+        let Some(stored) = by_txid.get(&txid) else {
+            continue;
+        };
+        let record = &stored.value;
+        let Some(intent) = record.broadcast.as_ref() else {
+            continue;
+        };
+        if intent.attempt_count != 0
+            || !matches!(
+                record.observation,
+                BitcoinChainObservation::AbsentFromCanonicalWalletView
+            )
+        {
+            continue;
+        }
+        let Some(raw) = record.raw_transaction.as_ref() else {
+            return Err(BitcoinWalletError::CorruptRuntimeState);
+        };
+        let transaction: Transaction =
+            deserialize(raw).map_err(|_| BitcoinWalletError::CorruptRuntimeState)?;
+        if transaction.compute_txid().to_byte_array() != txid
+            || !crate::recovery_publication::is_recovery_publication_transaction(&transaction)
+        {
+            return Err(BitcoinWalletError::CorruptRuntimeState);
+        }
+        abandon.insert(txid);
+        pending.extend(
+            transaction
+                .input
+                .iter()
+                .map(|input| input.previous_output.txid.to_byte_array())
+                .filter(|parent| by_txid.contains_key(parent)),
+        );
+    }
+
+    let mut saves = Vec::with_capacity(abandon.len());
+    for txid in abandon {
+        let stored = by_txid
+            .get(&txid)
+            .ok_or(BitcoinWalletError::CorruptRuntimeState)?;
+        let mut record = stored.value.clone();
+        record.broadcast = None;
+        record.raw_transaction = None;
+        record.last_changed_at_unix = now_unix;
+        record.validate()?;
+        saves.push(EntityBatchSave {
+            id: txid.to_vec(),
+            expected_revision: stored.revision,
+            value: record,
+            updated_at_unix: now_unix,
+        });
+    }
+    if saves.is_empty() {
+        return Ok(0);
+    }
+    store.apply_entity_batch(EntityKind::BitcoinTransaction, &saves, &[])?;
+    Ok(saves.len())
+}
 
 pub(crate) fn approved_broadcast_order(
     records: &[BitcoinTransactionRecord],
@@ -2830,12 +2958,12 @@ fn begin_broadcast_submission(
             submitted_at_unix: intent.last_submitted_at_unix,
         }));
     }
-    if crate::recovery_publication::is_recoverable_funding_transaction(&transaction)
+    if crate::recovery_publication::is_recovery_publication_transaction(&transaction)
         && now_unix >= intent.expires_at_unix
     {
-        // An unexposed contract is safe to abandon: its input remains an ordinary
-        // seed-owned publication output. Keep attempted submissions reserved,
-        // since their signed contract may already have reached a peer.
+        // An untouched package member is safe to abandon. Keep attempted
+        // submissions reserved because their signed bytes may already have
+        // reached a peer despite a local error.
         if intent.attempt_count == 0 {
             record.broadcast = None;
             record.raw_transaction = None;

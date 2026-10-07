@@ -735,6 +735,7 @@ mod tests {
         calls: std::sync::Arc<Mutex<Vec<Vec<u8>>>>,
         expire_after_parents: bool,
         fail_final: bool,
+        fail_ancestor_at: Option<usize>,
     }
     impl PublicationBackend {
         fn binding() -> SnapshotBinding {
@@ -849,6 +850,11 @@ mod tests {
             let tx = Transaction::decode(raw).map_err(|_| HnsWalletError::InvalidEvidence)?;
             let mut calls = self.calls.lock().unwrap();
             calls.push(raw.to_vec());
+            if self.fail_ancestor_at == Some(calls.len()) {
+                return Err(HnsWalletError::Backend(
+                    "injected ambiguous ancestor submission".into(),
+                ));
+            }
             if self.expire_after_parents && calls.len() == 6 {
                 self.clock.0.store(
                     self.expiry.load(std::sync::atomic::Ordering::SeqCst),
@@ -867,8 +873,17 @@ mod tests {
     #[test]
     fn hns_runtime_expired_publications_never_reveal_the_contract_and_preserve_attempted_journals()
     {
-        for (expire_after_parents, fail_final) in [(true, false), (false, true), (false, false)] {
-            let (store, mut account, coin, publication) = fixture(SwapAssetSide::Offered);
+        for (side, expire_after_parents, fail_final, fail_ancestor_at) in [
+            (SwapAssetSide::Offered, true, false, None),
+            (SwapAssetSide::Offered, false, true, None),
+            (SwapAssetSide::Offered, false, false, None),
+            (SwapAssetSide::Offered, false, false, Some(1)),
+            (SwapAssetSide::Received, true, false, None),
+            (SwapAssetSide::Received, false, true, None),
+            (SwapAssetSide::Received, false, false, None),
+            (SwapAssetSide::Received, false, false, Some(1)),
+        ] {
+            let (store, mut account, coin, publication) = fixture(side);
             account.config.value_operations_enabled = true;
             account.config.settlement_enabled = true;
             let clock = PublicationClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
@@ -882,6 +897,7 @@ mod tests {
                 calls: calls.clone(),
                 expire_after_parents,
                 fail_final,
+                fail_ancestor_at,
             };
             let runtime =
                 HnsWalletRuntime::open(backend, store, account.config.clone(), clock.clone())
@@ -924,7 +940,45 @@ mod tests {
                 &prepared.0,
                 expiry.load(std::sync::atomic::Ordering::SeqCst),
             );
-            if expire_after_parents {
+            if fail_ancestor_at.is_some() {
+                assert!(matches!(result, Err(HnsWalletError::Backend(_))));
+                assert_eq!(calls.lock().unwrap().len(), 1);
+                clock.0.store(
+                    serialized.expires_at_unix + SEND_PROPAGATION_GRACE_SECONDS,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                assert_eq!(runtime.rebroadcast_pending_settlements().unwrap(), 0);
+                assert_eq!(
+                    calls.lock().unwrap().len(),
+                    1,
+                    "an expired retry must not retransmit a public ancestor when the contract was never attempted"
+                );
+                let stored = runtime
+                    .store_lock()
+                    .unwrap()
+                    .load_workflow::<HnsPreparedSettlement>(serialized.workflow_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored.state.stage, HnsSettlementStage::Expired);
+                assert!(!stored.irreversible_broadcast_prepared);
+                assert!(
+                    stored
+                        .state
+                        .recovery_publication
+                        .unwrap()
+                        .final_submission_started_at_unix
+                        .is_none()
+                );
+                assert!(
+                    reservation_deletes(
+                        &runtime.store_lock().unwrap(),
+                        &account.config,
+                        serialized.workflow_id
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+            } else if expire_after_parents {
                 assert!(matches!(
                     result,
                     Err(HnsWalletError::PreparedArtifactExpired)
