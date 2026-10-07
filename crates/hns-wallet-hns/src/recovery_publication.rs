@@ -14,6 +14,16 @@ pub(crate) struct HnsRecoveryAncestor {
 pub(crate) struct HnsRecoveryPackage {
     pub network_encoding: Vec<u8>,
     pub ancestors: Vec<HnsRecoveryAncestor>,
+    #[serde(default)]
+    pub final_submission_started_at_unix: Option<u64>,
+    #[serde(default)]
+    pub funding_submission_before_unix: Option<u64>,
+}
+
+impl HnsRecoveryPackage {
+    pub(crate) fn same_approved_terms(&self, other: &Self) -> bool {
+        self.network_encoding == other.network_encoding && self.ancestors == other.ancestors
+    }
 }
 
 /// Publication parents are not confirmed coins. Height zero is used only as
@@ -710,6 +720,291 @@ mod tests {
             coin,
             SwapRecoveryPublication::from_terms(terms, side).unwrap(),
         )
+    }
+
+    #[derive(Clone)]
+    struct PublicationClock(std::sync::Arc<std::sync::atomic::AtomicU64>);
+    impl HnsClock for PublicationClock {
+        fn now_unix(&self) -> Result<u64, HnsWalletError> {
+            Ok(self.0.load(std::sync::atomic::Ordering::SeqCst))
+        }
+    }
+    struct PublicationBackend {
+        clock: PublicationClock,
+        expiry: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        calls: std::sync::Arc<Mutex<Vec<Vec<u8>>>>,
+        expire_after_parents: bool,
+        fail_final: bool,
+    }
+    impl PublicationBackend {
+        fn binding() -> SnapshotBinding {
+            SnapshotBinding {
+                tip: ChainTip {
+                    height: 2,
+                    block_hash: [1; 32],
+                    tree_root: [2; 32],
+                    median_time_past: 1_700_000_000,
+                },
+                chain_epoch: 1,
+            }
+        }
+        fn mempool() -> MempoolSnapshotBinding {
+            MempoolSnapshotBinding {
+                instance_nonce: [3; 32],
+                generation: 1,
+            }
+        }
+    }
+    impl HnsBackend for PublicationBackend {
+        fn get_chain_snapshot(&self) -> Result<SnapshotBinding, HnsWalletError> {
+            Ok(Self::binding())
+        }
+        fn get_chain_tip(&self) -> Result<ChainTip, HnsWalletError> {
+            Ok(Self::binding().tip)
+        }
+        fn get_block_hash(
+            &self,
+            _: u64,
+            _: SnapshotBinding,
+        ) -> Result<BlockHashEvidence, HnsWalletError> {
+            Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        }
+        fn get_confirmed_wallet_page(
+            &self,
+            _: ConfirmedWalletPageRequest<'_>,
+        ) -> Result<ConfirmedWalletPage, HnsWalletError> {
+            Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        }
+        fn get_mempool_wallet_page(
+            &self,
+            _: MempoolWalletPageRequest<'_>,
+        ) -> Result<MempoolWalletPage, HnsWalletError> {
+            Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        }
+        fn get_transaction_evidence(
+            &self,
+            _: TransactionHash,
+            _: SnapshotBinding,
+            _: Option<MempoolSnapshotBinding>,
+        ) -> Result<TransactionEvidence, HnsWalletError> {
+            Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        }
+        fn get_outpoint_spend_evidence(
+            &self,
+            _: &[HnsOutpoint],
+            _: SnapshotBinding,
+        ) -> Result<OutpointSpendEvidence, HnsWalletError> {
+            Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        }
+        fn get_name_evidence(
+            &self,
+            _: [u8; 32],
+            _: SnapshotBinding,
+        ) -> Result<NameEvidence, HnsWalletError> {
+            Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        }
+        fn get_name_action_context(
+            &self,
+            _: HnsNameAction,
+            _: [u8; 32],
+            _: SnapshotBinding,
+            _: MempoolSnapshotBinding,
+        ) -> Result<NameActionContextEvidence, HnsWalletError> {
+            Err(HnsWalletError::RuntimeIntegrationUnavailable)
+        }
+        fn estimate_fee_rate(&self, _: u16) -> Result<BaseUnits, HnsWalletError> {
+            Ok(BaseUnits::new(1_000))
+        }
+        fn quote_transaction_fee(
+            &self,
+            raw: &[u8],
+            coins: &[Coin],
+            target_blocks: u16,
+            binding: SnapshotBinding,
+            mempool: MempoolSnapshotBinding,
+        ) -> Result<HnsTransactionFeeQuote, HnsWalletError> {
+            let tx = Transaction::decode(raw).map_err(|_| HnsWalletError::InvalidEvidence)?;
+            let local = local_fee_policy_evidence(&tx, coins, BaseUnits::new(1_000))?;
+            let actual = actual_transaction_fee(&tx, coins)?;
+            Ok(HnsTransactionFeeQuote {
+                txid: wallet_transaction_hash(&tx)?,
+                binding,
+                mempool,
+                target_blocks,
+                rate_atomic_units_per_1000_policy_vbytes: 1_000,
+                rate_sample_count: 0,
+                rate_source: HnsFeeRateSource::MinimumRelay,
+                transaction_weight: local.transaction_weight,
+                transaction_sigops: local.transaction_sigops,
+                sigop_adjusted_policy_vbytes: local.policy_virtual_size,
+                minimum_policy_fee: local.minimum_fee,
+                actual_fee: actual,
+                meets_minimum_policy_fee: actual >= local.minimum_fee,
+                minimum_policy_fee_shortfall: BaseUnits::new(
+                    local.minimum_fee.get().saturating_sub(actual.get()),
+                ),
+            })
+        }
+        fn broadcast_transaction(&self, raw: &[u8]) -> Result<TransactionHash, HnsWalletError> {
+            let tx = Transaction::decode(raw).map_err(|_| HnsWalletError::InvalidEvidence)?;
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(raw.to_vec());
+            if self.expire_after_parents && calls.len() == 6 {
+                self.clock.0.store(
+                    self.expiry.load(std::sync::atomic::Ordering::SeqCst),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }
+            if self.fail_final && calls.len() == 7 {
+                return Err(HnsWalletError::Backend(
+                    "injected ambiguous final submission".into(),
+                ));
+            }
+            wallet_transaction_hash(&tx)
+        }
+    }
+
+    #[test]
+    fn hns_runtime_expired_publications_never_reveal_the_contract_and_preserve_attempted_journals()
+    {
+        for (expire_after_parents, fail_final) in [(true, false), (false, true), (false, false)] {
+            let (store, mut account, coin, publication) = fixture(SwapAssetSide::Offered);
+            account.config.value_operations_enabled = true;
+            account.config.settlement_enabled = true;
+            let clock = PublicationClock(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                1_700_000_000,
+            )));
+            let expiry = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let backend = PublicationBackend {
+                clock: clock.clone(),
+                expiry: expiry.clone(),
+                calls: calls.clone(),
+                expire_after_parents,
+                fail_final,
+            };
+            let runtime =
+                HnsWalletRuntime::open(backend, store, account.config.clone(), clock.clone())
+                    .unwrap();
+            {
+                let mut cache = runtime.cache_write().unwrap();
+                cache.coins = vec![coin];
+                cache.binding = Some(PublicationBackend::binding());
+                cache.mempool_binding = Some(PublicationBackend::mempool());
+                cache.sync = SyncStatus {
+                    phase: SyncPhase::Ready,
+                    validated_height: 2,
+                    scanned_height: 2,
+                    target_height: Some(2),
+                    last_error: None,
+                };
+            }
+            let descriptor =
+                build_recovered_hns_htlc(publication.terms(), publication.side()).unwrap();
+            let prepared = runtime
+                .prepare_native_recoverable_htlc_lock(
+                    SessionId::new(publication.terms().session_id),
+                    descriptor,
+                    BaseUnits::new(10_000),
+                    publication,
+                )
+                .unwrap();
+            let serialized: HnsPreparedSettlement =
+                serde_json::from_slice(prepared.0.commitment_bytes()).unwrap();
+            expiry.store(
+                if expire_after_parents {
+                    1_700_000_010
+                } else {
+                    serialized.expires_at_unix
+                },
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            assert!(prepared.0.fee > serialized.fee);
+            let result = runtime.broadcast_prepared_settlement_before(
+                &prepared.0,
+                expiry.load(std::sync::atomic::Ordering::SeqCst),
+            );
+            if expire_after_parents {
+                assert!(matches!(
+                    result,
+                    Err(HnsWalletError::PreparedArtifactExpired)
+                ));
+                let stored = runtime
+                    .store_lock()
+                    .unwrap()
+                    .load_workflow::<HnsPreparedSettlement>(serialized.workflow_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored.state.stage, HnsSettlementStage::Expired);
+                assert!(!stored.irreversible_broadcast_prepared);
+                assert!(
+                    stored
+                        .state
+                        .recovery_publication
+                        .unwrap()
+                        .final_submission_started_at_unix
+                        .is_none()
+                );
+                assert_eq!(calls.lock().unwrap().len(), 6);
+                for raw in calls.lock().unwrap().iter() {
+                    assert!(
+                        Transaction::decode(raw)
+                            .unwrap()
+                            .outputs
+                            .iter()
+                            .all(|out| out.address.version == 0 || out.address.version == 31)
+                    );
+                }
+                assert!(
+                    reservation_deletes(
+                        &runtime.store_lock().unwrap(),
+                        &account.config,
+                        serialized.workflow_id
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+            } else if fail_final {
+                assert!(matches!(result, Err(HnsWalletError::Backend(_))));
+                clock.0.store(
+                    serialized.expires_at_unix + SEND_PROPAGATION_GRACE_SECONDS,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                assert_eq!(runtime.rebroadcast_pending_settlements().unwrap(), 0);
+                let stored = runtime
+                    .store_lock()
+                    .unwrap()
+                    .load_workflow::<HnsPreparedSettlement>(serialized.workflow_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(stored.state.stage, HnsSettlementStage::RequiresRebroadcast);
+                assert!(stored.irreversible_broadcast_prepared);
+                assert!(
+                    stored
+                        .state
+                        .recovery_publication
+                        .unwrap()
+                        .final_submission_started_at_unix
+                        .is_some()
+                );
+                assert_eq!(
+                    calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|raw| Transaction::decode(raw)
+                            .unwrap()
+                            .outputs
+                            .iter()
+                            .any(|out| out.address.version == 0 && out.address.hash.len() == 32))
+                        .count(),
+                    1
+                );
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(calls.lock().unwrap().len(), 7);
+            }
+        }
     }
 
     #[test]

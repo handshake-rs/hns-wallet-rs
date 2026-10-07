@@ -55,6 +55,9 @@ pub fn persist_bitcoin_recoverable_funding(
     if package.aggregate_fee_sats > maximum_fee_sats || now_unix >= expires_at_unix {
         return Err(BitcoinWalletError::InvalidBroadcastApproval);
     }
+    let funding_expiry = guard.as_ref().map_or(expires_at_unix, |guard| {
+        expires_at_unix.min(guard.expires_at_unix())
+    });
     let mut plan = planning_wallet(wallet)?;
     let raws = package
         .publication_transactions
@@ -64,9 +67,13 @@ pub fn persist_bitcoin_recoverable_funding(
     // Check the entire sequence and aggregate accounting before any write.
     let mut bindings = Vec::new();
     let mut total = 0u64;
-    for raw in raws {
-        let approval =
-            derive_bitcoin_broadcast_approval(&plan, raw, maximum_fee_sats, expires_at_unix)?;
+    for (index, raw) in raws.enumerate() {
+        let expiry = if index == package.publication_transactions.len() {
+            funding_expiry
+        } else {
+            expires_at_unix
+        };
+        let approval = derive_bitcoin_broadcast_approval(&plan, raw, maximum_fee_sats, expiry)?;
         total = total
             .checked_add(approval.fee_sats)
             .ok_or(BitcoinWalletError::FeeLimit)?;
@@ -93,7 +100,7 @@ pub fn persist_bitcoin_recoverable_funding(
             .map_or(0, |record| record.revision);
         let is_funding = index == package.publication_transactions.len();
         let committed = if is_funding && guard.is_some() {
-            persist_guarded_prepared_bitcoin_broadcast(
+            crate::persist_guarded_prepared_bitcoin_broadcast(
                 &plan,
                 store,
                 raw,
@@ -101,7 +108,7 @@ pub fn persist_bitcoin_recoverable_funding(
                 maximum_fee_sats,
                 revision,
                 now_unix,
-                expires_at_unix,
+                approval.expires_at_unix,
                 guard.take().unwrap(),
             )?
         } else {
@@ -113,7 +120,7 @@ pub fn persist_bitcoin_recoverable_funding(
                 maximum_fee_sats,
                 revision,
                 now_unix,
-                expires_at_unix,
+                approval.expires_at_unix,
             )?
         };
         prepared.push(committed);
@@ -371,6 +378,12 @@ pub fn prepare_bitcoin_recoverable_htlc_funding(
         },
         aggregate_fee_sats: aggregate_fee,
         publication_transactions: transactions,
+    })
+}
+
+pub(crate) fn is_recoverable_funding_transaction(tx: &Transaction) -> bool {
+    transaction_data(tx).is_ok_and(|data| {
+        data.len() == hns_wallet_chain_api::SWAP_RECOVERY_MARKER_BYTES && data.starts_with(b"SRF1")
     })
 }
 
@@ -749,6 +762,17 @@ mod tests {
                 .into_iter()
                 .map(|row| row.value)
                 .collect::<Vec<_>>();
+            assert_eq!(
+                records
+                    .iter()
+                    .find(|record| record.txid == package.funding.txid.into_bytes())
+                    .unwrap()
+                    .broadcast
+                    .as_ref()
+                    .unwrap()
+                    .expires_at_unix,
+                300
+            );
             records.reverse();
             let resumed = crate::runtime::approved_broadcast_order(&records).unwrap();
             assert_eq!(

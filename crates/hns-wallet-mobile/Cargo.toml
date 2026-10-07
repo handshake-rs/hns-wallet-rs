@@ -1,6 +1,6 @@
 [package]
 name = "hns-wallet-mobile"
-version = "0.5.1"
+version = "0.5.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -20,7 +20,7 @@ hns-header-consensus.workspace = true
 hns-marketplace-protocol.workspace = true
 hns-primitives.workspace = true
 hns-swap.workspace = true
-hns-wallet-bitcoin-kyoto = { version = "0.4.3", path = "../hns-wallet-bitcoin-kyoto" }
+hns-wallet-bitcoin-kyoto = { version = "0.4.4", path = "../hns-wallet-bitcoin-kyoto" }
 hns-wallet-chain-api.workspace = true
 hns-wallet-ffi.workspace = true
 hns-wallet-hns.workspace = true

@@ -4616,7 +4616,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             stored.state.fee,
             stored.state.maximum_fee,
         )?;
-        let (submission_revision, submission_state) = {
+        let (mut submission_revision, mut submission_state) = {
             let mut store = self.store_lock()?;
             // Read time after acquiring the same mutex that protects the
             // guarded transaction. A lease which expires while waiting for
@@ -4656,6 +4656,15 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 Vec::new()
             };
             let mut state = current.state;
+            if state.recovery_publication.is_some() {
+                let limit = recovery_funding_submission_limit(&state);
+                let limit = not_after_unix.map_or(limit, |deadline| deadline.min(limit));
+                state
+                    .recovery_publication
+                    .as_mut()
+                    .ok_or(HnsWalletError::InvalidWorkflow)?
+                    .funding_submission_before_unix = Some(limit);
+            }
             state.stage = HnsSettlementStage::RequiresRebroadcast;
             state.fee_quote = Some(quote);
             if activate
@@ -4720,6 +4729,51 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 }
             }
         }
+        if stored.state.recovery_publication.is_some() {
+            let mut store = self.store_lock()?;
+            let now = self.clock.now_unix()?;
+            let current = store
+                .load_workflow::<HnsPreparedSettlement>(stored.id)?
+                .ok_or(HnsWalletError::InvalidWorkflow)?;
+            if current.revision != submission_revision || current.state != submission_state {
+                return Err(HnsWalletError::InvalidWorkflow);
+            }
+            let limit = recovery_funding_submission_limit(&current.state);
+            if now >= limit {
+                let mut state = current.state;
+                if state
+                    .recovery_publication
+                    .as_ref()
+                    .is_some_and(|package| package.final_submission_started_at_unix.is_none())
+                {
+                    state.stage = HnsSettlementStage::Expired;
+                    let deletes = reservation_deletes(&store, &config, current.id)?;
+                    store.save_workflow_with_entity_batch::<_, HnsInputReservation>(
+                        current.id,
+                        kind,
+                        current.revision,
+                        &state,
+                        false,
+                        now,
+                        EntityKind::InputReservation,
+                        &[],
+                        &deletes,
+                    )?;
+                }
+                return Err(HnsWalletError::PreparedArtifactExpired);
+            }
+            let mut state = current.state;
+            let package = state
+                .recovery_publication
+                .as_mut()
+                .ok_or(HnsWalletError::InvalidWorkflow)?;
+            if package.final_submission_started_at_unix.is_none() {
+                package.final_submission_started_at_unix = Some(now);
+                submission_revision =
+                    store.save_workflow(current.id, kind, current.revision, &state, true, now)?;
+                submission_state = state;
+            }
+        }
         let accepted = self
             .backend
             .broadcast_transaction(&stored.state.signed_transaction)?;
@@ -4779,7 +4833,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 serde_json::to_vec(&prepared)?,
             )
             .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
-            self.broadcast_prepared_settlement(&artifact)?;
+            match self.broadcast_prepared_settlement(&artifact) {
+                Ok(_) => {}
+                Err(HnsWalletError::PreparedArtifactExpired) => continue,
+                Err(error) => return Err(error),
+            }
             submitted = submitted
                 .checked_add(1)
                 .ok_or(HnsWalletError::HistoryLimit)?;
@@ -11062,6 +11120,8 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                             .encode()
                             .map_err(|_| ChainError::InvalidEvidence)?,
                         ancestors: package.ancestors,
+                        final_submission_started_at_unix: None,
+                        funding_submission_before_unix: None,
                     }),
                 )
             } else {
@@ -12375,6 +12435,22 @@ fn settlement_lock_workflow_may_be_reprepared(
         ) && !irreversible_broadcast_prepared)
 }
 
+fn recovery_funding_submission_limit(prepared: &HnsPreparedSettlement) -> u64 {
+    let limit = prepared
+        .recovery_publication
+        .as_ref()
+        .and_then(|package| package.funding_submission_before_unix)
+        .map_or(prepared.expires_at_unix, |limit| {
+            limit.min(prepared.expires_at_unix)
+        });
+    match prepared.broadcast_guard.as_ref().map(|guard| guard.purpose) {
+        Some(HnsSettlementBroadcastGuardPurpose::SecondFunding {
+            expires_at_unix, ..
+        }) => limit.min(expires_at_unix),
+        _ => limit,
+    }
+}
+
 fn same_prepared_settlement(
     stored: &HnsPreparedSettlement,
     artifact: &HnsPreparedSettlement,
@@ -12391,7 +12467,11 @@ fn same_prepared_settlement(
         && stored.fee == artifact.fee
         && stored.maximum_fee == artifact.maximum_fee
         && stored.expires_at_unix == artifact.expires_at_unix
-        && stored.recovery_publication == artifact.recovery_publication
+        && match (&stored.recovery_publication, &artifact.recovery_publication) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_approved_terms(b),
+            _ => false,
+        }
         && stored.terms == artifact.terms
         && stored.broadcast_guard == artifact.broadcast_guard
 }
@@ -12414,7 +12494,11 @@ fn same_prepared_settlement_except_guard(
         && stored.maximum_fee == artifact.maximum_fee
         && stored.fee_quote == artifact.fee_quote
         && stored.expires_at_unix == artifact.expires_at_unix
-        && stored.recovery_publication == artifact.recovery_publication
+        && match (&stored.recovery_publication, &artifact.recovery_publication) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.same_approved_terms(b),
+            _ => false,
+        }
         && stored.terms == artifact.terms
 }
 

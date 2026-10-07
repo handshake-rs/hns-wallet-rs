@@ -1,5 +1,13 @@
 # hns-wallet-bitcoin-kyoto
 
+## 0.4.4 - 2026-10-07
+
+<!-- hns-wallet-release-state: 0.4.4 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Check live funding expiry at the final HTLC submission after publication parents and during restart. Abandon unexposed expired contracts without locking ordinary seed-owned funds; retain already attempted submissions and prevent late rebroadcast.
+
+
 ## 0.4.3 - 2026-10-07
 
 <!-- hns-wallet-release-state: 0.4.3 release -->

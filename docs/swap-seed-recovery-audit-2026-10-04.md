@@ -158,3 +158,17 @@ The old beta output with its missing private derivation context is unchanged.
 This publication format establishes recovery for newly funded contracts and adds
 no legacy derivation adapter. No real wallet seed or real funds were used in
 these qualification transactions.
+
+## Final-submission expiry correction
+
+The first recovery cohort was published from `ce222cb` but the app delivery was
+stopped before upload when the funding-resume audit found that an approved
+publication package could reveal its final HTLC after its live funding window.
+The correction is Bitcoin 0.4.4, Handshake 0.4.5 and mobile 0.5.2. Bitcoin
+commits the stricter funding cutoff through its existing authenticated approval
+expiry and consumes the funding guard in the same write. Handshake persists the
+original funding cutoff and checkpoints whether the final contract was exposed.
+Both re-read time at final submission and reject expired funding/rebroadcast.
+An unexposed expired contract releases ordinary funds; an attempted contract
+retains its journal because the signed bytes may already have reached a peer.
+Ordinary wallet-send restart behavior remains unchanged.

@@ -1336,7 +1336,7 @@ impl MobileBitcoinValueController {
             .wallet
             .as_ref()
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
-        let (prepared_package, checkpoint_now_unix) =
+        let prepared_package =
             self.store
                 .try_with_store_mut(|store| -> Result<_, MobileWalletError> {
                     let checkpoint_now_unix = self::now_unix()?;
@@ -1361,7 +1361,7 @@ impl MobileBitcoinValueController {
                         pending.expires_at_unix,
                         guard,
                     )?;
-                    Ok((prepared, checkpoint_now_unix))
+                    Ok(prepared)
                 })?;
         let runtime = self
             .runtime
@@ -1376,7 +1376,7 @@ impl MobileBitcoinValueController {
             funding_receipt = Some(runtime.block_on(supervisor.broadcast_prepared_transaction(
                 &bitcoin_value_runtime_permit()?,
                 prepared.txid,
-                checkpoint_now_unix,
+                self::now_unix()?,
             ))?);
         }
         let receipt = funding_receipt.ok_or(MobileWalletError::InvalidBitcoinAction)?;

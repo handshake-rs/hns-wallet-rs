@@ -1,5 +1,13 @@
 # hns-wallet-mobile
 
+## 0.5.2 - 2026-10-07
+
+<!-- hns-wallet-release-state: 0.5.2 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Read fresh time for each approved publication transaction rather than reuse package-start time. Consume the corrected native funding cutoff and restart boundaries.
+
+
 ## 0.5.1 - 2026-10-07
 
 <!-- hns-wallet-release-state: 0.5.1 release -->

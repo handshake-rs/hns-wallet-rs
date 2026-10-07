@@ -2565,6 +2565,13 @@ impl KyotoSupervisor {
         if peers.len() < usize::from(self.required_peers) {
             return Err(BitcoinWalletError::PeerQuorumUnavailable);
         }
+        // Parent submissions and peer-quorum I/O may consume the live funding
+        // window. Re-read wall time here rather than reuse a package-start time.
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| BitcoinWalletError::ClockRollbackDetected)?
+            .as_secs()
+            .max(now_unix);
         let start = self.store.try_with_store_mut(|store| {
             begin_broadcast_submission(store, self.durable.state.network, txid, now_unix)
         })?;
@@ -2643,7 +2650,10 @@ impl KyotoSupervisor {
                 .await
             {
                 Ok(receipt) => receipts.push(receipt),
-                Err(BitcoinWalletError::BroadcastRetryNotReady) => {
+                Err(
+                    BitcoinWalletError::BroadcastRetryNotReady
+                    | BitcoinWalletError::BroadcastApprovalExpired,
+                ) => {
                     deferred.insert(txid);
                 }
                 Err(error) => return Err(error),
@@ -2819,6 +2829,20 @@ fn begin_broadcast_submission(
             attempt_count: intent.attempt_count,
             submitted_at_unix: intent.last_submitted_at_unix,
         }));
+    }
+    if crate::recovery_publication::is_recoverable_funding_transaction(&transaction)
+        && now_unix >= intent.expires_at_unix
+    {
+        // An unexposed contract is safe to abandon: its input remains an ordinary
+        // seed-owned publication output. Keep attempted submissions reserved,
+        // since their signed contract may already have reached a peer.
+        if intent.attempt_count == 0 {
+            record.broadcast = None;
+            record.raw_transaction = None;
+            record.last_changed_at_unix = now_unix;
+            store.save_bitcoin_transaction(&txid, stored.revision, &record, now_unix)?;
+        }
+        return Err(BitcoinWalletError::BroadcastApprovalExpired);
     }
     let last_attempt_at_unix = match intent.phase {
         BitcoinBroadcastPhase::Prepared => None,
@@ -3417,6 +3441,10 @@ pub struct BitcoinBroadcastAuthorizationGuard {
 }
 
 impl BitcoinBroadcastAuthorizationGuard {
+    pub(crate) const fn expires_at_unix(&self) -> u64 {
+        self.expires_at_unix
+    }
+
     pub fn new(
         workflow: WorkflowRevisionAssertion,
         authorization: EntityRevisionAssertion,
@@ -4401,16 +4429,27 @@ mod restart_tests {
         ));
     }
 
-    #[test]
-    fn lifecycle_recovery_skips_exhausted_and_observed_broadcasts() {
-        let transaction = genesis_block(Network::Regtest).txdata[0].clone();
+    fn approved_broadcast_fixture(recoverable: bool) -> BitcoinTransactionRecord {
+        let mut transaction = genesis_block(Network::Regtest).txdata[0].clone();
+        if recoverable {
+            let mut data = b"SRF1".to_vec();
+            data.resize(hns_wallet_chain_api::SWAP_RECOVERY_MARKER_BYTES, 1);
+            let data = bdk_wallet::bitcoin::script::PushBytesBuf::try_from(data).unwrap();
+            transaction.output.push(bdk_wallet::bitcoin::TxOut {
+                value: bdk_wallet::bitcoin::Amount::ZERO,
+                script_pubkey: bdk_wallet::bitcoin::script::Builder::new()
+                    .push_opcode(bdk_wallet::bitcoin::opcodes::all::OP_RETURN)
+                    .push_slice(data)
+                    .into_script(),
+            });
+        }
         let txid = transaction.compute_txid().to_byte_array();
         let wtxid = transaction.compute_wtxid().to_byte_array();
         let fee_sats = 1;
         let maximum_fee_sats = 1;
         let prepared_at_unix = 1;
         let expires_at_unix = prepared_at_unix + MAX_BROADCAST_APPROVAL_LIFETIME_SECONDS;
-        let mut record = BitcoinTransactionRecord {
+        BitcoinTransactionRecord {
             schema_version: BITCOIN_TRANSACTION_RECORD_VERSION,
             txid,
             wtxid,
@@ -4444,7 +4483,69 @@ mod restart_tests {
             }),
             first_observed_at_unix: None,
             last_changed_at_unix: 2,
-        };
+        }
+    }
+
+    #[test]
+    fn expired_funding_never_exposes_a_contract_and_retains_attempted_submissions() {
+        for attempted in [false, true] {
+            let mut store = WalletStore::create(":memory:", TEST_STORE_PASSPHRASE).unwrap();
+            let mut record = approved_broadcast_fixture(true);
+            let intent = record.broadcast.as_mut().unwrap();
+            intent.phase = if attempted {
+                BitcoinBroadcastPhase::SubmissionStarted
+            } else {
+                BitcoinBroadcastPhase::Prepared
+            };
+            intent.attempt_count = u16::from(attempted);
+            intent.last_submission_started_at_unix = attempted.then_some(2);
+            intent.last_submitted_at_unix = None;
+            let expiry = intent.expires_at_unix;
+            record.validate().unwrap();
+            let txid = record.txid;
+            store
+                .save_bitcoin_transaction(&txid, 0, &record, 2)
+                .unwrap();
+            assert!(matches!(
+                begin_broadcast_submission(&mut store, Network::Regtest, txid, expiry),
+                Err(BitcoinWalletError::BroadcastApprovalExpired)
+            ));
+            let retained = store
+                .bitcoin_transaction::<BitcoinTransactionRecord>(&txid)
+                .unwrap()
+                .unwrap()
+                .value;
+            assert_eq!(retained.raw_transaction.is_some(), attempted);
+            assert_eq!(retained.broadcast.is_some(), attempted);
+            let reserved = unobserved_approved_broadcast_inputs(&store, Network::Regtest).unwrap();
+            assert_eq!(reserved.is_empty(), !attempted);
+            assert_eq!(
+                approved_broadcast_order(&[retained]).unwrap().is_empty(),
+                !attempted
+            );
+        }
+        // Ordinary sends retain their existing durable restart behavior.
+        let mut store = WalletStore::create(":memory:", TEST_STORE_PASSPHRASE).unwrap();
+        let mut record = approved_broadcast_fixture(false);
+        let intent = record.broadcast.as_mut().unwrap();
+        intent.phase = BitcoinBroadcastPhase::Prepared;
+        intent.attempt_count = 0;
+        intent.last_submission_started_at_unix = None;
+        intent.last_submitted_at_unix = None;
+        let late = intent.expires_at_unix + 1;
+        let txid = record.txid;
+        store
+            .save_bitcoin_transaction(&txid, 0, &record, 2)
+            .unwrap();
+        assert!(matches!(
+            begin_broadcast_submission(&mut store, Network::Regtest, txid, late).unwrap(),
+            BroadcastStart::Submit(_)
+        ));
+    }
+
+    #[test]
+    fn lifecycle_recovery_skips_exhausted_and_observed_broadcasts() {
+        let mut record = approved_broadcast_fixture(false);
         record.validate().expect("retryable record is valid");
         assert!(broadcast_is_ready_to_resume(&record));
 

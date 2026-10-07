@@ -8,14 +8,14 @@ release state and scope in its own `CHANGELOG.md`.
 | --- | --- |
 | `hns-wallet-bdk-kyoto` | 0.4.1 |
 | `hns-wallet-bip157` | 0.4.2 |
-| `hns-wallet-bitcoin-kyoto` | 0.4.3 |
+| `hns-wallet-bitcoin-kyoto` | 0.4.4 |
 | `hns-wallet-chain-api` | 0.4.2 |
 | `hns-wallet-ethereum` | 0.4.1 |
 | `hns-wallet-ffi` | 0.4.1 |
-| `hns-wallet-hns` | 0.4.4 |
+| `hns-wallet-hns` | 0.4.5 |
 | `hns-wallet-host` | 0.4.1 |
 | `hns-wallet-market` | 0.5.1 |
-| `hns-wallet-mobile` | 0.5.1 |
+| `hns-wallet-mobile` | 0.5.2 |
 | `hns-wallet-provider` | 0.4.1 |
 | `hns-wallet-service` | 0.4.2 |
 | `hns-wallet-shakedex` | 0.4.1 |
