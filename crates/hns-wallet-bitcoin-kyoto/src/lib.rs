@@ -2,12 +2,14 @@
 #![forbid(unsafe_code)]
 
 mod persistence;
+mod recovery_publication;
 mod runtime;
 mod swap_key_store;
 mod swap_watch;
 mod sync_cache;
 
 pub use persistence::*;
+pub use recovery_publication::*;
 pub use runtime::*;
 pub use swap_key_store::*;
 pub use swap_watch::*;

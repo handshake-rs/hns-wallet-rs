@@ -4,8 +4,10 @@
 mod direct_board;
 mod direct_offer;
 mod direct_responder;
+mod recovered_swap;
 mod session_board;
 mod settlement_key;
+pub use recovered_swap::*;
 
 use hns_marketplace_protocol::{
     AssetId, ChainId, DeadlineKind, SettlementDeadline, SwapAssetSide, SwapSessionHello,
@@ -61,6 +63,10 @@ pub use direct_responder::{
     list_pending_local_shakescape_direct_offer_acceptances,
     reserved_local_shakescape_responder_amount,
 };
+pub use hns_wallet_chain_api::{
+    MAX_SWAP_RECOVERY_FRAMES, SWAP_RECOVERY_MARKER_BYTES, SwapRecoveryHtlcParameters,
+    SwapRecoveryPublication, SwapRecoveryPublicationError, SwapRecoveryTerms,
+};
 pub use session_board::{
     MAX_SHAKESCAPE_DIRECT_SWAP_HISTORY, MAX_SHAKESCAPE_DIRECT_SWAP_RECORDS,
     MAX_SHAKESCAPE_DIRECT_SWAPS, ShakescapeDirectSwapAdmission, ShakescapeDirectSwapPeerStatus,
@@ -75,6 +81,7 @@ pub use settlement_key::{
     CrossChainSwapKey, CrossChainSwapKeyAllocation, CrossChainSwapKeyError,
     CrossChainSwapKeyRequest, SwapParticipant, allocate_cross_chain_swap_key,
     derive_cross_chain_swap_key_from_store, load_cross_chain_swap_key_allocation,
+    recover_cross_chain_swap_key_allocation,
 };
 
 /// Terminal reason used when a countersigned session reaches its funding

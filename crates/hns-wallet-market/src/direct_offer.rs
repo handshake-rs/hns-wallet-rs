@@ -962,7 +962,7 @@ pub(crate) fn local_direct_offer_ids(
     Ok(ids)
 }
 
-fn derive_maker_preimage(
+pub(crate) fn derive_maker_preimage(
     store: &WalletStore,
     wallet_id: WalletId,
     session_id: SessionId,
@@ -988,7 +988,7 @@ fn derive_maker_preimage(
     Ok(Preimage::new(*preimage))
 }
 
-fn maker_preimage_record_id(session_id: SessionId) -> Vec<u8> {
+pub(crate) fn maker_preimage_record_id(session_id: SessionId) -> Vec<u8> {
     let mut id = Vec::with_capacity(MAKER_PREIMAGE_RECORD_DOMAIN.len() + 32);
     id.extend_from_slice(MAKER_PREIMAGE_RECORD_DOMAIN);
     id.extend_from_slice(session_id.as_bytes());

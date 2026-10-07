@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-bitcoin-kyoto"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "base64 0.22.1",
  "bdk_wallet",
@@ -1124,10 +1124,13 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-chain-api"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
+ "hns-marketplace-protocol",
  "hns-wallet-types",
+ "k256",
  "serde",
+ "sha2",
  "thiserror",
  "zeroize",
 ]
@@ -1163,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-hns"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "bech32",
  "bip32",
@@ -1212,13 +1215,17 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-market"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
+ "bdk_wallet",
+ "bech32",
  "hex",
  "hkdf",
+ "hns-covenants",
  "hns-marketplace-protocol",
  "hns-primitives",
  "hns-swap",
+ "hns-transaction",
  "hns-wallet-bitcoin-kyoto",
  "hns-wallet-chain-api",
  "hns-wallet-hns",
@@ -1234,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-mobile"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bdk_wallet",
  "getrandom 0.3.4",
@@ -1278,7 +1285,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-service"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "getrandom 0.3.4",
  "hns-covenants",

@@ -523,6 +523,45 @@ pub fn derive_cross_chain_swap_key_from_store(
     Ok(key)
 }
 
+/// Reconstruct the local participant's allocation from authenticated public
+/// contract terms and the restored seed. Neither the original wallet profile nor any
+/// offer/acceptance record is needed. A non-owned agreement cannot create an
+/// allocation. This restores signing context, not chain or maturity evidence.
+pub fn recover_cross_chain_swap_key_allocation(
+    store: &mut WalletStore,
+    wallet_id: WalletId,
+    terms: &hns_wallet_chain_api::SwapRecoveryTerms,
+    expected_network: NetworkBinding,
+    now_unix: u64,
+) -> Result<CrossChainSwapKeyAllocation, CrossChainSwapKeyError> {
+    terms
+        .validate()
+        .map_err(|_| CrossChainSwapKeyError::InvalidRequest)?;
+    if terms.network != expected_network {
+        return Err(CrossChainSwapKeyError::Protocol(
+            MarketplaceError::NetworkMismatch,
+        ));
+    }
+    let network_encoding = expected_network.encode()?;
+    for (participant, expected_public_key) in [
+        (SwapParticipant::Maker, terms.maker_public_key),
+        (SwapParticipant::Taker, terms.taker_public_key),
+    ] {
+        let request = CrossChainSwapKeyRequest {
+            wallet_id,
+            session_id: SessionId::new(terms.session_id),
+            participant,
+            network: expected_network,
+        };
+        request.validate()?;
+        let (key, _) = derive_key_from_store(store, request, &network_encoding)?;
+        if key.public_key() == expected_public_key {
+            return allocate_cross_chain_swap_key(store, request, now_unix);
+        }
+    }
+    Err(CrossChainSwapKeyError::WrongParticipant)
+}
+
 fn accept_existing(
     store: &WalletStore,
     allocation: CrossChainSwapKeyAllocation,

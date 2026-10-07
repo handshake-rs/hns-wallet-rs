@@ -1,5 +1,13 @@
 # hns-wallet-hns
 
+## 0.4.4 - 2026-10-07
+
+<!-- hns-wallet-release-state: 0.4.4 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Publish seed-discoverable Handshake swap terms through six ordinary wallet ancestors before HTLC funding. Verify ancestry and signatures, include all publication fees in native approval and preserve the approved package for interruption recovery.
+
+
 ## 0.4.3 - 2026-10-03
 
 <!-- hns-wallet-release-state: 0.4.3 release -->

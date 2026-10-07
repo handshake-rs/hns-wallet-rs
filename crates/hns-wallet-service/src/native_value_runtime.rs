@@ -1771,6 +1771,20 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             .map_err(chain_failure)
     }
 
+    pub fn prepare_trusted_native_hns_recoverable_htlc_lock(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        maximum_fee: BaseUnits,
+        publication: hns_wallet_chain_api::SwapRecoveryPublication,
+    ) -> Result<PreparedSettlementLock, ServiceFailure> {
+        self.runtime.exact_account()?;
+        self.runtime
+            .runtime
+            .prepare_native_recoverable_htlc_lock(session_id, descriptor, maximum_fee, publication)
+            .map_err(chain_failure)
+    }
+
     pub fn bind_trusted_native_hns_htlc_lock_broadcast_guard(
         &self,
         prepared: &PreparedSettlementLock,

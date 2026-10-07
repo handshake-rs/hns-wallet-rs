@@ -1,5 +1,13 @@
 # hns-wallet-bitcoin-kyoto
 
+## 0.4.3 - 2026-10-07
+
+<!-- hns-wallet-release-state: 0.4.3 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Publish seed-discoverable Bitcoin swap terms through three ordinary wallet ancestors before HTLC funding. Verify every ancestor signature, persist approved packages before broadcast, resume parents before children and register historical recovery watches.
+
+
 ## 0.4.2 - 2026-10-04
 
 <!-- hns-wallet-release-state: 0.4.2 release -->

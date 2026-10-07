@@ -1,5 +1,13 @@
 # hns-wallet-market
 
+## 0.5.1 - 2026-10-07
+
+<!-- hns-wallet-release-state: 0.5.1 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Reconstruct seed-owned settlement allocations and reclaim candidates from chain-bound public terms. Retain independently verified spends separately for each chain and restore public preimages for the taker’s remaining claim.
+
+
 ## 0.5.0 - 2026-10-04
 
 <!-- hns-wallet-release-state: 0.5.0 release -->

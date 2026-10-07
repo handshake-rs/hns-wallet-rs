@@ -94,7 +94,7 @@ these dependencies. Their checksum manifests are active build prerequisites.
 7. Confirm the selected package version and upload only that package:
 
    ```sh
-   ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.3
+   ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.4
    ```
 
    The package name must be allowlisted and the confirmation must match its
@@ -110,7 +110,7 @@ interval. Override a default only to match an explicit registry limit:
 ```sh
 PUBLISH_NEW_INTERVAL_SECONDS=605 \
 PUBLISH_UPDATE_INTERVAL_SECONDS=65 \
-  ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.3
+  ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.4
 ```
 
 Download the uploaded archive and verify checksum, exact source commit, and

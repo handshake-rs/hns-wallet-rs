@@ -4,13 +4,16 @@
 from __future__ import annotations
 
 import runpy
+import tomllib
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Callable
 
 
 REPO = Path(__file__).resolve().parent.parent
-CURRENT_RELEASE_VERSION = "0.4.3"
+CURRENT_RELEASE_VERSION = tomllib.loads(
+    (REPO / "crates/hns-wallet-hns/Cargo.toml").read_text(encoding="utf-8")
+)["package"]["version"]
 VALIDATOR = runpy.run_path(str(REPO / "scripts/verify-release.py"))
 verify_state = VALIDATOR["changelog_release_state"]
 require_execution_state = VALIDATOR["require_execution_release_state"]

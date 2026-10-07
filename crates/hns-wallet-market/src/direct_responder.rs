@@ -731,7 +731,6 @@ fn abandonment_record_id(wallet_id: WalletId, session_id: SessionId) -> Vec<u8> 
 #[cfg(test)]
 mod tests {
     use hns_marketplace_protocol::{ChainId, NetworkBinding};
-    use hns_primitives::BlockHash;
     use hns_wallet_store::{RECOVERY_SEED_BYTES, SecretKind};
 
     use super::*;
@@ -747,13 +746,21 @@ mod tests {
     const START: u64 = 1_700_000_000;
 
     fn policy() -> ShakescapeDirectSwapPolicy {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        let hns =
+            hns_wallet_hns::direct_shakescape_network_binding(hns_wallet_hns::HnsNetwork::Mainnet)
+                .unwrap();
         ShakescapeDirectSwapPolicy::new(
             ShakescapeDirectOfferBoardPolicy::new(NetworkBinding {
-                hns_magic: 0x5b6e_c393,
-                hns_genesis: BlockHash::new([1; 32]),
+                hns_magic: hns.magic,
+                hns_genesis: hns.genesis,
                 counterchain: ChainId::BITCOIN,
                 counterchain_network: 1,
-                counterchain_genesis: [2; 32],
+                counterchain_genesis: bdk_wallet::bitcoin::blockdata::constants::genesis_block(
+                    bdk_wallet::bitcoin::Network::Bitcoin,
+                )
+                .block_hash()
+                .to_byte_array(),
             })
             .expect("board policy"),
         )
@@ -786,6 +793,68 @@ mod tests {
         hello
             .verify_agreement(policy().network())
             .expect("authenticated public terms");
+        // Exercise the publication format for both assets and both offer
+        // directions. These tests authenticate data, not transaction ancestry.
+        for side in [SwapAssetSide::Offered, SwapAssetSide::Received] {
+            let publication = crate::SwapRecoveryPublication::new(hello, side, policy().network())
+                .expect("bounded chain recovery publication");
+            let restored_publication = crate::SwapRecoveryPublication::decode(
+                policy().network(),
+                publication.chain(),
+                publication.marker(),
+                publication.frames(),
+            )
+            .expect("authenticated published terms");
+            assert_eq!(
+                restored_publication.terms(),
+                &crate::SwapRecoveryTerms::from_hello(hello, policy().network())
+                    .expect("canonical recovery terms")
+            );
+            let mut truncated = publication.frames().to_vec();
+            truncated.pop();
+            assert!(
+                crate::SwapRecoveryPublication::decode(
+                    policy().network(),
+                    publication.chain(),
+                    publication.marker(),
+                    &truncated,
+                )
+                .is_err()
+            );
+            let mut changed = publication.frames().to_vec();
+            changed[0][4] ^= 1;
+            assert!(
+                crate::SwapRecoveryPublication::decode(
+                    policy().network(),
+                    publication.chain(),
+                    publication.marker(),
+                    &changed,
+                )
+                .is_err()
+            );
+            let mut reordered = publication.frames().to_vec();
+            reordered.swap(0, 1);
+            assert!(
+                crate::SwapRecoveryPublication::decode(
+                    policy().network(),
+                    publication.chain(),
+                    publication.marker(),
+                    &reordered,
+                )
+                .is_err()
+            );
+            let mut wrong_network = policy().network();
+            wrong_network.counterchain_genesis[0] ^= 1;
+            assert!(
+                crate::SwapRecoveryPublication::decode(
+                    wrong_network,
+                    publication.chain(),
+                    publication.marker(),
+                    publication.frames(),
+                )
+                .is_err()
+            );
+        }
         let (btc_side, hns_side, hns_receiver, hns_refund) = if hello.offered_asset == AssetId::BTC
         {
             (
@@ -837,9 +906,18 @@ mod tests {
                 hello.received_asset,
             ),
         ] {
-            // Restore only the seed under a different profile. The authenticated
-            // public agreement is supplied by this test, not discovered here.
+            // Publish complete funding ancestry, then retain only the public
+            // chain transactions. The fresh store below has none of the
+            // original offers, acceptances, allocations or execution journals.
             let wallet_id = WalletId::new([profile; 16]);
+            let funded = published_owned_funding(hello, participant, seed, wallet_id);
+            if let Some(lock) = &funded.bitcoin {
+                assert_eq!(lock.htlc, bitcoin.htlc);
+                assert_eq!(lock.value_sats, bitcoin.value_sats);
+            }
+            if let Some((descriptor, _)) = &funded.hns {
+                assert_eq!(*descriptor, hns.descriptor);
+            }
             let mut restored = store(wallet_id, seed);
             let request = CrossChainSwapKeyRequest {
                 wallet_id,
@@ -857,11 +935,48 @@ mod tests {
                 .expect("fresh allocation lookup")
                 .is_none()
             );
-            allocate_cross_chain_swap_key(&mut restored, request, START + 40)
-                .expect("reconstructed allocation");
+            let recovered = crate::retain_recovered_swap_candidate(
+                &mut restored,
+                wallet_id,
+                &funded.terms,
+                funded.side,
+                funded.transaction,
+                funded.output_index,
+                policy().network(),
+                START + 40,
+            )
+            .expect("reconstructed owned allocation without original records")
+            .expect("seed owns the recovered contract");
+            assert_eq!(recovered.participant, participant);
             let key = derive_cross_chain_swap_key_from_store(&restored, request)
                 .expect("restored signing authority");
             assert_eq!(key.public_key(), expected_key);
+            assert_funded_refund(&funded, &key);
+            let counterparty = if participant == SwapParticipant::Maker {
+                SwapParticipant::Taker
+            } else {
+                SwapParticipant::Maker
+            };
+            let counterparty_seed = if counterparty == SwapParticipant::Maker {
+                maker_seed
+            } else {
+                taker_seed
+            };
+            let receiving = published_owned_funding(
+                hello,
+                counterparty,
+                counterparty_seed,
+                WalletId::new([94; 16]),
+            );
+            let maker_origin = store(WalletId::new([95; 16]), maker_seed);
+            let preimage = crate::direct_offer::derive_maker_preimage(
+                &maker_origin,
+                WalletId::new([95; 16]),
+                request.session_id,
+                funded.terms.direct_offer_id,
+            )
+            .unwrap();
+            assert_funded_redeem(&receiving, &key, *preimage.expose_for_settlement());
             if funding_asset == AssetId::BTC {
                 assert_eq!(bitcoin.htlc.refund_public_key.as_slice(), key.public_key());
                 assert_eq!(hns.descriptor.receiver_public_key, key.public_key());
@@ -883,6 +998,377 @@ mod tests {
                     .verify_prehash(&digest, &signature)
                     .expect("valid restored signature");
             }
+        }
+        let wrong_wallet_id = WalletId::new([93; 16]);
+        let mut wrong_wallet = store(wrong_wallet_id, 0xf1);
+        assert!(
+            crate::recover_cross_chain_swap_key_allocation(
+                &mut wrong_wallet,
+                wrong_wallet_id,
+                &crate::SwapRecoveryTerms::from_hello(hello, policy().network())
+                    .expect("public terms"),
+                policy().network(),
+                START + 40,
+            )
+            .is_err()
+        );
+        for participant in [SwapParticipant::Maker, SwapParticipant::Taker] {
+            assert!(
+                crate::load_cross_chain_swap_key_allocation(
+                    &wrong_wallet,
+                    wrong_wallet_id,
+                    SessionId::new(hello.swap_session_id),
+                    participant,
+                )
+                .expect("rejected ownership leaves no allocation")
+                .is_none()
+            );
+        }
+    }
+
+    struct PublishedFundingFixture {
+        terms: crate::SwapRecoveryTerms,
+        side: hns_marketplace_protocol::SwapAssetSide,
+        transaction: hns_wallet_types::TransactionHash,
+        output_index: u32,
+        bitcoin: Option<hns_wallet_bitcoin_kyoto::VerifiedBitcoinLock>,
+        hns: Option<(hns_swap::HnsHtlc, hns_transaction::Coin)>,
+    }
+
+    fn published_owned_funding(
+        hello: &SwapSessionHello,
+        participant: SwapParticipant,
+        seed: u8,
+        wallet_id: WalletId,
+    ) -> PublishedFundingFixture {
+        use bdk_wallet::bitcoin::{self, hashes::Hash};
+        use hns_marketplace_protocol::SwapAssetSide;
+        let side = match participant {
+            SwapParticipant::Maker => SwapAssetSide::Offered,
+            SwapParticipant::Taker => SwapAssetSide::Received,
+        };
+        let publication =
+            crate::SwapRecoveryPublication::new(hello, side, policy().network()).unwrap();
+        if publication.chain() == ChainId::BITCOIN {
+            let mut wallet = hns_wallet_bitcoin_kyoto::create_descriptor_wallet_from_seed(
+                &[seed; 64],
+                bitcoin::Network::Bitcoin,
+            )
+            .unwrap();
+            let receive = wallet
+                .reveal_next_address(bdk_wallet::KeychainKind::External)
+                .address;
+            let deposit = bitcoin::Transaction {
+                version: bitcoin::transaction::Version::TWO,
+                lock_time: bitcoin::absolute::LockTime::ZERO,
+                input: vec![bitcoin::TxIn {
+                    previous_output: bitcoin::OutPoint {
+                        txid: bitcoin::Txid::from_byte_array([42; 32]),
+                        vout: 0,
+                    },
+                    script_sig: bitcoin::ScriptBuf::new(),
+                    sequence: bitcoin::Sequence::MAX,
+                    witness: bitcoin::Witness::new(),
+                }],
+                output: vec![bitcoin::TxOut {
+                    value: bitcoin::Amount::from_sat(10_000_000),
+                    script_pubkey: receive.script_pubkey(),
+                }],
+            };
+            let mut update = bdk_wallet::chain::TxUpdate::default();
+            update.anchors.insert((
+                bdk_wallet::chain::ConfirmationBlockTime {
+                    block_id: wallet.latest_checkpoint().block_id(),
+                    confirmation_time: 1,
+                },
+                deposit.compute_txid(),
+            ));
+            update.txs.push(std::sync::Arc::new(deposit));
+            wallet
+                .apply_update(bdk_wallet::Update {
+                    tx_update: update,
+                    ..Default::default()
+                })
+                .unwrap();
+            let funded = hns_wallet_bitcoin_kyoto::prepare_bitcoin_recoverable_htlc_funding(
+                &mut wallet,
+                &hns_wallet_bitcoin_kyoto::bitcoin_value_runtime_permit().unwrap(),
+                &publication,
+                1,
+                1_000,
+                &[],
+            )
+            .unwrap();
+            let mut seed_only = hns_wallet_bitcoin_kyoto::create_descriptor_wallet_from_seed(
+                &[seed; 64],
+                bitcoin::Network::Bitcoin,
+            )
+            .unwrap();
+            let _ = seed_only
+                .reveal_addresses_to(bdk_wallet::KeychainKind::Internal, 0)
+                .count();
+            for raw in funded
+                .publication_transactions()
+                .iter()
+                .map(Vec::as_slice)
+                .chain(std::iter::once(funded.funding.raw_transaction()))
+            {
+                seed_only.apply_unconfirmed_txs([(
+                    bitcoin::consensus::deserialize::<bitcoin::Transaction>(raw).unwrap(),
+                    1,
+                )]);
+            }
+            let mut contracts = hns_wallet_bitcoin_kyoto::discover_bitcoin_recovery_contracts(
+                &seed_only,
+                policy().network(),
+            )
+            .unwrap();
+            assert_eq!(contracts.len(), 1);
+            let recovered = contracts.pop().unwrap();
+            PublishedFundingFixture {
+                terms: recovered.terms,
+                side: recovered.side,
+                transaction: recovered.lock.funding_txid,
+                output_index: recovered.lock.output_index,
+                bitcoin: Some(recovered.lock),
+                hns: None,
+            }
+        } else {
+            let origin = store(wallet_id, seed);
+            let config = hns_wallet_hns::HnsRuntimeConfig::default_non_value(
+                wallet_id,
+                hns_wallet_types::AccountId::new([9; 16]),
+                hns_wallet_hns::HnsBootstrapPolicy::new(hns_wallet_hns::HnsNetwork::Mainnet, 0),
+            )
+            .unwrap();
+            let account = hns_wallet_hns::HnsAccountRecord::initial_non_value(config).unwrap();
+            let derivation = hns_wallet_types::DerivationReference {
+                role: hns_wallet_types::KeyRole::HnsCoin,
+                account: 0,
+                change: 0,
+                index: 0,
+            };
+            let public =
+                hns_wallet_hns::derive_hns_account_public_key(&origin, &account, derivation)
+                    .unwrap();
+            let address =
+                hns_wallet_hns::receive_address(hns_wallet_hns::HnsNetwork::Mainnet, &public)
+                    .unwrap();
+            let (_, _, program) = bech32::segwit::decode(&address).unwrap();
+            let coin = hns_wallet_hns::TrackedHnsCoin {
+                coin: hns_wallet_hns::WalletCoin {
+                    outpoint: hns_wallet_hns::HnsOutpoint {
+                        transaction: hns_wallet_types::TransactionHash::new([42; 32]),
+                        output_index: 0,
+                    },
+                    value: hns_wallet_types::BaseUnits::new(100_000_000),
+                    confirmation_count: 2,
+                    confirmed_height: Some(1),
+                    coinbase: false,
+                    covenant: hns_covenants::Covenant::default().encode().unwrap(),
+                    name_locked: false,
+                },
+                derivation,
+                address_program: program,
+            };
+            let funded = hns_wallet_hns::prepare_hns_recoverable_funding(
+                &origin,
+                &account,
+                vec![coin],
+                &publication,
+                hns_wallet_types::BaseUnits::new(1_000),
+                hns_wallet_types::BaseUnits::new(10_000),
+            )
+            .unwrap();
+            let mut chain_transactions = funded
+                .publication_transactions()
+                .map(<[u8]>::to_vec)
+                .collect::<Vec<_>>();
+            chain_transactions.push(funded.funding_transaction().to_vec());
+            // Discard the source store: discovery consumes only chain bytes.
+            drop(origin);
+            let mut contracts = hns_wallet_hns::discover_hns_recovery_contracts(
+                policy().network(),
+                &chain_transactions,
+            )
+            .unwrap();
+            assert_eq!(contracts.len(), 1);
+            let recovered = contracts.pop().unwrap();
+            let output = recovered.descriptor.funding_output().unwrap();
+            let coin = hns_transaction::Coin {
+                outpoint: hns_transaction::Outpoint {
+                    transaction_hash: hns_primitives::TransactionHash::new(
+                        recovered.funding_id.into_bytes(),
+                    ),
+                    index: recovered.output_index,
+                },
+                value: output.value,
+                height: hns_primitives::Height::new(1),
+                coinbase: false,
+                address: output.address,
+                covenant: output.covenant,
+            };
+            PublishedFundingFixture {
+                terms: recovered.terms,
+                side: recovered.side,
+                transaction: recovered.funding_id,
+                output_index: recovered.output_index,
+                bitcoin: None,
+                hns: Some((recovered.descriptor, coin)),
+            }
+        }
+    }
+
+    fn assert_funded_redeem(
+        funded: &PublishedFundingFixture,
+        key: &crate::CrossChainSwapKey,
+        preimage: [u8; 32],
+    ) {
+        use hns_wallet_chain_api::SettlementSigner;
+        if let Some(lock) = &funded.bitcoin {
+            use bdk_wallet::bitcoin::{self, hashes::Hash};
+            let raw = hns_wallet_bitcoin_kyoto::sign_bitcoin_htlc_spend_with_settlement_signer(
+                lock,
+                &hns_wallet_bitcoin_kyoto::bitcoin_value_runtime_permit().unwrap(),
+                hns_wallet_bitcoin_kyoto::BitcoinHtlcSpendRequest {
+                    destination: bitcoin::ScriptBuf::new_p2wpkh(
+                        &bitcoin::WPubkeyHash::from_byte_array([8; 20]),
+                    ),
+                    fee_sats: 100,
+                    branch: hns_wallet_bitcoin_kyoto::HtlcSpendBranch::Redeem,
+                    preimage: Some(preimage),
+                    chain_context: hns_wallet_bitcoin_kyoto::BitcoinChainLockContext {
+                        next_block_height: 1,
+                        median_time_past: 1,
+                    },
+                },
+                key,
+            )
+            .unwrap();
+            let verified = hns_wallet_bitcoin_kyoto::verify_signed_bitcoin_htlc_spend(
+                &raw,
+                lock,
+                hns_wallet_bitcoin_kyoto::HtlcSpendBranch::Redeem,
+            )
+            .unwrap();
+            assert_eq!(verified.revealed_preimage, Some(preimage));
+        }
+        if let Some((descriptor, coin)) = &funded.hns {
+            let mut redeem = hns_transaction::Transaction {
+                version: 0,
+                locktime: 0,
+                inputs: vec![hns_transaction::Input {
+                    previous_output: coin.outpoint,
+                    sequence: u32::MAX,
+                    witness: hns_transaction::Witness::default(),
+                }],
+                outputs: vec![hns_transaction::Output {
+                    value: hns_primitives::Dollarydoos::new(coin.value.get() - 100),
+                    address: hns_transaction::Address::new(0, vec![8; 20]).unwrap(),
+                    covenant: hns_covenants::Covenant::default(),
+                }],
+            };
+            let mut signature = key
+                .sign_digest(descriptor.signature_hash(&redeem, 0, coin).unwrap())
+                .unwrap()
+                .to_vec();
+            signature.push(hns_swap::HNS_HTLC_SIGHASH);
+            redeem.inputs[0].witness = descriptor
+                .redeem_witness(&signature.try_into().unwrap(), &preimage)
+                .unwrap();
+            assert_eq!(
+                descriptor
+                    .extract_preimage(&redeem.inputs[0].witness)
+                    .unwrap(),
+                preimage
+            );
+            assert!(matches!(
+                descriptor.verify_spend(&redeem, 0, coin).unwrap(),
+                hns_swap::HnsHtlcSpend::Redeem { .. }
+            ));
+        }
+    }
+
+    fn assert_funded_refund(funded: &PublishedFundingFixture, key: &crate::CrossChainSwapKey) {
+        use hns_wallet_chain_api::SettlementSigner;
+        if let Some(lock) = &funded.bitcoin {
+            use bdk_wallet::bitcoin::{self, hashes::Hash};
+            let destination =
+                bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::from_byte_array([8; 20]));
+            let deadline = lock.htlc.refund_locktime;
+            let request = hns_wallet_bitcoin_kyoto::BitcoinHtlcSpendRequest {
+                destination,
+                fee_sats: 100,
+                branch: hns_wallet_bitcoin_kyoto::HtlcSpendBranch::Refund,
+                preimage: None,
+                chain_context: hns_wallet_bitcoin_kyoto::BitcoinChainLockContext {
+                    next_block_height: 1,
+                    median_time_past: deadline + 1,
+                },
+            };
+            let raw = hns_wallet_bitcoin_kyoto::sign_bitcoin_htlc_spend_with_settlement_signer(
+                lock,
+                &hns_wallet_bitcoin_kyoto::bitcoin_value_runtime_permit().unwrap(),
+                request.clone(),
+                key,
+            )
+            .unwrap();
+            hns_wallet_bitcoin_kyoto::verify_signed_bitcoin_htlc_spend(
+                &raw,
+                lock,
+                hns_wallet_bitcoin_kyoto::HtlcSpendBranch::Refund,
+            )
+            .unwrap();
+            let mut premature = request;
+            premature.chain_context.median_time_past = deadline;
+            assert!(
+                hns_wallet_bitcoin_kyoto::sign_bitcoin_htlc_spend_with_settlement_signer(
+                    lock,
+                    &hns_wallet_bitcoin_kyoto::bitcoin_value_runtime_permit().unwrap(),
+                    premature,
+                    key
+                )
+                .is_err()
+            );
+        }
+        if let Some((descriptor, coin)) = &funded.hns {
+            let mut refund = hns_transaction::Transaction {
+                version: 0,
+                locktime: descriptor.refund_locktime,
+                inputs: vec![hns_transaction::Input {
+                    previous_output: coin.outpoint,
+                    sequence: u32::MAX - 1,
+                    witness: hns_transaction::Witness::default(),
+                }],
+                outputs: vec![hns_transaction::Output {
+                    value: hns_primitives::Dollarydoos::new(coin.value.get() - 100),
+                    address: hns_transaction::Address::new(0, vec![8; 20]).unwrap(),
+                    covenant: hns_covenants::Covenant::default(),
+                }],
+            };
+            let mut signature = key
+                .sign_digest(descriptor.signature_hash(&refund, 0, coin).unwrap())
+                .unwrap()
+                .to_vec();
+            signature.push(hns_swap::HNS_HTLC_SIGHASH);
+            refund.inputs[0].witness = descriptor
+                .refund_witness(&signature.try_into().unwrap())
+                .unwrap();
+            assert_eq!(
+                descriptor.verify_spend(&refund, 0, coin).unwrap(),
+                hns_swap::HnsHtlcSpend::Refund
+            );
+            let mut premature = refund;
+            premature.locktime -= 1;
+            let mut signature = key
+                .sign_digest(descriptor.signature_hash(&premature, 0, coin).unwrap())
+                .unwrap()
+                .to_vec();
+            signature.push(hns_swap::HNS_HTLC_SIGHASH);
+            premature.inputs[0].witness = descriptor
+                .refund_witness(&signature.try_into().unwrap())
+                .unwrap();
+            assert!(descriptor.verify_spend(&premature, 0, coin).is_err());
         }
     }
 

@@ -7,6 +7,7 @@ mod light_index;
 mod name_workflow;
 mod node_rpc;
 mod peer_coordinator;
+mod recovery_publication;
 mod shakedex_funding;
 mod shakedex_key;
 // The counter boundary stays crate-private until the immutable hns-rs HNSA/HNSR
@@ -45,6 +46,11 @@ pub use peer_coordinator::{
     open_wallet_direct_hns_peer_coordinator_with_floor_and_genesis_bootstrap,
     open_wallet_direct_hns_peer_coordinator_with_floor_and_public_peer_sessions,
     open_wallet_direct_hns_peer_coordinator_with_floor_checkpoint_and_public_peer_sessions,
+};
+pub use recovery_publication::{
+    HnsRecoverableFundingPlan, HnsRecoveryContract, build_recovered_hns_htlc,
+    discover_hns_recovery_contracts, hns_recovery_anchor_program, prepare_hns_recoverable_funding,
+    recover_hns_contract_from_ancestors,
 };
 pub use shakedex_funding::{
     HnsPreparedShakedexFunding, HnsShakedexChangeReservation,
@@ -3361,6 +3367,8 @@ struct HnsPreparedSettlement {
     expires_at_unix: u64,
     terms: HnsSettlementTerms,
     #[serde(default)]
+    recovery_publication: Option<recovery_publication::HnsRecoveryPackage>,
+    #[serde(default)]
     broadcast_guard: Option<HnsSettlementBroadcastGuard>,
 }
 
@@ -3394,6 +3402,27 @@ impl fmt::Debug for HnsPreparedSettlement {
             .field("terms", &self.terms)
             .field("signed_transaction", &"[REDACTED]")
             .finish()
+    }
+}
+
+impl HnsPreparedSettlement {
+    fn canonical_input_coins(&self) -> Result<Vec<Coin>, HnsWalletError> {
+        if self.recovery_publication.is_some() {
+            recovery_publication::canonical_package_inputs(&self.input_coins)
+        } else {
+            canonical_evidence_coins(&self.input_coins)
+        }
+    }
+    fn approved_fee(&self) -> Result<BaseUnits, HnsWalletError> {
+        let mut fee = self.fee.get();
+        if let Some(package) = &self.recovery_publication {
+            for ancestor in &package.ancestors {
+                fee = fee
+                    .checked_add(ancestor.fee.get())
+                    .ok_or(HnsWalletError::Arithmetic)?;
+            }
+        }
+        Ok(BaseUnits::new(fee))
     }
 }
 
@@ -4312,7 +4341,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let prepared: HnsPreparedSettlement = serde_json::from_slice(artifact.commitment_bytes())?;
         if prepared.stage != HnsSettlementStage::Prepared
             || prepared.session_id != artifact.session_id
-            || prepared.fee != artifact.fee
+            || prepared.approved_fee()? != artifact.fee
             || prepared.expires_at_unix != artifact.expires_at_unix
         {
             return Err(HnsWalletError::InvalidPreparedArtifact);
@@ -4359,7 +4388,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let prepared: HnsPreparedSettlement = serde_json::from_slice(artifact.commitment_bytes())?;
         if prepared.stage != HnsSettlementStage::Prepared
             || prepared.session_id != artifact.session_id
-            || prepared.fee != artifact.fee
+            || prepared.approved_fee()? != artifact.fee
             || prepared.expires_at_unix != artifact.expires_at_unix
         {
             return Err(HnsWalletError::InvalidPreparedArtifact);
@@ -4380,7 +4409,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let prepared: HnsPreparedSettlement = serde_json::from_slice(artifact.commitment_bytes())?;
         if prepared.stage != HnsSettlementStage::Prepared
             || prepared.session_id != artifact.session_id
-            || prepared.fee != artifact.fee
+            || prepared.approved_fee()? != artifact.fee
             || prepared.expires_at_unix != artifact.expires_at_unix
         {
             return Err(HnsWalletError::InvalidPreparedArtifact);
@@ -4396,7 +4425,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         }
         let transaction = Transaction::decode(&prepared.signed_transaction)
             .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
-        let input_coins = canonical_evidence_coins(&prepared.input_coins)?;
+        let input_coins = prepared.canonical_input_coins()?;
         if transaction.inputs.len() != input_coins.len() || input_coins.is_empty() {
             return Err(HnsWalletError::InvalidPreparedArtifact);
         }
@@ -4486,7 +4515,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let prepared: HnsPreparedSettlement = serde_json::from_slice(artifact.commitment_bytes())?;
         if prepared.session_id != artifact.session_id
             || prepared.stage != HnsSettlementStage::Prepared
-            || prepared.fee != artifact.fee
+            || prepared.approved_fee()? != artifact.fee
             || prepared.maximum_fee.is_zero()
             || prepared.fee > prepared.maximum_fee
             || prepared.expires_at_unix != artifact.expires_at_unix
@@ -4497,7 +4526,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .fee_quote
             .as_ref()
             .ok_or(HnsWalletError::InvalidPreparedArtifact)?;
-        let artifact_input_coins = canonical_evidence_coins(&prepared.input_coins)?;
+        let artifact_input_coins = prepared.canonical_input_coins()?;
         validate_final_fee_quote(
             &prepared.signed_transaction,
             &artifact_input_coins,
@@ -4568,7 +4597,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                 .fee_quote
                 .as_ref()
                 .ok_or(HnsWalletError::InvalidWorkflow)?;
-            let input_coins = canonical_evidence_coins(&stored.state.input_coins)?;
+            let input_coins = stored.state.canonical_input_coins()?;
             validate_final_fee_quote(
                 &stored.state.signed_transaction,
                 &input_coins,
@@ -4580,7 +4609,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             )?;
             stored
         };
-        let input_coins = canonical_evidence_coins(&stored.state.input_coins)?;
+        let input_coins = stored.state.canonical_input_coins()?;
         let quote = self.quote_final_transaction(
             &stored.state.signed_transaction,
             &input_coins,
@@ -4677,6 +4706,20 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             };
             (revision, state)
         };
+        if let Some(package) = &stored.state.recovery_publication {
+            recovery_publication::validate_prepared_publication(&stored.state)?;
+            for ancestor in &package.ancestors {
+                let tx = Transaction::decode(&ancestor.raw)
+                    .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
+                let coins = recovery_publication::canonical_package_inputs(&ancestor.inputs)?;
+                self.quote_final_transaction(&ancestor.raw, &coins, ancestor.fee, ancestor.fee)?;
+                if self.backend.broadcast_transaction(&ancestor.raw)?
+                    != wallet_transaction_hash(&tx)?
+                {
+                    return Err(HnsWalletError::InvalidEvidence);
+                }
+            }
+        }
         let accepted = self
             .backend
             .broadcast_transaction(&stored.state.signed_transaction)?;
@@ -4731,7 +4774,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             let artifact = PreparedArtifact::new(
                 ModuleId::Handshake,
                 prepared.session_id,
-                prepared.fee,
+                prepared.approved_fee()?,
                 prepared.expires_at_unix,
                 serde_json::to_vec(&prepared)?,
             )
@@ -4757,6 +4800,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         maximum_fee: BaseUnits,
         fee_quote: HnsTransactionFeeQuote,
         terms: HnsSettlementTerms,
+        recovery_publication: Option<recovery_publication::HnsRecoveryPackage>,
         broadcast_guard: Option<HnsSettlementBroadcastGuard>,
         reservation_saves: &[EntityBatchSave<HnsInputReservation>],
         account_save: Option<&EntityBatchSave<HnsAccountRecord>>,
@@ -4766,7 +4810,11 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         let transaction = Transaction::decode(&signed_transaction)
             .map_err(|_| HnsWalletError::InvalidPreparedArtifact)?;
         let transaction = wallet_transaction_hash(&transaction)?;
-        let canonical_input_coins = canonical_evidence_coins(&input_coins)?;
+        let canonical_input_coins = if recovery_publication.is_some() {
+            recovery_publication::canonical_package_inputs(&input_coins)?
+        } else {
+            canonical_evidence_coins(&input_coins)?
+        };
         validate_final_fee_quote(
             &signed_transaction,
             &canonical_input_coins,
@@ -4801,6 +4849,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             fee_quote: Some(fee_quote),
             expires_at_unix,
             terms,
+            recovery_publication,
             broadcast_guard,
         };
         let kind = settlement_workflow_kind(action);
@@ -5013,8 +5062,10 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
                     .fee_quote
                     .as_ref()
                     .ok_or(ChainError::InvalidEvidence)?;
-                let input_coins =
-                    canonical_evidence_coins(&stored.state.input_coins).map_err(map_chain_error)?;
+                let input_coins = stored
+                    .state
+                    .canonical_input_coins()
+                    .map_err(map_chain_error)?;
                 validate_final_fee_quote(
                     &stored.state.signed_transaction,
                     &input_coins,
@@ -5342,6 +5393,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             maximum_fee,
             quote,
             terms,
+            None,
             broadcast_guard,
             &reservation_saves,
             Some(&account_save),
@@ -5910,6 +5962,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
     fn prepared_settlement_artifact(
         prepared: &HnsPreparedSettlement,
     ) -> Result<PreparedArtifact, HnsWalletError> {
+        recovery_publication::validate_prepared_publication(prepared)?;
         if prepared.broadcast_guard.as_ref().is_some_and(|guard| {
             !guard.authorizes_action(prepared.action, prepared.session_id, None)
         }) {
@@ -5924,7 +5977,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             .fee_quote
             .as_ref()
             .ok_or(HnsWalletError::InvalidPreparedArtifact)?;
-        let input_coins = canonical_evidence_coins(&prepared.input_coins)?;
+        let input_coins = prepared.canonical_input_coins()?;
         validate_final_fee_quote(
             &prepared.signed_transaction,
             &input_coins,
@@ -5938,7 +5991,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         PreparedArtifact::new(
             ModuleId::Handshake,
             prepared.session_id,
-            prepared.fee,
+            prepared.approved_fee()?,
             prepared.expires_at_unix,
             payload,
         )
@@ -6092,6 +6145,41 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
         })
     }
 
+    /// Native Shakescape funding requires the complete public recovery terms
+    /// to be present in ordinary-wallet ancestors before its HTLC can exist.
+    pub fn prepare_native_recoverable_htlc_lock(
+        &self,
+        session_id: SessionId,
+        descriptor: HnsHtlc,
+        maximum_fee: BaseUnits,
+        publication: hns_wallet_chain_api::SwapRecoveryPublication,
+    ) -> Result<PreparedSettlementLock, ChainError> {
+        self.verify_native_htlc_network(&descriptor)?;
+        if publication.terms().session_id != session_id.into_bytes()
+            || recovery_publication::build_recovered_hns_htlc(
+                publication.terms(),
+                publication.side(),
+            )
+            .map_err(map_chain_error)?
+                != descriptor
+        {
+            return Err(ChainError::InvalidEvidence);
+        }
+        self.prepare_lock_with_publication(
+            SettlementLockRequest {
+                session_id,
+                module: ModuleId::Handshake,
+                amount: Amount::new(WalletAsset::Hns, u128::from(descriptor.value.get())),
+                hashlock: ObjectHash::new(descriptor.hashlock),
+                receiver: hex::encode(descriptor.receiver_public_key),
+                refund_target: hex::encode(descriptor.refund_public_key),
+                absolute_timelock: u64::from(descriptor.refund_locktime),
+                maximum_fee,
+            },
+            Some(publication),
+        )
+    }
+
     /// Bind or refresh a reversible prepared HNS lock with the exact durable
     /// second-funding authority that its first irreversible submission must
     /// consume. The signed transaction and reservations remain unchanged.
@@ -6108,7 +6196,7 @@ impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
             || prepared.stage != HnsSettlementStage::Prepared
             || prepared.action != HnsSettlementAction::Lock
             || prepared.session_id != artifact.0.session_id
-            || prepared.fee != artifact.0.fee
+            || prepared.approved_fee().map_err(map_chain_error)? != artifact.0.fee
             || prepared.expires_at_unix != artifact.0.expires_at_unix
             || prepared.expires_at_unix <= now_unix
             || !broadcast_guard.authorizes_action(
@@ -9728,6 +9816,11 @@ fn account_entity_prefix(config: &HnsRuntimeConfig) -> [u8; 32] {
     prefix
 }
 
+/// Public namespace for this exact account's authenticated transaction history.
+pub fn hns_account_transaction_history_prefix(config: &HnsRuntimeConfig) -> [u8; 32] {
+    account_entity_prefix(config)
+}
+
 fn account_entity_id(config: &HnsRuntimeConfig) -> [u8; 32] {
     account_entity_prefix(config)
 }
@@ -10765,27 +10858,11 @@ impl<B: HnsBackend, C: HnsClock> UtxoChainModule for HnsWalletRuntime<B, C> {
     }
 }
 
-impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
-    fn settlement_capabilities(&self) -> SettlementCapabilities {
-        let enabled = self.cache_read().is_ok_and(|cache| {
-            HNS_VALUE_RUNTIME_RELEASE_QUALIFIED
-                && HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED
-                && cache.account.config.settlement_enabled
-        });
-        let minimum_confirmations = self
-            .cache_read()
-            .map_or(0, |cache| cache.account.config.minimum_confirmations);
-        SettlementCapabilities {
-            module: ModuleId::Handshake,
-            supported: enabled,
-            minimum_confirmations,
-            maximum_lock_bytes: 256,
-        }
-    }
-
-    fn prepare_lock(
+impl<B: HnsBackend, C: HnsClock> HnsWalletRuntime<B, C> {
+    fn prepare_lock_with_publication(
         &self,
         request: SettlementLockRequest,
+        publication: Option<hns_wallet_chain_api::SwapRecoveryPublication>,
     ) -> Result<PreparedSettlementLock, ChainError> {
         validate_settlement_request(&request)?;
         let now = self.clock.now_unix().map_err(map_chain_error)?;
@@ -10804,6 +10881,28 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
             .load_workflow::<HnsPreparedSettlement>(workflow_id)
             .map_err(map_chain_error)?
         {
+            recovery_publication::validate_prepared_publication(&stored.state)
+                .map_err(map_chain_error)?;
+            match (&publication, &stored.state.recovery_publication) {
+                (None, None) => {}
+                (Some(expected), Some(package)) => {
+                    let raws = package
+                        .ancestors
+                        .iter()
+                        .map(|ancestor| ancestor.raw.clone())
+                        .collect::<Vec<_>>();
+                    let recovered = recover_hns_contract_from_ancestors(
+                        expected.terms().network,
+                        &stored.state.signed_transaction,
+                        &raws,
+                    )
+                    .map_err(map_chain_error)?;
+                    if recovered.terms != *expected.terms() || recovered.side != expected.side() {
+                        return Err(ChainError::InvalidEvidence);
+                    }
+                }
+                _ => return Err(ChainError::InvalidEvidence),
+            }
             let expected_terms = HnsSettlementTerms::Lock {
                 request: request.clone(),
             };
@@ -10866,8 +10965,10 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
                     .fee_quote
                     .as_ref()
                     .ok_or(ChainError::InvalidEvidence)?;
-                let input_coins =
-                    canonical_evidence_coins(&stored.state.input_coins).map_err(map_chain_error)?;
+                let input_coins = stored
+                    .state
+                    .canonical_input_coins()
+                    .map_err(map_chain_error)?;
                 validate_final_fee_quote(
                     &stored.state.signed_transaction,
                     &input_coins,
@@ -10880,23 +10981,16 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
                 .map_err(map_chain_error)?;
                 let artifact =
                     Self::prepared_settlement_artifact(&stored.state).map_err(map_chain_error)?;
-                let transaction = Transaction::decode(&stored.state.signed_transaction)
-                    .map_err(|_| ChainError::InvalidEvidence)?;
-                let outpoints: Vec<HnsOutpoint> = transaction
-                    .inputs
+                let reserved_inputs = stored
+                    .state
+                    .recovery_publication
+                    .as_ref()
+                    .and_then(|package| package.ancestors.first())
+                    .map_or(&stored.state.input_coins, |ancestor| &ancestor.inputs);
+                let outpoints = reserved_inputs
                     .iter()
-                    .map(|input| {
-                        if input.previous_output.is_null() {
-                            return Err(ChainError::InvalidEvidence);
-                        }
-                        Ok(HnsOutpoint {
-                            transaction: TransactionHash::new(
-                                input.previous_output.transaction_hash.into_bytes(),
-                            ),
-                            output_index: input.previous_output.index,
-                        })
-                    })
-                    .collect::<Result<_, _>>()?;
+                    .map(|coin| coin.outpoint)
+                    .collect::<Vec<_>>();
                 validate_prepared_reservations(
                     &store,
                     &account.config,
@@ -10942,47 +11036,88 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
         )
         .map_err(|_| ChainError::InvalidRequest("invalid change address"))?;
         let fee_rate = self.backend.estimate_fee_rate(6).map_err(map_chain_error)?;
-        let (transaction, selected, fee) = build_unsigned_payment(
-            coins,
-            lock_address,
-            change,
-            request.amount.base_units,
-            fee_rate,
-            request.maximum_fee,
-            account.config.dust_threshold,
-        )
-        .map_err(map_chain_error)?;
-        let policy_input_evidence = input_coin_evidence(&selected).map_err(map_chain_error)?;
-        let plan = HnsSpendPlan {
-            wallet_id: account.config.wallet_id,
-            account_id: account.config.account_id,
-            workflow_id,
-            request_nonce: 0,
-            unsigned_transaction: transaction
-                .encode()
-                .map_err(|_| ChainError::InvalidTransactionSize)?,
-            inputs: selected,
-            amount: request.amount.base_units,
-            fee,
-            maximum_fee: request.maximum_fee,
-            destination: hex::encode(Sha3_256::digest(&script)),
-            expires_at_unix: now
-                .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
-                .ok_or(ChainError::Overflow)?,
-        };
+        let (signed, selected, policy_input_evidence, input_coins, fee, recovery_package) =
+            if let Some(publication) = &publication {
+                let package = recovery_publication::prepare_hns_recoverable_funding(
+                    &store,
+                    &account,
+                    coins,
+                    publication,
+                    fee_rate,
+                    request.maximum_fee,
+                )
+                .map_err(map_chain_error)?;
+                let input_coins = recovery_publication::canonical_package_inputs(&package.inputs)
+                    .map_err(map_chain_error)?;
+                (
+                    package.raw,
+                    package.initial_inputs,
+                    package.inputs,
+                    input_coins,
+                    package.fee,
+                    Some(recovery_publication::HnsRecoveryPackage {
+                        network_encoding: publication
+                            .terms()
+                            .network
+                            .encode()
+                            .map_err(|_| ChainError::InvalidEvidence)?,
+                        ancestors: package.ancestors,
+                    }),
+                )
+            } else {
+                let (transaction, selected, fee) = build_unsigned_payment(
+                    coins,
+                    lock_address,
+                    change,
+                    request.amount.base_units,
+                    fee_rate,
+                    request.maximum_fee,
+                    account.config.dust_threshold,
+                )
+                .map_err(map_chain_error)?;
+                let policy_input_evidence =
+                    input_coin_evidence(&selected).map_err(map_chain_error)?;
+                let plan = HnsSpendPlan {
+                    wallet_id: account.config.wallet_id,
+                    account_id: account.config.account_id,
+                    workflow_id,
+                    request_nonce: 0,
+                    unsigned_transaction: transaction
+                        .encode()
+                        .map_err(|_| ChainError::InvalidTransactionSize)?,
+                    inputs: selected,
+                    amount: request.amount.base_units,
+                    fee,
+                    maximum_fee: request.maximum_fee,
+                    destination: hex::encode(Sha3_256::digest(&script)),
+                    expires_at_unix: now
+                        .checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
+                        .ok_or(ChainError::Overflow)?,
+                };
+                let signed = sign_payment_plan(&store, &account, &plan).map_err(map_chain_error)?;
+                let input_coins = canonical_input_coins(&plan.inputs).map_err(map_chain_error)?;
+                let transaction =
+                    validate_signed_payment_plan(&plan, &signed).map_err(map_chain_error)?;
+                validate_standard_input_authorizations(&transaction, &input_coins)
+                    .map_err(map_chain_error)?;
+                (
+                    signed,
+                    plan.inputs,
+                    policy_input_evidence,
+                    input_coins,
+                    fee,
+                    None,
+                )
+            };
         let reservation_saves = reservation_saves(
             &account.config,
             workflow_id,
-            &plan.inputs,
-            plan.expires_at_unix,
+            &selected,
+            now.checked_add(PREPARED_ARTIFACT_LIFETIME_SECONDS)
+                .ok_or(ChainError::Overflow)?,
             now,
         )
         .map_err(map_chain_error)?;
-        let signed = sign_payment_plan(&store, &account, &plan).map_err(map_chain_error)?;
-        let input_coins = canonical_input_coins(&plan.inputs).map_err(map_chain_error)?;
-        let transaction = validate_signed_payment_plan(&plan, &signed).map_err(map_chain_error)?;
-        validate_standard_input_authorizations(&transaction, &input_coins)
-            .map_err(map_chain_error)?;
         drop(store);
         let quote = self
             .quote_final_transaction(&signed, &input_coins, fee, request.maximum_fee)
@@ -11008,6 +11143,7 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
                 HnsSettlementTerms::Lock {
                     request: request.clone(),
                 },
+                recovery_package,
                 None,
                 &reservation_saves,
                 Some(&account_save),
@@ -11015,6 +11151,32 @@ impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
             )
             .map_err(map_chain_error)?;
         Ok(PreparedSettlementLock(artifact))
+    }
+}
+
+impl<B: HnsBackend, C: HnsClock> AtomicSettlement for HnsWalletRuntime<B, C> {
+    fn settlement_capabilities(&self) -> SettlementCapabilities {
+        let enabled = self.cache_read().is_ok_and(|cache| {
+            HNS_VALUE_RUNTIME_RELEASE_QUALIFIED
+                && HNS_FEE_QUOTE_ALGEBRA_RELEASE_QUALIFIED
+                && cache.account.config.settlement_enabled
+        });
+        let minimum_confirmations = self
+            .cache_read()
+            .map_or(0, |cache| cache.account.config.minimum_confirmations);
+        SettlementCapabilities {
+            module: ModuleId::Handshake,
+            supported: enabled,
+            minimum_confirmations,
+            maximum_lock_bytes: 256,
+        }
+    }
+
+    fn prepare_lock(
+        &self,
+        request: SettlementLockRequest,
+    ) -> Result<PreparedSettlementLock, ChainError> {
+        self.prepare_lock_with_publication(request, None)
     }
 
     fn verify_lock(
@@ -12229,6 +12391,7 @@ fn same_prepared_settlement(
         && stored.fee == artifact.fee
         && stored.maximum_fee == artifact.maximum_fee
         && stored.expires_at_unix == artifact.expires_at_unix
+        && stored.recovery_publication == artifact.recovery_publication
         && stored.terms == artifact.terms
         && stored.broadcast_guard == artifact.broadcast_guard
 }
@@ -12251,6 +12414,7 @@ fn same_prepared_settlement_except_guard(
         && stored.maximum_fee == artifact.maximum_fee
         && stored.fee_quote == artifact.fee_quote
         && stored.expires_at_unix == artifact.expires_at_unix
+        && stored.recovery_publication == artifact.recovery_publication
         && stored.terms == artifact.terms
 }
 

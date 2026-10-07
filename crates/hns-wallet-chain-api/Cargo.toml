@@ -1,7 +1,7 @@
 [package]
 name = "hns-wallet-chain-api"
 description = "Capability-separated external-chain and atomic-settlement traits"
-version = "0.4.1"
+version = "0.4.2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,6 +13,9 @@ readme = "README.md"
 publish = ["crates-io"]
 
 [dependencies]
+hns-marketplace-protocol.workspace = true
+k256.workspace = true
+sha2.workspace = true
 hns-wallet-types.workspace = true
 serde.workspace = true
 thiserror.workspace = true

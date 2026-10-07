@@ -2381,6 +2381,41 @@ impl KyotoSupervisor {
         request: BitcoinHtlcWatchRequest,
         now_unix: u64,
     ) -> Result<BitcoinHtlcWatchAdmission, BitcoinWalletError> {
+        self.register_htlc_watch_from_checkpoint(wallet, request, None, now_unix)
+    }
+
+    /// Recover a watch from a checkpoint already authenticated in the scanned
+    /// descriptor wallet's chain. This permits discovery of a contract whose
+    /// funding preceded registration without trusting a caller's block hash.
+    pub fn register_recovered_htlc_watch(
+        &mut self,
+        wallet: &EncryptedPersistedBitcoinWallet,
+        request: BitcoinHtlcWatchRequest,
+        recovery_checkpoint: BitcoinCheckpoint,
+        now_unix: u64,
+    ) -> Result<BitcoinHtlcWatchAdmission, BitcoinWalletError> {
+        if wallet
+            .latest_checkpoint()
+            .get(recovery_checkpoint.height)
+            .is_none_or(|point| point.hash().to_byte_array() != recovery_checkpoint.block_hash)
+        {
+            return Err(BitcoinWalletError::InvalidCheckpoint);
+        }
+        self.register_htlc_watch_from_checkpoint(
+            wallet,
+            request,
+            Some(recovery_checkpoint),
+            now_unix,
+        )
+    }
+
+    fn register_htlc_watch_from_checkpoint(
+        &mut self,
+        wallet: &EncryptedPersistedBitcoinWallet,
+        request: BitcoinHtlcWatchRequest,
+        recovery_checkpoint: Option<BitcoinCheckpoint>,
+        now_unix: u64,
+    ) -> Result<BitcoinHtlcWatchAdmission, BitcoinWalletError> {
         if self.poisoned
             || !phase_accepts_htlc_watch_registration(&self.durable.state.phase)
             || wallet.network() != self.durable.state.network
@@ -2401,7 +2436,7 @@ impl KyotoSupervisor {
                 wallet.network(),
                 wallet.account_id(),
                 &request,
-                checkpoint,
+                recovery_checkpoint.unwrap_or(checkpoint),
                 now_unix,
             )
         })?;
@@ -2589,30 +2624,113 @@ impl KyotoSupervisor {
             if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
                 return Err(BitcoinWalletError::BitcoinTransactionCapacity);
             }
-            records
-                .into_iter()
-                .filter_map(|stored| {
-                    let record = stored.value;
-                    if let Err(error) = record.validate() {
-                        return Some(Err(error));
-                    }
-                    broadcast_is_ready_to_resume(&record).then_some(Ok(record.txid))
-                })
-                .collect::<Result<Vec<_>, BitcoinWalletError>>()
+            approved_broadcast_order(
+                &records
+                    .into_iter()
+                    .map(|stored| stored.value)
+                    .collect::<Vec<_>>(),
+            )
         })?;
         let mut receipts = Vec::with_capacity(txids.len());
-        for txid in txids {
+        let mut deferred = BTreeSet::new();
+        for (txid, parents) in txids {
+            if parents.iter().any(|parent| deferred.contains(parent)) {
+                deferred.insert(txid);
+                continue;
+            }
             match self
                 .broadcast_prepared_transaction(permit, txid, now_unix)
                 .await
             {
                 Ok(receipt) => receipts.push(receipt),
-                Err(BitcoinWalletError::BroadcastRetryNotReady) => {}
+                Err(BitcoinWalletError::BroadcastRetryNotReady) => {
+                    deferred.insert(txid);
+                }
                 Err(error) => return Err(error),
             }
         }
         Ok(receipts)
     }
+}
+
+/// Restore approved packages in dependency order rather than arbitrary txid
+/// order. A parent's retry cooldown also defers its children for that pass.
+type ApprovedBroadcastDependencies = Vec<([u8; 32], Vec<[u8; 32]>)>;
+
+pub(crate) fn approved_broadcast_order(
+    records: &[BitcoinTransactionRecord],
+) -> Result<ApprovedBroadcastDependencies, BitcoinWalletError> {
+    let mut pending = BTreeMap::new();
+    for record in records {
+        record.validate()?;
+        if !broadcast_is_ready_to_resume(record) {
+            continue;
+        }
+        let raw = record
+            .raw_transaction
+            .as_ref()
+            .ok_or(BitcoinWalletError::InvalidEvidence)?;
+        let tx: Transaction = deserialize(raw).map_err(|_| BitcoinWalletError::InvalidEvidence)?;
+        pending.insert(
+            record.txid,
+            tx.input
+                .iter()
+                .map(|input| input.previous_output.txid.to_byte_array())
+                .collect::<Vec<_>>(),
+        );
+    }
+    let candidates = pending.keys().copied().collect::<BTreeSet<_>>();
+    let exhausted = records
+        .iter()
+        .filter(|record| {
+            record.raw_transaction.is_some()
+                && matches!(
+                    record.observation,
+                    BitcoinChainObservation::AbsentFromCanonicalWalletView
+                )
+                && !candidates.contains(&record.txid)
+        })
+        .map(|record| record.txid)
+        .collect::<BTreeSet<_>>();
+    let mut blocked = exhausted;
+    loop {
+        let descendants = pending
+            .iter()
+            .filter(|(_, parents)| parents.iter().any(|parent| blocked.contains(parent)))
+            .map(|(txid, _)| *txid)
+            .collect::<Vec<_>>();
+        if descendants.is_empty() {
+            break;
+        }
+        for txid in descendants {
+            pending.remove(&txid);
+            blocked.insert(txid);
+        }
+    }
+    let mut ordered = Vec::new();
+    while !pending.is_empty() {
+        let ready = pending
+            .iter()
+            .filter(|(_, parents)| parents.iter().all(|parent| !pending.contains_key(parent)))
+            .map(|(txid, _)| *txid)
+            .collect::<Vec<_>>();
+        if ready.is_empty() {
+            return Err(BitcoinWalletError::InvalidEvidence);
+        }
+        for txid in ready {
+            let parents = pending
+                .remove(&txid)
+                .ok_or(BitcoinWalletError::InvalidEvidence)?;
+            ordered.push((
+                txid,
+                parents
+                    .into_iter()
+                    .filter(|parent| candidates.contains(parent))
+                    .collect(),
+            ));
+        }
+    }
+    Ok(ordered)
 }
 
 fn median_time_past(

@@ -1,6 +1,12 @@
 #![doc = "Capability-separated wallet chain interfaces."]
 #![forbid(unsafe_code)]
 
+mod recovery_publication;
+pub use recovery_publication::{
+    MAX_SWAP_RECOVERY_FRAMES, SWAP_RECOVERY_MARKER_BYTES, SwapRecoveryHtlcParameters,
+    SwapRecoveryPublication, SwapRecoveryPublicationError, SwapRecoveryTerms,
+};
+
 use std::collections::BTreeMap;
 
 use hns_wallet_types::{
