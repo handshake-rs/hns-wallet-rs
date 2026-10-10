@@ -1116,6 +1116,27 @@ fn select_earlier_scan_checkpoint(
     })
 }
 
+fn funded_watch_replay_anchor(
+    registered: BitcoinCheckpoint,
+    funding_height: Option<u32>,
+    watch_scanned: BitcoinCheckpoint,
+    durable_scanned: BitcoinCheckpoint,
+    wallet_chain: &CheckPoint,
+) -> BitcoinCheckpoint {
+    let Some(funding_height) = funding_height.filter(|_| watch_scanned == durable_scanned) else {
+        return registered;
+    };
+    let floor = funding_height.saturating_sub(NORMAL_REORG_SAFETY_DEPTH);
+    wallet_chain
+        .iter()
+        .find(|checkpoint| checkpoint.height() <= floor)
+        .map(|checkpoint| BitcoinCheckpoint {
+            height: checkpoint.height(),
+            block_hash: checkpoint.hash().to_byte_array(),
+        })
+        .unwrap_or(registered)
+}
+
 struct KyotoWalletSwapScan {
     account_id: Vec<u8>,
     scan_type: ScanType,
@@ -1785,10 +1806,21 @@ impl KyotoSupervisor {
             .iter()
             .filter_map(|watch| {
                 let snapshot = watch.snapshot();
-                snapshot
-                    .spending_txid
-                    .is_none()
-                    .then_some(snapshot.registered_checkpoint)
+                if snapshot.spending_txid.is_some() {
+                    return None;
+                }
+                // A confirmed funding observation already proves the lock
+                // existed on the scanned chain. Future spends cannot precede
+                // that lock, so a restarted watch only needs the funding
+                // block and its reorg margin. Keeping the registration anchor
+                // can replay hundreds of thousands of filters on a phone.
+                Some(funded_watch_replay_anchor(
+                    snapshot.registered_checkpoint,
+                    snapshot.funding_height,
+                    snapshot.scanned_checkpoint,
+                    durable.state.scanned_checkpoint,
+                    &wallet.latest_checkpoint(),
+                ))
             })
             .min_by_key(|checkpoint| checkpoint.height)
             .map(|checkpoint| checkpoint.to_kyoto(wallet.network()))
@@ -4799,6 +4831,54 @@ mod restart_tests {
         assert_eq!(
             select_earlier_scan_checkpoint(ordinary, None).expect("ordinary replay window"),
             ordinary
+        );
+    }
+
+    #[test]
+    fn confirmed_swap_watch_restarts_near_funding_instead_of_registration() {
+        let chain = CheckPoint::from_block_ids([
+            BlockId {
+                height: 0,
+                hash: block_hash(0),
+            },
+            BlockId {
+                height: 899_999,
+                hash: block_hash(899_999),
+            },
+            BlockId {
+                height: 970_678,
+                hash: block_hash(970_678),
+            },
+            BlockId {
+                height: 970_685,
+                hash: block_hash(970_685),
+            },
+            BlockId {
+                height: 970_705,
+                hash: block_hash(970_705),
+            },
+        ])
+        .expect("authenticated wallet chain");
+        let registration = BitcoinCheckpoint {
+            height: 0,
+            block_hash: block_hash(0).to_byte_array(),
+        };
+        let scanned = BitcoinCheckpoint {
+            height: 970_705,
+            block_hash: block_hash(970_705).to_byte_array(),
+        };
+        assert_eq!(
+            funded_watch_replay_anchor(registration, Some(970_685), scanned, scanned, &chain)
+                .height,
+            970_678,
+        );
+        assert_eq!(
+            funded_watch_replay_anchor(registration, None, scanned, scanned, &chain),
+            registration,
+        );
+        assert_eq!(
+            funded_watch_replay_anchor(registration, Some(970_685), registration, scanned, &chain),
+            registration,
         );
     }
 
