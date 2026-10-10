@@ -2994,7 +2994,7 @@ mod tests {
             500,
         )
         .expect("HTLC");
-        let lock = verify_htlc_funding(&serialize(&funding(&htlc, 50_000)), &htlc, 50_000, 1, 1)
+        let lock = verify_htlc_funding(&serialize(&funding(&htlc, 1_330)), &htlc, 1_330, 1, 1)
             .expect("funding lock");
         let raw = sign_bitcoin_htlc_spend_with_settlement_signer(
             &lock,
@@ -3026,6 +3026,13 @@ mod tests {
         )
         .expect("fee-rate settlement spend");
         let transaction: Transaction = deserialize(&fee_rate_raw).expect("signed transaction");
+        assert_eq!(
+            transaction.input.len(),
+            1,
+            "redeem needs no wallet fee input"
+        );
+        assert_eq!(transaction.output.len(), 1);
+        assert!(transaction.output[0].value.to_sat() >= MIN_HTLC_DUST_SATS);
         let verified =
             verify_signed_bitcoin_htlc_spend(&fee_rate_raw, &lock, HtlcSpendBranch::Redeem)
                 .expect("verified fee-rate settlement spend");
