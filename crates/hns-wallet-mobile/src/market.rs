@@ -2203,8 +2203,10 @@ impl MobileShakescapeSessionController {
                                 | SwapState::SecondFundingPending
                         ))
                         || first_chain_revalidation
-                        || (session.state == SwapState::SecondFundingPending
-                            && session.second_module == hns_wallet_types::ModuleId::Bitcoin);
+                        || (matches!(
+                            session.state,
+                            SwapState::FirstFunded | SwapState::SecondFundingPending
+                        ) && session.second_module == hns_wallet_types::ModuleId::Bitcoin);
                     let recoverable_timeout = session.state == SwapState::Failed
                         && session.first_module == hns_wallet_types::ModuleId::Bitcoin
                         && session.first_funding.is_none()
