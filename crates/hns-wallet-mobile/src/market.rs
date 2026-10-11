@@ -155,6 +155,12 @@ pub struct MobileShakescapeBitcoinAbsencePermit {
     side: SwapAssetSide,
 }
 
+/// Proof produced only by this wallet's HNS value controller after checking
+/// the exact session's durable native-lock broadcast journal.
+pub struct MobileShakescapeUnfundedHnsProof {
+    pub(crate) session_id: hns_wallet_types::SessionId,
+}
+
 pub struct MobileShakescapeHnsWatchPermit {
     hello: SwapSessionHello,
     settlement_key: hns_wallet_market::CrossChainSwapKey,
@@ -1991,6 +1997,104 @@ impl MobileShakescapeSessionController {
                     }
                 }
                 Ok::<_, hns_wallet_market::MarketError>(candidates)
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    /// Enumerate expired HNS-first maker sessions whose local lock must be
+    /// checked against the native settlement journal before releasing funds.
+    pub fn expired_local_hns_first_funding_permits(
+        &self,
+        now_unix: u64,
+    ) -> Result<Vec<MobileShakescapeHnsVerificationPermit>, MobileWalletError> {
+        if now_unix == 0 {
+            return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+        }
+        let policy = self.policy;
+        self.store
+            .try_with_store(|store| {
+                let mut candidates = Vec::new();
+                for execution in list_shakescape_executions(store, &policy)? {
+                    if execution.state != SwapState::FirstFundingPending
+                        || execution.first_funding.is_some()
+                        || execution.first_module != hns_wallet_types::ModuleId::Handshake
+                        || !is_local_shakescape_direct_maker(
+                            store,
+                            &policy,
+                            self.wallet_id,
+                            execution.id,
+                        )?
+                    {
+                        continue;
+                    }
+                    let record = load_shakescape_direct_swap(store, &policy, execution.id)?
+                        .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                    let hello = record
+                        .hello
+                        .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                    if hello.offered_asset == AssetId::HNS && now_unix > hello.header.expires_at {
+                        candidates.push(MobileShakescapeHnsVerificationPermit {
+                            terms: hns_wallet_chain_api::SwapRecoveryTerms::from_hello(
+                                &hello,
+                                policy.network(),
+                            )
+                            .map_err(|_| hns_wallet_market::MarketError::InvalidEvidence)?,
+                            side: SwapAssetSide::Offered,
+                            funding_transaction: None,
+                        });
+                    }
+                }
+                Ok::<_, hns_wallet_market::MarketError>(candidates)
+            })
+            .map_err(MobileWalletError::from)
+    }
+
+    /// Release an expired HNS-first maker reservation only when the native
+    /// value controller has proved no irreversible local lock submission.
+    pub fn fail_expired_local_hns_first_funding(
+        &mut self,
+        proof: MobileShakescapeUnfundedHnsProof,
+        now_unix: u64,
+    ) -> Result<(), MobileWalletError> {
+        let policy = self.policy;
+        self.store
+            .try_with_store_mut(|store| {
+                let execution = load_shakescape_execution(store, &policy, proof.session_id)?
+                    .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                let record = load_shakescape_direct_swap(store, &policy, proof.session_id)?
+                    .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                let hello = record
+                    .hello
+                    .ok_or(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+                if execution.state != SwapState::FirstFundingPending
+                    || execution.first_funding.is_some()
+                    || execution.first_module != hns_wallet_types::ModuleId::Handshake
+                    || hello.offered_asset != AssetId::HNS
+                    || now_unix <= hello.header.expires_at
+                    || !is_local_shakescape_direct_maker(
+                        store,
+                        &policy,
+                        self.wallet_id,
+                        proof.session_id,
+                    )?
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
+                }
+                let mut execution =
+                    open_shakescape_execution(store, &policy, proof.session_id, now_unix)?;
+                let mut journal = WalletStoreJournal {
+                    store,
+                    workflow_id: shakescape_execution_workflow_id(proof.session_id),
+                    updated_at_unix: now_unix,
+                };
+                execution.apply(
+                    VerifiedEvidence::TerminalFailure {
+                        reason: hns_wallet_market::PREFUNDING_DEADLINE_FAILURE.to_owned(),
+                    },
+                    now_unix,
+                    &mut journal,
+                )?;
+                Ok::<_, hns_wallet_market::MarketError>(())
             })
             .map_err(MobileWalletError::from)
     }
@@ -6302,6 +6406,46 @@ mod tests {
                 .expect("watch already persisted")
                 .is_none()
         );
+
+        // An HNS-first maker may retain its reservation through the deadline
+        // until the native value controller proves no lock was submitted.
+        let expired_at = hello.header.expires_at + 1;
+        assert!(
+            controller
+                .reserved_hns_dollarydoos(expired_at)
+                .expect("maker reservation before absence proof")
+                > 0
+        );
+        assert_eq!(
+            controller
+                .expired_local_hns_first_funding_permits(expired_at)
+                .expect("expired HNS-first maker permits")
+                .len(),
+            1
+        );
+        assert!(
+            controller
+                .fail_expired_local_hns_first_funding(
+                    MobileShakescapeUnfundedHnsProof {
+                        session_id: hns_wallet_types::SessionId::new(hello.swap_session_id),
+                    },
+                    hello.header.expires_at,
+                )
+                .is_err()
+        );
+        controller
+            .fail_expired_local_hns_first_funding(
+                MobileShakescapeUnfundedHnsProof {
+                    session_id: hns_wallet_types::SessionId::new(hello.swap_session_id),
+                },
+                expired_at,
+            )
+            .expect("release proven unsubmitted HNS-first maker reservation");
+        assert_eq!(
+            controller.durable_executions().unwrap()[0].state,
+            SwapState::Failed
+        );
+        assert_eq!(controller.reserved_hns_dollarydoos(expired_at).unwrap(), 0);
     }
 
     #[test]

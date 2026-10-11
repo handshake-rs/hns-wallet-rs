@@ -30,7 +30,7 @@ pub use market::{
     MobileShakescapeFirstFundingObservation, MobileShakescapeHnsFundingPermit,
     MobileShakescapeHnsSettlementPermit, MobileShakescapeHnsVerificationPermit,
     MobileShakescapeHnsWatchPermit, MobileShakescapeSessionController,
-    MobileShakescapeSettlementAction,
+    MobileShakescapeSettlementAction, MobileShakescapeUnfundedHnsProof,
 };
 
 use hns_primitives::BlockHash as ProtocolBlockHash;
@@ -2555,6 +2555,30 @@ impl<B: HnsBackend, C: HnsClock> MobileHnsValueController<B, C> {
             .service
             .rebroadcast_trusted_native_hns_settlements()
             .map_err(mobile_service_failure)
+    }
+
+    /// Prove that this wallet never crossed the irreversible HNS lock
+    /// broadcast gate for the exact signed swap descriptor. A prepared action
+    /// without that durable gate remains safe to abandon after its deadline.
+    pub fn prove_shakescape_hns_htlc_unfunded(
+        &self,
+        permit: &MobileShakescapeHnsVerificationPermit,
+    ) -> Result<Option<MobileShakescapeUnfundedHnsProof>, MobileWalletError> {
+        let session_id = permit.session_id();
+        if permit.funding_transaction().is_some()
+            || self.pending_shakescape_hns_funding_session_id() == Some(session_id)
+        {
+            return Ok(None);
+        }
+        let descriptor = hns_wallet_hns::build_recovered_hns_htlc(permit.terms(), permit.side())?;
+        let submitted = self
+            .session
+            .service
+            .submitted_trusted_native_hns_htlc_lock_transaction_id(session_id, descriptor)
+            .map_err(mobile_service_failure)?;
+        Ok(submitted
+            .is_none()
+            .then_some(MobileShakescapeUnfundedHnsProof { session_id }))
     }
 
     pub fn verified_shakescape_hns_funding(

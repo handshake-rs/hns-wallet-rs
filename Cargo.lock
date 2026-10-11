@@ -1241,7 +1241,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-mobile"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "bdk_wallet",
  "getrandom 0.3.4",
