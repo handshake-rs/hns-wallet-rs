@@ -128,10 +128,10 @@ The dependency-ordered public list is maintained in
 ## Version and dependency policy
 
 Wallet crates are versioned and published independently. Compatible dependency
-patches do not require new versions of unchanged consumers. The current source
-prepares `hns-wallet-hns` 0.4.3 and `hns-wallet-market`, `hns-wallet-bip157`,
-`hns-wallet-bitcoin-kyoto`, and `hns-wallet-mobile` 0.4.2; the other eleven
-packages remain at 0.4.1. The wallet uses one canonical hsd/Bob-compatible HNS account
+patches do not require new versions of unchanged consumers. The manifests and
+[current package table](CHANGELOG.md) record the selected source versions;
+[the release procedure](docs/releasing.md) distinguishes source changes from
+published packages. The wallet uses one canonical hsd/Bob-compatible HNS account
 for payments and name ownership, responder-as-maker direct swaps, and
 protocol-specific ShakeDex and atomic-swap keys.
 

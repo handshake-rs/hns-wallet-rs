@@ -1,5 +1,13 @@
 # hns-wallet-mobile
 
+## 0.6.0 - 2026-10-13
+
+<!-- hns-wallet-release-state: 0.6.0 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Move the native wallet entry point to the coordinator-owned direct controller
+while retaining its existing HNS and Bitcoin authority boundaries.
+
 ## 0.5.2 - 2026-10-07
 
 <!-- hns-wallet-release-state: 0.5.2 release -->

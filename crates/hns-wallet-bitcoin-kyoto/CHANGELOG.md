@@ -1,5 +1,20 @@
 # hns-wallet-bitcoin-kyoto
 
+## Unreleased
+
+On a recovery address-window expansion, rematch previously covered compact
+filters only against newly derived wallet scripts. New blocks, reorganizations,
+approved-broadcast recovery, and later sync cycles retain full matching. This
+source change has not been published as a new crate version.
+
+## 0.4.5 - 2026-10-10
+
+<!-- hns-wallet-release-state: 0.4.5 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Bound funded Bitcoin swap-watch replay to the verified funding lock and its
+canonical checkpoint.
+
 ## 0.4.4 - 2026-10-07
 
 <!-- hns-wallet-release-state: 0.4.4 release -->
