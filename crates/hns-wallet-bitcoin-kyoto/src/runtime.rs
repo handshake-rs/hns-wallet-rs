@@ -1232,6 +1232,38 @@ struct QueuedBitcoinBlock {
     swap_match: bool,
 }
 
+/// A completed filter pass has already matched every script against this
+/// canonical chain. A recovery-gap extension only needs to test its newly
+/// derived scripts on unchanged blocks. New or reorganized blocks still need
+/// the complete wallet and swap script sets.
+struct IncrementalRecoveryScan {
+    covered_tip_height: u32,
+    canonical_chain_changed: bool,
+    new_wallet_scripts: HashSet<ScriptBuf>,
+}
+
+impl IncrementalRecoveryScan {
+    fn observe_chain_event(&mut self, event: &BlockHeaderChanges) {
+        self.canonical_chain_changed |= match event {
+            BlockHeaderChanges::Reorganized { .. } => true,
+            BlockHeaderChanges::Connected(header) => header.height <= self.covered_tip_height,
+            BlockHeaderChanges::ForkAdded(_) => false,
+        };
+    }
+
+    fn scripts_for_filter<'a>(
+        &'a self,
+        height: u32,
+        all_wallet_scripts: &'a HashSet<ScriptBuf>,
+    ) -> (&'a HashSet<ScriptBuf>, bool) {
+        if height <= self.covered_tip_height && !self.canonical_chain_changed {
+            (&self.new_wallet_scripts, false)
+        } else {
+            (all_wallet_scripts, true)
+        }
+    }
+}
+
 /// One compact-filter consumer for both the descriptor wallet and every
 /// active native HTLC. Keeping the script sets in one subscriber avoids a
 /// second node, a second peer pool, or counterparty-provided chain authority.
@@ -1245,6 +1277,7 @@ struct KyotoWalletSwapSubscriber {
     graph: IndexedTxGraph<ConfirmationBlockTime, KeychainTxOutIndex<KeychainKind>>,
     recovery_gap_limit: Option<u32>,
     recovery_script_count: u32,
+    incremental_recovery_scan: Option<IncrementalRecoveryScan>,
     progress: KyotoSyncProgressHandle,
     store: SharedWalletStore,
     network: Network,
@@ -1283,6 +1316,7 @@ impl KyotoWalletSwapSubscriber {
             graph,
             recovery_gap_limit,
             recovery_script_count: recovery_gap_limit.unwrap_or(0),
+            incremental_recovery_scan: None,
             progress: init.progress,
             store: init.store,
             network: init.network,
@@ -1299,8 +1333,14 @@ impl KyotoWalletSwapSubscriber {
         while let Some(event) = self.receiver.recv().await {
             match event {
                 Event::IndexedFilter(filter) => {
-                    let wallet_match = filter.contains_any(self.wallet_scripts.iter());
-                    let swap_match = filter.contains_any(self.swap_scripts.values());
+                    let (wallet_scripts, check_swap_scripts) = self
+                        .incremental_recovery_scan
+                        .as_ref()
+                        .map(|scan| scan.scripts_for_filter(filter.height(), &self.wallet_scripts))
+                        .unwrap_or((&self.wallet_scripts, true));
+                    let wallet_match = filter.contains_any(wallet_scripts.iter());
+                    let swap_match =
+                        check_swap_scripts && filter.contains_any(self.swap_scripts.values());
                     self.progress.record_filter(wallet_match || swap_match);
                     if wallet_match || swap_match {
                         let hash = filter.block_hash();
@@ -1387,6 +1427,7 @@ impl KyotoWalletSwapSubscriber {
                         recovery_rescanned_txids.extend(unobserved_broadcast_txids);
                         let rescan_from =
                             approved_broadcast_recovery_rescan_height(update.tip().height);
+                        self.incremental_recovery_scan = None;
                         self.requester
                             .rescan_from(rescan_from)
                             .map_err(|error| BitcoinWalletError::Kyoto(error.to_string()))?;
@@ -1400,9 +1441,19 @@ impl KyotoWalletSwapSubscriber {
                             gap_limit,
                         )?;
                         if required_script_count > self.recovery_script_count {
+                            let new_wallet_scripts: HashSet<ScriptBuf> =
+                                wallet_scripts(&self.graph.index, required_script_count)
+                                    .difference(&self.wallet_scripts)
+                                    .cloned()
+                                    .collect();
                             self.recovery_script_count = required_script_count;
                             self.wallet_scripts
-                                .extend(wallet_scripts(&self.graph.index, required_script_count));
+                                .extend(new_wallet_scripts.iter().cloned());
+                            self.incremental_recovery_scan = Some(IncrementalRecoveryScan {
+                                covered_tip_height: update.tip().height,
+                                canonical_chain_changed: false,
+                                new_wallet_scripts,
+                            });
                             self.requester
                                 .rescan()
                                 .map_err(|_| BitcoinWalletError::KyotoNodeStopped)?;
@@ -1412,6 +1463,10 @@ impl KyotoWalletSwapSubscriber {
                     }
                     self.wallet_scripts
                         .extend(wallet_scripts_to_lookahead(&self.graph.index));
+                    // The optimization applies only to this recovery-gap
+                    // replay. A later sync cycle must evaluate its own tip
+                    // filter against every current wallet and swap script.
+                    self.incremental_recovery_scan = None;
                     let tx_update = TxUpdate::from(self.graph.graph().clone());
                     let graph = core::mem::take(&mut self.graph);
                     let last_active_indices = graph.index.last_used_indices();
@@ -1433,6 +1488,9 @@ impl KyotoWalletSwapSubscriber {
     }
 
     fn apply_chain_event(&mut self, event: &BlockHeaderChanges) {
+        if let Some(scan) = self.incremental_recovery_scan.as_mut() {
+            scan.observe_chain_event(event);
+        }
         match event {
             BlockHeaderChanges::Connected(header) => {
                 self.chain = self.chain.clone().insert(BlockId {
@@ -4540,6 +4598,7 @@ fn bitcoin_outpoint_id(txid: [u8; 32], output_index: u32) -> Vec<u8> {
 #[cfg(test)]
 mod restart_tests {
     use super::*;
+    use bdk_wallet::bitcoin::bip158::BlockFilter;
     use bdk_wallet::bitcoin::blockdata::constants::genesis_block;
 
     const TEST_STORE_PASSPHRASE: &str = "correct horse battery staple";
@@ -4783,6 +4842,72 @@ mod restart_tests {
         assert_eq!(
             approved_broadcast_recovery_rescan_height(1_000),
             1_000 - MAX_APPROVED_BROADCAST_RECOVERY_BLOCKS
+        );
+    }
+
+    #[test]
+    fn gap_extension_matches_only_new_scripts_on_covered_canonical_blocks() {
+        let old_script = ScriptBuf::from_bytes(vec![0x51]);
+        let new_script = ScriptBuf::from_bytes(vec![0x52]);
+        let mut old_block = genesis_block(Network::Regtest);
+        old_block.txdata[0].output[0].script_pubkey = old_script.clone();
+        old_block.header.merkle_root = old_block.compute_merkle_root().unwrap();
+        let old_filter = BlockFilter::new_script_filter(&old_block, |_| Ok(ScriptBuf::new()))
+            .expect("old script filter");
+        let mut new_block = genesis_block(Network::Regtest);
+        new_block.txdata[0].output[0].script_pubkey = new_script.clone();
+        new_block.header.merkle_root = new_block.compute_merkle_root().unwrap();
+        let new_filter = BlockFilter::new_script_filter(&new_block, |_| Ok(ScriptBuf::new()))
+            .expect("new script filter");
+
+        let mut scan = IncrementalRecoveryScan {
+            covered_tip_height: 10,
+            canonical_chain_changed: false,
+            new_wallet_scripts: HashSet::from([new_script.clone()]),
+        };
+        let all_scripts = HashSet::from([old_script, new_script]);
+
+        let (scripts, check_swaps) = scan.scripts_for_filter(10, &all_scripts);
+        assert!(!check_swaps);
+        assert!(
+            !old_filter
+                .match_any(
+                    &old_block.block_hash(),
+                    scripts.iter().map(|script| script.as_script().to_bytes())
+                )
+                .unwrap()
+        );
+
+        let (scripts, check_swaps) = scan.scripts_for_filter(9, &all_scripts);
+        assert!(!check_swaps);
+        assert!(
+            new_filter
+                .match_any(
+                    &new_block.block_hash(),
+                    scripts.iter().map(|script| script.as_script().to_bytes())
+                )
+                .unwrap()
+        );
+
+        // New heights use the full set even before a reorganization.
+        let (scripts, check_swaps) = scan.scripts_for_filter(11, &all_scripts);
+        assert!(check_swaps);
+        assert_eq!(scripts, &all_scripts);
+
+        // Once the canonical chain changes, even old heights use the full set.
+        scan.observe_chain_event(&BlockHeaderChanges::Reorganized {
+            accepted: Vec::new(),
+            reorganized: Vec::new(),
+        });
+        let (scripts, check_swaps) = scan.scripts_for_filter(10, &all_scripts);
+        assert!(check_swaps);
+        assert!(
+            old_filter
+                .match_any(
+                    &old_block.block_hash(),
+                    scripts.iter().map(|script| script.as_script().to_bytes())
+                )
+                .unwrap()
         );
     }
 
