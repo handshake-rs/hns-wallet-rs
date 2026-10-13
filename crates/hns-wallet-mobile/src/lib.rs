@@ -20,17 +20,18 @@ pub use hns_wallet_bitcoin_kyoto::{
     BitcoinBroadcastRecoverySummary, VerifiedBitcoinHtlcSpendObservation, VerifiedBitcoinLock,
 };
 pub use market::{
-    MINIMUM_BITCOIN_FEE_RESERVE_SATS, MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary,
-    MobileDirectOfferAcceptanceApproval, MobileDirectOfferAcceptanceSummary,
-    MobileDirectOfferSummary, MobileHnsForBtcOfferApproval, MobileShakescapeBitcoinAbsencePermit,
-    MobileShakescapeBitcoinFundingPermit, MobileShakescapeBitcoinSettlementPermit,
-    MobileShakescapeBitcoinWatchPermit, MobileShakescapeDirectAdmission,
-    MobileShakescapeDirectInventoryReport, MobileShakescapeDirectMessageKind,
-    MobileShakescapeDirectTransportReport, MobileShakescapeExecutionSummary,
-    MobileShakescapeFirstFundingObservation, MobileShakescapeHnsFundingPermit,
-    MobileShakescapeHnsSettlementPermit, MobileShakescapeHnsVerificationPermit,
-    MobileShakescapeHnsWatchPermit, MobileShakescapeSessionController,
-    MobileShakescapeSettlementAction, MobileShakescapeUnfundedHnsProof,
+    MINIMUM_BITCOIN_FEE_RESERVE_SATS, MobileAutomaticSettlementPermission,
+    MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDirectOfferAcceptanceApproval,
+    MobileDirectOfferAcceptanceSummary, MobileDirectOfferSummary, MobileHnsForBtcOfferApproval,
+    MobileShakescapeBitcoinAbsencePermit, MobileShakescapeBitcoinFundingPermit,
+    MobileShakescapeBitcoinSettlementPermit, MobileShakescapeBitcoinWatchPermit,
+    MobileShakescapeDirectAdmission, MobileShakescapeDirectInventoryReport,
+    MobileShakescapeDirectMessageKind, MobileShakescapeDirectTransportReport,
+    MobileShakescapeExecutionSummary, MobileShakescapeFirstFundingObservation,
+    MobileShakescapeHnsFundingPermit, MobileShakescapeHnsSettlementPermit,
+    MobileShakescapeHnsVerificationPermit, MobileShakescapeHnsWatchPermit,
+    MobileShakescapeSessionController, MobileShakescapeSettlementAction,
+    MobileShakescapeUnfundedHnsProof,
 };
 
 use hns_primitives::BlockHash as ProtocolBlockHash;

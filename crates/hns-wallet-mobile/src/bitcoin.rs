@@ -49,6 +49,11 @@ use crate::{
     MobileShakescapeSettlementAction, MobileWalletError,
 };
 
+// The peer relay floor only says what can enter a mempool. Give new swap
+// funding and time-sensitive settlement a modest economical floor while the
+// exact transaction builder still enforces the user's approved fee cap.
+const ECONOMICAL_SWAP_FEE_RATE_SAT_VB: u64 = 2;
+
 const BITCOIN_RECOVERY_GAP_LIMIT: u32 = DEFAULT_RECOVERY_GAP_LIMIT;
 const BITCOIN_SEND_APPROVAL_LIFETIME_SECONDS: u64 = 300;
 const MOBILE_ACTION_TOKEN_BYTES: usize = 32;
@@ -1167,7 +1172,9 @@ impl MobileBitcoinValueController {
             .supervisor
             .as_ref()
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
-        let fee_rate_sat_vb = runtime.block_on(supervisor.minimum_broadcast_fee_rate_sat_vb())?;
+        let fee_rate_sat_vb = runtime
+            .block_on(supervisor.minimum_broadcast_fee_rate_sat_vb())?
+            .max(ECONOMICAL_SWAP_FEE_RATE_SAT_VB);
         let value_sats = binding.value_sats;
         let committed_inputs = self.unobserved_approved_inputs()?;
         let publication =
@@ -1461,7 +1468,9 @@ impl MobileBitcoinValueController {
             .supervisor
             .as_ref()
             .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
-        let fee_rate_sat_vb = runtime.block_on(supervisor.minimum_broadcast_fee_rate_sat_vb())?;
+        let fee_rate_sat_vb = runtime
+            .block_on(supervisor.minimum_broadcast_fee_rate_sat_vb())?
+            .max(ECONOMICAL_SWAP_FEE_RATE_SAT_VB);
         let chain_context = match branch {
             HtlcSpendBranch::Redeem => None,
             HtlcSpendBranch::Refund => {

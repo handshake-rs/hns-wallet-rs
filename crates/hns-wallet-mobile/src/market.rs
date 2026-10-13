@@ -30,7 +30,7 @@ use hns_wallet_market::{
     load_shakescape_direct_swaps, load_shakescape_execution, open_shakescape_execution,
     prune_expired_shakescape_direct_market_state, shakescape_execution_workflow_id,
 };
-use hns_wallet_store::SharedWalletStore;
+use hns_wallet_store::{EntityKind, SharedWalletStore};
 use hns_wallet_types::{ModuleId, ObjectHash, TransactionHash, WalletId};
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +43,49 @@ use crate::{MobileShakescapeUnfundedBitcoinProof, MobileWalletError};
 // time.  The chain refund deadlines are also retained as a lower bound so a
 // slow but still live swap is not cut off by its old listing deadline.
 const FUNDING_STATUS_REPLAY_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
+const AUTOMATIC_SETTLEMENT_GRANT_PREFIX: &[u8] = b"shakescape-auto-settlement-v1\0";
+
+/// Wallet-local consent retained only after this participant approved and
+/// submitted its exact funding transaction. It authorizes one later redeem or
+/// refund of this same session; native settlement permits still verify chain
+/// evidence, keys, destination, and branch before signing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AutomaticSettlementGrant {
+    schema_version: u16,
+    wallet_id_hex: String,
+    session_id: [u8; 32],
+    exact_hello_hex: String,
+    local_is_maker: bool,
+    received_asset: String,
+    received_fee_cap: u64,
+    refund_asset: String,
+    refund_fee_cap: u64,
+    approved_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileAutomaticSettlementPermission {
+    pub session_id: String,
+    pub asset: String,
+    pub maximum_fee: u64,
+    pub minimum_wallet_output: u64,
+}
+
+fn automatic_settlement_grant_id(session_id: hns_wallet_types::SessionId) -> Vec<u8> {
+    let mut id = Vec::with_capacity(AUTOMATIC_SETTLEMENT_GRANT_PREFIX.len() + 32);
+    id.extend_from_slice(AUTOMATIC_SETTLEMENT_GRANT_PREFIX);
+    id.extend_from_slice(session_id.as_bytes());
+    id
+}
+
+fn exact_hello_hex(hello: &SwapSessionHello) -> Result<String, MobileWalletError> {
+    let encoded = hello
+        .encode()
+        .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
+    Ok(crate::lowercase_hex(&encoded))
+}
 
 fn recovery_now_unix() -> Result<u64, MobileWalletError> {
     std::time::SystemTime::now()
@@ -1536,6 +1579,201 @@ impl MobileShakescapeSessionController {
                 Ok::<_, hns_wallet_market::MarketError>(summaries)
             })
             .map_err(MobileWalletError::from)
+    }
+
+    /// Retain the user's one-swap consent after the first local funding
+    /// transaction was explicitly approved and submitted. This grant lives in
+    /// the encrypted wallet database and cannot authorize a new funding lock.
+    pub fn retain_automatic_settlement_approval(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+        now_unix: u64,
+    ) -> Result<(), MobileWalletError> {
+        if now_unix == 0 {
+            return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+        }
+        self.store.try_with_store_mut(|store| {
+            let record = load_shakescape_direct_swap(store, &self.policy, session_id)?
+                .ok_or(MobileWalletError::InvalidShakescapeSessionMessage)?;
+            let hello = record
+                .hello
+                .as_ref()
+                .ok_or(MobileWalletError::InvalidShakescapeSessionMessage)?;
+            let local_is_maker =
+                is_local_shakescape_direct_maker(store, &self.policy, self.wallet_id, session_id)?;
+            let local_is_taker =
+                is_local_shakescape_direct_taker(store, self.wallet_id, session_id)?;
+            if local_is_maker == local_is_taker {
+                return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+            }
+            let (received_asset, received_amount, refund_asset, refund_amount, refund_fee_cap) =
+                if local_is_maker {
+                    let (_, reserve) = hns_wallet_market::derive_local_direct_maker_key(
+                        store,
+                        &self.policy,
+                        self.wallet_id,
+                        session_id,
+                    )?;
+                    (
+                        hello.received_asset,
+                        hello.received_amount.get(),
+                        hello.offered_asset,
+                        hello.offered_amount.get(),
+                        reserve,
+                    )
+                } else {
+                    let (_, reserve) = hns_wallet_market::derive_local_direct_taker_key(
+                        store,
+                        &self.policy,
+                        self.wallet_id,
+                        session_id,
+                    )?;
+                    (
+                        hello.offered_asset,
+                        hello.offered_amount.get(),
+                        hello.received_asset,
+                        hello.received_amount.get(),
+                        reserve,
+                    )
+                };
+            let received_amount = u64::try_from(received_amount)
+                .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
+            let refund_amount = u64::try_from(refund_amount)
+                .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
+            let received_fee_cap = match received_asset {
+                AssetId::BTC => MINIMUM_BITCOIN_FEE_RESERVE_SATS,
+                AssetId::HNS => MINIMUM_HNS_FEE_RESERVE_DOLLARYDOOS,
+                _ => return Err(MobileWalletError::InvalidShakescapeSessionMessage),
+            };
+            if !amount_covers_settlement_fee_reserve(
+                received_asset,
+                received_amount,
+                received_fee_cap,
+            ) || !amount_covers_settlement_fee_reserve(
+                refund_asset,
+                refund_amount,
+                refund_fee_cap,
+            ) {
+                return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+            }
+            let grant = AutomaticSettlementGrant {
+                schema_version: 1,
+                wallet_id_hex: crate::lowercase_hex(self.wallet_id.as_bytes()),
+                session_id: *session_id.as_bytes(),
+                exact_hello_hex: exact_hello_hex(hello)?,
+                local_is_maker,
+                received_asset: asset_name(received_asset).to_owned(),
+                received_fee_cap,
+                refund_asset: asset_name(refund_asset).to_owned(),
+                refund_fee_cap,
+                approved_at_unix: now_unix,
+            };
+            let id = automatic_settlement_grant_id(session_id);
+            if let Some(existing) =
+                store.load_entity::<AutomaticSettlementGrant>(EntityKind::PendingApproval, &id)?
+            {
+                if existing.value.schema_version == grant.schema_version
+                    && existing.value.wallet_id_hex == grant.wallet_id_hex
+                    && existing.value.session_id == grant.session_id
+                    && existing.value.exact_hello_hex == grant.exact_hello_hex
+                    && existing.value.local_is_maker == grant.local_is_maker
+                    && existing.value.received_asset == grant.received_asset
+                    && existing.value.received_fee_cap == grant.received_fee_cap
+                    && existing.value.refund_asset == grant.refund_asset
+                    && existing.value.refund_fee_cap == grant.refund_fee_cap
+                {
+                    return Ok(());
+                }
+                return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+            }
+            store.save_entity(EntityKind::PendingApproval, &id, 0, &grant, now_unix)?;
+            Ok(())
+        })
+    }
+
+    /// Return only the fee budget authorized by that exact funding approval.
+    /// The caller must still obtain the fresh native redeem/refund permit and
+    /// verify the chain lock before a settlement transaction can be signed.
+    pub fn authorized_automatic_settlement(
+        &self,
+        session_id: hns_wallet_types::SessionId,
+        redeem: bool,
+    ) -> Result<Option<MobileAutomaticSettlementPermission>, MobileWalletError> {
+        self.store.try_with_store(|store| {
+            let id = automatic_settlement_grant_id(session_id);
+            let Some(stored) =
+                store.load_entity::<AutomaticSettlementGrant>(EntityKind::PendingApproval, &id)?
+            else {
+                return Ok(None);
+            };
+            let grant = stored.value;
+            let record = load_shakescape_direct_swap(store, &self.policy, session_id)?
+                .ok_or(MobileWalletError::InvalidShakescapeSessionMessage)?;
+            let hello = record
+                .hello
+                .as_ref()
+                .ok_or(MobileWalletError::InvalidShakescapeSessionMessage)?;
+            let local_is_maker =
+                is_local_shakescape_direct_maker(store, &self.policy, self.wallet_id, session_id)?;
+            let local_is_taker =
+                is_local_shakescape_direct_taker(store, self.wallet_id, session_id)?;
+            if grant.schema_version != 1
+                || grant.wallet_id_hex != crate::lowercase_hex(self.wallet_id.as_bytes())
+                || grant.session_id != *session_id.as_bytes()
+                || grant.exact_hello_hex != exact_hello_hex(hello)?
+                || local_is_maker == local_is_taker
+                || grant.local_is_maker != local_is_maker
+            {
+                return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+            }
+            let (asset, amount, cap) = if redeem {
+                (
+                    if local_is_maker {
+                        hello.received_asset
+                    } else {
+                        hello.offered_asset
+                    },
+                    if local_is_maker {
+                        hello.received_amount.get()
+                    } else {
+                        hello.offered_amount.get()
+                    },
+                    grant.received_fee_cap,
+                )
+            } else {
+                (
+                    if local_is_maker {
+                        hello.offered_asset
+                    } else {
+                        hello.received_asset
+                    },
+                    if local_is_maker {
+                        hello.offered_amount.get()
+                    } else {
+                        hello.received_amount.get()
+                    },
+                    grant.refund_fee_cap,
+                )
+            };
+            let expected_asset = if redeem {
+                &grant.received_asset
+            } else {
+                &grant.refund_asset
+            };
+            let amount = u64::try_from(amount)
+                .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
+            if expected_asset != asset_name(asset)
+                || !amount_covers_settlement_fee_reserve(asset, amount, cap)
+            {
+                return Err(MobileWalletError::InvalidShakescapeSessionMessage);
+            }
+            Ok(Some(MobileAutomaticSettlementPermission {
+                session_id: crate::lowercase_hex(session_id.as_bytes()),
+                asset: expected_asset.clone(),
+                maximum_fee: cap,
+                minimum_wallet_output: amount - cap,
+            }))
+        })
     }
 
     fn recovered_refund_context(
@@ -6192,6 +6430,26 @@ mod tests {
         assert_eq!(maker_execution.len(), 1);
         assert_eq!(maker_execution[0].local_role, "maker");
         assert_eq!(maker_execution[0].state, SwapState::TermsFrozen);
+        for (participant, received_asset, received_output, refund_asset, refund_output) in [
+            (&maker_controller, "hns", 1_900_000, "btc", 8_000),
+            (&controller, "btc", 8_000, "hns", 1_990_000),
+        ] {
+            participant
+                .retain_automatic_settlement_approval(offer.offer.session_id, START + 33)
+                .expect("bind local approval to signed terms");
+            let redeem = participant
+                .authorized_automatic_settlement(offer.offer.session_id, true)
+                .expect("redeem permission")
+                .expect("redeem grant");
+            assert_eq!(redeem.asset, received_asset);
+            assert_eq!(redeem.minimum_wallet_output, received_output);
+            let refund = participant
+                .authorized_automatic_settlement(offer.offer.session_id, false)
+                .expect("refund permission")
+                .expect("refund grant");
+            assert_eq!(refund.asset, refund_asset);
+            assert_eq!(refund.minimum_wallet_output, refund_output);
+        }
         let maker_replay = maker_controller
             .direct_swap_handshake_reconciliation_envelopes(START + 33)
             .expect("maker reconciliation envelopes");
@@ -6383,6 +6641,37 @@ mod tests {
         )
         .expect("persist HNS watch state for the responder-maker");
 
+        let taker_controller = MobileShakescapeSessionController::new(
+            SharedWalletStore::new(offer_setter),
+            policy,
+            offer_setter_id,
+        );
+        taker_controller
+            .retain_automatic_settlement_approval(offer.offer.session_id, START + 31)
+            .expect("HNS-first taker approval");
+        let taker_redeem = taker_controller
+            .authorized_automatic_settlement(offer.offer.session_id, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                taker_redeem.asset.as_str(),
+                taker_redeem.minimum_wallet_output
+            ),
+            ("hns", 1_900_000)
+        );
+        let taker_refund = taker_controller
+            .authorized_automatic_settlement(offer.offer.session_id, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                taker_refund.asset.as_str(),
+                taker_refund.minimum_wallet_output
+            ),
+            ("btc", 8_000)
+        );
+
         let shared = SharedWalletStore::new(responder_maker);
         let mut controller =
             MobileShakescapeSessionController::new(shared, policy, responder_maker_id);
@@ -6399,6 +6688,39 @@ mod tests {
         assert_eq!(
             controller.durable_executions().unwrap()[0].state,
             SwapState::FirstFundingPending
+        );
+        let session_id = offer.offer.session_id;
+        assert!(
+            controller
+                .authorized_automatic_settlement(session_id, true)
+                .expect("no grant before funding approval")
+                .is_none()
+        );
+        controller
+            .retain_automatic_settlement_approval(session_id, START + 32)
+            .expect("retain exact session approval");
+        controller
+            .retain_automatic_settlement_approval(session_id, START + 33)
+            .expect("idempotent approval retention");
+        let redeem = controller
+            .authorized_automatic_settlement(session_id, true)
+            .expect("read redeem approval")
+            .expect("redeem approved");
+        assert_eq!(redeem.asset, "btc");
+        assert_eq!(redeem.maximum_fee, MINIMUM_BITCOIN_FEE_RESERVE_SATS);
+        assert_eq!(redeem.minimum_wallet_output, 8_000);
+        let refund = controller
+            .authorized_automatic_settlement(session_id, false)
+            .expect("read refund approval")
+            .expect("refund approved");
+        assert_eq!(refund.asset, "hns");
+        assert_eq!(refund.maximum_fee, 10_000);
+        assert_eq!(refund.minimum_wallet_output, 1_990_000);
+        assert!(
+            controller
+                .authorized_automatic_settlement(hns_wallet_types::SessionId::new([0xff; 32]), true)
+                .expect("other session has no approval")
+                .is_none()
         );
         assert!(
             controller
