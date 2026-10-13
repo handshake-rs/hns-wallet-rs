@@ -76,7 +76,10 @@ integration, HNSA/HNSR product wiring, installed mobile transport, and release
 qualification remain separate work.
 
 `MobileDirectHnsValueController` retains the direct-peer coordinator beside the
-value runtime. Its native façade schedules configured-peer connection, one
+value runtime. Mobile shells construct it with
+`into_wallet_owned_direct_hns_value_with_wallet_owned_direct_shakedex`, which
+binds the coordinator and value runtime to one wallet authority. Its native
+façade schedules configured-peer connection, one
 header round, a bounded filtered-block scan, mempool refresh, and restore-gap
 growth with the exact value-runtime clock; a host cannot substitute a timestamp
 or watch set. Direct Shakescape listeners and outbound peers use that same retained

@@ -6,6 +6,7 @@ mod market;
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 
 pub use bitcoin::{
@@ -34,8 +35,6 @@ pub use market::{
     MobileShakescapeUnfundedHnsProof,
 };
 
-use hns_primitives::BlockHash as ProtocolBlockHash;
-use hns_swap::NetworkBinding;
 use hns_wallet_chain_api::{PreparedArtifact, PreparedSettlementLock};
 use hns_wallet_ffi::{
     AbiError, AccountSummary, ApprovalSummary, HnsNameDisclosure, HostFrame, HostPlatform,
@@ -80,10 +79,7 @@ use hns_wallet_service::{
     PersistentShakescapeTransport, ServiceError, ServiceRuntime, TRUSTED_NATIVE_HNS_VALUE_ORIGIN,
     TrustedNativeHnsValueAction, WalletService,
 };
-use hns_wallet_shakedex::{
-    DirectShakescapeBoardSyncReport, ShakedexSellerPolicy, ShakescapeHnsaEndpointBinding,
-    ShakescapeHrmRootBinding, ShakescapePublicationAcceptancePolicy,
-};
+use hns_wallet_shakedex::{DirectShakescapeBoardSyncReport, ShakedexSellerPolicy};
 use hns_wallet_store::{SharedWalletStore, StoreError, WalletStore};
 use hns_wallet_types::{
     AccountId, Amount, ApprovalId, ApprovalKind, BaseUnits, HnsNameReceiveTarget, ModuleId,
@@ -96,7 +92,6 @@ use zeroize::Zeroizing;
 
 pub const MOBILE_DATABASE_KEY_BYTES: usize = 32;
 pub const MAX_MOBILE_RECOVERY_PHRASE_BYTES: usize = 256;
-pub const MAX_MOBILE_SHAKEDEX_POLICY_BYTES: usize = 16 * 1024;
 pub const MOBILE_ACCOUNT_LABEL: &str = "Handshake";
 pub const MAX_MOBILE_HNS_NAME_PAGE: usize = MAX_HNS_NAME_DISCLOSURES;
 const STORE_PASSPHRASE_DOMAIN: &str = "hns-wallet-mobile/store-passphrase/v1:";
@@ -332,6 +327,20 @@ pub struct MobileDirectHnsValueController<C: HnsClock = HnsReadSystemClock> {
     coordinator: HnsDirectPeerCoordinator,
 }
 
+impl<C: HnsClock> Deref for MobileDirectHnsValueController<C> {
+    type Target = MobileHnsValueController<EmbeddedHnsBackend, C>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl<C: HnsClock> DerefMut for MobileDirectHnsValueController<C> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
+}
+
 /// A direct Shakescape listener created by one [`MobileDirectHnsValueController`].
 ///
 /// The underlying listener stays private so accepting a peer has to cross the
@@ -541,42 +550,6 @@ pub struct MobileShakescapeHnsSettlementReceipt {
     pub action: MobileShakescapeSettlementAction,
     pub transaction_id: String,
     pub accepted_at_unix: u64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MobileShakescapeAcceptancePolicyFile {
-    network_magic: u32,
-    network_genesis: String,
-    hrm: MobileShakescapeHrmPolicyFile,
-    hnsa: MobileShakescapeHnsaPolicyFile,
-    maximum_receipt_lifetime_seconds: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MobileShakescapeHrmPolicyFile {
-    subject: String,
-    sequence: u64,
-    envelope_hash: String,
-    chain_height: u64,
-    chain_work_be: String,
-    chain_anchor: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MobileShakescapeHnsaPolicyFile {
-    canonical_service_name: String,
-    application_profile_id: u16,
-    service_resource_id: String,
-    service_delegation_id: String,
-    service_generation: u64,
-    endpoint_delegation_id: String,
-    endpoint_sequence: u64,
-    endpoint_public_key: String,
-    effective_not_before_unix: u64,
-    effective_expires_at_unix: u64,
 }
 
 /// A newly created controller and its one-time dedicated recovery display.
@@ -1163,11 +1136,9 @@ impl MobileWalletController {
     /// Consume this lifecycle controller into native HNS value and Shakedex
     /// runtimes that both use wallet-owned direct peers.
     ///
-    /// This is the direct counterpart to
-    /// [`Self::into_hns_value_with_wallet_owned_direct_shakedex`]. It fixes
-    /// the marketplace policy to no marketplace fee and wallet-peer board
-    /// transport, while retaining the same direct HNS coordinator for chain
-    /// evidence, fee evidence, broadcasts, and later direct synchronization.
+    /// This fixes the marketplace policy to no marketplace fee and wallet-peer
+    /// board transport, while retaining the same direct HNS coordinator for
+    /// chain evidence, fee evidence, broadcasts, and later direct synchronization.
     pub fn into_wallet_owned_direct_hns_value_with_wallet_owned_direct_shakedex(
         self,
         database_key: &MobileDatabaseKey,
@@ -1195,40 +1166,6 @@ impl MobileWalletController {
             database_key,
             coordinator,
             clock,
-            Some(wallet_owned_direct_shakedex_config()),
-        )
-    }
-
-    /// Activate the complete native HNS and Shakedex composition from an
-    /// exact public relay-acceptance policy. This explicit legacy path is
-    /// retained for deployments that choose a relay; the wallet-owned direct
-    /// path below does not use or require it.
-    /// Marketplace fees are disabled; neither Android nor iOS can supply a fee
-    /// destination through this path.
-    pub fn into_hns_value_with_shakedex_policy<B: HnsBackend>(
-        self,
-        database_key: &MobileDatabaseKey,
-        backend: B,
-        acceptance_policy_json: &[u8],
-    ) -> Result<MobileHnsValueController<B>, MobileWalletError> {
-        let shakedex = mobile_shakedex_config(acceptance_policy_json)?;
-        self.into_hns_value(database_key, backend, Some(shakedex))
-    }
-
-    /// Activate the complete native HNS and Shakedex composition with the
-    /// board replicated only over negotiated wallet-owned direct peers.
-    ///
-    /// No relay URL, endpoint key, HRM retrieval, HNSA delegation, or
-    /// acceptance receipt is an authority input in this mode. Listings remain
-    /// subject to the wallet's local chain and current-lock verification.
-    pub fn into_hns_value_with_wallet_owned_direct_shakedex<B: HnsBackend>(
-        self,
-        database_key: &MobileDatabaseKey,
-        backend: B,
-    ) -> Result<MobileHnsValueController<B>, MobileWalletError> {
-        self.into_hns_value(
-            database_key,
-            backend,
             Some(wallet_owned_direct_shakedex_config()),
         )
     }
@@ -3664,82 +3601,11 @@ fn mobile_native_hns_name_summary(
     Ok(summary)
 }
 
-fn mobile_shakedex_config(json: &[u8]) -> Result<PersistentShakedexConfig, MobileWalletError> {
-    if json.len() < 2
-        || json.len() > MAX_MOBILE_SHAKEDEX_POLICY_BYTES
-        || json.first() != Some(&b'{')
-        || json.last() != Some(&b'}')
-    {
-        return Err(MobileWalletError::InvalidShakedexConfiguration);
-    }
-    let wire: MobileShakescapeAcceptancePolicyFile = serde_json::from_slice(json)
-        .map_err(|_| MobileWalletError::InvalidShakedexConfiguration)?;
-    let acceptance_policy = ShakescapePublicationAcceptancePolicy::new(
-        NetworkBinding {
-            magic: wire.network_magic,
-            genesis: ProtocolBlockHash::new(mobile_policy_hex(&wire.network_genesis)?),
-        },
-        ShakescapeHrmRootBinding {
-            subject: ObjectHash::new(mobile_policy_hex(&wire.hrm.subject)?),
-            sequence: wire.hrm.sequence,
-            envelope_hash: ObjectHash::new(mobile_policy_hex(&wire.hrm.envelope_hash)?),
-            chain_height: wire.hrm.chain_height,
-            chain_work_be: mobile_policy_hex(&wire.hrm.chain_work_be)?,
-            chain_anchor: ObjectHash::new(mobile_policy_hex(&wire.hrm.chain_anchor)?),
-        },
-        ShakescapeHnsaEndpointBinding {
-            canonical_service_name: wire.hnsa.canonical_service_name.into_bytes(),
-            application_profile_id: wire.hnsa.application_profile_id,
-            service_resource_id: ObjectHash::new(mobile_policy_hex(
-                &wire.hnsa.service_resource_id,
-            )?),
-            service_delegation_id: ObjectHash::new(mobile_policy_hex(
-                &wire.hnsa.service_delegation_id,
-            )?),
-            service_generation: wire.hnsa.service_generation,
-            endpoint_delegation_id: ObjectHash::new(mobile_policy_hex(
-                &wire.hnsa.endpoint_delegation_id,
-            )?),
-            endpoint_sequence: wire.hnsa.endpoint_sequence,
-            endpoint_public_key: mobile_policy_hex(&wire.hnsa.endpoint_public_key)?,
-            effective_not_before_unix: wire.hnsa.effective_not_before_unix,
-            effective_expires_at_unix: wire.hnsa.effective_expires_at_unix,
-        },
-        wire.maximum_receipt_lifetime_seconds,
-    )
-    .map_err(|_| MobileWalletError::InvalidShakedexConfiguration)?;
-    Ok(PersistentShakedexConfig {
-        seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
-        transport: PersistentShakescapeTransport::RelayAcceptance(acceptance_policy),
-    })
-}
-
 fn wallet_owned_direct_shakedex_config() -> PersistentShakedexConfig {
     PersistentShakedexConfig {
         seller_policy: ShakedexSellerPolicy::no_marketplace_fee(),
         transport: PersistentShakescapeTransport::WalletPeers,
     }
-}
-
-fn mobile_policy_hex<const N: usize>(encoded: &str) -> Result<[u8; N], MobileWalletError> {
-    if encoded.len() != N * 2 {
-        return Err(MobileWalletError::InvalidShakedexConfiguration);
-    }
-    let mut decoded = [0_u8; N];
-    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
-        let nibble = |byte| match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            _ => None,
-        };
-        let high = nibble(pair[0]).ok_or(MobileWalletError::InvalidShakedexConfiguration)?;
-        let low = nibble(pair[1]).ok_or(MobileWalletError::InvalidShakedexConfiguration)?;
-        decoded[index] = (high << 4) | low;
-    }
-    if decoded.iter().all(|byte| *byte == 0) {
-        return Err(MobileWalletError::InvalidShakedexConfiguration);
-    }
-    Ok(decoded)
 }
 
 fn lowercase_hex(bytes: &[u8]) -> String {
@@ -3824,8 +3690,6 @@ pub enum MobileWalletError {
     InvalidActionToken,
     #[error("native HNS value action is invalid")]
     InvalidValueAction,
-    #[error("native Shakedex acceptance policy is invalid")]
-    InvalidShakedexConfiguration,
     #[error("secure native randomness is unavailable")]
     Randomness,
     #[error("wallet service rejected the request ({code:?}): {message}")]
@@ -3921,71 +3785,6 @@ mod tests {
 
         let invalid_envelope = MobileWalletError::InvalidShakescapeSessionMessage;
         assert!(invalid_envelope.invalidates_direct_shakescape_transport());
-    }
-
-    fn shakescape_acceptance_policy_json() -> Vec<u8> {
-        serde_json::to_vec(&json!({
-            "network_magic": 1_535_399_072_u32,
-            "network_genesis": "11".repeat(32),
-            "hrm": {
-                "subject": "21".repeat(32),
-                "sequence": 7,
-                "envelope_hash": "22".repeat(32),
-                "chain_height": 500,
-                "chain_work_be": "23".repeat(32),
-                "chain_anchor": "24".repeat(32)
-            },
-            "hnsa": {
-                "canonical_service_name": "relay-market",
-                "application_profile_id": 17_490,
-                "service_resource_id": "31".repeat(32),
-                "service_delegation_id": "32".repeat(32),
-                "service_generation": 3,
-                "endpoint_delegation_id": "33".repeat(32),
-                "endpoint_sequence": 9,
-                "endpoint_public_key":
-                    "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-                "effective_not_before_unix": 1_800_000_000_u64,
-                "effective_expires_at_unix": 1_800_003_600_u64
-            },
-            "maximum_receipt_lifetime_seconds": 120
-        }))
-        .expect("serialize Shakescape acceptance policy")
-    }
-
-    #[test]
-    fn installed_shakescape_policy_is_exact_and_disables_marketplace_fees() {
-        let encoded = shakescape_acceptance_policy_json();
-        let config = mobile_shakedex_config(&encoded).expect("valid Shakescape policy");
-
-        assert_eq!(
-            config.seller_policy,
-            ShakedexSellerPolicy::no_marketplace_fee()
-        );
-        let PersistentShakescapeTransport::RelayAcceptance(acceptance_policy) = &config.transport
-        else {
-            panic!("explicit legacy relay policy must select relay transport");
-        };
-        assert_eq!(acceptance_policy.network().magic, 1_535_399_072);
-        assert_eq!(acceptance_policy.hrm().sequence, 7);
-        assert_eq!(
-            acceptance_policy.hnsa().canonical_service_name,
-            b"relay-market"
-        );
-        assert_eq!(acceptance_policy.maximum_receipt_lifetime_seconds(), 120);
-
-        let mut unknown_field: Value =
-            serde_json::from_slice(&encoded).expect("decode test policy");
-        unknown_field
-            .as_object_mut()
-            .expect("policy object")
-            .insert("alternate_relay".to_owned(), Value::Bool(true));
-        assert!(matches!(
-            mobile_shakedex_config(
-                &serde_json::to_vec(&unknown_field).expect("serialize invalid policy")
-            ),
-            Err(MobileWalletError::InvalidShakedexConfiguration)
-        ));
     }
 
     #[derive(Default)]
