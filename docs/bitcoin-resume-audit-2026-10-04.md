@@ -71,3 +71,34 @@ repeating network downloads on these rescans while preserving fresh matching.
 All three 0.4.2 packages were published from the source commit
 527aa27f71a7054c7f2efc99a50a33d12ef3d784 and checked against their registry
 source archives and SHA-256 digests. The mobile app now pins that exact cohort.
+
+## Recovery gap replay follow-up, 2026-10-13
+
+Source commit `7e844b759ebffa2df4f2b332ed9f1298cfffa7e8` limits a recovery
+address-window expansion to the newly derived wallet scripts for filters below
+the preceding completed pass's tip. Previously matched wallet transactions
+and swap blocks remain in that update's in-memory graph and block collection.
+Filters above the covered tip use all current wallet and swap scripts. A
+reported reorganization returns the rest of the pass to full matching. An
+approved-broadcast recovery replay and the next separate sync cycle also use
+full matching.
+
+Kyoto still replays each cached filter through its verified header and
+filter-commitment path. This reduces script matching work during repeated gap
+expansion; it does not remove cache reads, filter validation, or the requirement
+for fresh peers before completion. All 62 `hns-wallet-bitcoin-kyoto` library
+tests passed, including a BIP158 filter fixture for old and newly derived
+scripts and a reorganization fallback check. Warning-denied Clippy passed for
+all package targets.
+
+The five `hns-wallet-bip157` cache tests also passed, covering restart replay,
+holes, corruption, context binding, and reorganization.
+
+There is no new installed-device cold-restore timing from this source change.
+Measure the same funded recovery fixture before and after with the same
+birthday, address history, peer conditions, and device. Record each pass's
+filter count, address-window expansion count, elapsed time, matched and fetched
+block count, and peak memory. Require identical transactions, checkpoints,
+swap evidence, and restart/reorganization results before claiming a speedup.
+The mobile product remains pinned to the previously published Bitcoin wallet
+crate until a separately qualified package release and dependency update.
