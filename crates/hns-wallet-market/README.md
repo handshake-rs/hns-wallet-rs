@@ -4,7 +4,8 @@
 fixed-terms HNS/BTC offers plus durable, chain-neutral HTLC session admission.
 
 Each public offer is an indivisible offer-setter intent to exchange one exact
-HNS amount for one exact BTC amount. It is not yet an executable maker listing.
+HNS amount for one exact BTC amount. Swap execution begins after a responder
+accepts the offer and proposes a contract.
 The board retains only canonical signed offers and cancellations,
 re-authenticates them against the wallet's local network binding on every
 load, and expires or hides inactive rows. It contains no oracle,
@@ -50,14 +51,14 @@ carry the canonical Shakescape frames; none is pricing, market, or chain authori
 The crate supplies no discovery service or product UI. Release gates for real
 value execution remain owned by the application layer.
 
-## Recovery status of 0.5.0
+## Recovery
 
-Signing authority and maker preimages are reproducible from the wallet recovery
-seed and authenticated public context, independently of the original profile
-ID or private offer intent. This does not make a funded contract discoverable
-from the seed alone: its public terms still need an automatic recovery path.
-The owner authorized store delivery with this remaining limitation disclosed.
-Automatic contract discovery after losing the local database is incomplete;
-this release does not claim that restoring the seed alone recovers every funded
-swap. No separate recovery-file workflow is required. See the
-[recovery audit](../../docs/swap-seed-recovery-audit-2026-10-04.md).
+Signing authority and maker preimages derive from the wallet recovery seed and
+authenticated public context. For contracts funded with chain-visible
+publication terms, a seed restore discovers the contract from verified wallet
+chain history and reconstructs seed-owned reclaim authority for either asset
+and participant role. Recovered records cannot authorize new funding; spending
+still requires a current verified chain view, an unspent exact contract, and
+consensus maturity. Contracts without the publication terms are outside this
+seed-only discovery path. See [Shakedex and market](../../docs/SHAKEDEX_AND_MARKET.md)
+for the current recovery and execution contracts.

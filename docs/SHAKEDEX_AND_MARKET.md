@@ -52,8 +52,8 @@ requires exact `SIGHASH_ALL` P2PKH funding witnesses and rechecks bounded
 ordinary outputs, covenant links, and standard witness execution rather than
 trusting a caller success flag.
 
-The production-facing construction adapters no longer accept those chain facts
-independently. Buyer fulfillment consumes the current-lock authority and its
+The production-facing construction adapters require bound chain authority.
+Buyer fulfillment consumes the current-lock authority and its
 snapshot-bound parent MTP; seller recovery consumes the same current lock;
 script FINALIZE consumes a current unspent TRANSFER authority that binds the
 exact parent bytes, active NameState, maturity, and selected renewal block.
