@@ -195,7 +195,10 @@ impl Peer {
                                 },
                             }
                         },
-                        None => continue,
+                        // The reader task has ended. A closed receiver is
+                        // always ready, so continuing here spins forever on
+                        // a single-threaded wallet runtime.
+                        None => return Ok(()),
                     }
                 }
                 // The main thread sent us a message
@@ -213,7 +216,9 @@ impl Peer {
                                 },
                             }
                         },
-                        None => continue,
+                        // The node has stopped owning this peer. Exit instead
+                        // of polling the closed channel without yielding.
+                        None => return Ok(()),
                     }
                 }
                 _ = interval.tick() => continue,
@@ -504,5 +509,54 @@ impl Peer {
             }
             Err(_) => Err(PeerError::HandshakeFailed),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::p2p::address::AddrV2;
+    use std::net::{IpAddr, Ipv4Addr};
+    use tokio::net::TcpListener;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closed_node_channel_retires_peer() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let remote = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let (node_tx, node_rx) = mpsc::channel(1);
+        drop(node_tx);
+        let (peer_tx, _peer_rx) = mpsc::channel(1);
+        let (info_tx, _info_rx) = mpsc::channel(1);
+        let (warn_tx, _warn_rx) = mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let dialog = Arc::new(Dialog::new(info_tx, warn_tx, event_tx));
+        let source = Record::new(
+            AddrV2::Ipv4(Ipv4Addr::LOCALHOST),
+            listener.local_addr().unwrap().port(),
+            ServiceFlags::NETWORK,
+            &IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let mut peer = Peer::new(
+            PeerId(1),
+            source,
+            Network::Regtest,
+            BlockType::Witness,
+            peer_tx,
+            node_rx,
+            dialog,
+            Arc::new(Mutex::new(AddressBook::new())),
+            PeerTimeoutConfig::default(),
+            Arc::new(Mutex::new(BroadcastQueue::new())),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), peer.run(socket, false))
+                .await
+                .unwrap()
+                .is_ok()
+        );
+        drop(remote);
     }
 }
