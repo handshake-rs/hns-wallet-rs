@@ -5,6 +5,7 @@
 //! filters, headers, descriptor state, and the restart journal remain local.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -396,6 +397,7 @@ pub struct MobileBitcoinValueController {
     tip_discovery: Option<KyotoTipDiscovery>,
     initialization: MobileBitcoinInitialization,
     shutdown: Option<MobileBitcoinShutdownHandle>,
+    shutdown_generation: Arc<AtomicU64>,
     progress: Option<MobileBitcoinSyncProgressHandle>,
     receive_address: Option<String>,
     pending_send: Option<PendingMobileBitcoinSend>,
@@ -408,21 +410,25 @@ pub struct MobileBitcoinValueController {
 /// This can be retained outside a native controller lock so an app-background
 /// teardown does not wait for the full synchronization timeout.
 #[derive(Clone, Debug)]
-pub struct MobileBitcoinShutdownHandle(Arc<Mutex<KyotoShutdownHandle>>);
+pub struct MobileBitcoinShutdownHandle {
+    handle: Arc<Mutex<KyotoShutdownHandle>>,
+    generation: Arc<AtomicU64>,
+}
 
 impl MobileBitcoinShutdownHandle {
     pub fn request_shutdown(&self) -> Result<(), MobileWalletError> {
         let handle = self
-            .0
+            .handle
             .lock()
             .map_err(|_| MobileWalletError::BitcoinRuntimeInactive)?
             .clone();
+        self.generation.fetch_add(1, Ordering::AcqRel);
         handle.request_shutdown().map_err(MobileWalletError::from)
     }
 
     fn replace(&self, handle: KyotoShutdownHandle) -> Result<(), MobileWalletError> {
         *self
-            .0
+            .handle
             .lock()
             .map_err(|_| MobileWalletError::BitcoinRuntimeInactive)? = handle;
         Ok(())
@@ -511,6 +517,7 @@ impl MobileBitcoinValueController {
                 requested_recovery_height: None,
             },
             shutdown: None,
+            shutdown_generation: Arc::new(AtomicU64::new(0)),
             progress: None,
             receive_address: None,
             pending_send: None,
@@ -666,11 +673,18 @@ impl MobileBitcoinValueController {
     pub fn synchronize_once(
         &mut self,
     ) -> Result<(KyotoSyncReceipt, MobileBitcoinSnapshot), MobileWalletError> {
+        // A requested stop also closes Kyoto's event channel. Do not mistake
+        // that deliberate shutdown for a transient peer failure and replay the
+        // entire cached chain before returning control to the caller.
+        let shutdown_generation = self.shutdown_generation.load(Ordering::Acquire);
         let first_attempt = self.synchronize_once_inner();
-        let requires_reconstruction = first_attempt
-            .as_ref()
-            .err()
-            .is_some_and(bitcoin_sync_requires_supervisor_reconstruction);
+        let requires_reconstruction = first_attempt.as_ref().err().is_some_and(|error| {
+            bitcoin_sync_should_reconstruct(
+                error,
+                shutdown_generation,
+                self.shutdown_generation.load(Ordering::Acquire),
+            )
+        });
         if !requires_reconstruction {
             return first_attempt;
         }
@@ -687,9 +701,15 @@ impl MobileBitcoinValueController {
         let shutdown = self.shutdown.clone();
         let progress = self.progress.clone();
         let _ = self.deactivate();
+        if self.shutdown_generation.load(Ordering::Acquire) != shutdown_generation {
+            return first_attempt;
+        }
         self.shutdown = shutdown;
         self.progress = progress;
         self.activate()?;
+        if self.shutdown_generation.load(Ordering::Acquire) != shutdown_generation {
+            return first_attempt;
+        }
         self.synchronize_once_inner()
     }
 
@@ -1899,7 +1919,10 @@ impl MobileBitcoinValueController {
         if let Some(handle) = self.shutdown.as_ref() {
             handle.replace(shutdown)?;
         } else {
-            self.shutdown = Some(MobileBitcoinShutdownHandle(Arc::new(Mutex::new(shutdown))));
+            self.shutdown = Some(MobileBitcoinShutdownHandle {
+                handle: Arc::new(Mutex::new(shutdown)),
+                generation: self.shutdown_generation.clone(),
+            });
         }
         if let Some(handle) = self.progress.as_ref() {
             handle.replace(progress, self.config.required_peers)?;
@@ -2060,6 +2083,15 @@ fn bitcoin_sync_requires_supervisor_reconstruction(error: &MobileWalletError) ->
                 | BitcoinWalletError::SupervisorPoisoned
         )
     )
+}
+
+fn bitcoin_sync_should_reconstruct(
+    error: &MobileWalletError,
+    started_generation: u64,
+    current_generation: u64,
+) -> bool {
+    started_generation == current_generation
+        && bitcoin_sync_requires_supervisor_reconstruction(error)
 }
 
 impl Drop for MobileBitcoinValueController {
@@ -2239,6 +2271,13 @@ mod tests {
         assert!(!bitcoin_sync_requires_supervisor_reconstruction(
             &MobileWalletError::InvalidBitcoinAction
         ));
+    }
+
+    #[test]
+    fn requested_shutdown_suppresses_stopped_supervisor_retry() {
+        let stopped = MobileWalletError::Bitcoin(BitcoinWalletError::KyotoNodeStopped);
+        assert!(bitcoin_sync_should_reconstruct(&stopped, 4, 4));
+        assert!(!bitcoin_sync_should_reconstruct(&stopped, 4, 5));
     }
 
     #[test]
