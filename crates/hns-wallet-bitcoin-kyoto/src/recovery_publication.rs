@@ -60,7 +60,13 @@ pub fn preflight_bitcoin_recoverable_htlc_funding(
         .checked_sub(amount)
         .filter(|cap| *cap > 0)
         .ok_or(BitcoinWalletError::InvalidAmount)?;
-    let mut trial_cap = signed_fee_cap_sats.min(affordable_cap);
+    // The actual funding builder reserves the full signed cap when selecting
+    // inputs. A quote based on a smaller cap would incorrectly clear an offer
+    // that cannot later be funded from these confirmed coins.
+    if signed_fee_cap_sats > affordable_cap {
+        return Err(BitcoinWalletError::InvalidAmount);
+    }
+    let mut trial_cap = signed_fee_cap_sats;
     loop {
         let mut disposable = planning_wallet(wallet)?;
         match prepare_bitcoin_recoverable_htlc_funding(
@@ -1116,6 +1122,17 @@ mod tests {
         )
         .unwrap();
         assert!(enough.signed_cap_sufficient);
+        assert!(matches!(
+            preflight_bitcoin_recoverable_htlc_funding(
+                &wallet,
+                &BitcoinValueRuntimePermit(()),
+                &publication,
+                1,
+                50_001,
+                &[],
+            ),
+            Err(BitcoinWalletError::InvalidAmount)
+        ));
         assert_eq!(wallet.balance(), before);
     }
 
