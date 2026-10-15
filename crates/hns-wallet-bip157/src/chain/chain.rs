@@ -126,7 +126,11 @@ impl Chain {
 
     /// Replay raw filters for the latest canonical chain. Old-branch filters
     /// remain saved evidence but cannot select blocks for the current wallet.
-    pub(crate) fn restore_filter(&mut self, packet: CFilter) -> Result<(), CFilterSyncError> {
+    pub(crate) fn restore_filter(
+        &mut self,
+        packet: CFilter,
+        replay_slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(), CFilterSyncError> {
         if self
             .header_chain
             .height_of_hash_canonical_only(packet.block_hash)
@@ -135,7 +139,7 @@ impl Chain {
         {
             return Ok(());
         }
-        self.apply_filter(packet)
+        self.apply_filter(packet, Some(replay_slot))
     }
 
     // The last ten heights and headers in the chain
@@ -399,13 +403,17 @@ impl Chain {
                 was_last_in_batch: self.requested_filter_batch_complete(),
             });
         }
-        self.apply_filter(filter_message)?;
+        self.apply_filter(filter_message, None)?;
         Ok(FilterCheck {
             was_last_in_batch: self.requested_filter_batch_complete(),
         })
     }
 
-    fn apply_filter(&mut self, filter_message: CFilter) -> Result<(), CFilterSyncError> {
+    fn apply_filter(
+        &mut self,
+        filter_message: CFilter,
+        replay_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<(), CFilterSyncError> {
         if filter_message.filter_type != u8::from(self.filter_type) {
             return Err(CFilterSyncError::WrongFilterType);
         }
@@ -432,7 +440,10 @@ impl Chain {
             .header_chain
             .header_at_hash(filter_message.block_hash)
             .ok_or(CFilterSyncError::UnknownFilterHash)?;
-        let indexed_filter = IndexedFilter::new(height, header, filter);
+        let mut indexed_filter = IndexedFilter::new(height, header, filter);
+        if let Some(slot) = replay_slot {
+            indexed_filter = indexed_filter.with_replay_slot(slot);
+        }
         self.dialog.send_event(Event::IndexedFilter(indexed_filter));
         self.header_chain.check_filter(filter_message.block_hash);
         Ok(())

@@ -13,7 +13,10 @@ use bitcoin::{
 };
 use tokio::{
     select,
-    sync::mpsc::{self},
+    sync::{
+        mpsc::{self},
+        Semaphore,
+    },
 };
 use tokio::{
     sync::mpsc::{Receiver, UnboundedReceiver},
@@ -46,6 +49,7 @@ use crate::sync_cache::{CachedSyncBatch, SyncCacheContext, SyncCacheKind, Verifi
 
 pub(crate) const WTXID_VERSION: u32 = 70016;
 const LOOP_TIMEOUT: Duration = Duration::from_millis(10);
+const MAX_PENDING_REPLAY_FILTERS: usize = 64;
 
 type PeerRequirement = usize;
 
@@ -67,6 +71,7 @@ pub struct Node {
     saved_filters: HashSet<BlockHash>,
     pending_filters: Vec<CFilter>,
     pending_filter_bytes: usize,
+    replay_slots: Arc<Semaphore>,
 }
 
 impl Node {
@@ -143,6 +148,7 @@ impl Node {
                 saved_filters: HashSet::new(),
                 pending_filters: Vec::with_capacity(64),
                 pending_filter_bytes: 0,
+                replay_slots: Arc::new(Semaphore::new(MAX_PENDING_REPLAY_FILTERS)),
             },
             client,
         )
@@ -735,9 +741,13 @@ impl Node {
                         return Err(NodeError::SyncCache("invalid cached filter batch".into()));
                     }
                     for filter in filters {
+                        let slot = Arc::clone(&self.replay_slots)
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| NodeError::SyncCache("cache replay stopped".into()))?;
                         self.saved_filters.insert(filter.block_hash);
                         self.chain
-                            .restore_filter(filter)
+                            .restore_filter(filter, slot)
                             .map_err(|error| NodeError::SyncCache(error.to_string()))?;
                     }
                 }
@@ -1032,11 +1042,64 @@ mod cache_tests {
         }
         assert!(restored.chain.is_filters_synced());
         restored.state = NodeState::FiltersSynced;
-        assert!(restored.rescan(None).await.unwrap().is_none());
-        assert_eq!(matches(&mut client, &script), vec![17]);
+        let mut replay = tokio::spawn(async move {
+            let result = restored.rescan(None).await;
+            (restored, result)
+        });
+        let mut replayed_matches = Vec::new();
+        let (mut restored, result) = loop {
+            tokio::select! {
+                result = &mut replay => break result.unwrap(),
+                event = client.event_rx.recv() => {
+                    if let Event::IndexedFilter(filter) = event.unwrap() {
+                        if filter.contains_any(std::iter::once(&script)) {
+                            replayed_matches.push(filter.height());
+                        }
+                    }
+                }
+            }
+        };
+        assert!(result.unwrap().is_none());
+        replayed_matches.extend(matches(&mut client, &script));
+        assert_eq!(replayed_matches, vec![17]);
         // No redundant header response is appended after reconnect.
         restored.handle_headers(PeerId(1), headers).await;
         assert!(cache.read(SyncCacheKind::Headers, 1).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn cache_replay_waits_for_filter_consumer() {
+        let cache = new_cache();
+        let (headers, filters, commitments, _) =
+            headers_and_filters(120, genesis_block(Network::Regtest).header, 600);
+        cache.append(&CachedSyncBatch::Headers(headers)).unwrap();
+        cache
+            .append(&CachedSyncBatch::FilterHeaders(commitments))
+            .unwrap();
+        for batch in filters.chunks(64) {
+            cache
+                .append(&CachedSyncBatch::Filters(batch.to_vec()))
+                .unwrap();
+        }
+        let (mut restored, mut client) = node(cache);
+        let mut replay = tokio::spawn(async move { restored.restore_cache().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut replay)
+                .await
+                .is_err()
+        );
+        let mut replayed = 0;
+        while replayed < filters.len() {
+            let event = tokio::time::timeout(Duration::from_secs(5), client.event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(event, Event::IndexedFilter(_)) {
+                replayed += 1;
+            }
+        }
+        replay.await.unwrap().unwrap();
+        assert_eq!(replayed, filters.len());
     }
 
     #[tokio::test]

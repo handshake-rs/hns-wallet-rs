@@ -44,6 +44,8 @@
 #![warn(missing_docs)]
 pub mod chain;
 
+use std::sync::Arc;
+
 use crate::network::{ConnectionType, PeerTimeoutConfig};
 
 mod network;
@@ -138,12 +140,23 @@ impl From<FilterType> for u8 {
 }
 
 /// A compact block filter with associated height.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct IndexedFilter {
     height: u32,
     header: Header,
     filter: Filter,
+    // A restored filter holds a replay slot until its consumer finishes
+    // matching scripts. Live network filters do not use replay slots.
+    replay_slot: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
 }
+
+impl PartialEq for IndexedFilter {
+    fn eq(&self, other: &Self) -> bool {
+        self.height == other.height && self.header == other.header && self.filter == other.filter
+    }
+}
+
+impl Eq for IndexedFilter {}
 
 impl IndexedFilter {
     fn new(height: u32, header: Header, filter: Filter) -> Self {
@@ -151,7 +164,13 @@ impl IndexedFilter {
             height,
             header,
             filter,
+            replay_slot: None,
         }
+    }
+
+    fn with_replay_slot(mut self, slot: tokio::sync::OwnedSemaphorePermit) -> Self {
+        self.replay_slot = Some(Arc::new(slot));
+        self
     }
 
     /// The height in the chain.
