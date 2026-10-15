@@ -1197,6 +1197,7 @@ fn build_wallet_swap_client(
         warn_rx,
         event_rx,
     } = client;
+    let node_progress = scan.progress.clone();
     let updates = KyotoWalletSwapSubscriber::new(
         requester.clone(),
         event_rx,
@@ -1209,7 +1210,11 @@ fn build_wallet_swap_client(
             network: config.network,
         },
     );
-    bip157::tokio::task::spawn(async move { node.run().await });
+    bip157::tokio::task::spawn(async move {
+        if let Err(error) = node.run().await {
+            node_progress.record_node_error(error.to_string());
+        }
+    });
     Ok((
         requester,
         LoggingSubscribers {
@@ -1659,6 +1664,7 @@ pub struct KyotoSyncProgress {
 struct KyotoSyncProgressState {
     public: KyotoSyncProgress,
     cycle_started: Instant,
+    node_error: Option<String>,
 }
 
 impl Default for KyotoSyncProgressState {
@@ -1666,6 +1672,7 @@ impl Default for KyotoSyncProgressState {
         Self {
             public: KyotoSyncProgress::default(),
             cycle_started: Instant::now(),
+            node_error: None,
         }
     }
 }
@@ -1688,9 +1695,22 @@ impl KyotoSyncProgressHandle {
         snapshot
     }
 
+    /// The bounded cause of an exited Bitcoin node, retained for native
+    /// diagnostics even when the supervisor is rebuilt for one retry.
+    pub fn node_error(&self) -> Option<String> {
+        self.0.lock().ok()?.node_error.clone()
+    }
+
+    fn record_node_error(&self, error: String) {
+        if let Ok(mut current) = self.0.lock() {
+            current.node_error = Some(error.chars().take(512).collect());
+        }
+    }
+
     fn begin_cycle(&self) {
         if let Ok(mut current) = self.0.lock() {
             let prior = current.public;
+            let node_error = current.node_error.take();
             *current = KyotoSyncProgressState {
                 public: KyotoSyncProgress {
                     stage: if prior.connections_met {
@@ -1707,6 +1727,7 @@ impl KyotoSyncProgressHandle {
                     ..KyotoSyncProgress::default()
                 },
                 cycle_started: Instant::now(),
+                node_error,
             };
         }
     }

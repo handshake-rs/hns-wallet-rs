@@ -399,6 +399,7 @@ pub struct MobileBitcoinValueController {
     shutdown: Option<MobileBitcoinShutdownHandle>,
     shutdown_generation: Arc<AtomicU64>,
     progress: Option<MobileBitcoinSyncProgressHandle>,
+    last_node_error: Option<String>,
     receive_address: Option<String>,
     pending_send: Option<PendingMobileBitcoinSend>,
     pending_htlc_funding: Option<PendingMobileBitcoinHtlcFunding>,
@@ -519,6 +520,7 @@ impl MobileBitcoinValueController {
             shutdown: None,
             shutdown_generation: Arc::new(AtomicU64::new(0)),
             progress: None,
+            last_node_error: None,
             receive_address: None,
             pending_send: None,
             pending_htlc_funding: None,
@@ -653,6 +655,11 @@ impl MobileBitcoinValueController {
         self.progress.clone()
     }
 
+    /// Diagnostic cause retained across the one allowed supervisor retry.
+    pub fn last_node_error(&self) -> Option<&str> {
+        self.last_node_error.as_deref()
+    }
+
     /// Reveal and persist one deterministic Bitcoin receive address. This
     /// method performs no network I/O and is safe before the first sync.
     pub fn next_receive_address(&mut self) -> Result<String, MobileWalletError> {
@@ -673,11 +680,16 @@ impl MobileBitcoinValueController {
     pub fn synchronize_once(
         &mut self,
     ) -> Result<(KyotoSyncReceipt, MobileBitcoinSnapshot), MobileWalletError> {
+        self.last_node_error = None;
         // A requested stop also closes Kyoto's event channel. Do not mistake
         // that deliberate shutdown for a transient peer failure and replay the
         // entire cached chain before returning control to the caller.
         let shutdown_generation = self.shutdown_generation.load(Ordering::Acquire);
         let first_attempt = self.synchronize_once_inner();
+        self.last_node_error = self
+            .supervisor
+            .as_ref()
+            .and_then(|supervisor| supervisor.progress_handle().node_error());
         let requires_reconstruction = first_attempt.as_ref().err().is_some_and(|error| {
             bitcoin_sync_should_reconstruct(
                 error,
@@ -710,7 +722,14 @@ impl MobileBitcoinValueController {
         if self.shutdown_generation.load(Ordering::Acquire) != shutdown_generation {
             return first_attempt;
         }
-        self.synchronize_once_inner()
+        let retry = self.synchronize_once_inner();
+        if self.last_node_error.is_none() {
+            self.last_node_error = self
+                .supervisor
+                .as_ref()
+                .and_then(|supervisor| supervisor.progress_handle().node_error());
+        }
+        retry
     }
 
     fn synchronize_once_inner(
