@@ -20,7 +20,10 @@ const VERSION: u16 = 1;
 const CHUNK_BYTES: usize = 512 * 1024;
 const MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_STREAM_BATCHES: u32 = 65_536;
+// Older wallets may already have a large authenticated prefix. Keep it
+// readable, but bound new on-device cache growth to a practical size.
 const MAX_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const MAX_NEW_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const DOMAIN: &[u8] = b"hns-wallet-rs/verified-bitcoin-sync-cache/v1";
 const RECOVERY_DOMAIN: &[u8] = b"hns-wallet-rs/verified-bitcoin-sync-cache/recovery/v1";
 
@@ -364,14 +367,19 @@ impl EncryptedSyncCache {
         let stream = stream(batch.kind());
         self.store.try_with_store_mut(|store| {
             let (revision, mut counts, total_bytes) = self.head(store)?;
+            let Some(next_total_bytes) = total_bytes
+                .checked_add(payload.len() as u64)
+                .filter(|bytes| *bytes <= MAX_NEW_CACHE_BYTES)
+            else {
+                // The cache is optional transport evidence. Once its bounded
+                // prefix is full, the live node still verifies the remaining
+                // responses and can resume from that prefix after a restart.
+                return Ok(());
+            };
             let index = counts[usize::from(stream)];
             if index >= MAX_STREAM_BATCHES {
-                return Err(BitcoinWalletError::CorruptRuntimeState);
+                return Ok(());
             }
-            let total_bytes = total_bytes
-                .checked_add(payload.len() as u64)
-                .filter(|bytes| *bytes <= MAX_CACHE_BYTES)
-                .ok_or(BitcoinWalletError::CorruptRuntimeState)?;
             counts[usize::from(stream)] += 1;
             // One SQLite transaction advances the head and creates every
             // immutable chunk. A killed process can expose neither a gap nor
@@ -384,7 +392,7 @@ impl EncryptedSyncCache {
                         version: VERSION,
                         namespace: self.namespace,
                         counts,
-                        bytes: total_bytes,
+                        bytes: next_total_bytes,
                     },
                     updated_at_unix: 0,
                 },
@@ -761,6 +769,41 @@ mod tests {
         );
         assert!(cache.read(SyncCacheKind::Headers, 0).unwrap().is_none());
         assert!(cache.read(SyncCacheKind::Filters, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn full_legacy_cache_remains_readable_without_blocking_live_filters() {
+        let dir = private_dir();
+        let store = SharedWalletStore::new(
+            WalletStore::create(dir.path().join("wallet.sqlite"), "cache test passphrase").unwrap(),
+        );
+        let cache = EncryptedSyncCache::new(store.clone(), b"account", context()).unwrap();
+        store
+            .with_store_mut(|store| {
+                store.save_bitcoin_header(
+                    &cache.id(0, 0, 0, 0),
+                    0,
+                    &CacheRecord::Head {
+                        version: VERSION,
+                        namespace: cache.namespace,
+                        counts: [0; 3],
+                        bytes: MAX_CACHE_BYTES,
+                    },
+                    0,
+                )
+            })
+            .unwrap();
+        let filter = CachedSyncBatch::Filters(vec![CFilter {
+            filter_type: 0,
+            block_hash: context().checkpoint.hash,
+            filter: vec![1, 2, 3],
+        }]);
+        cache.append(&filter).unwrap();
+        assert!(cache.read(SyncCacheKind::Filters, 0).unwrap().is_none());
+        assert_eq!(
+            store.try_with_store(|store| cache.head(store)).unwrap().2,
+            MAX_CACHE_BYTES
+        );
     }
 
     #[test]
