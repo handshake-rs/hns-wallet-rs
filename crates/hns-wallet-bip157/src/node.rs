@@ -753,9 +753,11 @@ impl Node {
                 }
             }
             self.cache_restored = true;
-            // Progress walks the header graph. Keep replay linear in
-            // practice rather than walking it after every 64 filters.
-            if index % 32 == 0 {
+            // A progress snapshot walks the entire header graph. During a
+            // large cache replay, report roughly every 32,768 filters and
+            // once more at the end instead of repeatedly walking the whole
+            // chain for each small batch.
+            if index % 512 == 0 {
                 self.chain.send_chain_update();
             }
             index = index
