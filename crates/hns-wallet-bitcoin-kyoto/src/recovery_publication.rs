@@ -15,6 +15,104 @@ pub struct PreparedBitcoinRecoverableFunding {
     publication_transactions: Vec<Vec<u8>>,
 }
 
+/// A fresh, local estimate for the complete publication ancestry and HTLC
+/// lock. The quote uses the wallet's currently confirmed inputs and observed
+/// fee rate. A later funding approval must rebuild the real package because
+/// both inputs and network fees can change while an offer is open.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BitcoinRecoverableFundingFeeQuote {
+    pub required_fee_sats: u64,
+    pub fee_rate_sat_vb: u64,
+    pub transaction_count: usize,
+    pub signed_cap_sufficient: bool,
+}
+
+/// Sign a disposable copy of the whole package to check a proposed signed
+/// cap before a public offer or acceptance is approved. No live wallet state,
+/// broadcast journal, or chain state is changed.
+pub fn preflight_bitcoin_recoverable_htlc_funding(
+    wallet: &Wallet,
+    permit: &BitcoinValueRuntimePermit,
+    publication: &SwapRecoveryPublication,
+    fee_rate_sat_vb: u64,
+    signed_fee_cap_sats: u64,
+    unspendable: &[OutPoint],
+) -> Result<BitcoinRecoverableFundingFeeQuote, BitcoinWalletError> {
+    if signed_fee_cap_sats == 0 || fee_rate_sat_vb == 0 {
+        return Err(BitcoinWalletError::InvalidAmount);
+    }
+    let available = wallet
+        .list_unspent()
+        .filter(|coin| {
+            coin.chain_position.is_confirmed()
+                && !unspendable.contains(&coin.outpoint)
+                && !wallet
+                    .list_locked_outpoints()
+                    .any(|locked| locked == coin.outpoint)
+        })
+        .try_fold(0u64, |total, coin| {
+            total
+                .checked_add(coin.txout.value.to_sat())
+                .ok_or(BitcoinWalletError::InvalidAmount)
+        })?;
+    let amount = publication.terms().htlc(publication.side()).amount;
+    let affordable_cap = available
+        .checked_sub(amount)
+        .filter(|cap| *cap > 0)
+        .ok_or(BitcoinWalletError::InvalidAmount)?;
+    let mut trial_cap = signed_fee_cap_sats.min(affordable_cap);
+    loop {
+        let mut disposable = planning_wallet(wallet)?;
+        match prepare_bitcoin_recoverable_htlc_funding(
+            &mut disposable,
+            permit,
+            publication,
+            fee_rate_sat_vb,
+            trial_cap,
+            unspendable,
+        ) {
+            Ok(package) => {
+                // DER signature lengths can differ for a later session.
+                // Reserve two vbytes for every signed package input.
+                let count = package.publication_transactions.len() + 1;
+                let input_count = package
+                    .publication_transactions
+                    .iter()
+                    .map(Vec::as_slice)
+                    .chain(std::iter::once(package.funding.raw_transaction()))
+                    .try_fold(0u64, |total, raw| {
+                        let transaction: Transaction =
+                            deserialize(raw).map_err(|_| recovery_error())?;
+                        total
+                            .checked_add(
+                                u64::try_from(transaction.input.len())
+                                    .map_err(|_| BitcoinWalletError::FeeLimit)?,
+                            )
+                            .ok_or(BitcoinWalletError::FeeLimit)
+                    })?;
+                let margin = fee_rate_sat_vb
+                    .checked_mul(input_count)
+                    .and_then(|value| value.checked_mul(2))
+                    .ok_or(BitcoinWalletError::FeeLimit)?;
+                let required = package
+                    .aggregate_fee_sats
+                    .checked_add(margin)
+                    .ok_or(BitcoinWalletError::FeeLimit)?;
+                return Ok(BitcoinRecoverableFundingFeeQuote {
+                    required_fee_sats: required,
+                    fee_rate_sat_vb,
+                    transaction_count: count,
+                    signed_cap_sufficient: signed_fee_cap_sats >= required,
+                });
+            }
+            Err(BitcoinWalletError::FeeLimit) if trial_cap < affordable_cap => {
+                trial_cap = trial_cap.saturating_mul(2).max(4_000).min(affordable_cap);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 impl fmt::Debug for PreparedBitcoinRecoverableFunding {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -990,6 +1088,35 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn preflight_quotes_the_complete_package_without_touching_live_wallet() {
+        let (wallet, publication) = fixture(SwapAssetSide::Offered);
+        let before = wallet.balance();
+        let low = preflight_bitcoin_recoverable_htlc_funding(
+            &wallet,
+            &BitcoinValueRuntimePermit(()),
+            &publication,
+            1,
+            100,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(low.transaction_count, 4);
+        assert!(low.required_fee_sats > 100);
+        assert!(!low.signed_cap_sufficient);
+        let enough = preflight_bitcoin_recoverable_htlc_funding(
+            &wallet,
+            &BitcoinValueRuntimePermit(()),
+            &publication,
+            1,
+            1_000,
+            &[],
+        )
+        .unwrap();
+        assert!(enough.signed_cap_sufficient);
+        assert_eq!(wallet.balance(), before);
     }
 
     #[test]

@@ -1,11 +1,16 @@
 # hns-wallet-bitcoin-kyoto
 
-## Unreleased
+## 0.4.6 - 2026-10-15
+
+<!-- hns-wallet-release-state: 0.4.6 candidate -->
+This heading describes the current unpublished release candidate, not an
+existing crates.io package, Git tag, or GitHub release.
 
 On a recovery address-window expansion, rematch previously covered compact
 filters only against newly derived wallet scripts. New blocks, reorganizations,
 approved-broadcast recovery, and later sync cycles retain full matching. This
-source change has not been published as a new crate version.
+release also adds a read-only fee quote for the complete Bitcoin swap funding
+package, including recovery publications and the HTLC lock.
 
 ## 0.4.5 - 2026-10-10
 

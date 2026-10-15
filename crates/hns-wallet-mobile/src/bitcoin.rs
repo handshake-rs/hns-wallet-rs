@@ -30,8 +30,8 @@ use hns_wallet_bitcoin_kyoto::{
     load_bitcoin_htlc_watch, load_cached_bitcoin_peers, load_persisted_descriptor_wallet_from_seed,
     monitor_kyoto_sync_progress, persist_bitcoin_recoverable_funding_before,
     persist_prepared_bitcoin_broadcast, persist_prepared_bitcoin_htlc_spend_broadcast,
-    prepare_bitcoin_recoverable_htlc_funding, prepare_native_send_excluding,
-    recommended_initialization_checkpoint,
+    preflight_bitcoin_recoverable_htlc_funding, prepare_bitcoin_recoverable_htlc_funding,
+    prepare_native_send_excluding, recommended_initialization_checkpoint,
     sign_bitcoin_htlc_redeem_at_fee_rate_with_settlement_signer,
     sign_bitcoin_htlc_spend_at_fee_rate_with_settlement_signer,
     unobserved_approved_broadcast_inputs, verify_htlc_funding,
@@ -339,6 +339,15 @@ pub struct MobileBitcoinHtlcFundingApproval {
     pub maximum_fee_sats: u64,
     pub refund_at_unix: u64,
     pub expires_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileBitcoinFundingFeePreflight {
+    pub required_fee_sats: u64,
+    pub fee_rate_sat_vb: u64,
+    pub transaction_count: u32,
+    pub signed_cap_sufficient: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1159,6 +1168,96 @@ impl MobileBitcoinValueController {
         self.require_pending_send_token(action_token)?;
         self.pending_send = None;
         Ok(())
+    }
+
+    /// Estimate every recovery publication and the Bitcoin lock against the
+    /// current confirmed UTXOs before an offer is published or accepted. The
+    /// disposable contract has the exact fixed-size publication shape. It is
+    /// never stored or broadcast; funding still checks the real signed terms.
+    pub fn preflight_shakescape_bitcoin_funding(
+        &self,
+        bitcoin_amount_sats: u64,
+        signed_fee_cap_sats: u64,
+    ) -> Result<MobileBitcoinFundingFeePreflight, MobileWalletError> {
+        if bitcoin_amount_sats == 0 || signed_fee_cap_sats == 0 {
+            return Err(MobileWalletError::InvalidBitcoinAction);
+        }
+        let wallet = self
+            .wallet
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let supervisor = self
+            .supervisor
+            .as_ref()
+            .ok_or(MobileWalletError::BitcoinRuntimeInactive)?;
+        let fee_rate_sat_vb = runtime
+            .block_on(supervisor.minimum_broadcast_fee_rate_sat_vb())?
+            .max(ECONOMICAL_SWAP_FEE_RATE_SAT_VB);
+        let hns_network =
+            hns_wallet_hns::direct_shakescape_network_binding(self.hns_account.network)?;
+        let (counterchain_network, counterchain_genesis) =
+            MobileBitcoinDirectConfig::direct_shakescape_counterchain(self.hns_account.network);
+        let network = hns_marketplace_protocol::NetworkBinding {
+            hns_magic: hns_network.magic,
+            hns_genesis: hns_network.genesis,
+            counterchain: hns_marketplace_protocol::ChainId::BITCOIN,
+            counterchain_network,
+            counterchain_genesis,
+        };
+        let secp = bdk_wallet::bitcoin::secp256k1::Secp256k1::new();
+        let dummy_key = |byte| {
+            bdk_wallet::bitcoin::secp256k1::PublicKey::from_secret_key(
+                &secp,
+                &bdk_wallet::bitcoin::secp256k1::SecretKey::from_slice(&[byte; 32])
+                    .expect("fixed nonzero preflight key"),
+            )
+            .serialize()
+        };
+        let now = now_unix()?;
+        let terms = hns_wallet_chain_api::SwapRecoveryTerms {
+            network,
+            session_id: [1; 32],
+            direct_offer_id: [2; 32],
+            maker_public_key: dummy_key(3),
+            taker_public_key: dummy_key(4),
+            hashlock: [5; 32],
+            offered_asset: hns_marketplace_protocol::AssetId::BTC,
+            offered_amount: bitcoin_amount_sats,
+            received_amount: 1_000_000,
+            offered_refund_at: now
+                .checked_add(20_000)
+                .ok_or(MobileWalletError::InvalidBitcoinAction)?,
+            received_refund_at: now
+                .checked_add(10_000)
+                .ok_or(MobileWalletError::InvalidBitcoinAction)?,
+            offered_minimum_confirmations: 1,
+            received_minimum_confirmations: 2,
+        };
+        let publication = hns_wallet_chain_api::SwapRecoveryPublication::from_terms(
+            terms,
+            hns_marketplace_protocol::SwapAssetSide::Offered,
+        )
+        .map_err(|_| MobileWalletError::InvalidBitcoinAction)?;
+        let reserved = self.unobserved_approved_inputs()?;
+        let quote = preflight_bitcoin_recoverable_htlc_funding(
+            wallet,
+            &bitcoin_value_runtime_permit()?,
+            &publication,
+            fee_rate_sat_vb,
+            signed_fee_cap_sats,
+            &reserved,
+        )?;
+        Ok(MobileBitcoinFundingFeePreflight {
+            required_fee_sats: quote.required_fee_sats,
+            fee_rate_sat_vb: quote.fee_rate_sat_vb,
+            transaction_count: u32::try_from(quote.transaction_count)
+                .map_err(|_| MobileWalletError::InvalidBitcoinAction)?,
+            signed_cap_sufficient: quote.signed_cap_sufficient,
+        })
     }
 
     /// Prepare the exact first-chain Bitcoin HTLC transaction committed by a
