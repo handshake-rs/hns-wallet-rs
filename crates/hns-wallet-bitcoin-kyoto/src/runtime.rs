@@ -1177,7 +1177,7 @@ fn build_wallet_swap_client(
             required_peers: config.required_peers,
             filter_type: 0,
         },
-    ));
+    )?);
     let mut builder = Builder::new(config.network)
         // BDK needs witnesses for its own SegWit transactions, and the swap
         // observer additionally extracts the HTLC redeem preimage from them.
