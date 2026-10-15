@@ -5,7 +5,7 @@ use std::fmt;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bip157::sync_cache::{CachedSyncBatch, SyncCacheContext, SyncCacheKind, VerifiedSyncCache};
-use bitcoin::consensus::{deserialize, serialize};
+use bitcoin::consensus::{deserialize, deserialize_partial, encode::VarInt, serialize};
 use bitcoin::p2p::message_filter::CFilter;
 use hns_wallet_store::{EntityBatchSave, EntityKind, SharedWalletStore, WalletStore};
 use serde::{Deserialize, Serialize};
@@ -323,6 +323,20 @@ fn decode_filters(mut bytes: &[u8]) -> Result<Vec<CFilter>, BitcoinWalletError> 
         let packet = bytes
             .get(..len)
             .ok_or(BitcoinWalletError::CorruptRuntimeState)?;
+        // CFilter ends with a length-prefixed byte vector. The consensus
+        // decoder allocates from that declared length before discovering that
+        // a truncated packet has no such bytes. Validate it against the
+        // authenticated packet boundary first, even for a small cache batch.
+        let encoded_filter = packet
+            .get(33..)
+            .ok_or(BitcoinWalletError::CorruptRuntimeState)?;
+        let (VarInt(filter_len), prefix_len) = deserialize_partial(encoded_filter)
+            .map_err(|_| BitcoinWalletError::CorruptRuntimeState)?;
+        let filter_len =
+            usize::try_from(filter_len).map_err(|_| BitcoinWalletError::CorruptRuntimeState)?;
+        if filter_len != encoded_filter.len().saturating_sub(prefix_len) {
+            return Err(BitcoinWalletError::CorruptRuntimeState);
+        }
         filters.push(deserialize(packet).map_err(|_| BitcoinWalletError::CorruptRuntimeState)?);
         bytes = &bytes[len..];
     }
@@ -514,5 +528,15 @@ mod tests {
         );
         assert!(cache.read(SyncCacheKind::Headers, 0).unwrap().is_none());
         assert!(cache.read(SyncCacheKind::Filters, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn malformed_cached_filter_length_is_rejected_before_allocation() {
+        let mut packet = vec![0; 33];
+        packet.extend(serialize(&VarInt(u64::MAX)));
+        let mut batch = 1_u32.to_le_bytes().to_vec();
+        batch.extend((packet.len() as u32).to_le_bytes());
+        batch.extend(packet);
+        assert!(decode_filters(&batch).is_err());
     }
 }
