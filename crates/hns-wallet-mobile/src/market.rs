@@ -30,7 +30,7 @@ use hns_wallet_market::{
     load_shakescape_direct_swaps, load_shakescape_execution, open_shakescape_execution,
     prune_expired_shakescape_direct_market_state, shakescape_execution_workflow_id,
 };
-use hns_wallet_store::{EntityKind, SharedWalletStore};
+use hns_wallet_store::{EntityBatchDelete, EntityKind, SharedWalletStore, WalletStore};
 use hns_wallet_types::{ModuleId, ObjectHash, TransactionHash, WalletId};
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +44,237 @@ use crate::{MobileShakescapeUnfundedBitcoinProof, MobileWalletError};
 // slow but still live swap is not cut off by its old listing deadline.
 const FUNDING_STATUS_REPLAY_LIFETIME_SECONDS: u64 = 7 * 24 * 60 * 60;
 const AUTOMATIC_SETTLEMENT_GRANT_PREFIX: &[u8] = b"shakescape-auto-settlement-v1\0";
+const OFFER_CANDIDATE_PREFIX: &[u8] = b"shakescape-offer-candidate-v1\0";
+// The mobile execution snapshot has a 16 KiB transport envelope. Keep this
+// inbox bounded so the choice UI remains readable alongside live executions.
+const MAX_LOCAL_OFFER_CANDIDATES: usize = 16;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingOfferCandidate {
+    wallet_id: WalletId,
+    offer_id: [u8; 32],
+    responder_identity: Vec<u8>,
+    acceptance_envelope: Vec<u8>,
+    proposal_envelope: Option<Vec<u8>>,
+    expires_at_unix: u64,
+    received_at_unix: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileDirectOfferCandidateSummary {
+    pub offer_id: String,
+    pub session_id: String,
+    pub responder_identity: String,
+    pub offered_asset: String,
+    pub offered_amount: u64,
+    pub received_asset: String,
+    pub received_amount: u64,
+    pub proposal_expires_at_unix: u64,
+}
+
+fn offer_candidate_prefix(wallet_id: WalletId) -> Vec<u8> {
+    let mut id = OFFER_CANDIDATE_PREFIX.to_vec();
+    id.extend_from_slice(wallet_id.as_bytes());
+    id
+}
+
+fn offer_candidate_id(wallet_id: WalletId, offer_id: [u8; 32], responder: [u8; 33]) -> Vec<u8> {
+    let mut id = offer_candidate_prefix(wallet_id);
+    id.extend_from_slice(&offer_id);
+    id.extend_from_slice(&responder);
+    id
+}
+
+fn pending_offer_candidates(
+    store: &WalletStore,
+    wallet_id: WalletId,
+) -> Result<
+    Vec<hns_wallet_store::StoredEntity<PendingOfferCandidate>>,
+    hns_wallet_market::MarketError,
+> {
+    let rows = store.list_entities_by_id_prefix::<PendingOfferCandidate>(
+        EntityKind::ShakescapeBoardObject,
+        &offer_candidate_prefix(wallet_id),
+        MAX_LOCAL_OFFER_CANDIDATES + 1,
+    )?;
+    if rows.len() > MAX_LOCAL_OFFER_CANDIDATES {
+        return Err(hns_wallet_market::MarketError::ShakescapeDirectSwapCapacity);
+    }
+    Ok(rows)
+}
+
+fn prune_pending_offer_candidates(
+    store: &mut WalletStore,
+    wallet_id: WalletId,
+    now_unix: u64,
+) -> Result<(), hns_wallet_market::MarketError> {
+    let rows = pending_offer_candidates(store, wallet_id)?;
+    let deletes = rows
+        .into_iter()
+        .filter(|row| row.value.expires_at_unix <= now_unix)
+        .map(|row| {
+            (
+                EntityKind::ShakescapeBoardObject,
+                EntityBatchDelete {
+                    id: row.id,
+                    expected_revision: row.revision,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if !deletes.is_empty() {
+        store.delete_entities(&deletes)?;
+    }
+    Ok(())
+}
+
+fn stage_offer_acceptance(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    acceptance: &hns_marketplace_protocol::DirectOfferAcceptance,
+    envelope: &[u8],
+    now_unix: u64,
+) -> Result<(), hns_wallet_market::MarketError> {
+    let offer = load_shakescape_direct_offer(store, &policy.board_policy(), acceptance.offer_id)?
+        .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectOffer)?;
+    if !offer.is_active_at(now_unix)
+        || !is_local_shakescape_direct_offer_setter(
+            store,
+            wallet_id,
+            ObjectHash::new(acceptance.offer_id),
+        )?
+    {
+        return Err(hns_wallet_market::MarketError::InvalidShakescapePeerMessage);
+    }
+    acceptance
+        .verify_for_offer(&offer.offer, policy.network(), now_unix)
+        .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapePeerMessage)?;
+    if let Some(selected) = load_shakescape_direct_swap(
+        store,
+        policy,
+        hns_wallet_types::SessionId::new(acceptance.swap_session_id),
+    )? {
+        return if selected.acceptance == *acceptance {
+            Ok(())
+        } else {
+            Err(hns_wallet_market::MarketError::ShakescapeDirectSwapConflict)
+        };
+    }
+    prune_pending_offer_candidates(store, wallet_id, now_unix)?;
+    let id = offer_candidate_id(
+        wallet_id,
+        acceptance.offer_id,
+        acceptance.header.signer_public_key,
+    );
+    if let Some(existing) =
+        store.load_entity::<PendingOfferCandidate>(EntityKind::ShakescapeBoardObject, &id)?
+    {
+        let candidate = existing.value;
+        let (_, CrossChainMessage::AcceptDirectOffer(previous)) =
+            CrossChainMessage::decode_envelope(&candidate.acceptance_envelope)
+                .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
+        else {
+            return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+        };
+        if candidate.wallet_id != wallet_id
+            || candidate.offer_id != acceptance.offer_id
+            || candidate.responder_identity.as_slice() != acceptance.header.signer_public_key
+            || previous != *acceptance
+        {
+            return Err(hns_wallet_market::MarketError::ShakescapeDirectSwapConflict);
+        }
+        return Ok(());
+    }
+    let rows = pending_offer_candidates(store, wallet_id)?;
+    if rows.len() >= MAX_LOCAL_OFFER_CANDIDATES {
+        // These are unselected, nonfunding messages. Eviction must never
+        // displace a countersigned execution or permanently close the inbox.
+        let oldest = rows
+            .into_iter()
+            .min_by_key(|row| row.value.received_at_unix)
+            .ok_or(hns_wallet_market::MarketError::ShakescapeDirectSwapCapacity)?;
+        store.delete_entities(&[(
+            EntityKind::ShakescapeBoardObject,
+            EntityBatchDelete {
+                id: oldest.id,
+                expected_revision: oldest.revision,
+            },
+        )])?;
+    }
+    store.save_entity(
+        EntityKind::ShakescapeBoardObject,
+        &id,
+        0,
+        &PendingOfferCandidate {
+            wallet_id,
+            offer_id: acceptance.offer_id,
+            responder_identity: acceptance.header.signer_public_key.to_vec(),
+            acceptance_envelope: envelope.to_vec(),
+            proposal_envelope: None,
+            expires_at_unix: acceptance.header.expires_at,
+            received_at_unix: now_unix,
+        },
+        now_unix,
+    )?;
+    Ok(())
+}
+
+fn stage_offer_proposal(
+    store: &mut WalletStore,
+    policy: &ShakescapeDirectSwapPolicy,
+    wallet_id: WalletId,
+    proposal: &hns_marketplace_protocol::SwapSessionProposal,
+    envelope: &[u8],
+    now_unix: u64,
+) -> Result<(), hns_wallet_market::MarketError> {
+    let terms = proposal.terms();
+    let id = offer_candidate_id(
+        wallet_id,
+        terms.direct_offer_id,
+        terms.header.signer_public_key,
+    );
+    let stored = store
+        .load_entity::<PendingOfferCandidate>(EntityKind::ShakescapeBoardObject, &id)?
+        .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?;
+    let mut candidate = stored.value;
+    let (_, CrossChainMessage::AcceptDirectOffer(acceptance)) =
+        CrossChainMessage::decode_envelope(&candidate.acceptance_envelope)
+            .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
+    else {
+        return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+    };
+    let offer = load_shakescape_direct_offer(store, &policy.board_policy(), candidate.offer_id)?
+        .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectOffer)?;
+    proposal
+        .verify_for_direct_offer(&offer.offer, &acceptance, policy.network(), now_unix)
+        .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapePeerMessage)?;
+    if let Some(existing) = &candidate.proposal_envelope {
+        let (_, CrossChainMessage::SwapSessionProposal(previous)) =
+            CrossChainMessage::decode_envelope(existing)
+                .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
+        else {
+            return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+        };
+        if previous == *proposal {
+            return Ok(());
+        }
+        if previous.terms().header.expires_at > now_unix {
+            return Err(hns_wallet_market::MarketError::ShakescapeDirectSwapConflict);
+        }
+    }
+    candidate.proposal_envelope = Some(envelope.to_vec());
+    store.save_entity(
+        EntityKind::ShakescapeBoardObject,
+        &id,
+        stored.revision,
+        &candidate,
+        now_unix,
+    )?;
+    Ok(())
+}
 
 /// Wallet-local consent retained only after this participant approved and
 /// submitted its exact funding transaction. It authorizes one later redeem or
@@ -2486,6 +2717,194 @@ impl MobileShakescapeSessionController {
             })
     }
 
+    /// Complete, signed responses to this wallet's offers. Listing a response
+    /// never selects it or creates an executable swap.
+    pub fn pending_direct_offer_candidates(
+        &self,
+        now_unix: u64,
+    ) -> Result<Vec<MobileDirectOfferCandidateSummary>, MobileWalletError> {
+        let candidates = self
+            .store
+            .try_with_store(|store| {
+                let mut summaries = Vec::new();
+                for row in pending_offer_candidates(store, self.wallet_id)? {
+                    let candidate = row.value;
+                    if candidate.wallet_id != self.wallet_id
+                        || candidate.expires_at_unix <= now_unix
+                    {
+                        continue;
+                    }
+                    let Some(proposal_envelope) = candidate.proposal_envelope else {
+                        continue;
+                    };
+                    let Some(offer) = load_shakescape_direct_offer(
+                        store,
+                        &self.policy.board_policy(),
+                        candidate.offer_id,
+                    )?
+                    else {
+                        continue;
+                    };
+                    if !offer.is_active_at(now_unix)
+                        || load_shakescape_direct_swap(
+                            store,
+                            &self.policy,
+                            hns_wallet_types::SessionId::new(offer.offer.swap_session_id),
+                        )?
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let (_, CrossChainMessage::AcceptDirectOffer(acceptance)) =
+                        CrossChainMessage::decode_envelope(&candidate.acceptance_envelope)
+                            .map_err(|_| {
+                                hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
+                            })?
+                    else {
+                        return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+                    };
+                    let (_, CrossChainMessage::SwapSessionProposal(proposal)) =
+                        CrossChainMessage::decode_envelope(&proposal_envelope).map_err(|_| {
+                            hns_wallet_market::MarketError::CorruptShakescapeDirectSwap
+                        })?
+                    else {
+                        return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+                    };
+                    if proposal
+                        .verify_for_direct_offer(
+                            &offer.offer,
+                            &acceptance,
+                            self.policy.network(),
+                            now_unix,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    summaries.push(MobileDirectOfferCandidateSummary {
+                        offer_id: crate::lowercase_hex(&candidate.offer_id),
+                        session_id: crate::lowercase_hex(&offer.offer.swap_session_id),
+                        responder_identity: crate::lowercase_hex(&candidate.responder_identity),
+                        offered_asset: asset_name(offer.offer.offered_asset).to_owned(),
+                        offered_amount: u64::try_from(offer.offer.offered_amount.get()).map_err(
+                            |_| hns_wallet_market::MarketError::InvalidShakescapeDirectOffer,
+                        )?,
+                        received_asset: asset_name(offer.offer.received_asset).to_owned(),
+                        received_amount: u64::try_from(offer.offer.received_amount.get()).map_err(
+                            |_| hns_wallet_market::MarketError::InvalidShakescapeDirectOffer,
+                        )?,
+                        proposal_expires_at_unix: proposal.terms().header.expires_at,
+                    });
+                }
+                summaries.sort_by(|a, b| {
+                    b.proposal_expires_at_unix
+                        .cmp(&a.proposal_expires_at_unix)
+                        .then_with(|| a.responder_identity.cmp(&b.responder_identity))
+                });
+                Ok::<_, hns_wallet_market::MarketError>(summaries)
+            })
+            .map_err(MobileWalletError::from)?;
+        Ok(candidates)
+    }
+
+    /// The publisher explicitly chooses one responder. Only here is its
+    /// acceptance promoted into the one durable swap session and countersigned.
+    pub fn choose_direct_offer_candidate(
+        &self,
+        offer_id: &str,
+        responder_identity: &str,
+        peer: &mut HnsDirectShakescapePeer,
+        now_unix: u64,
+    ) -> Result<(), MobileWalletError> {
+        let offer_id = decode_offer_id(offer_id)?;
+        let responder_identity = decode_responder_identity(responder_identity)?;
+        let accepted = self
+            .store
+            .try_with_store_mut(|store| {
+                let id = offer_candidate_id(self.wallet_id, offer_id, responder_identity);
+                let candidate = store
+                    .load_entity::<PendingOfferCandidate>(EntityKind::ShakescapeBoardObject, &id)?
+                    .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap)?
+                    .value;
+                if candidate.wallet_id != self.wallet_id
+                    || candidate.offer_id != offer_id
+                    || candidate.responder_identity.as_slice() != responder_identity
+                    || candidate.expires_at_unix <= now_unix
+                {
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
+                }
+                let proposal = candidate
+                    .proposal_envelope
+                    .ok_or(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+                let (_, CrossChainMessage::AcceptDirectOffer(acceptance)) =
+                    CrossChainMessage::decode_envelope(&candidate.acceptance_envelope)
+                        .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
+                else {
+                    return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+                };
+                let (_, CrossChainMessage::SwapSessionProposal(terms)) =
+                    CrossChainMessage::decode_envelope(&proposal)
+                        .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
+                else {
+                    return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+                };
+                let offer =
+                    load_shakescape_direct_offer(store, &self.policy.board_policy(), offer_id)?
+                        .ok_or(hns_wallet_market::MarketError::UnknownShakescapeDirectOffer)?;
+                if !offer.is_active_at(now_unix) {
+                    return Err(hns_wallet_market::MarketError::InvalidShakescapeDirectSwap);
+                }
+                terms
+                    .verify_for_direct_offer(
+                        &offer.offer,
+                        &acceptance,
+                        self.policy.network(),
+                        now_unix,
+                    )
+                    .map_err(|_| hns_wallet_market::MarketError::InvalidShakescapeDirectSwap)?;
+                admit_shakescape_direct_offer_acceptance(
+                    store,
+                    &self.policy,
+                    &candidate.acceptance_envelope,
+                    now_unix,
+                )?;
+                admit_shakescape_direct_swap_proposal(store, &self.policy, &proposal, now_unix)?;
+                accept_shakescape_direct_maker_proposal(
+                    store,
+                    &self.policy,
+                    self.wallet_id,
+                    hns_wallet_types::SessionId::new(acceptance.swap_session_id),
+                    now_unix,
+                )
+            })
+            .map_err(MobileWalletError::from)?;
+        // Once the hello is signed, an interrupted send cannot undo the
+        // durable choice. Ordinary handshake reconciliation resends it.
+        let _ = peer.send_cross_chain_envelope(&accepted.envelope);
+        // Cleanup is opportunistic. A failed deletion must not turn the
+        // already-countersigned execution into an apparent choice failure.
+        let _ = self.store.try_with_store_mut(|store| {
+            let deletes = pending_offer_candidates(store, self.wallet_id)?
+                .into_iter()
+                .filter(|row| row.value.offer_id == offer_id)
+                .map(|row| {
+                    (
+                        EntityKind::ShakescapeBoardObject,
+                        EntityBatchDelete {
+                            id: row.id,
+                            expected_revision: row.revision,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !deletes.is_empty() {
+                store.delete_entities(&deletes)?;
+            }
+            Ok::<_, hns_wallet_market::MarketError>(())
+        });
+        Ok(())
+    }
+
     /// Durably abandon one pre-execution acceptance and release its reserved
     /// funds. Terms-frozen/funded swaps are rejected by the market layer.
     pub fn abandon_pending_direct_offer_acceptance(
@@ -4777,31 +5196,38 @@ impl MobileShakescapeSessionController {
                         })
                     }
                     CrossChainMessage::AcceptDirectOffer(acceptance) => {
-                        if !is_local_shakescape_direct_offer_setter(
+                        stage_offer_acceptance(
                             store,
+                            &self.policy,
                             self.wallet_id,
-                            hns_wallet_types::ObjectHash::new(acceptance.offer_id),
-                        )? {
-                            return Err(
-                                hns_wallet_market::MarketError::InvalidShakescapePeerMessage,
-                            );
-                        }
-                        admit_shakescape_direct_offer_acceptance(
-                            store,
-                            &self.policy,
+                            &acceptance,
                             envelope,
                             now_unix,
-                        )
-                        .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
+                        )?;
+                        Ok(None)
                     }
-                    CrossChainMessage::SwapSessionProposal(_) => {
-                        admit_shakescape_direct_swap_proposal(
-                            store,
-                            &self.policy,
-                            envelope,
-                            now_unix,
-                        )
-                        .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
+                    CrossChainMessage::SwapSessionProposal(proposal) => {
+                        let session_id =
+                            hns_wallet_types::SessionId::new(proposal.terms().swap_session_id);
+                        if load_shakescape_direct_swap(store, &self.policy, session_id)?.is_some() {
+                            admit_shakescape_direct_swap_proposal(
+                                store,
+                                &self.policy,
+                                envelope,
+                                now_unix,
+                            )
+                            .map(|admission| Some(MobileShakescapeDirectAdmission::Swap(admission)))
+                        } else {
+                            stage_offer_proposal(
+                                store,
+                                &self.policy,
+                                self.wallet_id,
+                                &proposal,
+                                envelope,
+                                now_unix,
+                            )?;
+                            Ok(None)
+                        }
                     }
                     CrossChainMessage::SwapSessionHello(hello) => {
                         let admission = admit_shakescape_direct_swap_hello(
@@ -5206,29 +5632,8 @@ impl MobileShakescapeSessionController {
             CrossChainMessage::AcceptDirectOffer(_) => {
                 report.admission = self.admit_direct_envelope(envelope, now_unix)?;
             }
-            CrossChainMessage::SwapSessionProposal(ref proposal) => {
+            CrossChainMessage::SwapSessionProposal(_) => {
                 report.admission = self.admit_direct_envelope(envelope, now_unix)?;
-                let session_id = hns_wallet_types::SessionId::new(proposal.terms().swap_session_id);
-                let accepted = self.store.try_with_store_mut(|store| {
-                    accept_shakescape_direct_maker_proposal(
-                        store,
-                        &self.policy,
-                        self.wallet_id,
-                        session_id,
-                        now_unix,
-                    )
-                });
-                match accepted {
-                    Ok(accepted) => {
-                        let (response_id, response) =
-                            CrossChainMessage::decode_envelope(&accepted.envelope)
-                                .map_err(|_| MobileWalletError::InvalidShakescapeSessionMessage)?;
-                        peer.send_cross_chain_message_with_request_id(response_id, &response)?;
-                        report.messages_sent = report.messages_sent.saturating_add(1);
-                    }
-                    Err(hns_wallet_market::MarketError::UnknownShakescapeDirectSwap) => {}
-                    Err(error) => return Err(MobileWalletError::from(error)),
-                }
             }
             CrossChainMessage::SwapSessionHello(_)
             | CrossChainMessage::SwapFundingStatus(_)
@@ -5481,6 +5886,29 @@ fn decode_offer_id(encoded: &str) -> Result<[u8; 32], MobileWalletError> {
         return Err(MobileWalletError::InvalidDirectOfferAction);
     }
     Ok(offer_id)
+}
+
+fn decode_responder_identity(encoded: &str) -> Result<[u8; 33], MobileWalletError> {
+    if encoded.len() != 66
+        || !encoded
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(MobileWalletError::InvalidDirectOfferAction);
+    }
+    let mut identity = [0_u8; 33];
+    for (index, pair) in encoded.as_bytes().chunks_exact(2).enumerate() {
+        let nibble = |byte| match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            _ => 0,
+        };
+        identity[index] = (nibble(pair[0]) << 4) | nibble(pair[1]);
+    }
+    if !matches!(identity[0], 2 | 3) {
+        return Err(MobileWalletError::InvalidDirectOfferAction);
+    }
+    Ok(identity)
 }
 
 #[cfg(test)]
@@ -6292,6 +6720,166 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(restarted.durable_executions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn two_offer_responses_remain_unselected_until_publisher_chooses() {
+        let policy = policy();
+        let publisher_id = WalletId::new([0x91; 16]);
+        let mut publisher = seeded_store(publisher_id, 0x92);
+        let offer = create_shakescape_hns_for_btc_offer(
+            &mut publisher,
+            &policy.board_policy(),
+            ShakescapeHnsForBtcOfferRequest {
+                wallet_id: publisher_id,
+                hns_amount_dollarydoos: 2_000_000,
+                btc_amount_sats: 9_000,
+                hns_fee_reserve_dollarydoos: 100_000,
+                created_at_unix: START,
+                expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
+                nonce: [0x93; 32],
+            },
+        )
+        .unwrap();
+        let signed_offer = load_shakescape_direct_offer(
+            &publisher,
+            &policy.board_policy(),
+            offer.offer.offer_id.into_bytes(),
+        )
+        .unwrap()
+        .unwrap()
+        .offer;
+        let offer_envelope = CrossChainMessage::DirectOffer(signed_offer)
+            .encode_envelope(1)
+            .unwrap();
+        let mut first_envelope = None;
+        for (index, seed) in [(0x94_u8, 0x95_u8), (0x96, 0x97)] {
+            let responder_id = WalletId::new([index; 16]);
+            let mut responder = seeded_store(responder_id, seed);
+            admit_shakescape_direct_offer(
+                &mut responder,
+                &policy.board_policy(),
+                &offer_envelope,
+                START,
+            )
+            .unwrap();
+            let acceptance = create_shakescape_btc_for_hns_offer_acceptance(
+                &mut responder,
+                &policy,
+                ShakescapeBtcForHnsOfferAcceptanceRequest {
+                    wallet_id: responder_id,
+                    offer_id: offer.offer.offer_id,
+                    bitcoin_fee_reserve_sats: 1_000,
+                    created_at_unix: START + 10,
+                    expires_at_unix: START + MIN_DIRECT_OFFER_LIFETIME_SECONDS,
+                    nonce: [index; 32],
+                },
+            )
+            .unwrap();
+            let (_, CrossChainMessage::AcceptDirectOffer(signed_acceptance)) =
+                CrossChainMessage::decode_envelope(&acceptance.envelope).unwrap()
+            else {
+                panic!("signed acceptance");
+            };
+            stage_offer_acceptance(
+                &mut publisher,
+                &policy,
+                publisher_id,
+                &signed_acceptance,
+                &acceptance.envelope,
+                START + 10,
+            )
+            .unwrap();
+            let replayed_acceptance =
+                CrossChainMessage::AcceptDirectOffer(signed_acceptance.clone())
+                    .encode_envelope(700 + u64::from(index))
+                    .unwrap();
+            stage_offer_acceptance(
+                &mut publisher,
+                &policy,
+                publisher_id,
+                &signed_acceptance,
+                &replayed_acceptance,
+                START + 11,
+            )
+            .unwrap();
+            let proposal = create_shakescape_btc_for_hns_maker_proposal(
+                &mut responder,
+                &policy,
+                ShakescapeBtcForHnsMakerProposalRequest {
+                    wallet_id: responder_id,
+                    session_id: offer.offer.session_id,
+                    now_unix: START + 20,
+                    funding_window_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                    second_refund_after_seconds: 2 * DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                    refund_safety_margin_seconds: DIRECT_SWAP_FUNDING_WINDOW_SECONDS,
+                    bitcoin_minimum_confirmations: 1,
+                    hns_minimum_confirmations: 2,
+                },
+            )
+            .unwrap();
+            stage_offer_proposal(
+                &mut publisher,
+                &policy,
+                publisher_id,
+                &proposal.proposal,
+                &proposal.envelope,
+                START + 20,
+            )
+            .unwrap();
+            let replayed_proposal =
+                CrossChainMessage::SwapSessionProposal(proposal.proposal.clone())
+                    .encode_envelope(800 + u64::from(index))
+                    .unwrap();
+            stage_offer_proposal(
+                &mut publisher,
+                &policy,
+                publisher_id,
+                &proposal.proposal,
+                &replayed_proposal,
+                START + 21,
+            )
+            .unwrap();
+            first_envelope.get_or_insert((acceptance.envelope, proposal.envelope));
+        }
+        assert!(
+            load_shakescape_direct_swap(&publisher, &policy, offer.offer.session_id)
+                .unwrap()
+                .is_none()
+        );
+        let shared = SharedWalletStore::new(publisher);
+        let controller =
+            MobileShakescapeSessionController::new(shared.clone(), policy, publisher_id);
+        assert_eq!(
+            controller
+                .pending_direct_offer_candidates(START + 21)
+                .unwrap()
+                .len(),
+            2
+        );
+        let restarted =
+            MobileShakescapeSessionController::new(shared.clone(), policy, publisher_id);
+        assert_eq!(
+            restarted
+                .pending_direct_offer_candidates(START + 21)
+                .unwrap()
+                .len(),
+            2
+        );
+        let (acceptance, proposal) = first_envelope.unwrap();
+        shared
+            .try_with_store_mut(|store| {
+                admit_shakescape_direct_offer_acceptance(store, &policy, &acceptance, START + 21)?;
+                admit_shakescape_direct_swap_proposal(store, &policy, &proposal, START + 21)?;
+                Ok::<_, hns_wallet_market::MarketError>(())
+            })
+            .unwrap();
+        assert!(
+            restarted
+                .pending_direct_offer_candidates(START + 21)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1,5 +1,14 @@
 # hns-wallet-mobile
 
+## 0.6.2 - 2026-10-16
+
+<!-- hns-wallet-release-state: 0.6.2 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Keep signed direct-offer responses in a bounded durable inbox. The offer
+publisher explicitly selects one responder before the wallet countersigns
+swap terms or opens an execution.
+
 ## 0.6.1 - 2026-10-15
 
 <!-- hns-wallet-release-state: 0.6.1 release -->

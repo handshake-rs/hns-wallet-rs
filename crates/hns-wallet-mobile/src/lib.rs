@@ -23,16 +23,16 @@ pub use hns_wallet_bitcoin_kyoto::{
 pub use market::{
     MINIMUM_BITCOIN_FEE_RESERVE_SATS, MobileAutomaticSettlementPermission,
     MobileBtcForHnsOfferApproval, MobileBtcForHnsOfferSummary, MobileDirectOfferAcceptanceApproval,
-    MobileDirectOfferAcceptanceSummary, MobileDirectOfferSummary, MobileHnsForBtcOfferApproval,
-    MobileShakescapeBitcoinAbsencePermit, MobileShakescapeBitcoinFundingPermit,
-    MobileShakescapeBitcoinSettlementPermit, MobileShakescapeBitcoinWatchPermit,
-    MobileShakescapeDirectAdmission, MobileShakescapeDirectInventoryReport,
-    MobileShakescapeDirectMessageKind, MobileShakescapeDirectTransportReport,
-    MobileShakescapeExecutionSummary, MobileShakescapeFirstFundingObservation,
-    MobileShakescapeHnsFundingPermit, MobileShakescapeHnsSettlementPermit,
-    MobileShakescapeHnsVerificationPermit, MobileShakescapeHnsWatchPermit,
-    MobileShakescapeSessionController, MobileShakescapeSettlementAction,
-    MobileShakescapeUnfundedHnsProof,
+    MobileDirectOfferAcceptanceSummary, MobileDirectOfferCandidateSummary,
+    MobileDirectOfferSummary, MobileHnsForBtcOfferApproval, MobileShakescapeBitcoinAbsencePermit,
+    MobileShakescapeBitcoinFundingPermit, MobileShakescapeBitcoinSettlementPermit,
+    MobileShakescapeBitcoinWatchPermit, MobileShakescapeDirectAdmission,
+    MobileShakescapeDirectInventoryReport, MobileShakescapeDirectMessageKind,
+    MobileShakescapeDirectTransportReport, MobileShakescapeExecutionSummary,
+    MobileShakescapeFirstFundingObservation, MobileShakescapeHnsFundingPermit,
+    MobileShakescapeHnsSettlementPermit, MobileShakescapeHnsVerificationPermit,
+    MobileShakescapeHnsWatchPermit, MobileShakescapeSessionController,
+    MobileShakescapeSettlementAction, MobileShakescapeUnfundedHnsProof,
 };
 
 use hns_wallet_chain_api::{PreparedArtifact, PreparedSettlementLock};
