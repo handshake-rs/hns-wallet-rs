@@ -2,9 +2,8 @@
 
 ## 0.4.6 - 2026-10-15
 
-<!-- hns-wallet-release-state: 0.4.6 candidate -->
-This heading describes the current unpublished release candidate, not an
-existing crates.io package, Git tag, or GitHub release.
+<!-- hns-wallet-release-state: 0.4.6 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
 
 On a recovery address-window expansion, rematch previously covered compact
 filters only against newly derived wallet scripts. New blocks, reorganizations,

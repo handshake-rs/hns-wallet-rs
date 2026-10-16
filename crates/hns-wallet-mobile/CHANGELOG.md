@@ -2,9 +2,8 @@
 
 ## 0.6.1 - 2026-10-15
 
-<!-- hns-wallet-release-state: 0.6.1 candidate -->
-This heading describes the current unpublished release candidate, not an
-existing crates.io package, Git tag, or GitHub release.
+<!-- hns-wallet-release-state: 0.6.1 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
 
 Expose a read-only Bitcoin swap funding fee preflight using the current
 confirmed wallet inputs and observed fee rate before direct offers are approved.
