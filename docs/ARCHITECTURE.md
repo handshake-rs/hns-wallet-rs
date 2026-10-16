@@ -358,15 +358,16 @@ rollback fail closed, and recovery recomputes the public key before exposing
 the non-serializable, zeroizing secret handle. The role-aware HTLC constructor
 accepts that handle rather than a deserializable public record.
 
-This is an allocation primitive, not a value-path integration. The settlement
-layer must construct the opaque commitment from its complete canonical terms
-and must never recycle a session ID. A whole encrypted-database rollback cannot
-be detected solely by records inside that database; session-bound derivation
-prevents cross-session key reuse, but recovery of already active swaps still
-requires a current encrypted database backup. The byte-level scheme and
-persistence boundary are documented in [BITCOIN_KYOTO.md](BITCOIN_KYOTO.md).
-Signed-spend supervision and complete restart/reorg qualification remain
-release blockers.
+This Bitcoin key namespace is a lower-level allocation primitive. Direct
+Shakescape settlement uses a separate seed-derived key bound to the public
+session ID, participant role, and network. Its funding transactions commit
+chain-visible recovery terms, so a fresh wallet restored from the same phrase
+can discover a funded contract and reconstruct a refund after scanning from
+before the funding height. The original encrypted database remains necessary
+to continue the exact peer session and pending broadcast journal. Both the
+normal and restored paths verify the current chain lock, spend state, and
+refund maturity before signing. The byte-level Bitcoin key scheme is
+documented in [BITCOIN_KYOTO.md](BITCOIN_KYOTO.md).
 
 The Kyoto module starts from an explicit validated birthday, persists a
 sequence/phase transition before sync, commits each returned update to a

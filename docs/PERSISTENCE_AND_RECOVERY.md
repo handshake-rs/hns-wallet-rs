@@ -631,13 +631,18 @@ commitment and public-key matches before returning the zeroizing in-memory
 secret handle. Counter, reference, record-kind, revision, time, or terms
 mismatch fails closed.
 
-The allocation-specific KDF additionally binds wallet ID, session ID, and terms
-commitment, so a stale or copied counter cannot reuse a key for a different
-logical swap. A full database snapshot rollback cannot be detected solely from
-inside the rolled-back database and can still lose an active binding or choose
-a different numeric reference. Session IDs must never be recycled, and a
-current encrypted database backup is required to recover already active swaps;
-the mnemonic alone is not an allocation journal.
+This allocation namespace is distinct from the direct Shakescape settlement
+keys. Direct settlement keys derive from the recovery seed, public session ID,
+participant role, and network; the wallet profile ID only locates records in
+the local store. Direct funding publishes authenticated contract terms in
+transactions chained to the funded output. After a seed-only restore and a
+complete scan from the wallet's earliest activity, the app can rediscover a
+funded contract, reconstruct its refund key, and request a refund once the
+chain verifies the lock and its timeout. The encrypted database is still
+needed to continue the exact peer conversation and its pending broadcast
+journal. A full database rollback cannot be detected solely from records
+inside that database, so fresh chain verification remains necessary before
+any settlement spend.
 
 A sync records `synchronizing`, authenticates matched HTLC blocks against the
 same locally validated Kyoto checkpoint, commits swap observations, applies

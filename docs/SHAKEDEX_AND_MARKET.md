@@ -446,5 +446,13 @@ required confirmation evidence, preserving time for preimage observation and
 first-chain redemption. Peer status cannot prove funding, redemption, or
 refund; every value transition requires independently verified local chain
 evidence. HNS/BTC uses SHA-256 native HTLCs on both chains. Installed-product
-transport, recovery, reorg, and live-network qualification remain separate
-release requirements.
+transport and live-network qualification have their own release checks.
+
+Funding publishes the signed public contract terms in ancestor transactions
+committed by the final HTLC transaction. A wallet restored from its recovery
+phrase can scan the relevant chain history, identify a seed-owned funded
+contract, and derive its refund key without the original peer or local swap
+journal. A refund still requires the exact unspent lock, sufficient verified
+confirmations, and a mature chain timeout. The encrypted database is needed
+to continue the same live peer conversation or retry an approved transaction
+that has not appeared on chain.
