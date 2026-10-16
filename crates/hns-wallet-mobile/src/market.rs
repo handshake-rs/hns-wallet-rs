@@ -190,10 +190,21 @@ fn stage_offer_acceptance(
     }
     let rows = pending_offer_candidates(store, wallet_id)?;
     if rows.len() >= MAX_LOCAL_OFFER_CANDIDATES {
-        // These are unselected, nonfunding messages. Eviction must never
-        // displace a countersigned execution or permanently close the inbox.
+        // Inbox entries have not authorized funding. Eviction must never
+        // displace a choice whose signed hello
+        // has not yet been persisted. A different offer can fill the inbox
+        // while the publisher is resuming that interrupted choice.
+        let selected = load_shakescape_direct_swaps(store, policy)?;
         let oldest = rows
             .into_iter()
+            .filter(|row| {
+                !selected.iter().any(|record| {
+                    record.hello.is_none()
+                        && record.offer.offer_id == row.value.offer_id
+                        && record.acceptance.header.signer_public_key.as_slice()
+                            == row.value.responder_identity.as_slice()
+                })
+            })
             .min_by_key(|row| row.value.received_at_unix)
             .ok_or(hns_wallet_market::MarketError::ShakescapeDirectSwapCapacity)?;
         store.delete_entities(&[(
@@ -276,9 +287,9 @@ fn stage_offer_proposal(
     Ok(())
 }
 
-/// Wallet-local consent retained only after this participant approved and
-/// submitted its exact funding transaction. It authorizes one later redeem or
-/// refund of this same session; native settlement permits still verify chain
+/// Wallet-local consent retained when this participant explicitly approves
+/// funding, before submitting its transaction. It authorizes one later redeem
+/// or refund of this same session; native settlement permits still verify chain
 /// evidence, keys, destination, and branch before signing.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1812,8 +1823,8 @@ impl MobileShakescapeSessionController {
             .map_err(MobileWalletError::from)
     }
 
-    /// Retain the user's one-swap consent after the first local funding
-    /// transaction was explicitly approved and submitted. This grant lives in
+    /// Retain the user's one-swap consent after the funding action is explicitly
+    /// approved and before its transaction is submitted. This grant lives in
     /// the encrypted wallet database and cannot authorize a new funding lock.
     pub fn retain_automatic_settlement_approval(
         &self,
@@ -2745,14 +2756,7 @@ impl MobileShakescapeSessionController {
                     else {
                         continue;
                     };
-                    if !offer.is_active_at(now_unix)
-                        || load_shakescape_direct_swap(
-                            store,
-                            &self.policy,
-                            hns_wallet_types::SessionId::new(offer.offer.swap_session_id),
-                        )?
-                        .is_some()
-                    {
+                    if !offer.is_active_at(now_unix) {
                         continue;
                     }
                     let (_, CrossChainMessage::AcceptDirectOffer(acceptance)) =
@@ -2779,6 +2783,26 @@ impl MobileShakescapeSessionController {
                         )
                         .is_err()
                     {
+                        continue;
+                    }
+                    // Admission of the chosen acceptance and proposal uses
+                    // separate durable writes. A restart between those writes
+                    // and the signed hello must leave that same choice
+                    // visible so the publisher can resume it. Once a hello
+                    // exists the execution owns the session instead.
+                    let selected = load_shakescape_direct_swap(
+                        store,
+                        &self.policy,
+                        hns_wallet_types::SessionId::new(offer.offer.swap_session_id),
+                    )?;
+                    if selected.as_ref().is_some_and(|selected| {
+                        selected.hello.is_some()
+                            || selected.acceptance != acceptance
+                            || selected
+                                .proposal
+                                .as_ref()
+                                .is_some_and(|current| current != &proposal)
+                    }) {
                         continue;
                     }
                     summaries.push(MobileDirectOfferCandidateSummary {
@@ -6726,7 +6750,23 @@ mod tests {
     fn two_offer_responses_remain_unselected_until_publisher_chooses() {
         let policy = policy();
         let publisher_id = WalletId::new([0x91; 16]);
-        let mut publisher = seeded_store(publisher_id, 0x92);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("publisher.sqlite");
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            directory.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
+        let mut publisher = WalletStore::create(&path, PASSPHRASE).unwrap();
+        publisher
+            .put_secret(
+                publisher_id.as_bytes(),
+                SecretKind::RecoverySeed,
+                &[0x92; RECOVERY_SEED_BYTES],
+                1,
+            )
+            .unwrap();
         let offer = create_shakescape_hns_for_btc_offer(
             &mut publisher,
             &policy.board_policy(),
@@ -6857,6 +6897,11 @@ mod tests {
                 .len(),
             2
         );
+        drop(controller);
+        drop(shared);
+        let mut reopened = WalletStore::open(&path).unwrap();
+        reopened.unlock(PASSPHRASE).unwrap();
+        let shared = SharedWalletStore::new(reopened);
         let restarted =
             MobileShakescapeSessionController::new(shared.clone(), policy, publisher_id);
         assert_eq!(
@@ -6867,18 +6912,95 @@ mod tests {
             2
         );
         let (acceptance, proposal) = first_envelope.unwrap();
+        let (_, CrossChainMessage::AcceptDirectOffer(selected_acceptance)) =
+            CrossChainMessage::decode_envelope(&acceptance).unwrap()
+        else {
+            panic!("signed acceptance");
+        };
         shared
             .try_with_store_mut(|store| {
                 admit_shakescape_direct_offer_acceptance(store, &policy, &acceptance, START + 21)?;
+                Ok::<_, hns_wallet_market::MarketError>(())
+            })
+            .unwrap();
+        let remaining = restarted
+            .pending_direct_offer_candidates(START + 21)
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].responder_identity,
+            crate::lowercase_hex(&selected_acceptance.header.signer_public_key)
+        );
+        drop(restarted);
+        drop(shared);
+        let mut reopened = WalletStore::open(&path).unwrap();
+        reopened.unlock(PASSPHRASE).unwrap();
+        let shared = SharedWalletStore::new(reopened);
+        let restarted =
+            MobileShakescapeSessionController::new(shared.clone(), policy, publisher_id);
+        assert_eq!(
+            restarted
+                .pending_direct_offer_candidates(START + 21)
+                .unwrap()
+                .len(),
+            1
+        );
+        shared
+            .try_with_store_mut(|store| {
                 admit_shakescape_direct_swap_proposal(store, &policy, &proposal, START + 21)?;
                 Ok::<_, hns_wallet_market::MarketError>(())
             })
             .unwrap();
+        assert_eq!(
+            restarted
+                .pending_direct_offer_candidates(START + 21)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(restarted);
+        drop(shared);
+        let mut reopened = WalletStore::open(&path).unwrap();
+        reopened.unlock(PASSPHRASE).unwrap();
+        let shared = SharedWalletStore::new(reopened);
+        shared
+            .try_with_store_mut(|store| {
+                accept_shakescape_direct_maker_proposal(
+                    store,
+                    &policy,
+                    publisher_id,
+                    offer.offer.session_id,
+                    START + 22,
+                )?;
+                Ok::<_, hns_wallet_market::MarketError>(())
+            })
+            .unwrap();
+        let restarted = MobileShakescapeSessionController::new(shared, policy, publisher_id);
         assert!(
             restarted
                 .pending_direct_offer_candidates(START + 21)
                 .unwrap()
                 .is_empty()
+        );
+        assert_eq!(restarted.durable_executions().unwrap().len(), 1);
+        // Funding approval can persist its exact settlement consent before
+        // any chain broadcast. A restart in that window must retain it.
+        restarted
+            .retain_automatic_settlement_approval(offer.offer.session_id, START + 23)
+            .unwrap();
+        drop(restarted);
+        let mut reopened = WalletStore::open(&path).unwrap();
+        reopened.unlock(PASSPHRASE).unwrap();
+        let after_approval = MobileShakescapeSessionController::new(
+            SharedWalletStore::new(reopened),
+            policy,
+            publisher_id,
+        );
+        assert!(
+            after_approval
+                .authorized_automatic_settlement(offer.offer.session_id, true)
+                .unwrap()
+                .is_some()
         );
     }
 
