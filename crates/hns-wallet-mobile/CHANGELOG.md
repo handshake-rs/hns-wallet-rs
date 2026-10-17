@@ -2,8 +2,9 @@
 
 ## 0.6.3 - 2026-10-17
 
-<!-- hns-wallet-release-state: 0.6.3 release -->
-This crate changelog describes the prepared `hns-wallet-rs` release source.
+<!-- hns-wallet-release-state: 0.6.3 candidate -->
+This heading describes the current unpublished release candidate, not an
+existing crates.io package, Git tag, or GitHub release.
 
 Resume recovered Handshake spend observation and settlement from an indexed
 counterparty lock even when that lock is absent from the restored wallet's
