@@ -2079,6 +2079,14 @@ impl MobileShakescapeSessionController {
         let Some(account) = &self.recovery_account else {
             return Ok(None);
         };
+        let descriptor = hns_wallet_hns::build_recovered_hns_htlc(terms, side)
+            .map_err(|_| hns_wallet_market::MarketError::InvalidEvidence)?;
+        if let Some(locator) =
+            hns_wallet_hns::recovered_hns_htlc_funding_locator(store, account, &descriptor)
+                .map_err(|_| hns_wallet_market::MarketError::InvalidEvidence)?
+        {
+            return Ok(Some(locator));
+        }
         let records = store.list_entities_by_id_prefix::<hns_wallet_hns::HnsTransactionRecord>(
             hns_wallet_store::EntityKind::HnsTransaction,
             &hns_wallet_hns::hns_account_transaction_history_prefix(account),
@@ -6117,37 +6125,72 @@ mod tests {
                 let mut restored_config = origin_config.clone();
                 restored_config.wallet_id = restored_id;
                 restored_config.account_id = hns_wallet_types::AccountId::new([0x54; 16]);
-                for raw in &hns_raws {
-                    let tx = hns_transaction::Transaction::decode(raw).unwrap();
-                    let txid = TransactionHash::new(tx.transaction_hash().unwrap().into_bytes());
-                    let mut id =
-                        hns_wallet_hns::hns_account_transaction_history_prefix(&restored_config)
-                            .to_vec();
-                    id.extend_from_slice(txid.as_bytes());
+                let chain = terms.htlc(side).chain;
+                if chain == ChainId::BITCOIN {
+                    // The remote HNS funder's publication is absent from this
+                    // account's ordinary transaction history. A complete
+                    // swap-script scan still retains its authenticated lock.
+                    let raw = package.funding_transaction().to_vec();
+                    let tx = hns_transaction::Transaction::decode(&raw).unwrap();
+                    let txid = tx.transaction_hash().unwrap().into_bytes();
+                    let mut id = restored_config.account_id.as_bytes().to_vec();
+                    id.extend_from_slice(b"/hns-light-index/tx/");
+                    id.extend_from_slice(&txid);
                     restored
                         .save_entity(
-                            hns_wallet_store::EntityKind::HnsTransaction,
+                            hns_wallet_store::EntityKind::HnsLightWallet,
                             &id,
                             0,
-                            &hns_wallet_hns::HnsTransactionRecord {
-                                summary: hns_wallet_types::TransactionSummary {
-                                    module: ModuleId::Handshake,
-                                    txid,
-                                    status: hns_wallet_types::LocalTransactionStatus::Confirmed,
-                                    net_amount: Default::default(),
-                                    fee: None,
-                                    block_height: Some(1),
-                                    first_seen_unix: Some(START),
-                                    confirmation_count: 2,
-                                },
-                                raw: raw.clone(),
-                                inclusion: None,
-                            },
+                            &serde_json::json!({
+                                "record": "transaction",
+                                "format_version": hns_wallet_hns::HNS_LIGHT_INDEX_FORMAT_VERSION,
+                                "network": hns_header_consensus::Network::Mainnet.id(),
+                                "txid": txid,
+                                "raw": raw,
+                                "height": 1,
+                                "block_hash": vec![0x96_u8; 32],
+                                "transaction_index": 0,
+                                "block_time": START,
+                                "coinbase": tx.is_coinbase(),
+                                "evidence_only": false,
+                            }),
                             START,
                         )
                         .unwrap();
+                } else {
+                    for raw in &hns_raws {
+                        let tx = hns_transaction::Transaction::decode(raw).unwrap();
+                        let txid =
+                            TransactionHash::new(tx.transaction_hash().unwrap().into_bytes());
+                        let mut id = hns_wallet_hns::hns_account_transaction_history_prefix(
+                            &restored_config,
+                        )
+                        .to_vec();
+                        id.extend_from_slice(txid.as_bytes());
+                        restored
+                            .save_entity(
+                                hns_wallet_store::EntityKind::HnsTransaction,
+                                &id,
+                                0,
+                                &hns_wallet_hns::HnsTransactionRecord {
+                                    summary: hns_wallet_types::TransactionSummary {
+                                        module: ModuleId::Handshake,
+                                        txid,
+                                        status: hns_wallet_types::LocalTransactionStatus::Confirmed,
+                                        net_amount: Default::default(),
+                                        fee: None,
+                                        block_height: Some(1),
+                                        first_seen_unix: Some(START),
+                                        confirmation_count: 2,
+                                    },
+                                    raw: raw.clone(),
+                                    inclusion: None,
+                                },
+                                START,
+                            )
+                            .unwrap();
+                    }
                 }
-                let chain = terms.htlc(side).chain;
                 let (transaction, output_index) = if chain == ChainId::HANDSHAKE {
                     (hns_contract.funding_id, hns_contract.output_index)
                 } else {

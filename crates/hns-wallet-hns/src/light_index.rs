@@ -8,10 +8,12 @@ use hns_light_sync::SyncState;
 use hns_light_wallet::VerifiedWalletBlock;
 use hns_p2p_wire::ProofPacket;
 use hns_primitives::{NameHash, Outpoint, TransactionHash as CanonicalTransactionHash, TreeRoot};
+use hns_swap::HnsHtlc;
 use hns_transaction::{Transaction, TransactionError};
 use hns_urkel_proof::HsdUrkelProof;
 use hns_wallet_store::{
     EntityBatchDelete, EntityBatchSave, EntityKind, SharedWalletStore, StoreError, StoredEntity,
+    WalletStore,
 };
 use hns_wallet_types::{AccountId, KeyRole, TransactionHash};
 use serde::{Deserialize, Serialize};
@@ -19,9 +21,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    EncryptedHnsLightAuthority, HnsAccountRecord, HnsLightError, HnsNetwork,
-    SpendingTransactionEvidence, WalletAddressKey, derive_hns_light_watch_set,
-    derive_restore_addresses,
+    EncryptedHnsLightAuthority, HnsAccountRecord, HnsLightError, HnsNetwork, HnsRuntimeConfig,
+    HnsWalletError, SpendingTransactionEvidence, WalletAddressKey, derive_hns_light_watch_set,
+    derive_restore_addresses, shakedex_network_binding,
 };
 
 /// Version of the encrypted filtered-block index envelope.
@@ -217,6 +219,49 @@ impl StoredHnsLightTransaction {
             coinbase: self.coinbase,
         })
     }
+}
+
+/// Find a recovered swap's exact HNS lock in the account's authenticated
+/// filtered-block history. The returned transaction ID is only a locator:
+/// current-chain inclusion, confirmations, and the lock output are checked
+/// again by the native settlement verifier before any spend is authorized.
+pub fn recovered_hns_htlc_funding_locator(
+    store: &WalletStore,
+    account: &HnsRuntimeConfig,
+    descriptor: &HnsHtlc,
+) -> Result<Option<TransactionHash>, HnsWalletError> {
+    descriptor
+        .verify_for_network(shakedex_network_binding(account.network)?)
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    let expected_output = descriptor
+        .funding_output()
+        .map_err(|_| HnsWalletError::InvalidEvidence)?;
+    let rows = store.list_entities_by_id_prefix::<StoredHnsLightWalletRecord>(
+        EntityKind::HnsLightWallet,
+        &transaction_prefix(account.account_id),
+        crate::MAX_HISTORY_RESULTS,
+    )?;
+    let mut found = None;
+    for row in rows {
+        let StoredHnsLightWalletRecord::Transaction(record) = row.value else {
+            return Err(HnsWalletError::InvalidEvidence);
+        };
+        if row.id != transaction_id(account.account_id, record.txid) {
+            return Err(HnsWalletError::InvalidEvidence);
+        }
+        let observed = record
+            .decode(consensus_network(account.network))
+            .map_err(|_| HnsWalletError::InvalidEvidence)?;
+        for output in &observed.transaction.outputs {
+            if output == &expected_output {
+                if found.is_some() {
+                    return Err(HnsWalletError::InvalidEvidence);
+                }
+                found = Some(observed.txid);
+            }
+        }
+    }
+    Ok(found)
 }
 
 impl StoredHnsLightNameProof {
@@ -1649,6 +1694,7 @@ mod tests {
     use hns_primitives::{BlockTime, Dollarydoos, MerkleRoot, TreeRoot};
     use hns_transaction::{Address, Input, Output, Witness};
     use hns_wallet_store::WalletStore;
+    use k256::ecdsa::SigningKey;
 
     use super::*;
 
@@ -1656,6 +1702,113 @@ mod tests {
         SharedWalletStore::new(
             WalletStore::create(":memory:", "correct horse battery staple").unwrap(),
         )
+    }
+
+    #[test]
+    fn recovered_htlc_locator_uses_exact_indexed_funding_and_rejects_ambiguity() {
+        let store = store();
+        let account = HnsRuntimeConfig::default_non_value(
+            hns_wallet_types::WalletId::new([0x51; 16]),
+            AccountId::new([0x52; 16]),
+            crate::HnsBootstrapPolicy::new(HnsNetwork::Regtest, 0),
+        )
+        .unwrap();
+        let public_key = |byte| {
+            SigningKey::from_bytes((&[byte; 32]).into())
+                .unwrap()
+                .verifying_key()
+                .to_encoded_point(true)
+                .as_bytes()
+                .try_into()
+                .unwrap()
+        };
+        let descriptor = HnsHtlc {
+            network: shakedex_network_binding(account.network).unwrap(),
+            value: Dollarydoos::new(1_000),
+            hashlock: [0x53; 32],
+            receiver_public_key: public_key(0x54),
+            refund_public_key: public_key(0x55),
+            refund_locktime: crate::LOCKTIME_FLAG | 2,
+        };
+        let unrelated = Transaction {
+            version: 0,
+            inputs: Vec::new(),
+            outputs: vec![Output {
+                value: Dollarydoos::new(1_000),
+                address: Address::new(0, vec![0x56; 32]).unwrap(),
+                covenant: Covenant::default(),
+            }],
+            locktime: 0,
+        };
+        let funding = Transaction {
+            version: 0,
+            inputs: Vec::new(),
+            outputs: vec![descriptor.funding_output().unwrap()],
+            locktime: 1,
+        };
+        let insert = |transaction: &Transaction| {
+            let txid = transaction.transaction_hash().unwrap().into_bytes();
+            let raw = transaction.encode().unwrap();
+            store
+                .with_store_mut(|wallet| {
+                    wallet.save_entity(
+                        EntityKind::HnsLightWallet,
+                        &transaction_id(account.account_id, txid),
+                        0,
+                        &StoredHnsLightWalletRecord::Transaction(StoredHnsLightTransaction {
+                            format_version: HNS_LIGHT_INDEX_FORMAT_VERSION,
+                            network: Network::Regtest.id(),
+                            txid,
+                            raw,
+                            height: 1,
+                            block_hash: [0x57; 32],
+                            transaction_index: 0,
+                            block_time: 1,
+                            coinbase: transaction.is_coinbase(),
+                            evidence_only: false,
+                        }),
+                        1,
+                    )
+                })
+                .unwrap();
+            TransactionHash::new(txid)
+        };
+        insert(&unrelated);
+        assert_eq!(
+            store
+                .try_with_store(|wallet| recovered_hns_htlc_funding_locator(
+                    wallet,
+                    &account,
+                    &descriptor
+                ))
+                .unwrap(),
+            None
+        );
+        let funding_id = insert(&funding);
+        assert_eq!(
+            store
+                .try_with_store(|wallet| recovered_hns_htlc_funding_locator(
+                    wallet,
+                    &account,
+                    &descriptor
+                ))
+                .unwrap(),
+            Some(funding_id)
+        );
+        let duplicate = Transaction {
+            locktime: 2,
+            ..funding
+        };
+        insert(&duplicate);
+        assert!(
+            store
+                .try_with_store(|wallet| recovered_hns_htlc_funding_locator(
+                    wallet,
+                    &account,
+                    &descriptor
+                ))
+                .is_err()
+        );
     }
 
     fn verified_block(program: &[u8]) -> (VerifiedWalletBlock, Header) {

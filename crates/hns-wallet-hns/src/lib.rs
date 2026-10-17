@@ -24,6 +24,7 @@ pub use light_authority::{
 pub use light_index::{
     EncryptedHnsLightIndex, HNS_LIGHT_INDEX_FORMAT_VERSION, HnsLightIndexError, HnsLightScanStatus,
     HnsLightWatchSet, VerifiedHnsNameProof, VerifiedHnsTransactionObservation,
+    recovered_hns_htlc_funding_locator,
 };
 pub use name_workflow::{
     AuthorizedNameOperation, CurrentShakedexLockQuery, HnsNameAction, HnsNameLifecycle,
