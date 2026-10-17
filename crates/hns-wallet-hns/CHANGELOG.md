@@ -2,9 +2,8 @@
 
 ## 0.4.6 - 2026-10-17
 
-<!-- hns-wallet-release-state: 0.4.6 candidate -->
-This heading describes the current unpublished release candidate, not an
-existing crates.io package, Git tag, or GitHub release.
+<!-- hns-wallet-release-state: 0.4.6 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
 
 Locate a recovered swap's exact Handshake lock from authenticated filtered-block
 history, including a lock funded by the counterparty. Require native
