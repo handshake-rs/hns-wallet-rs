@@ -8,4 +8,4 @@ extend the browser/provider API or export HNS signing keys.
 This is a nested Cargo workspace so the main wallet release remains exactly
 its published crate set.
 
-See [the protocol and recovery contract](../../docs/BASICSWAP_BRIDGE.md).
+See [the protocol and recovery contract](BRIDGE.md).

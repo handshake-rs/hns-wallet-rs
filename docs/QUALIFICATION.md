@@ -17,9 +17,6 @@ cargo +1.89.0 test --workspace --all-targets --locked
 
 The complete gate includes release metadata, argument validation, ABI
 contracts and vectors, deterministic contract artifacts, and package inventory.
-The experimental BasicSwap bridge is checked separately when that integration
-changes; it is not part of the wallet release gate. Its focused commands are in
-[BASICSWAP_BRIDGE.md](BASICSWAP_BRIDGE.md).
 For publication, run the selected normalized package preflight described in
 [releasing.md](releasing.md). CI, security review, and preflight must qualify
 the same immutable source commit.

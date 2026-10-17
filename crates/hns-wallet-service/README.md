@@ -5,11 +5,8 @@ store authority, provider policy, and selected non-value HNS reads.
 
 The default `hns-wallet-service` executable remains a locked existing-database
 control surface; it does not select a live backend or expose a browser
-transport. The separate `integrations/basicswap-bridge` workspace builds a
-trusted local process pipe for exact native-HNS HTLC operations and is never
-part of the browser/provider ABI or the published wallet crate set. See
-[the bridge protocol](../../docs/BASICSWAP_BRIDGE.md)
-and the [workspace repository](https://github.com/handshake-rs/hns-wallet-rs)
+transport. See the
+[workspace repository](https://github.com/handshake-rs/hns-wallet-rs)
 for the available library compositions and release gates.
 
 For a separately trusted native browser launcher, the library exposes
