@@ -1,5 +1,15 @@
 # hns-wallet-bip157
 
+## 0.4.3 - 2026-10-18
+
+<!-- hns-wallet-release-state: 0.4.3 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Bound cached compact-filter replay to wallet consumption so a slow filter
+consumer cannot accumulate an unbounded in-memory queue during Bitcoin sync.
+Avoid repeated full-chain progress recounts while restoring a large cache and
+retire peers whose message channels close.
+
 ## 0.4.2 - 2026-10-04
 
 <!-- hns-wallet-release-state: 0.4.2 release -->
