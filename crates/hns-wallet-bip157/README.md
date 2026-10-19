@@ -27,6 +27,9 @@ fresh compact-filter peers before declaring synchronization complete. Cached
 filter matching decisions are never reused. Applications must provide an
 authenticated store; the `data_dir` option alone does not persist this evidence.
 
+Version 0.4.3 bounds in-flight cached filters while the
+wallet replays them, preventing a slow consumer from exhausting app memory.
+
 See the repository-level
 [`CHANGELOG.md`](https://github.com/handshake-rs/hns-wallet-rs/blob/main/CHANGELOG.md)
 and [Bitcoin integration notes](../../docs/BITCOIN_KYOTO.md).
