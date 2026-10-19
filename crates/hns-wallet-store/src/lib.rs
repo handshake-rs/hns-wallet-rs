@@ -4289,6 +4289,7 @@ struct UnixBoundaryMetadata {
 enum UnixAncestorPolicy {
     Strict,
     AndroidSystemUid1000,
+    IosPlatformPrefix,
 }
 
 #[cfg(unix)]
@@ -4297,7 +4298,11 @@ const fn active_unix_ancestor_policy() -> UnixAncestorPolicy {
     {
         UnixAncestorPolicy::AndroidSystemUid1000
     }
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    {
+        UnixAncestorPolicy::IosPlatformPrefix
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         UnixAncestorPolicy::Strict
     }
@@ -4339,15 +4344,24 @@ fn validate_unix_ancestor_chain(
     }
 
     // The native host chooses the path and therefore owns the non-writable
-    // platform prefix above the first process-owned directory. Android app
-    // sandboxes additionally traverse uid-1000 platform directories that can
-    // be group-writable; that exception is compiled only for Android and still
-    // rejects world-writable entries. Once the path enters the process-owned
-    // suffix, ownership may not change again.
-    let trusted_suffix = ancestors
-        .iter()
-        .position(|ancestor| ancestor.uid == process_uid)
-        .ok_or(StoreError::UnsafeFilesystemBoundary)?;
+    // platform prefix. iOS can have system-owned container directories below
+    // the mobile user's home, so its private suffix starts after the last
+    // ownership transition. Android additionally traverses uid-1000 platform
+    // directories that can be group-writable; that exception remains Android-only.
+    let trusted_suffix = if policy == UnixAncestorPolicy::IosPlatformPrefix {
+        ancestors
+            .iter()
+            .rposition(|ancestor| ancestor.uid != process_uid)
+            .map_or(0, |index| index + 1)
+    } else {
+        ancestors
+            .iter()
+            .position(|ancestor| ancestor.uid == process_uid)
+            .ok_or(StoreError::UnsafeFilesystemBoundary)?
+    };
+    if trusted_suffix == ancestors.len() {
+        return Err(StoreError::UnsafeFilesystemBoundary);
+    }
     for (index, ancestor) in ancestors[..trusted_suffix].iter().enumerate() {
         if ancestor.mode & 0o022 != 0 {
             let sticky = ancestor.mode & 0o1000 != 0;
@@ -5819,6 +5833,110 @@ mod tests {
                 ],
                 UID,
                 STRICT,
+            ),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ios_platform_prefix_allows_owner_transition_before_private_suffix() {
+        const UID: u32 = 10_123;
+        let root = UnixBoundaryMetadata {
+            kind: UnixBoundaryKind::Directory,
+            uid: 0,
+            mode: 0o755,
+            dev: 1,
+            ino: 1,
+            nlink: 2,
+        };
+        let mobile_home = UnixBoundaryMetadata {
+            uid: UID,
+            ino: 2,
+            ..root
+        };
+        let system_container = UnixBoundaryMetadata {
+            uid: 200,
+            mode: 0o555,
+            ino: 3,
+            ..root
+        };
+        let app_container = UnixBoundaryMetadata {
+            uid: UID,
+            mode: 0o700,
+            ino: 4,
+            ..root
+        };
+        let private_wallet = UnixBoundaryMetadata {
+            ino: 5,
+            ..app_container
+        };
+        let chain = [
+            root,
+            mobile_home,
+            system_container,
+            app_container,
+            private_wallet,
+        ];
+
+        assert!(matches!(
+            validate_unix_ancestor_chain(&chain, UID, UnixAncestorPolicy::Strict),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+        assert!(
+            validate_unix_ancestor_chain(&chain, UID, UnixAncestorPolicy::IosPlatformPrefix)
+                .is_ok()
+        );
+
+        for (index, unsafe_ancestor) in [
+            (
+                1,
+                UnixBoundaryMetadata {
+                    mode: 0o775,
+                    ..mobile_home
+                },
+            ),
+            (
+                2,
+                UnixBoundaryMetadata {
+                    mode: 0o775,
+                    ..system_container
+                },
+            ),
+            (
+                3,
+                UnixBoundaryMetadata {
+                    mode: 0o770,
+                    ..app_container
+                },
+            ),
+            (
+                4,
+                UnixBoundaryMetadata {
+                    mode: 0o770,
+                    ..private_wallet
+                },
+            ),
+        ] {
+            let mut unsafe_chain = chain;
+            unsafe_chain[index] = unsafe_ancestor;
+            assert!(matches!(
+                validate_unix_ancestor_chain(
+                    &unsafe_chain,
+                    UID,
+                    UnixAncestorPolicy::IosPlatformPrefix
+                ),
+                Err(StoreError::UnsafeFilesystemBoundary)
+            ));
+        }
+
+        let mut unowned_wallet = chain;
+        unowned_wallet[4].uid = 200;
+        assert!(matches!(
+            validate_unix_ancestor_chain(
+                &unowned_wallet,
+                UID,
+                UnixAncestorPolicy::IosPlatformPrefix
             ),
             Err(StoreError::UnsafeFilesystemBoundary)
         ));

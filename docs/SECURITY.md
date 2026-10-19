@@ -314,9 +314,11 @@ switched to WAL or migrated. Selected-entry symlinks are rejected, system
 ancestor aliases are canonicalized, and device/inode identity is compared
 around recognition and the write-capable no-follow open.
 
-Non-writable system-owned prefix components are host-trusted. Generic Unix and
-iOS reject unowned group/world-writable prefix components unless a sticky
-directory protects a root- or effective-UID-owned child. Only the Android
+Non-writable platform prefix components are host-trusted. On iOS the prefix
+extends through the last system-managed ownership transition before the
+app-owned suffix; the host must supply an app-container path. Generic Unix and
+iOS reject group/world-writable prefix components unless a sticky directory
+protects a root- or effective-UID-owned child. Only the Android
 target admits the additional UID-1000, group-writable but non-world-writable
 app-data prefix, relying on SELinux/app-data-root containment. The same-UID
 suffix cannot change owner or be group/world writable, except for a sticky

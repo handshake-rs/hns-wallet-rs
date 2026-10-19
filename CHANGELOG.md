@@ -19,6 +19,6 @@ release state and scope in its own `CHANGELOG.md`.
 | `hns-wallet-provider` | 0.4.1 |
 | `hns-wallet-service` | 0.4.2 |
 | `hns-wallet-shakedex` | 0.4.1 |
-| `hns-wallet-store` | 0.4.1 |
+| `hns-wallet-store` | 0.4.2 |
 | `hns-wallet-testkit` | 0.5.0 |
 | `hns-wallet-types` | 0.4.1 |

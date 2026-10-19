@@ -30,7 +30,7 @@ categories = ["cryptography::cryptocurrencies"]
 
 [workspace.dependencies]
 hns-wallet-types = { version = "0.4.1", path = "crates/hns-wallet-types" }
-hns-wallet-store = { version = "0.4.1", path = "crates/hns-wallet-store" }
+hns-wallet-store = { version = "0.4.2", path = "crates/hns-wallet-store" }
 hns-wallet-chain-api = { version = "0.4.2", path = "crates/hns-wallet-chain-api" }
 hns-wallet-hns = { version = "0.4.6", path = "crates/hns-wallet-hns" }
 hns-wallet-provider = { version = "0.4.1", path = "crates/hns-wallet-provider" }

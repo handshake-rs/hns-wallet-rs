@@ -745,16 +745,19 @@ commit but before phrase display requires a product-level
 display/acknowledgement recovery design; RAII alone cannot prove delivery.
 
 The selected directory and database entry may not be symlinks. System-level
-ancestor aliases are canonicalized once. The prefix above the first directory
-owned by the effective UID is an explicit native-host/platform trust boundary;
-non-writable system-owned components in that prefix are host-trusted. Generic
-Unix and iOS reject an unowned group- or world-writable prefix component unless
-the sticky-directory rule protects a root- or effective-UID-owned next entry.
+ancestor aliases are canonicalized once. The native host supplies the path
+inside its app sandbox. On generic Unix and Android, the prefix above the first
+directory owned by the effective UID is a platform trust boundary. On iOS,
+system-managed directories can appear below the mobile user's home, so that
+prefix ends at the last ownership transition before the app-owned suffix.
+Non-writable components in either prefix are host-trusted. Generic Unix and
+iOS reject a group- or world-writable prefix component unless the
+sticky-directory rule protects a root- or effective-UID-owned next entry.
 Only an Android build selects the additional app-data policy: a group-writable,
 non-world-writable prefix directory owned by Android system UID 1000 is
 accepted, relying on Android SELinux and app-data-root containment. From the
-first process-owned directory through the selected `0700` directory, ownership
-may not change and group/world write is rejected. A sticky writable directory
+start of the process-owned suffix through the selected `0700` directory,
+ownership may not change and group/world write is rejected. A sticky writable directory
 is accepted only when its next child is also owned by the effective UID, so
 sticky rename protection actually applies. The database device/inode and
 single-link identity are compared around both read-only recognition and
