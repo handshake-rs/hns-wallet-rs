@@ -26,7 +26,7 @@ use corepc_node::{anyhow, exe_path};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-// Start the bitcoin daemon either through an environment variable or by download
+// Start the bitcoin daemon from BITCOIND_EXE or PATH.
 fn start_bitcoind(with_v2_transport: bool) -> anyhow::Result<(corepc_node::Node, SocketAddrV4)> {
     let path = exe_path()?;
     let mut conf = corepc_node::Conf::default();

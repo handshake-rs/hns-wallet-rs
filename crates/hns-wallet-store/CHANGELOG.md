@@ -1,10 +1,9 @@
 # hns-wallet-store
 
-## 0.4.2 - unreleased
+## 0.4.2 - 2026-10-18
 
-<!-- hns-wallet-release-state: 0.4.2 candidate -->
-This heading describes the current unpublished release candidate, not an
-existing crates.io package, Git tag, or GitHub release.
+<!-- hns-wallet-release-state: 0.4.2 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
 
 Accept iOS system-managed ownership transitions before the app-owned wallet
 directory while retaining private-directory and writable-ancestor checks.
