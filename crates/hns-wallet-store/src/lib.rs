@@ -4385,19 +4385,31 @@ fn validate_unix_ancestor_chain(
             }
         }
     }
-    for (offset, ancestor) in ancestors[trusted_suffix..].iter().enumerate() {
+    let private_suffix = &ancestors[trusted_suffix..];
+    let mut owner_only_ancestor = false;
+    for (offset, ancestor) in private_suffix.iter().enumerate() {
         if ancestor.uid != process_uid {
             return Err(StoreError::UnsafeFilesystemBoundary);
         }
         if ancestor.mode & 0o022 != 0 {
+            // CoreSimulator can create an owner-owned, group-writable `data`
+            // directory beneath the app user's owner-only Library directory.
+            // That intermediate directory cannot be traversed by another uid.
+            // Keep the selected wallet parent owner-only, and do not extend
+            // this exception to world-writable or Android paths.
+            let protected_ios_intermediate = policy == UnixAncestorPolicy::IosPlatformPrefix
+                && owner_only_ancestor
+                && offset + 1 < private_suffix.len()
+                && ancestor.mode & 0o002 == 0;
             let sticky = ancestor.mode & 0o1000 != 0;
             let trusted_child = ancestors
                 .get(trusted_suffix + offset + 1)
                 .is_some_and(|child| child.uid == process_uid);
-            if !sticky || !trusted_child {
+            if !protected_ios_intermediate && (!sticky || !trusted_child) {
                 return Err(StoreError::UnsafeFilesystemBoundary);
             }
         }
+        owner_only_ancestor |= ancestor.mode & 0o077 == 0;
     }
     Ok(())
 }
@@ -5940,6 +5952,69 @@ mod tests {
             ),
             Err(StoreError::UnsafeFilesystemBoundary)
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ios_private_ancestor_protects_group_writable_simulator_intermediate() {
+        const UID: u32 = 10_123;
+        let root = UnixBoundaryMetadata {
+            kind: UnixBoundaryKind::Directory,
+            uid: 0,
+            mode: 0o755,
+            dev: 1,
+            ino: 1,
+            nlink: 2,
+        };
+        let owner_home = UnixBoundaryMetadata {
+            uid: UID,
+            ino: 2,
+            ..root
+        };
+        let owner_library = UnixBoundaryMetadata {
+            mode: 0o700,
+            ino: 3,
+            ..owner_home
+        };
+        let simulator_data = UnixBoundaryMetadata {
+            mode: 0o775,
+            ino: 4,
+            ..owner_home
+        };
+        let wallet_parent = UnixBoundaryMetadata {
+            mode: 0o700,
+            ino: 5,
+            ..owner_home
+        };
+        let chain = [
+            root,
+            owner_home,
+            owner_library,
+            simulator_data,
+            wallet_parent,
+        ];
+
+        assert!(
+            validate_unix_ancestor_chain(&chain, UID, UnixAncestorPolicy::IosPlatformPrefix)
+                .is_ok()
+        );
+        assert!(matches!(
+            validate_unix_ancestor_chain(&chain, UID, UnixAncestorPolicy::Strict),
+            Err(StoreError::UnsafeFilesystemBoundary)
+        ));
+
+        for (index, mode) in [(1, 0o775), (3, 0o777), (4, 0o770)] {
+            let mut unsafe_chain = chain;
+            unsafe_chain[index].mode = mode;
+            assert!(matches!(
+                validate_unix_ancestor_chain(
+                    &unsafe_chain,
+                    UID,
+                    UnixAncestorPolicy::IosPlatformPrefix
+                ),
+                Err(StoreError::UnsafeFilesystemBoundary)
+            ));
+        }
     }
 
     #[cfg(unix)]
