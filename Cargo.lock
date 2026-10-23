@@ -1146,7 +1146,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-mobile"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "bdk_wallet",
  "getrandom 0.3.4",
@@ -1177,7 +1177,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-provider"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "hns-wallet-store",
  "hns-wallet-types",
@@ -1190,7 +1190,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-service"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "getrandom 0.3.4",
  "hns-covenants",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-shakedex"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "blake2",
  "hex",
@@ -1270,7 +1270,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-types"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "hex",
  "serde",

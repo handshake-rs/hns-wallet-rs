@@ -1,5 +1,13 @@
 # hns-wallet-mobile
 
+## 0.6.4 - unreleased
+
+<!-- hns-wallet-release-state: 0.6.4 candidate -->
+This heading describes the current unpublished release candidate, not an
+existing crates.io package, Git tag, or GitHub release.
+
+Add native queries for owned name offers and exact current name-offer readback.
+
 ## 0.6.3 - 2026-10-17
 
 <!-- hns-wallet-release-state: 0.6.3 release -->

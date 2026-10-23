@@ -1,5 +1,13 @@
 # hns-wallet-service
 
+## 0.4.3 - unreleased
+
+<!-- hns-wallet-release-state: 0.4.3 candidate -->
+This heading describes the current unpublished release candidate, not an
+existing crates.io package, Git tag, or GitHub release.
+
+Expose account-bound seller-offer pagination and exact current name-offer lookup for mobile review.
+
 ## 0.4.2 - 2026-10-07
 
 <!-- hns-wallet-release-state: 0.4.2 release -->
