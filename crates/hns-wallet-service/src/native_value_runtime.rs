@@ -240,6 +240,14 @@ struct NameMarketListOffersParams {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct NameMarketListMyOffersParams {
+    account: String,
+    cursor: Option<String>,
+    limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct NameMarketCreateOfferParams {
     account: String,
     name: String,
@@ -849,6 +857,47 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         public_offer_page(page)
     }
 
+    fn provider_market_my_offers(&self, call: &ApprovedCall) -> Result<Value, ServiceFailure> {
+        let params: NameMarketListMyOffersParams = self
+            .parse_market_params(call, |params: &NameMarketListMyOffersParams| {
+                params.account.as_str()
+            })?;
+        let cursor = params
+            .cursor
+            .as_deref()
+            .map(|cursor| parse_workflow_id(cursor, "cursor"))
+            .transpose()?;
+        let limit = usize::from(params.limit.unwrap_or(16));
+        if limit == 0 || limit > 16 {
+            return Err(invalid_request("name-market seller page limit is invalid"));
+        }
+        self.reconcile()?;
+        let mut offers = self
+            .recovered_shakedex_runtime()?
+            .list_seller_offers()
+            .map_err(shakedex_failure)?;
+        offers.sort_by_key(|offer| offer.workflow_id);
+        let start = cursor.map_or(0, |cursor| {
+            offers.partition_point(|offer| offer.workflow_id <= cursor)
+        });
+        let has_more = offers.len().saturating_sub(start) > limit;
+        let selected = offers.into_iter().skip(start).take(limit);
+        let mut page = Vec::with_capacity(limit);
+        let mut last = None;
+        for offer in selected {
+            last = Some(offer.workflow_id);
+            page.push(public_seller_offer(&offer)?);
+        }
+        bounded_provider_value(json!({
+            "offers": page,
+            "nextCursor": if has_more {
+                last.map(|id| lowercase_hex(id.as_bytes()))
+            } else {
+                None
+            },
+        }))
+    }
+
     fn provider_market_session(&self, call: &ApprovedCall) -> Result<Value, ServiceFailure> {
         let params = self.parse_market_params(call, |params: &NameMarketSessionParams| {
             params.account.as_str()
@@ -1279,6 +1328,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
             && matches!(
                 method,
                 ProviderMethod::NameMarketListOffers
+                    | ProviderMethod::NameMarketListMyOffers
                     | ProviderMethod::NameMarketCreateFixedPriceOffer
                     | ProviderMethod::NameMarketCancelOffer
                     | ProviderMethod::NameMarketAcceptOffer
@@ -1613,6 +1663,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
             }
             ProviderMethod::HnsImportKnownName => self.import_known_name(&call),
             ProviderMethod::NameMarketListOffers => self.provider_market_offers(&call),
+            ProviderMethod::NameMarketListMyOffers => self.provider_market_my_offers(&call),
             ProviderMethod::NameMarketGetSession => self.provider_market_session(&call),
             ProviderMethod::HnsGetNames | ProviderMethod::HnsGetName => Err(
                 ServiceFailure::unsupported(ServiceCapability::ProviderDispatch),
@@ -2349,7 +2400,9 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
             || call.request_nonce == 0
             || !matches!(
                 call.method,
-                ProviderMethod::NameMarketListOffers | ProviderMethod::NameMarketGetSession
+                ProviderMethod::NameMarketListOffers
+                    | ProviderMethod::NameMarketListMyOffers
+                    | ProviderMethod::NameMarketGetSession
             )
         {
             return Err(invalid_request("native Shakedex query is invalid"));

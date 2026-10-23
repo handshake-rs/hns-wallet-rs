@@ -475,6 +475,10 @@ pub enum MobileShakedexQuery {
         cursor: Option<String>,
         limit: Option<u16>,
     },
+    ListMyOffers {
+        cursor: Option<String>,
+        limit: Option<u16>,
+    },
     GetSession {
         session_id: String,
     },
@@ -3247,6 +3251,14 @@ impl MobileShakedexQuery {
                     "sessionId": session_id,
                 }),
             ),
+            Self::ListMyOffers { cursor, limit } => (
+                ProviderMethod::NameMarketListMyOffers,
+                json!({
+                    "account": lowercase_hex(account.as_bytes()),
+                    "cursor": cursor,
+                    "limit": limit,
+                }),
+            ),
         }
     }
 }
@@ -4616,6 +4628,23 @@ mod tests {
             serde_json::from_value::<MobileShakedexQuery>(json!({
                 "query": "getSession",
                 "sessionId": "11".repeat(32),
+                "account": "caller-controlled"
+            }))
+            .is_err()
+        );
+        let my_offers = MobileShakedexQuery::ListMyOffers {
+            cursor: None,
+            limit: Some(16),
+        };
+        let encoded = serde_json::to_value(&my_offers).expect("serialize seller query");
+        assert_eq!(encoded["query"], "listMyOffers");
+        assert_eq!(encoded["limit"], 16);
+        assert!(encoded.get("account").is_none());
+        assert!(
+            serde_json::from_value::<MobileShakedexQuery>(json!({
+                "query": "listMyOffers",
+                "cursor": null,
+                "limit": 16,
                 "account": "caller-controlled"
             }))
             .is_err()

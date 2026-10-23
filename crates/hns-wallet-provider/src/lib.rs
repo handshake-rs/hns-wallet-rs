@@ -182,6 +182,9 @@ pub enum ProviderMethod {
     /// Set the exact Handshake resource bytes for a currently owned name.
     /// Appended to preserve every existing stable enum/wire index.
     HnsUpdateName,
+    /// List seller workflows owned by the selected wallet account.
+    /// Appended to preserve existing enum and wire indices.
+    NameMarketListMyOffers,
 }
 
 impl ProviderMethod {
@@ -228,6 +231,7 @@ impl ProviderMethod {
         Self::SwapRedeem,
         Self::SwapRefund,
         Self::HnsUpdateName,
+        Self::NameMarketListMyOffers,
     ];
 
     pub const fn wire_name(self) -> &'static str {
@@ -265,6 +269,7 @@ impl ProviderMethod {
                 | Self::HnsUpdateName
                 | Self::HnsSignTypedMessage
                 | Self::NameMarketListOffers
+                | Self::NameMarketListMyOffers
                 | Self::NameMarketCreateFixedPriceOffer
                 | Self::NameMarketCancelOffer
                 | Self::NameMarketAcceptOffer
@@ -302,6 +307,7 @@ impl ProviderMethod {
             Self::HnsUpdateName => Some(PermissionCapability::NameUpdate),
             Self::HnsSignTypedMessage => Some(PermissionCapability::TypedIdentitySignature),
             Self::NameMarketListOffers
+            | Self::NameMarketListMyOffers
             | Self::NameMarketCreateFixedPriceOffer
             | Self::NameMarketCancelOffer
             | Self::NameMarketAcceptOffer
@@ -1417,12 +1423,12 @@ mod tests {
 
     #[test]
     fn canonical_provider_method_set_has_exact_wire_round_trips() {
-        assert_eq!(ProviderMethod::ALL.len(), 42);
+        assert_eq!(ProviderMethod::ALL.len(), 43);
         let names: BTreeSet<_> = ProviderMethod::ALL
             .into_iter()
             .map(ProviderMethod::wire_name)
             .collect();
-        assert_eq!(names.len(), 42);
+        assert_eq!(names.len(), 43);
         for (index, method) in ProviderMethod::ALL.into_iter().enumerate() {
             assert_eq!(method.wire_name(), PROVIDER_METHOD_WIRE_NAMES[index]);
             assert!(matches!(
@@ -1454,7 +1460,7 @@ mod tests {
             .into_iter()
             .filter(|method| method.requires_hns_namespace())
             .collect::<Vec<_>>();
-        assert_eq!(hns_methods.len(), 20);
+        assert_eq!(hns_methods.len(), 21);
         for (index, method) in hns_methods.into_iter().enumerate() {
             let request = serde_json::to_vec(&serde_json::json!({
                 "method": method.wire_name(),

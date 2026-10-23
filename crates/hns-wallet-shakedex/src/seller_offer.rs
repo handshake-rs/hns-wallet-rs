@@ -553,6 +553,7 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
     }
 
     pub(crate) fn list_previews(&self) -> Result<Vec<SellerOfferPreview>, ShakedexError> {
+        let config = self.hns.configured_runtime_config()?;
         let stored = self.store.try_with_store(|store| {
             store
                 .list_workflows_complete::<SellerOfferWorkflow>(
@@ -564,13 +565,29 @@ impl<'a, B: HnsBackend, C: HnsClock> SellerOfferRuntime<'a, B, C> {
         stored
             .into_iter()
             .map(validate_stored_seller_offer)
+            .filter_map(|stored| match stored {
+                Ok(stored)
+                    if stored.state.wallet_id == config.wallet_id
+                        && stored.state.account_id == config.account_id =>
+                {
+                    Some(Ok(stored))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
             .map(|stored| stored.and_then(|stored| self.preview(stored)))
             .collect()
     }
 
     fn load(&self, workflow_id: WorkflowId) -> Result<Option<StoredSellerOffer>, ShakedexError> {
-        self.store
-            .try_with_store(|store| load_seller_offer(store, workflow_id))
+        let config = self.hns.configured_runtime_config()?;
+        Ok(self
+            .store
+            .try_with_store(|store| load_seller_offer(store, workflow_id))?
+            .filter(|stored| {
+                stored.state.wallet_id == config.wallet_id
+                    && stored.state.account_id == config.account_id
+            }))
     }
 
     fn preview(&self, stored: StoredSellerOffer) -> Result<SellerOfferPreview, ShakedexError> {
