@@ -479,6 +479,9 @@ pub enum MobileShakedexQuery {
         cursor: Option<String>,
         limit: Option<u16>,
     },
+    GetOffer {
+        listing_id: String,
+    },
     GetSession {
         session_id: String,
     },
@@ -3259,6 +3262,12 @@ impl MobileShakedexQuery {
                     "limit": limit,
                 }),
             ),
+            Self::GetOffer { listing_id } => (
+                ProviderMethod::NameMarketGetOffer,
+                json!({
+                    "listingId": listing_id,
+                }),
+            ),
         }
     }
 }
@@ -4649,6 +4658,13 @@ mod tests {
             }))
             .is_err()
         );
+        let get_offer = MobileShakedexQuery::GetOffer {
+            listing_id: "22".repeat(32),
+        };
+        let encoded = serde_json::to_value(&get_offer).expect("serialize offer lookup");
+        assert_eq!(encoded["query"], "getOffer");
+        assert_eq!(encoded["listingId"], "22".repeat(32));
+        assert!(encoded.get("account").is_none());
     }
 
     #[test]

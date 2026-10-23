@@ -7,7 +7,7 @@ use thiserror::Error;
 
 /// The complete canonical website-provider method vocabulary in stable enum
 /// order. Availability is negotiated separately.
-pub const PROVIDER_METHOD_WIRE_NAMES: [&str; 43] = [
+pub const PROVIDER_METHOD_WIRE_NAMES: [&str; 44] = [
     "wallet_getCapabilities",
     "wallet_getEnabledModules",
     "wallet_enableModule",
@@ -51,6 +51,7 @@ pub const PROVIDER_METHOD_WIRE_NAMES: [&str; 43] = [
     "swap_refund",
     "hns_updateName",
     "nameMarket_listMyOffers",
+    "nameMarket_getOffer",
 ];
 
 macro_rules! semantic_id {

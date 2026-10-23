@@ -35,8 +35,8 @@ use hns_wallet_shakedex::{
     MAX_SHAKEDEX_OFFER_PAGE_SIZE, PrepareBuyerTrade, PrepareScriptFinalize, PrepareSellerOffer,
     SHAKEDEX_CANONICAL_V2_RELEASE_QUALIFIED, SHAKEDEX_SHAKESCAPE_V1_RELEASE_QUALIFIED,
     SHAKEDEX_VALUE_RUNTIME_RELEASE_QUALIFIED, SellerOfferPreview, SellerOfferStage, ShakedexError,
-    ShakedexOfferPage, ShakedexPurchaseFinalizePhase, ShakedexSellerPolicy, ShakedexTradePreview,
-    ShakedexTradeRuntime, ShakedexValueAction, ShakedexValueStage,
+    ShakedexOfferPage, ShakedexOfferPreview, ShakedexPurchaseFinalizePhase, ShakedexSellerPolicy,
+    ShakedexTradePreview, ShakedexTradeRuntime, ShakedexValueAction, ShakedexValueStage,
     ShakescapePublicationAcceptancePolicy, ShakescapeTransportRuntime,
     WalletNativeShakescapeTransport,
 };
@@ -244,6 +244,12 @@ struct NameMarketListMyOffersParams {
     account: String,
     cursor: Option<String>,
     limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct NameMarketGetOfferParams {
+    listing_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -898,6 +904,21 @@ impl<B: HnsBackend, C: HnsClock> PersistentHnsValueRuntime<B, C> {
         }))
     }
 
+    fn provider_market_offer(&self, call: &ApprovedCall) -> Result<Value, ServiceFailure> {
+        self.sync_shakedex_transport()?;
+        self.assert_hns_call(call)?;
+        let params: NameMarketGetOfferParams = serde_json::from_value(call.params.clone())
+            .map_err(|_| invalid_request("name-market offer parameters are invalid"))?;
+        let listing_hash = parse_object_hash(&params.listing_id, "listingId")?;
+        self.reconcile()?;
+        let offer = self
+            .recovered_shakedex_runtime()?
+            .current_offer_preview(listing_hash)
+            .map_err(shakedex_failure)?
+            .ok_or_else(|| invalid_request("name-market offer is not current"))?;
+        bounded_provider_value(json!({ "offer": public_offer_preview(&offer)? }))
+    }
+
     fn provider_market_session(&self, call: &ApprovedCall) -> Result<Value, ServiceFailure> {
         let params = self.parse_market_params(call, |params: &NameMarketSessionParams| {
             params.account.as_str()
@@ -1329,6 +1350,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
                 method,
                 ProviderMethod::NameMarketListOffers
                     | ProviderMethod::NameMarketListMyOffers
+                    | ProviderMethod::NameMarketGetOffer
                     | ProviderMethod::NameMarketCreateFixedPriceOffer
                     | ProviderMethod::NameMarketCancelOffer
                     | ProviderMethod::NameMarketAcceptOffer
@@ -1664,6 +1686,7 @@ impl<B: HnsBackend, C: HnsClock> ServiceRuntime for PersistentHnsValueRuntime<B,
             ProviderMethod::HnsImportKnownName => self.import_known_name(&call),
             ProviderMethod::NameMarketListOffers => self.provider_market_offers(&call),
             ProviderMethod::NameMarketListMyOffers => self.provider_market_my_offers(&call),
+            ProviderMethod::NameMarketGetOffer => self.provider_market_offer(&call),
             ProviderMethod::NameMarketGetSession => self.provider_market_session(&call),
             ProviderMethod::HnsGetNames | ProviderMethod::HnsGetName => Err(
                 ServiceFailure::unsupported(ServiceCapability::ProviderDispatch),
@@ -2402,6 +2425,7 @@ impl<B: HnsBackend, C: HnsClock> WalletService<SharedWalletStore, PersistentHnsV
                 call.method,
                 ProviderMethod::NameMarketListOffers
                     | ProviderMethod::NameMarketListMyOffers
+                    | ProviderMethod::NameMarketGetOffer
                     | ProviderMethod::NameMarketGetSession
             )
         {
@@ -2777,22 +2801,24 @@ fn public_offer_page(page: ShakedexOfferPage) -> Result<Value, ServiceFailure> {
     let offers = page
         .offers
         .into_iter()
-        .map(|offer| {
-            Ok(json!({
-                "listingId": lowercase_hex(offer.listing_hash.as_bytes()),
-                "name": prepared_name_text(&offer.name)?,
-                "price": offer.price.get().to_string(),
-                "marketplaceFee": offer.marketplace_fee.get().to_string(),
-                "sellerPaymentAddress": offer.seller_payment_address,
-                "createdAtUnix": public_safe_u64(offer.created_at_unix, "createdAtUnix")?,
-                "expiresAtUnix": public_safe_u64(offer.expires_at_unix, "expiresAtUnix")?,
-            }))
-        })
+        .map(|offer| public_offer_preview(&offer))
         .collect::<Result<Vec<_>, ServiceFailure>>()?;
     bounded_provider_value(json!({
         "boardRevision": public_safe_u64(page.board_revision, "boardRevision")?,
         "offers": offers,
         "nextCursor": page.next_cursor.map(|hash| lowercase_hex(hash.as_bytes())),
+    }))
+}
+
+fn public_offer_preview(offer: &ShakedexOfferPreview) -> Result<Value, ServiceFailure> {
+    bounded_provider_value(json!({
+        "listingId": lowercase_hex(offer.listing_hash.as_bytes()),
+        "name": prepared_name_text(&offer.name)?,
+        "price": offer.price.get().to_string(),
+        "marketplaceFee": offer.marketplace_fee.get().to_string(),
+        "sellerPaymentAddress": offer.seller_payment_address,
+        "createdAtUnix": public_safe_u64(offer.created_at_unix, "createdAtUnix")?,
+        "expiresAtUnix": public_safe_u64(offer.expires_at_unix, "expiresAtUnix")?,
     }))
 }
 

@@ -317,18 +317,7 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
             if current.board_revision() != inventory.board_revision() {
                 return Err(ShakedexError::StaleRevision);
             }
-            let listing = current.listing();
-            offers.push(ShakedexOfferPreview {
-                listing_hash: listing.listing_hash(),
-                name: listing.name().to_vec(),
-                price: BaseUnits::new(u128::from(listing.price_base_units())),
-                marketplace_fee: BaseUnits::new(u128::from(listing.proof().fee.get())),
-                seller_payment_address: self
-                    .hns
-                    .shakedex_address_display(&listing.proof().payment_address)?,
-                created_at_unix: listing.created_at_unix(),
-                expires_at_unix: listing.expires_at_unix(),
-            });
+            offers.push(self.public_offer_preview(current.listing())?);
         }
         let next_cursor = (start + selected.len() < hashes.len())
             .then(|| selected.last().copied())
@@ -337,6 +326,36 @@ impl<'a, B: HnsBackend, C: HnsClock> ShakedexTradeRuntime<'a, B, C> {
             board_revision: inventory.board_revision(),
             offers,
             next_cursor,
+        })
+    }
+
+    /// Resolve one exact listing for an untrusted app URI. This repeats the
+    /// same signature, board, and current-lock checks as a discovery page;
+    /// purchase preparation independently rechecks them again.
+    pub fn current_offer_preview(
+        &self,
+        listing_hash: ObjectHash,
+    ) -> Result<Option<ShakedexOfferPreview>, ShakedexError> {
+        self.board
+            .current_offer(listing_hash)?
+            .map(|offer| self.public_offer_preview(offer.listing()))
+            .transpose()
+    }
+
+    fn public_offer_preview(
+        &self,
+        listing: &crate::VerifiedFixedPriceListing,
+    ) -> Result<ShakedexOfferPreview, ShakedexError> {
+        Ok(ShakedexOfferPreview {
+            listing_hash: listing.listing_hash(),
+            name: listing.name().to_vec(),
+            price: BaseUnits::new(u128::from(listing.price_base_units())),
+            marketplace_fee: BaseUnits::new(u128::from(listing.proof().fee.get())),
+            seller_payment_address: self
+                .hns
+                .shakedex_address_display(&listing.proof().payment_address)?,
+            created_at_unix: listing.created_at_unix(),
+            expires_at_unix: listing.expires_at_unix(),
         })
     }
 
