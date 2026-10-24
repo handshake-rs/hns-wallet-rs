@@ -134,7 +134,7 @@ impl MarketFixture {
         let name = b"authority-board".to_vec();
         let name_hash = hash_name(&name).expect("name hash");
         let signing_key = SigningKey::from_slice(&[0x31; 32]).expect("seller key");
-        let seller_public_key = signing_key.verifying_key().to_encoded_point(true);
+        let seller_public_key = signing_key.verifying_key().to_sec1_point(true);
         let seller_public_key: [u8; 33] = seller_public_key
             .as_bytes()
             .try_into()
@@ -255,7 +255,7 @@ impl MarketFixture {
     }
 
     fn listing(&self, sequence: u64, price: u64) -> FixedPriceListing {
-        let seller_public_key = self.signing_key.verifying_key().to_encoded_point(true);
+        let seller_public_key = self.signing_key.verifying_key().to_sec1_point(true);
         let seller_public_key: [u8; 33] = seller_public_key
             .as_bytes()
             .try_into()
@@ -451,11 +451,7 @@ impl HnsBackend for TestBackend {
         self.control
             .mempool_query_count
             .fetch_add(1, Ordering::SeqCst);
-        let seller_public_key = self
-            .market
-            .signing_key
-            .verifying_key()
-            .to_encoded_point(true);
+        let seller_public_key = self.market.signing_key.verifying_key().to_sec1_point(true);
         let expected = lock_script_hash(
             seller_public_key
                 .as_bytes()
@@ -653,7 +649,7 @@ impl BatchMarketFixture {
     fn new(name: &[u8], signing_key: SigningKey, tag: u8) -> Self {
         let seller_public_key = signing_key
             .verifying_key()
-            .to_encoded_point(true)
+            .to_sec1_point(true)
             .as_bytes()
             .try_into()
             .expect("compressed batch seller key");
@@ -1365,7 +1361,7 @@ fn current_lock_batch_rejects_all_bad_input_before_store_backend_or_clock_io() {
     let seller_public_key: [u8; 33] = market
         .signing_key
         .verifying_key()
-        .to_encoded_point(true)
+        .to_sec1_point(true)
         .as_bytes()
         .try_into()
         .expect("compressed seller key");
@@ -1390,7 +1386,7 @@ fn current_lock_batch_rejects_all_bad_input_before_store_backend_or_clock_io() {
             name: market.name.clone(),
             seller_public_key: alternate_key
                 .verifying_key()
-                .to_encoded_point(true)
+                .to_sec1_point(true)
                 .as_bytes()
                 .try_into()
                 .expect("alternate compressed seller key"),
@@ -1463,7 +1459,7 @@ fn current_lock_batch_retains_one_fenced_authority_without_store_writes() {
     let seller_public_key: [u8; 33] = market
         .signing_key
         .verifying_key()
-        .to_encoded_point(true)
+        .to_sec1_point(true)
         .as_bytes()
         .try_into()
         .expect("compressed seller key");
@@ -3276,7 +3272,7 @@ fn cancellation_admission_rejects_wrong_identity_absence_and_expired_initial_mut
     let wrong_seller_key = SigningKey::from_slice(&[0x44; 32]).expect("wrong seller key");
     let wrong_seller_public_key: [u8; 33] = wrong_seller_key
         .verifying_key()
-        .to_encoded_point(true)
+        .to_sec1_point(true)
         .as_bytes()
         .try_into()
         .expect("wrong compressed seller key");

@@ -370,7 +370,7 @@ pub fn derive_hns_account_public_key(
         SigningKey::from_slice(secret.as_slice()).map_err(|_| HnsWalletError::KeyDerivation)?;
     signing
         .verifying_key()
-        .to_encoded_point(true)
+        .to_sec1_point(true)
         .as_bytes()
         .try_into()
         .map_err(|_| HnsWalletError::KeyDerivation)
@@ -12112,7 +12112,7 @@ fn sign_ordered_p2pkh_inputs_from(
         let secret = derive_account_secret(&seed, account.config.network, coin.derivation)?;
         let signing =
             SigningKey::from_slice(secret.as_slice()).map_err(|_| HnsWalletError::KeyDerivation)?;
-        let public = signing.verifying_key().to_encoded_point(true);
+        let public = signing.verifying_key().to_sec1_point(true);
         let public_bytes: [u8; 33] = public
             .as_bytes()
             .try_into()
@@ -12127,7 +12127,7 @@ fn sign_ordered_p2pkh_inputs_from(
         let signature: Signature = signing
             .sign_prehash(&digest)
             .map_err(|_| HnsWalletError::Signing)?;
-        let signature = signature.normalize_s().unwrap_or(signature);
+        let signature = signature.normalize_s();
         let mut encoded = signature.to_bytes().to_vec();
         encoded.push(SIGHASH_ALL as u8);
         transaction.inputs[index].witness = Witness {
@@ -12338,7 +12338,7 @@ fn derive_settlement_public_key(
         SigningKey::from_slice(secret.as_slice()).map_err(|_| HnsWalletError::KeyDerivation)?;
     signing
         .verifying_key()
-        .to_encoded_point(true)
+        .to_sec1_point(true)
         .as_bytes()
         .try_into()
         .map_err(|_| HnsWalletError::KeyDerivation)
@@ -12679,7 +12679,7 @@ fn sign_htlc_spend(
     let signature: Signature = signing
         .sign_prehash(&digest)
         .map_err(|_| HnsWalletError::Signing)?;
-    let signature = signature.normalize_s().unwrap_or(signature);
+    let signature = signature.normalize_s();
     let mut encoded = signature.to_bytes().to_vec();
     encoded.push(SIGHASH_ALL as u8);
     transaction.inputs[0].witness = if refund {
@@ -12716,7 +12716,7 @@ fn sign_htlc_spend_with_settlement_signer(
         .sign_digest(digest)
         .map_err(|_| HnsWalletError::Signing)?;
     let signature = Signature::from_slice(&signature).map_err(|_| HnsWalletError::Signing)?;
-    if signature.normalize_s().is_some() {
+    if signature != signature.normalize_s() {
         return Err(HnsWalletError::Signing);
     }
     let verifying = VerifyingKey::from_sec1_bytes(&signer.compressed_public_key())
@@ -13313,7 +13313,7 @@ mod tests {
         let expected_path = "m/44'/5353'/0'/0/0"
             .parse::<DerivationPath>()
             .expect("canonical hsd path");
-        let expected = XPrv::derive_from_path(seed, &expected_path).expect("canonical hsd child");
+        let expected = XPrv::derive_from_path(&seed, &expected_path).expect("canonical hsd child");
         assert_eq!(
             actual.as_slice(),
             expected.private_key().to_bytes().as_slice()
@@ -13321,7 +13321,7 @@ mod tests {
         let public = SigningKey::from_slice(actual.as_slice())
             .expect("hsd secret")
             .verifying_key()
-            .to_encoded_point(true);
+            .to_sec1_point(true);
         assert_eq!(
             hex::encode(public.as_bytes()),
             "03a527c08aeb86e99f6a4019d9bcd38290a598d7287fcca929a684004ed8d41d39"
@@ -15854,7 +15854,7 @@ mod tests {
         let refund = SigningKey::from_slice(&[93; 32])
             .expect("refund key")
             .verifying_key()
-            .to_encoded_point(true);
+            .to_sec1_point(true);
         let refund: [u8; 33] = refund.as_bytes().try_into().expect("compressed refund key");
         let preimage = Preimage::new([94; 32]);
         let hashlock = ObjectHash::new(Sha256::digest(preimage.expose_for_settlement()).into());
@@ -16894,7 +16894,7 @@ mod tests {
             SigningKey::from_slice(shakedex.as_slice()).expect("Shakedex signing key");
         let shakedex_public: [u8; 33] = shakedex_signing
             .verifying_key()
-            .to_encoded_point(true)
+            .to_sec1_point(true)
             .as_bytes()
             .try_into()
             .expect("compressed Shakedex key");
@@ -16925,7 +16925,7 @@ mod tests {
         .expect("canonical account-zero coin key");
         let signing = SigningKey::from_slice(coin.as_slice()).expect("signing key");
         let public: [u8; 33] = VerifyingKey::from(&signing)
-            .to_encoded_point(true)
+            .to_sec1_point(true)
             .as_bytes()
             .try_into()
             .expect("compressed key");
@@ -17052,11 +17052,11 @@ mod tests {
         let receiver = SigningKey::from_bytes((&[31_u8; 32]).into())
             .expect("receiver key")
             .verifying_key()
-            .to_encoded_point(true);
+            .to_sec1_point(true);
         let refund = SigningKey::from_bytes((&[32_u8; 32]).into())
             .expect("refund key")
             .verifying_key()
-            .to_encoded_point(true);
+            .to_sec1_point(true);
         let receiver: [u8; 33] = receiver.as_bytes().try_into().expect("receiver SEC1");
         let refund: [u8; 33] = refund.as_bytes().try_into().expect("refund SEC1");
         let descriptor = HnsHtlc {

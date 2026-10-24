@@ -1425,7 +1425,7 @@ mod tests {
         let signing = SigningKey::from_slice(&[secret_byte; 32]).expect("valid test scalar");
         signing
             .verifying_key()
-            .to_encoded_point(true)
+            .to_sec1_point(true)
             .as_bytes()
             .try_into()
             .expect("compressed endpoint key")

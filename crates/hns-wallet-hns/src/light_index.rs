@@ -1717,7 +1717,7 @@ mod tests {
             SigningKey::from_bytes((&[byte; 32]).into())
                 .unwrap()
                 .verifying_key()
-                .to_encoded_point(true)
+                .to_sec1_point(true)
                 .as_bytes()
                 .try_into()
                 .unwrap()

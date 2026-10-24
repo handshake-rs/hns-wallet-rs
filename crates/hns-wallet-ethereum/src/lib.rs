@@ -237,7 +237,7 @@ fn derive_account(
 }
 
 fn address_from_verifying_key(key: &VerifyingKey) -> EthereumAddress {
-    let encoded = key.to_encoded_point(false);
+    let encoded = key.to_sec1_point(false);
     let digest = Keccak256::digest(&encoded.as_bytes()[1..]);
     let mut address = [0_u8; 20];
     address.copy_from_slice(&digest[12..]);
@@ -791,9 +791,7 @@ impl PreparedEip1559Transaction {
         signing_payload.extend_from_slice(unsigned_rlp.as_slice());
         let digest: Zeroizing<[u8; 32]> =
             Zeroizing::new(Keccak256::digest(signing_payload.as_slice()).into());
-        let (signature, recovery) = signing
-            .sign_prehash_recoverable(&digest[..])
-            .map_err(|_| EthereumError::Signing)?;
+        let (signature, recovery) = signing.sign_prehash_recoverable(&digest[..]);
         if recovery.is_x_reduced() {
             return Err(EthereumError::Signing);
         }

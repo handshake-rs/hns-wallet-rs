@@ -15,10 +15,10 @@ from pathlib import Path
 
 REPOSITORY = "https://github.com/handshake-rs/hns-wallet-rs"
 PROTOCOL_REPOSITORY = "https://github.com/handshake-rs/hns-rs.git"
-PROTOCOL_REVISION = "60eb912d615243a6bfb9741b17f16833c5a9181a"
-PROTOCOL_VERSION = "=0.5.0"
+PROTOCOL_REVISION = "a113595341984a2c82f7e2792deb55b2c7957203"
+PROTOCOL_VERSION = "=0.5.1"
 REGISTRY_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-PROTOCOL_CHECKSUM_MANIFEST = "release/hns-rs-0.5.0-crates.sha256"
+PROTOCOL_CHECKSUM_MANIFEST = "release/hns-rs-0.5.1-crates.sha256"
 PROTOCOL_PUBLIC_PACKAGES = (
     "hns-encoding",
     "hns-rollback-journal",
@@ -56,10 +56,10 @@ ENGINE_REPOSITORY = "https://github.com/handshake-rs/hns-dane-engine.git"
 ENGINE_REVISION = "b7fdf8826c81b77650a0f740d1f05314b74969f9"
 ENGINE_VERSION = "=0.2.2"
 ENGINE_CHECKSUM_MANIFEST = "release/hns-dane-engine-0.2.2-crates.sha256"
-ENGINE_PATCH_REVISION = "90a5dfeb5b7c00e8fea010e79f82076de4263fd6"
-ENGINE_PATCH_VERSION = "=0.2.6"
+ENGINE_PATCH_REVISION = "66eebf9e9655d69316f7270fa24c77ff3a425fcc"
+ENGINE_PATCH_VERSION = "=0.2.7"
 ENGINE_PATCH_CHECKSUM_MANIFEST = (
-    "release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256"
+    "release/hns-dane-engine-mobile-wallet-0.2.7-crates.sha256"
 )
 ENGINE_PATCH_PACKAGES = (
     "hns-light-chain",
@@ -258,7 +258,7 @@ def verify_release_document(repo: Path, order: list[str], version: str) -> None:
     for required in required_release_text:
         if required not in document:
             fail(f"docs/releasing.md omits {required!r}")
-    if "nineteen-crate `hns-rs` `0.5.0` prerequisite" not in document:
+    if "nineteen-crate `hns-rs` `0.5.1` prerequisite" not in document:
         fail("docs/releasing.md omits the current protocol prerequisites")
     if re.search(
         r"20\s+required\s+`hns-dane-engine` `0\.2\.2` archives",
@@ -322,9 +322,9 @@ def verify_publish_script_safety(repo: Path) -> None:
         "verify_protocol_packages_published()",
         "verify_engine_packages_published()",
         "verify_published_cohort()",
-        "protocol_checksum_manifest=release/hns-rs-0.5.0-crates.sha256",
+        "protocol_checksum_manifest=release/hns-rs-0.5.1-crates.sha256",
         "engine_checksum_manifest=release/hns-dane-engine-0.2.2-crates.sha256",
-        "engine_patch_checksum_manifest=release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256",
+        "engine_patch_checksum_manifest=release/hns-dane-engine-mobile-wallet-0.2.7-crates.sha256",
         "require_clean_archive_vcs=yes",
         '*\\"dirty\\":true*',
         'cohort_vcs_info="$release_tmp/$package-$version.cargo_vcs_info.json"',

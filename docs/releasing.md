@@ -5,6 +5,11 @@ with changes that need distribution. A compatible dependency patch does not
 require a new release of its consumers. Each package declares its own version
 and maintains one current release entry in its `CHANGELOG.md`.
 
+The current crypto dependency migration selects the eleven packages in
+[`release/crypto-dependency-2026-10-24-crates.txt`](../release/crypto-dependency-2026-10-24-crates.txt).
+Publish them in that file's dependency order after the protocol and engine
+cohorts are available.
+
 ## Public package allowlist
 
 The release script accepts one package per execution. Use dependency order
@@ -35,14 +40,14 @@ package-local release entries.
 
 ## Dependency prerequisites
 
-The nineteen-crate `hns-rs` `0.5.0` prerequisite uses source
-`60eb912d615243a6bfb9741b17f16833c5a9181a` and checksum manifest
-`release/hns-rs-0.5.0-crates.sha256`.
+The nineteen-crate `hns-rs` `0.5.1` prerequisite uses source
+`a113595341984a2c82f7e2792deb55b2c7957203` and checksum manifest
+`release/hns-rs-0.5.1-crates.sha256`.
 
 Execution verifies all 20 required `hns-dane-engine` `0.2.2` archives against
 source `b7fdf8826c81b77650a0f740d1f05314b74969f9` and
-`release/hns-dane-engine-0.2.2-crates.sha256`. The four-package light-client `0.2.6` cohort uses source `90a5dfeb5b7c00e8fea010e79f82076de4263fd6`, and
-`release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256`.
+`release/hns-dane-engine-0.2.2-crates.sha256`. The four-package light-client `0.2.7` cohort uses source `66eebf9e9655d69316f7270fa24c77ff3a425fcc` and
+`release/hns-dane-engine-mobile-wallet-0.2.7-crates.sha256`.
 
 Immediately before uploading, verify API checksum and non-yanked status,
 archive SHA-256, clean source identity, and `crates/<package>` VCS path for
@@ -50,12 +55,11 @@ these dependencies. Their checksum manifests are active build prerequisites.
 
 ## Qualification and upload
 
-The current root `Cargo.lock` resolves Tokio 1.53.1 through the Bitcoin
-transport stack. Before the next release qualification, review the
-[Tokio AsyncFd advisory](https://rustsec.org/advisories/RUSTSEC-2026-0386.html),
-refresh the lockfile to at least 1.53.3, and run the exact source gate again.
-This is a lockfile and qualification requirement; it does not change the
-versions of unchanged wallet packages.
+The current root `Cargo.lock` resolves Tokio 1.53.3 through the Bitcoin
+transport stack, addressing the
+[Tokio AsyncFd advisory](https://rustsec.org/advisories/RUSTSEC-2026-0386.html).
+The release gate checks the locked graph without changing the versions of
+unchanged wallet packages.
 
 1. Increment the changed package's explicit version. Keep consumer dependency
    requirements when they already accept it. Update the wallet lockfile and
@@ -77,6 +81,8 @@ versions of unchanged wallet packages.
 4. Commit the reviewed source and run `./scripts/check.sh` for that exact
    commit. Execution rejects a dirty worktree. Qualify source once; repeat a
    check when a source change, failure, or unresolved concern requires it.
+   The Bitcoin regtest integration suite requires Bitcoin Core 30.2;
+   set `BITCOIND_EXE` to its `bitcoind` executable when it is not on `PATH`.
 5. Dispatch [release-preflight.yml](../.github/workflows/release-preflight.yml)
    with its qualified 40-character `expected_commit` and selected `package`.
    The equivalent local normalized qualification is:
@@ -101,7 +107,7 @@ versions of unchanged wallet packages.
 7. Confirm the selected package version and upload only that package:
 
    ```sh
-   ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.6
+   ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.7
    ```
 
    The package name must be allowlisted and the confirmation must match its
@@ -117,7 +123,7 @@ interval. Override a default only to match an explicit registry limit:
 ```sh
 PUBLISH_NEW_INTERVAL_SECONDS=605 \
 PUBLISH_UPDATE_INTERVAL_SECONDS=65 \
-  ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.6
+  ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.7
 ```
 
 Download the uploaded archive and verify checksum, exact source commit, and

@@ -432,7 +432,7 @@ fn sign_owned_inputs(
         let secret = derive_account_secret(&seed, account.config.network, *derivation)?;
         let key =
             SigningKey::from_slice(secret.as_slice()).map_err(|_| HnsWalletError::KeyDerivation)?;
-        let public = key.verifying_key().to_encoded_point(true);
+        let public = key.verifying_key().to_sec1_point(true);
         let public_bytes: [u8; 33] = public
             .as_bytes()
             .try_into()
@@ -451,11 +451,7 @@ fn sign_owned_inputs(
         let signature: Signature = key
             .sign_prehash(&digest)
             .map_err(|_| HnsWalletError::Signing)?;
-        let mut signature = signature
-            .normalize_s()
-            .unwrap_or(signature)
-            .to_bytes()
-            .to_vec();
+        let mut signature = signature.normalize_s().to_bytes().to_vec();
         signature.push(SIGHASH_ALL as u8);
         tx.inputs[index].witness.items = vec![signature, public.as_bytes().to_vec()];
     }
@@ -635,7 +631,7 @@ mod tests {
         SigningKey::from_slice(&[byte; 32])
             .unwrap()
             .verifying_key()
-            .to_encoded_point(true)
+            .to_sec1_point(true)
             .as_bytes()
             .try_into()
             .unwrap()

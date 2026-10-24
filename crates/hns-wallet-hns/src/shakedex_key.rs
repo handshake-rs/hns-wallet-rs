@@ -1131,7 +1131,7 @@ fn derive_key_material(
     let secret = super::derive_secret(seed.as_slice(), reference)?;
     let signing = SigningKey::from_slice(secret.as_slice())
         .map_err(|_| HnsShakedexKeyAllocationError::CorruptAllocation)?;
-    let compressed_public_key = signing.verifying_key().to_encoded_point(true);
+    let compressed_public_key = signing.verifying_key().to_sec1_point(true);
     let compressed_public_key = compressed_public_key
         .as_bytes()
         .try_into()
@@ -1359,7 +1359,7 @@ impl HnsShakedexSigner {
             .signing_key()?
             .sign_prehash(&digest)
             .map_err(|_| HnsShakedexKeyAllocationError::SigningFailure)?;
-        let signature = signature.normalize_s().unwrap_or(signature);
+        let signature = signature.normalize_s();
         let mut encoded = [0_u8; 65];
         encoded[..64].copy_from_slice(&signature.to_bytes());
         encoded[64] = SHAKEDEX_RECOVERY_SIGHASH as u8;
@@ -1387,7 +1387,7 @@ impl HnsShakedexSigner {
     fn signing_key(&self) -> Result<SigningKey, HnsShakedexKeyAllocationError> {
         let signing = SigningKey::from_slice(self.secret.as_slice())
             .map_err(|_| HnsShakedexKeyAllocationError::CorruptAllocation)?;
-        if signing.verifying_key().to_encoded_point(true).as_bytes() != self.compressed_public_key {
+        if signing.verifying_key().to_sec1_point(true).as_bytes() != self.compressed_public_key {
             return Err(HnsShakedexKeyAllocationError::CorruptAllocation);
         }
         Ok(signing)

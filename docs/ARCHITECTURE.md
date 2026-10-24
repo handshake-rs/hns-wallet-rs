@@ -20,9 +20,9 @@ Canonical Handshake transactions, covenants, scripts, Urkel proofs, Shakedex
 proofs, signed fixed-price listings/cancellations, Shakescape name-market envelopes,
 and Shakescape V1 direct HNS/BTC offer/session envelopes remain in `hns-rs`. This
 workspace consumes the required protocol crates as exact published registry
-`hns-rs` `0.5.0`, whose release source is
-`60eb912d615243a6bfb9741b17f16833c5a9181a`. The full 19-crate archive cohort is
-recorded in `release/hns-rs-0.5.0-crates.sha256`. The direct light-wallet
+`hns-rs` `0.5.1`, whose release source is
+`a113595341984a2c82f7e2792deb55b2c7957203`. The full 19-crate archive cohort is
+recorded in `release/hns-rs-0.5.1-crates.sha256`. The direct light-wallet
 dependencies use the published `hns-dane-engine` `0.2.6` source
 `90a5dfeb5b7c00e8fea010e79f82076de4263fd6`, recorded in
 `release/hns-dane-engine-mobile-wallet-0.2.6-crates.sha256`. Unchanged engine
@@ -186,7 +186,7 @@ one full reconciliation and one retry for stale or unavailable quote evidence.
 Confirmed wallet coins retain exact inclusion height and canonical covenant
 bytes through encrypted persistence. Final transactions are checked against
 the ordered reconstructed consensus coins: published registry `hns-script`
-`0.5.0` source `60eb912d615243a6bfb9741b17f16833c5a9181a` computes sigops,
+`0.5.1` source `a113595341984a2c82f7e2792deb55b2c7957203` computes sigops,
 policy virtual size, minimum fee, and standard weight/sigop bounds, while exact
 input/output sums independently reproduce actual fee.
 Missing or mismatched evidence fails closed. The source gate

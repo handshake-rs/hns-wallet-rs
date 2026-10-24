@@ -43,7 +43,7 @@ fn listing_fixture() -> (FixedPriceListing, Coin, SigningKey) {
     let signing_key = SigningKey::from_slice(&[0x31; 32]).expect("seller key");
     let seller_public_key: [u8; 33] = signing_key
         .verifying_key()
-        .to_encoded_point(true)
+        .to_sec1_point(true)
         .as_bytes()
         .try_into()
         .expect("compressed seller key");
@@ -104,7 +104,7 @@ fn listing_fixture() -> (FixedPriceListing, Coin, SigningKey) {
 fn public_key_hash(key: &SigningKey) -> ([u8; 33], [u8; 20]) {
     let public_key: [u8; 33] = key
         .verifying_key()
-        .to_encoded_point(true)
+        .to_sec1_point(true)
         .as_bytes()
         .try_into()
         .expect("compressed public key");
@@ -168,7 +168,7 @@ fn sign_p2pkh_input_with_sighash(
     let digest = signature_hash(transaction, index, &script, coin.value.get(), sighash_type)
         .expect("P2PKH signature hash");
     let signature: Signature = key.sign_prehash(&digest).expect("P2PKH signature");
-    let signature = signature.normalize_s().unwrap_or(signature);
+    let signature = signature.normalize_s();
     let mut encoded = signature.to_bytes().to_vec();
     encoded.push(sighash_type as u8);
     transaction.inputs[index].witness = Witness {
@@ -178,7 +178,7 @@ fn sign_p2pkh_input_with_sighash(
 
 fn compact_recovery_signature(key: &SigningKey, digest: &[u8; 32]) -> [u8; 65] {
     let signature: Signature = key.sign_prehash(digest).expect("recovery signature");
-    let signature = signature.normalize_s().unwrap_or(signature);
+    let signature = signature.normalize_s();
     let mut encoded = [0_u8; 65];
     encoded[..64].copy_from_slice(&signature.to_bytes());
     encoded[64] = SHAKEDEX_RECOVERY_SIGHASH as u8;

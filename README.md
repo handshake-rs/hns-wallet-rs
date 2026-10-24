@@ -135,8 +135,8 @@ published packages. The wallet uses one canonical hsd/Bob-compatible HNS account
 for payments and name ownership, responder-as-maker direct swaps, and
 protocol-specific ShakeDex and atomic-swap keys.
 
-The `0.4.1` source pins the exact `hns-rs 0.5.0` protocol cohort and the
-`hns-dane-engine 0.2.6` light-client cohort from crates.io. Their published
+The current source pins the exact `hns-rs 0.5.1` protocol cohort and the
+`hns-dane-engine 0.2.7` light-client cohort from crates.io. Their published
 archive checksums and source revisions are recorded in `release/`; the release
 gate reads them back before any wallet upload. See
 [`docs/releasing.md`](docs/releasing.md) for the version and source policy.

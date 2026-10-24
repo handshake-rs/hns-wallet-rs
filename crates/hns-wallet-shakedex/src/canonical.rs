@@ -637,7 +637,7 @@ mod tests {
 
     fn listing_fixture(sequence: u64) -> (FixedPriceListing, Coin, SigningKey) {
         let signing_key = SigningKey::from_slice(&[0x31; 32]).expect("seller key");
-        let seller_public_key = signing_key.verifying_key().to_encoded_point(true);
+        let seller_public_key = signing_key.verifying_key().to_sec1_point(true);
         let seller_public_key = seller_public_key
             .as_bytes()
             .try_into()

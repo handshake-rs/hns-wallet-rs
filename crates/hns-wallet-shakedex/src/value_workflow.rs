@@ -3740,7 +3740,7 @@ mod tests {
     fn production_next_public_key_hash(key: &SigningKey) -> ([u8; 33], [u8; 20]) {
         let public_key: [u8; 33] = key
             .verifying_key()
-            .to_encoded_point(true)
+            .to_sec1_point(true)
             .as_bytes()
             .try_into()
             .expect("compressed public key");
@@ -3798,7 +3798,7 @@ mod tests {
         let digest = signature_hash(transaction, index, &script, coin.value.get(), SIGHASH_ALL)
             .expect("P2PKH signature hash");
         let signature: Signature = key.sign_prehash(&digest).expect("P2PKH signature");
-        let signature = signature.normalize_s().unwrap_or(signature);
+        let signature = signature.normalize_s();
         let mut encoded = signature.to_bytes().to_vec();
         encoded.push(SIGHASH_ALL as u8);
         transaction.inputs[index].witness = Witness {

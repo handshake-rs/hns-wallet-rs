@@ -1709,7 +1709,7 @@ mod normalized_storage_tests {
         let signing_key = SigningKey::from_slice(&[0x61; 32]).expect("seller key");
         let seller_public_key: [u8; 33] = signing_key
             .verifying_key()
-            .to_encoded_point(true)
+            .to_sec1_point(true)
             .as_bytes()
             .try_into()
             .expect("compressed seller key");

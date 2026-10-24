@@ -1713,7 +1713,7 @@ mod tests {
         network: NetworkBinding,
         endpoint_key: &SigningKey,
     ) -> ShakescapePublicationAcceptancePolicy {
-        let endpoint_public_key = endpoint_key.verifying_key().to_encoded_point(true);
+        let endpoint_public_key = endpoint_key.verifying_key().to_sec1_point(true);
         ShakescapePublicationAcceptancePolicy::new(
             network,
             ShakescapeHrmRootBinding {
@@ -1786,7 +1786,7 @@ mod tests {
         VerifiedListingCancellation,
     ) {
         let signing_key = SigningKey::from_slice(&[0x31; 32]).expect("seller key");
-        let seller_public_key = signing_key.verifying_key().to_encoded_point(true);
+        let seller_public_key = signing_key.verifying_key().to_sec1_point(true);
         let seller_public_key = seller_public_key
             .as_bytes()
             .try_into()

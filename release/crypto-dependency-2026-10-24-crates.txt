@@ -1,0 +1,11 @@
+hns-wallet-chain-api
+hns-wallet-ffi
+hns-wallet-hns
+hns-wallet-bitcoin-kyoto
+hns-wallet-market
+hns-wallet-shakedex
+hns-wallet-ethereum
+hns-wallet-host
+hns-wallet-service
+hns-wallet-testkit
+hns-wallet-mobile

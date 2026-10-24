@@ -370,7 +370,7 @@ impl SettlementSigner for CrossChainSwapKey {
         let signature: Signature = signing
             .sign_prehash(&digest)
             .map_err(|_| SettlementSigningError::SigningFailed)?;
-        let signature = signature.normalize_s().unwrap_or(signature);
+        let signature = signature.normalize_s();
         Ok(signature.to_bytes().into())
     }
 }
@@ -609,7 +609,7 @@ fn derive_key_from_store(
         if let Ok(signing) = SigningKey::from_bytes((&*secret).into()) {
             let compressed_public_key = signing
                 .verifying_key()
-                .to_encoded_point(true)
+                .to_sec1_point(true)
                 .as_bytes()
                 .try_into()
                 .map_err(|_| CrossChainSwapKeyError::DerivationFailed)?;
@@ -729,7 +729,7 @@ mod tests {
             pair: MarketPair::HNS_BTC,
             signer_public_key: identity
                 .verifying_key()
-                .to_encoded_point(true)
+                .to_sec1_point(true)
                 .as_bytes()
                 .try_into()
                 .expect("compressed identity"),
@@ -753,7 +753,10 @@ mod tests {
         assert!(format!("{recovered:?}").contains("<redacted>"));
         let signature = recovered.sign_digest([42; 32]).expect("digest signature");
         let signature = Signature::from_slice(&signature).expect("compact signature");
-        assert!(signature.normalize_s().is_none(), "signature must be low-S");
+        assert!(
+            signature == signature.normalize_s(),
+            "signature must be low-S"
+        );
 
         let id = allocation_record_id(request.wallet_id, request.session_id, request.participant);
         assert!(matches!(

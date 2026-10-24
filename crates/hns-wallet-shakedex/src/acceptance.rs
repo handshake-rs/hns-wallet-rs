@@ -408,7 +408,7 @@ fn parse_and_verify(receipt_bytes: &[u8]) -> Result<ParsedAcceptance, ShakedexEr
     }
     let signature = Signature::from_der(&parsed.signature)
         .map_err(|_| ShakedexError::InvalidShakescapePublicationAcceptance)?;
-    if signature.normalize_s().is_some() || signature.to_der().as_bytes() != parsed.signature {
+    if signature != signature.normalize_s() || signature.to_der().as_bytes() != parsed.signature {
         return Err(ShakedexError::InvalidShakescapePublicationAcceptance);
     }
     let key = VerifyingKey::from_sec1_bytes(&parsed.policy.hnsa.endpoint_public_key)
@@ -564,7 +564,7 @@ pub(crate) fn signed_acceptance_for_test(
     let signature: Signature = signing_key
         .sign_prehash(&acceptance_digest(&body))
         .expect("test endpoint signature");
-    let signature = signature.normalize_s().unwrap_or(signature).to_der();
+    let signature = signature.normalize_s().to_der();
     parsed.signature = signature.as_bytes().to_vec();
     let mut receipt = body;
     put_u16(

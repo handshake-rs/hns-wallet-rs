@@ -31,30 +31,30 @@ categories = ["cryptography::cryptocurrencies"]
 [workspace.dependencies]
 hns-wallet-types = { version = "0.4.2", path = "crates/hns-wallet-types" }
 hns-wallet-store = { version = "0.4.2", path = "crates/hns-wallet-store" }
-hns-wallet-chain-api = { version = "0.4.2", path = "crates/hns-wallet-chain-api" }
-hns-wallet-hns = { version = "0.4.6", path = "crates/hns-wallet-hns" }
+hns-wallet-chain-api = { version = "0.4.3", path = "crates/hns-wallet-chain-api" }
+hns-wallet-hns = { version = "0.4.7", path = "crates/hns-wallet-hns" }
 hns-wallet-provider = { version = "0.4.2", path = "crates/hns-wallet-provider" }
-hns-wallet-shakedex = { version = "0.4.2", path = "crates/hns-wallet-shakedex" }
-hns-wallet-market = { version = "0.5.1", path = "crates/hns-wallet-market" }
-hns-wallet-mobile = { version = "0.6.4", path = "crates/hns-wallet-mobile" }
-hns-wallet-bitcoin-kyoto = { version = "0.4.6", path = "crates/hns-wallet-bitcoin-kyoto" }
-hns-wallet-ethereum = { version = "0.4.1", path = "crates/hns-wallet-ethereum" }
-hns-wallet-ffi = { version = "0.4.1", path = "crates/hns-wallet-ffi" }
-hns-wallet-service = { version = "0.4.3", path = "crates/hns-wallet-service" }
-hns-wallet-host = { version = "0.4.1", path = "crates/hns-wallet-host" }
+hns-wallet-shakedex = { version = "0.4.3", path = "crates/hns-wallet-shakedex" }
+hns-wallet-market = { version = "0.5.2", path = "crates/hns-wallet-market" }
+hns-wallet-mobile = { version = "0.6.5", path = "crates/hns-wallet-mobile" }
+hns-wallet-bitcoin-kyoto = { version = "0.4.7", path = "crates/hns-wallet-bitcoin-kyoto" }
+hns-wallet-ethereum = { version = "0.4.2", path = "crates/hns-wallet-ethereum" }
+hns-wallet-ffi = { version = "0.4.2", path = "crates/hns-wallet-ffi" }
+hns-wallet-service = { version = "0.4.4", path = "crates/hns-wallet-service" }
+hns-wallet-host = { version = "0.4.2", path = "crates/hns-wallet-host" }
 
 argon2 = "0.5.3"
 base64 = "0.22.1"
 bech32 = "0.11.0"
 blake2 = "0.10.6"
-bip32 = { version = "0.5.3", default-features = false, features = ["secp256k1", "std"] }
+bip32 = { version = "0.6.0", default-features = false, features = ["secp256k1", "alloc"] }
 bip39 = { version = "2.2.0", features = ["rand", "zeroize"] }
 chacha20poly1305 = "0.10.1"
 getrandom = "0.3.3"
 hex = "0.4.3"
 hkdf = "0.12.4"
 hmac = "0.12.1"
-k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "std"] }
+k256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "std"] }
 # One native SQLite link target shared with the mobile embedding workspaces.
 # BDK persistence is implemented over encrypted WalletStore records and must
 # not re-enable BDK's independent rusqlite feature. `fallible_uint` preserves
@@ -71,21 +71,21 @@ zeroize = { version = "1.8.1", features = ["derive"] }
 
 # Canonical Handshake and light-engine sources. All external cohorts are
 # exact, checksum-bearing crates.io dependencies.
-hns-covenants = { version = "=0.5.0" }
-hns-header-consensus = { version = "=0.5.0" }
-hns-mining = { version = "=0.5.0" }
-hns-marketplace-protocol = { version = "=0.5.0" }
-hns-p2p-experimental = { version = "=0.5.0" }
-hns-light-chain = { version = "=0.2.6" }
-hns-light-p2p = { version = "=0.2.6" }
-hns-light-sync = { version = "=0.2.6" }
-hns-light-wallet = { version = "=0.2.6" }
-hns-p2p-wire = { version = "=0.5.0" }
-hns-primitives = { version = "=0.5.0" }
-hns-script = { version = "=0.5.0" }
-hns-swap = { version = "=0.5.0" }
-hns-transaction = { version = "=0.5.0" }
-hns-urkel-proof = { version = "=0.5.0" }
+hns-covenants = { version = "=0.5.1" }
+hns-header-consensus = { version = "=0.5.1" }
+hns-mining = { version = "=0.5.1" }
+hns-marketplace-protocol = { version = "=0.5.1" }
+hns-p2p-experimental = { version = "=0.5.1" }
+hns-light-chain = { version = "=0.2.7" }
+hns-light-p2p = { version = "=0.2.7" }
+hns-light-sync = { version = "=0.2.7" }
+hns-light-wallet = { version = "=0.2.7" }
+hns-p2p-wire = { version = "=0.5.1" }
+hns-primitives = { version = "=0.5.1" }
+hns-script = { version = "=0.5.1" }
+hns-swap = { version = "=0.5.1" }
+hns-transaction = { version = "=0.5.1" }
+hns-urkel-proof = { version = "=0.5.1" }
 
 # The only Bitcoin production synchronization implementation. The exact BDK
 # release is part of the encrypted changeset format contract.
@@ -93,7 +93,7 @@ bdk_wallet = { version = "=3.1.0", features = ["keys-bip39"] }
 bdk_kyoto = { package = "hns-wallet-bdk-kyoto", version = "0.4.1", path = "crates/hns-wallet-bdk-kyoto" }
 bip157 = { package = "hns-wallet-bip157", version = "0.4.1", path = "crates/hns-wallet-bip157" }
 bitcoin = { version = "0.32.8", features = ["serde"] }
-tokio = { version = "1.47.1", features = ["rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "sync", "time"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
