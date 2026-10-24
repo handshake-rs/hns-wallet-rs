@@ -50,6 +50,13 @@ these dependencies. Their checksum manifests are active build prerequisites.
 
 ## Qualification and upload
 
+The current root `Cargo.lock` resolves Tokio 1.53.1 through the Bitcoin
+transport stack. Before the next release qualification, review the
+[Tokio AsyncFd advisory](https://rustsec.org/advisories/RUSTSEC-2026-0386.html),
+refresh the lockfile to at least 1.53.3, and run the exact source gate again.
+This is a lockfile and qualification requirement; it does not change the
+versions of unchanged wallet packages.
+
 1. Increment the changed package's explicit version. Keep consumer dependency
    requirements when they already accept it. Update the wallet lockfile and
    inspect the package and dependency changes.
