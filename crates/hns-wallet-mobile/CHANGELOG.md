@@ -1,5 +1,13 @@
 # hns-wallet-mobile
 
+## 0.6.6 - 2026-10-25
+
+<!-- hns-wallet-release-state: 0.6.6 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Include a local redemption stage and transaction ID in Shakescape execution
+summaries while retaining chain-verified swap progress separately.
+
 ## 0.6.5 - 2026-10-24
 
 <!-- hns-wallet-release-state: 0.6.5 release -->

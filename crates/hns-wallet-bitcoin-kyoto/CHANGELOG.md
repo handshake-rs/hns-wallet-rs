@@ -1,5 +1,14 @@
 # hns-wallet-bitcoin-kyoto
 
+## 0.4.8 - 2026-10-25
+
+<!-- hns-wallet-release-state: 0.4.8 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
+
+Expose the exact approved Bitcoin HTLC redeem transaction and its durable
+broadcast or chain-observation stage, including recovery lookup by signed
+witness script.
+
 ## 0.4.7 - 2026-10-24
 
 <!-- hns-wallet-release-state: 0.4.7 release -->

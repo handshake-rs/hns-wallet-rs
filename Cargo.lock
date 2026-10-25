@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-bitcoin-kyoto"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "base64 0.22.1",
  "bdk_wallet",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-hns"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "bech32",
  "bip32",
@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "hns-wallet-mobile"
-version = "0.6.5"
+version = "0.6.6"
 dependencies = [
  "bdk_wallet",
  "getrandom 0.3.4",

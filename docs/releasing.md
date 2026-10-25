@@ -5,10 +5,11 @@ with changes that need distribution. A compatible dependency patch does not
 require a new release of its consumers. Each package declares its own version
 and maintains one current release entry in its `CHANGELOG.md`.
 
-The current crypto dependency migration selects the eleven packages in
+The pending Shakescape redemption-status release changes three packages.
+Publish `hns-wallet-hns` 0.4.8 and `hns-wallet-bitcoin-kyoto` 0.4.8 before
+`hns-wallet-mobile` 0.6.6. The mobile package requires the new APIs in both
+chain packages. The prior crypto dependency migration is recorded in
 [`release/crypto-dependency-2026-10-24-crates.txt`](../release/crypto-dependency-2026-10-24-crates.txt).
-Publish them in that file's dependency order after the protocol and engine
-cohorts are available.
 
 ## Public package allowlist
 
@@ -107,7 +108,7 @@ unchanged wallet packages.
 7. Confirm the selected package version and upload only that package:
 
    ```sh
-   ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.7
+   ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.8
    ```
 
    The package name must be allowlisted and the confirmation must match its
@@ -123,7 +124,7 @@ interval. Override a default only to match an explicit registry limit:
 ```sh
 PUBLISH_NEW_INTERVAL_SECONDS=605 \
 PUBLISH_UPDATE_INTERVAL_SECONDS=65 \
-  ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.7
+  ./scripts/publish.sh --execute hns-wallet-hns --confirm-publish 0.4.8
 ```
 
 Download the uploaded archive and verify checksum, exact source commit, and
