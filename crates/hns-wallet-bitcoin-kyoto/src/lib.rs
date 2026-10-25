@@ -2982,7 +2982,7 @@ mod tests {
             .broadcast
             .as_mut()
             .expect("intent")
-            .last_submitted_at_unix = Some(102);
+            .last_submitted_at_unix = Some(101);
         approved.last_changed_at_unix = 102;
         let revision = store
             .save_bitcoin_transaction(&persisted.txid, stored.revision, &approved, 102)
