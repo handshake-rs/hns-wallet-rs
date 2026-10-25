@@ -1,14 +1,19 @@
 //! Persisted direct Shakescape HNS/BTC session admission for installed wallets.
 
+use bdk_wallet::bitcoin::hashes::Hash as _;
+use bdk_wallet::bitcoin::{Network as BitcoinNetwork, Txid};
 use hns_marketplace_protocol::{
     AssetId, ChainId, CrossChainMessage, FundingState, NetworkBinding, SignedObjectHeader,
     SwapAssetSide, SwapFundingStatus, SwapSessionHello,
 };
 use hns_wallet_bitcoin_kyoto::{
-    BitcoinHtlcWatchRequest, MIN_HTLC_DUST_SATS, build_shakescape_bitcoin_htlc,
+    BitcoinHtlcRedeemSubmissionStage, BitcoinHtlcWatchRequest, MIN_HTLC_DUST_SATS,
+    bitcoin_htlc_redeem_submission_for_script, build_recovered_bitcoin_htlc,
+    build_shakescape_bitcoin_htlc,
 };
 use hns_wallet_hns::{
-    DEFAULT_DUST_THRESHOLD, HnsDirectPeerCoordinator, HnsDirectShakescapePeer, HnsRuntimeConfig,
+    DEFAULT_DUST_THRESHOLD, HnsDirectPeerCoordinator, HnsDirectShakescapePeer,
+    HnsRedeemSubmissionStage, HnsRuntimeConfig, hns_redeem_submission,
 };
 use hns_wallet_market::{
     ShakescapeBtcForHnsOfferRequest, ShakescapeDirectOfferAcceptanceRequest,
@@ -932,6 +937,10 @@ pub struct MobileShakescapeExecutionSummary {
     /// This is coordination metadata only; the confirmed booleans below still
     /// require independent local chain verification.
     pub local_funding_state: Option<String>,
+    /// Exact approved redeem transaction, if its durable broadcast checkpoint
+    /// has been crossed. This is independent of chain-verified swap progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_redemption: Option<MobileLocalRedemptionSummary>,
     pub first_funding_confirmed: bool,
     pub second_funding_confirmed: bool,
     pub first_redemption_confirmed: bool,
@@ -939,6 +948,13 @@ pub struct MobileShakescapeExecutionSummary {
     pub refund_confirmed: bool,
     pub last_verified_at_unix: u64,
     pub failure_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct MobileLocalRedemptionSummary {
+    pub state: String,
+    pub transaction_id: String,
 }
 
 /// One locally admitted direct-board or direct-session event. The native
@@ -1705,11 +1721,19 @@ impl MobileShakescapeSessionController {
                                 funding_state_name(retained.status.state).to_owned()
                             }
                         });
+                        let local_redemption = local_redemption_summary(
+                            store,
+                            self.recovery_account.as_ref(),
+                            hello,
+                            &session,
+                            local_role,
+                        )?;
                         execution_summary(
                             session,
                             local_role,
                             funding_deadline_unix,
                             local_funding_state,
+                            local_redemption,
                         )
                         .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)
                     })
@@ -1755,26 +1779,42 @@ impl MobileShakescapeSessionController {
                         candidate.session_id,
                         other_module,
                     )?;
+                    let state = if settlement
+                        .as_ref()
+                        .is_some_and(|record| record.state != SwapState::Refunded)
+                        && other_settlement
+                            .as_ref()
+                            .is_some_and(|record| record.state != SwapState::Refunded)
+                    {
+                        SwapState::Completed
+                    } else if let Some(settlement) = &settlement {
+                        settlement.state
+                    } else if recovery_now_unix().unwrap_or(0)
+                        >= terms.htlc(publication.side()).refund_at
+                    {
+                        SwapState::RefundEligible
+                    } else {
+                        SwapState::Failed
+                    };
+                    let local_redemption = if matches!(
+                        state,
+                        SwapState::Completed | SwapState::SecondRedeemed | SwapState::Refunded
+                    ) {
+                        None
+                    } else {
+                        recovered_redemption_summary(
+                            store,
+                            self.recovery_account.as_ref(),
+                            terms,
+                            candidate.session_id,
+                            candidate.participant,
+                            self.policy.network(),
+                        )?
+                    };
                     summaries.push(MobileShakescapeExecutionSummary {
                         session_id,
                         revision: 1,
-                        state: if settlement
-                            .as_ref()
-                            .is_some_and(|record| record.state != SwapState::Refunded)
-                            && other_settlement
-                                .as_ref()
-                                .is_some_and(|record| record.state != SwapState::Refunded)
-                        {
-                            SwapState::Completed
-                        } else if let Some(settlement) = &settlement {
-                            settlement.state
-                        } else if recovery_now_unix().unwrap_or(0)
-                            >= terms.htlc(publication.side()).refund_at
-                        {
-                            SwapState::RefundEligible
-                        } else {
-                            SwapState::Failed
-                        },
+                        state,
                         first_chain: if terms.offered_asset == AssetId::BTC {
                             "bitcoin"
                         } else {
@@ -1801,6 +1841,7 @@ impl MobileShakescapeSessionController {
                         first_refund_at_unix: terms.offered_refund_at,
                         second_refund_at_unix: terms.received_refund_at,
                         local_funding_state: Some("submitted".into()),
+                        local_redemption,
                         first_funding_confirmed: false,
                         second_funding_confirmed: false,
                         first_redemption_confirmed: false,
@@ -5840,6 +5881,7 @@ fn execution_summary(
     local_role: &str,
     funding_deadline_unix: u64,
     local_funding_state: Option<String>,
+    local_redemption: Option<MobileLocalRedemptionSummary>,
 ) -> Result<MobileShakescapeExecutionSummary, MobileWalletError> {
     let chain = |module| -> Result<String, MobileWalletError> {
         match module {
@@ -5878,6 +5920,7 @@ fn execution_summary(
         first_refund_at_unix: session.timeouts.first_chain_refund_at,
         second_refund_at_unix: session.timeouts.second_chain_refund_at,
         local_funding_state,
+        local_redemption,
         first_funding_confirmed: session.first_funding_is_current(),
         second_funding_confirmed: session.second_funding.is_some(),
         first_redemption_confirmed: session.first_redemption.is_some(),
@@ -5886,6 +5929,150 @@ fn execution_summary(
         last_verified_at_unix: session.last_verified_at_unix,
         failure_reason: session.failure_reason,
     })
+}
+
+fn local_redemption_summary(
+    store: &WalletStore,
+    account: Option<&HnsRuntimeConfig>,
+    hello: &SwapSessionHello,
+    session: &hns_wallet_market::SwapSession,
+    local_role: &str,
+) -> Result<Option<MobileLocalRedemptionSummary>, hns_wallet_market::MarketError> {
+    if !matches!(
+        session.state,
+        SwapState::BothFunded
+            | SwapState::FirstRedeemed
+            | SwapState::SecretObserved
+            | SwapState::RefundEligible
+            | SwapState::RefundBroadcast
+            | SwapState::Failed
+    ) {
+        return Ok(None);
+    }
+    let (module, funding_evidence, side) = if local_role == "maker" {
+        (
+            session.second_module,
+            session.second_funding,
+            SwapAssetSide::Received,
+        )
+    } else {
+        (
+            session.first_module,
+            session.first_funding,
+            SwapAssetSide::Offered,
+        )
+    };
+    let Some(_) = funding_evidence else {
+        return Ok(None);
+    };
+    let status = match module {
+        ModuleId::Handshake => {
+            let Some(account) = account else {
+                return Ok(None);
+            };
+            hns_redeem_submission(store, account, session.id)
+                .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
+                .map(|submission| MobileLocalRedemptionSummary {
+                    state: match submission.stage {
+                        HnsRedeemSubmissionStage::Queued => "queued",
+                        HnsRedeemSubmissionStage::Submitted => "submitted",
+                        HnsRedeemSubmissionStage::Seen => "seen",
+                        HnsRedeemSubmissionStage::Confirmed => "confirmed",
+                        HnsRedeemSubmissionStage::NeedsRecovery => "needs_recovery",
+                    }
+                    .to_owned(),
+                    transaction_id: crate::lowercase_hex(submission.transaction.as_bytes()),
+                })
+        }
+        ModuleId::Bitcoin => {
+            let network = bitcoin_network_for_binding(hello.header.network)?;
+            let binding = build_shakescape_bitcoin_htlc(hello, side)
+                .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+            bitcoin_htlc_redeem_submission_for_script(store, network, &binding.htlc.witness_script)
+                .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
+                .map(|submission| MobileLocalRedemptionSummary {
+                    state: match submission.stage {
+                        BitcoinHtlcRedeemSubmissionStage::Queued => "queued",
+                        BitcoinHtlcRedeemSubmissionStage::Submitted => "submitted",
+                        BitcoinHtlcRedeemSubmissionStage::Seen => "seen",
+                        BitcoinHtlcRedeemSubmissionStage::Confirmed => "confirmed",
+                    }
+                    .to_owned(),
+                    transaction_id: Txid::from_byte_array(submission.txid).to_string(),
+                })
+        }
+        ModuleId::Ethereum => {
+            return Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap);
+        }
+    };
+    Ok(status)
+}
+
+fn recovered_redemption_summary(
+    store: &WalletStore,
+    account: Option<&HnsRuntimeConfig>,
+    terms: &hns_wallet_chain_api::SwapRecoveryTerms,
+    session_id: hns_wallet_types::SessionId,
+    participant: hns_wallet_market::SwapParticipant,
+    network: NetworkBinding,
+) -> Result<Option<MobileLocalRedemptionSummary>, hns_wallet_market::MarketError> {
+    let side = match participant {
+        hns_wallet_market::SwapParticipant::Maker => SwapAssetSide::Received,
+        hns_wallet_market::SwapParticipant::Taker => SwapAssetSide::Offered,
+    };
+    match terms.htlc(side).chain {
+        ChainId::HANDSHAKE => {
+            let Some(account) = account else {
+                return Ok(None);
+            };
+            Ok(hns_redeem_submission(store, account, session_id)
+                .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
+                .map(|submission| MobileLocalRedemptionSummary {
+                    state: match submission.stage {
+                        HnsRedeemSubmissionStage::Queued => "queued",
+                        HnsRedeemSubmissionStage::Submitted => "submitted",
+                        HnsRedeemSubmissionStage::Seen => "seen",
+                        HnsRedeemSubmissionStage::Confirmed => "confirmed",
+                        HnsRedeemSubmissionStage::NeedsRecovery => "needs_recovery",
+                    }
+                    .to_owned(),
+                    transaction_id: crate::lowercase_hex(submission.transaction.as_bytes()),
+                }))
+        }
+        ChainId::BITCOIN => {
+            let bitcoin = bitcoin_network_for_binding(network)?;
+            let htlc = build_recovered_bitcoin_htlc(terms, side)
+                .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?;
+            Ok(
+                bitcoin_htlc_redeem_submission_for_script(store, bitcoin, &htlc.witness_script)
+                    .map_err(|_| hns_wallet_market::MarketError::CorruptShakescapeDirectSwap)?
+                    .map(|submission| MobileLocalRedemptionSummary {
+                        state: match submission.stage {
+                            BitcoinHtlcRedeemSubmissionStage::Queued => "queued",
+                            BitcoinHtlcRedeemSubmissionStage::Submitted => "submitted",
+                            BitcoinHtlcRedeemSubmissionStage::Seen => "seen",
+                            BitcoinHtlcRedeemSubmissionStage::Confirmed => "confirmed",
+                        }
+                        .to_owned(),
+                        transaction_id: Txid::from_byte_array(submission.txid).to_string(),
+                    }),
+            )
+        }
+        _ => Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap),
+    }
+}
+
+fn bitcoin_network_for_binding(
+    binding: NetworkBinding,
+) -> Result<BitcoinNetwork, hns_wallet_market::MarketError> {
+    match binding.counterchain_network {
+        1 => Ok(BitcoinNetwork::Bitcoin),
+        2 => Ok(BitcoinNetwork::Testnet),
+        3 => Ok(BitcoinNetwork::Regtest),
+        4 => Ok(BitcoinNetwork::Testnet4),
+        5 => Ok(BitcoinNetwork::Signet),
+        _ => Err(hns_wallet_market::MarketError::CorruptShakescapeDirectSwap),
+    }
 }
 
 fn funding_state_name(state: FundingState) -> &'static str {

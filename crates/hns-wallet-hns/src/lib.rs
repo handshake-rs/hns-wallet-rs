@@ -3168,6 +3168,62 @@ enum HnsSettlementStage {
     Cancelled,
 }
 
+/// Non-sensitive state of this wallet's durable HNS redeem submission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HnsRedeemSubmissionStage {
+    Queued,
+    Submitted,
+    Seen,
+    Confirmed,
+    NeedsRecovery,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HnsRedeemSubmission {
+    pub transaction: TransactionHash,
+    pub stage: HnsRedeemSubmissionStage,
+}
+
+/// Read the exact session's approved redeem checkpoint. A merely prepared
+/// transaction is still awaiting approval and must not hide the redeem action.
+pub fn hns_redeem_submission(
+    store: &WalletStore,
+    config: &HnsRuntimeConfig,
+    session_id: SessionId,
+) -> Result<Option<HnsRedeemSubmission>, HnsWalletError> {
+    let id = settlement_workflow_id(config, session_id, HnsSettlementAction::Redeem);
+    let Some(stored) = store.load_workflow::<serde_json::Value>(id)? else {
+        return Ok(None);
+    };
+    if stored.kind != WorkflowKind::AtomicSwap {
+        return Err(HnsWalletError::InvalidWorkflow);
+    }
+    let state: HnsPreparedSettlement = serde_json::from_value(stored.state)?;
+    if state.workflow_id != id
+        || state.session_id != session_id
+        || state.wallet_id != config.wallet_id
+        || state.account_id != config.account_id
+        || state.action != HnsSettlementAction::Redeem
+    {
+        return Err(HnsWalletError::InvalidWorkflow);
+    }
+    let stage = match state.stage {
+        HnsSettlementStage::Prepared if stored.irreversible_broadcast_prepared => {
+            Some(HnsRedeemSubmissionStage::Queued)
+        }
+        HnsSettlementStage::Broadcast => Some(HnsRedeemSubmissionStage::Submitted),
+        HnsSettlementStage::Mempool => Some(HnsRedeemSubmissionStage::Seen),
+        HnsSettlementStage::Confirmed => Some(HnsRedeemSubmissionStage::Confirmed),
+        HnsSettlementStage::RequiresRebroadcast => Some(HnsRedeemSubmissionStage::Queued),
+        HnsSettlementStage::Conflicted => Some(HnsRedeemSubmissionStage::NeedsRecovery),
+        _ => None,
+    };
+    Ok(stage.map(|stage| HnsRedeemSubmission {
+        transaction: state.transaction,
+        stage,
+    }))
+}
+
 /// Exact persisted ShakeScape state that must still authorize a guarded HNS
 /// redeem when its signed transaction crosses the irreversible broadcast
 /// checkpoint. The workflow revision binds current funding authority; the
@@ -16992,6 +17048,100 @@ mod tests {
                 stage, 0, false, 100,
             ));
         }
+    }
+
+    #[test]
+    fn hns_redeem_status_starts_at_the_irreversible_checkpoint() {
+        let config = test_runtime_config();
+        let session_id = SessionId::new([31; 32]);
+        let transaction = TransactionHash::new([32; 32]);
+        let id = settlement_workflow_id(&config, session_id, HnsSettlementAction::Redeem);
+        let mut store = WalletStore::create(":memory:", "redeem-status").expect("store");
+        let mut state = HnsPreparedSettlement {
+            wallet_id: config.wallet_id,
+            account_id: config.account_id,
+            workflow_id: id,
+            session_id,
+            action: HnsSettlementAction::Redeem,
+            stage: HnsSettlementStage::Prepared,
+            transaction,
+            signed_transaction: vec![1],
+            input_coins: Vec::new(),
+            fee: BaseUnits::new(1),
+            maximum_fee: BaseUnits::new(1),
+            fee_quote: None,
+            expires_at_unix: 200,
+            terms: HnsSettlementTerms::Redeem {
+                lock: VerifiedLock {
+                    module: ModuleId::Handshake,
+                    session_id,
+                    funding_id: TransactionHash::new([33; 32]),
+                    amount: Amount::new(WalletAsset::Hns, 100),
+                    hashlock: ObjectHash::new([34; 32]),
+                    absolute_timelock: 300,
+                    confirmation_count: 2,
+                    evidence_hash: ObjectHash::new([35; 32]),
+                },
+            },
+            recovery_publication: None,
+            broadcast_guard: None,
+        };
+        let revision = store
+            .save_workflow(id, WorkflowKind::AtomicSwap, 0, &state, false, 100)
+            .expect("reversible preparation");
+        assert!(
+            hns_redeem_submission(&store, &config, session_id)
+                .expect("unapproved state")
+                .is_none()
+        );
+        let revision = store
+            .save_workflow(id, WorkflowKind::AtomicSwap, revision, &state, true, 101)
+            .expect("durable broadcast checkpoint");
+        assert_eq!(
+            hns_redeem_submission(&store, &config, session_id)
+                .expect("queued state")
+                .expect("queued claim")
+                .stage,
+            HnsRedeemSubmissionStage::Queued
+        );
+        state.stage = HnsSettlementStage::Broadcast;
+        let revision = store
+            .save_workflow(id, WorkflowKind::AtomicSwap, revision, &state, true, 102)
+            .expect("submitted checkpoint");
+        assert_eq!(
+            hns_redeem_submission(&store, &config, session_id).expect("submitted state"),
+            Some(HnsRedeemSubmission {
+                transaction,
+                stage: HnsRedeemSubmissionStage::Submitted,
+            })
+        );
+        state.stage = HnsSettlementStage::Confirmed;
+        let revision = store
+            .save_workflow(id, WorkflowKind::AtomicSwap, revision, &state, true, 103)
+            .expect("confirmed checkpoint");
+        assert_eq!(
+            hns_redeem_submission(&store, &config, session_id)
+                .expect("confirmed state")
+                .expect("same claim")
+                .stage,
+            HnsRedeemSubmissionStage::Confirmed
+        );
+        state.stage = HnsSettlementStage::RequiresRebroadcast;
+        store
+            .save_workflow(id, WorkflowKind::AtomicSwap, revision, &state, true, 104)
+            .expect("reorged checkpoint");
+        assert_eq!(
+            hns_redeem_submission(&store, &config, session_id)
+                .expect("reorged state")
+                .expect("same claim")
+                .stage,
+            HnsRedeemSubmissionStage::Queued
+        );
+        assert!(
+            hns_redeem_submission(&store, &config, SessionId::new([36; 32]))
+                .expect("different session")
+                .is_none()
+        );
     }
 
     #[test]

@@ -2931,6 +2931,131 @@ mod tests {
                 .map(|intent| intent.fee_sats),
             Some(500)
         );
+        let status = bitcoin_htlc_redeem_submission(
+            &store,
+            Network::Regtest,
+            *lock.funding_txid.as_bytes(),
+            &lock.htlc.witness_script,
+        )
+        .expect("durable queued redeem")
+        .expect("approved redeem");
+        assert_eq!(status.txid, persisted.txid);
+        assert_eq!(status.stage, BitcoinHtlcRedeemSubmissionStage::Queued);
+        assert_eq!(
+            bitcoin_htlc_redeem_submission_for_script(
+                &store,
+                Network::Regtest,
+                &lock.htlc.witness_script,
+            )
+            .expect("recovered claim by exact script"),
+            Some(status),
+        );
+        assert!(
+            bitcoin_htlc_redeem_submission(
+                &store,
+                Network::Regtest,
+                [42; 32],
+                &lock.htlc.witness_script,
+            )
+            .expect("different swap")
+            .is_none()
+        );
+        assert!(
+            bitcoin_htlc_redeem_submission(
+                &store,
+                Network::Regtest,
+                *lock.funding_txid.as_bytes(),
+                &[42; 32],
+            )
+            .expect("different HTLC script")
+            .is_none()
+        );
+        let mut approved = stored.value.clone();
+        approved.broadcast.as_mut().expect("intent").phase = BitcoinBroadcastPhase::Submitted;
+        approved.broadcast.as_mut().expect("intent").attempt_count = 1;
+        approved
+            .broadcast
+            .as_mut()
+            .expect("intent")
+            .last_submission_started_at_unix = Some(101);
+        approved
+            .broadcast
+            .as_mut()
+            .expect("intent")
+            .last_submitted_at_unix = Some(102);
+        approved.last_changed_at_unix = 102;
+        let revision = store
+            .save_bitcoin_transaction(&persisted.txid, stored.revision, &approved, 102)
+            .expect("submitted checkpoint");
+        assert_eq!(
+            bitcoin_htlc_redeem_submission(
+                &store,
+                Network::Regtest,
+                *lock.funding_txid.as_bytes(),
+                &lock.htlc.witness_script,
+            )
+            .expect("submitted redeem")
+            .expect("redeem")
+            .stage,
+            BitcoinHtlcRedeemSubmissionStage::Submitted
+        );
+        approved.observation = BitcoinChainObservation::Unconfirmed {
+            first_seen_at_unix: Some(103),
+            last_seen_at_unix: Some(103),
+        };
+        approved.last_changed_at_unix = 103;
+        let revision = store
+            .save_bitcoin_transaction(&persisted.txid, revision, &approved, 103)
+            .expect("observed checkpoint");
+        assert_eq!(
+            bitcoin_htlc_redeem_submission(
+                &store,
+                Network::Regtest,
+                *lock.funding_txid.as_bytes(),
+                &lock.htlc.witness_script,
+            )
+            .expect("observed redeem")
+            .expect("redeem")
+            .stage,
+            BitcoinHtlcRedeemSubmissionStage::Seen
+        );
+        approved.observation = BitcoinChainObservation::Confirmed {
+            height: 120,
+            block_hash: [44; 32],
+            confirmation_time_unix: 104,
+            transitively_confirmed_by: None,
+        };
+        approved.last_changed_at_unix = 104;
+        let revision = store
+            .save_bitcoin_transaction(&persisted.txid, revision, &approved, 104)
+            .expect("confirmed checkpoint");
+        assert_eq!(
+            bitcoin_htlc_redeem_submission_for_script(
+                &store,
+                Network::Regtest,
+                &lock.htlc.witness_script,
+            )
+            .expect("confirmed redeem")
+            .expect("redeem")
+            .stage,
+            BitcoinHtlcRedeemSubmissionStage::Confirmed
+        );
+        approved.observation = BitcoinChainObservation::AbsentFromCanonicalWalletView;
+        approved.last_changed_at_unix = 105;
+        store
+            .save_bitcoin_transaction(&persisted.txid, revision, &approved, 105)
+            .expect("reorged checkpoint");
+        assert_eq!(
+            bitcoin_htlc_redeem_submission_for_script(
+                &store,
+                Network::Regtest,
+                &lock.htlc.witness_script,
+            )
+            .expect("reorged redeem")
+            .expect("same approved redeem")
+            .stage,
+            BitcoinHtlcRedeemSubmissionStage::Submitted
+        );
 
         let mut changed_output = redeem_transaction.clone();
         changed_output.output[0].value = BitcoinAmount::from_sat(49_499);

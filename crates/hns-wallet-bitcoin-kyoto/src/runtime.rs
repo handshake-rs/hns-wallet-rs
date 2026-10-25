@@ -3434,6 +3434,102 @@ pub struct BitcoinBroadcastRecoverySummary {
     pub last_changed_at_unix: Option<u64>,
 }
 
+/// Non-sensitive status of an approved redeem of one exact Bitcoin HTLC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BitcoinHtlcRedeemSubmissionStage {
+    Queued,
+    Submitted,
+    Seen,
+    Confirmed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BitcoinHtlcRedeemSubmission {
+    pub txid: [u8; 32],
+    pub stage: BitcoinHtlcRedeemSubmissionStage,
+}
+
+/// Match an approved signed redeem against both the exact funding transaction
+/// and its HTLC witness script. Other wallet sends and the refund branch must
+/// never suppress the redeem action for this session.
+pub fn bitcoin_htlc_redeem_submission(
+    store: &WalletStore,
+    network: Network,
+    funding_txid: [u8; 32],
+    witness_script: &[u8],
+) -> Result<Option<BitcoinHtlcRedeemSubmission>, BitcoinWalletError> {
+    bitcoin_htlc_redeem_submission_inner(store, network, Some(funding_txid), witness_script)
+}
+
+/// Recover a claim when the original execution journal is unavailable. The
+/// exact signed HTLC script still binds the approved spend to one swap.
+pub fn bitcoin_htlc_redeem_submission_for_script(
+    store: &WalletStore,
+    network: Network,
+    witness_script: &[u8],
+) -> Result<Option<BitcoinHtlcRedeemSubmission>, BitcoinWalletError> {
+    bitcoin_htlc_redeem_submission_inner(store, network, None, witness_script)
+}
+
+fn bitcoin_htlc_redeem_submission_inner(
+    store: &WalletStore,
+    network: Network,
+    funding_txid: Option<[u8; 32]>,
+    witness_script: &[u8],
+) -> Result<Option<BitcoinHtlcRedeemSubmission>, BitcoinWalletError> {
+    let records = store
+        .bitcoin_transactions::<BitcoinTransactionRecord>(MAX_TRACKED_BITCOIN_TRANSACTIONS + 1)?;
+    if records.len() > MAX_TRACKED_BITCOIN_TRANSACTIONS {
+        return Err(BitcoinWalletError::BitcoinTransactionCapacity);
+    }
+    let mut match_found = None;
+    for stored in records {
+        let record = stored.value;
+        record.validate()?;
+        let Some(intent) = record.broadcast.as_ref() else {
+            continue;
+        };
+        if intent.network != network {
+            return Err(BitcoinWalletError::NetworkMismatch);
+        }
+        let raw = record
+            .raw_transaction
+            .as_ref()
+            .ok_or(BitcoinWalletError::CorruptRuntimeState)?;
+        let transaction: Transaction =
+            deserialize(raw).map_err(|_| BitcoinWalletError::CorruptRuntimeState)?;
+        let is_redeem = transaction.input.iter().any(|input| {
+            funding_txid.is_none_or(|id| input.previous_output.txid.to_byte_array() == id)
+                && input.witness.len() == 4
+                && input.witness[2].as_ref() == [1]
+                && &input.witness[3] == witness_script
+        });
+        if !is_redeem {
+            continue;
+        }
+        if match_found.is_some() {
+            return Err(BitcoinWalletError::BroadcastConflict);
+        }
+        let stage = match record.observation {
+            BitcoinChainObservation::Confirmed { .. } => {
+                BitcoinHtlcRedeemSubmissionStage::Confirmed
+            }
+            BitcoinChainObservation::Unconfirmed { .. } => BitcoinHtlcRedeemSubmissionStage::Seen,
+            BitcoinChainObservation::AbsentFromCanonicalWalletView => match intent.phase {
+                BitcoinBroadcastPhase::Prepared | BitcoinBroadcastPhase::SubmissionStarted => {
+                    BitcoinHtlcRedeemSubmissionStage::Queued
+                }
+                BitcoinBroadcastPhase::Submitted => BitcoinHtlcRedeemSubmissionStage::Submitted,
+            },
+        };
+        match_found = Some(BitcoinHtlcRedeemSubmission {
+            txid: record.txid,
+            stage,
+        });
+    }
+    Ok(match_found)
+}
+
 /// Authenticate and summarize all approved broadcasts for the selected
 /// network without exposing their signed bytes or wallet inputs.
 pub fn bitcoin_broadcast_recovery_summary(
