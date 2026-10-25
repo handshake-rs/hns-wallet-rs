@@ -1,10 +1,9 @@
 # hns-wallet-bitcoin-kyoto
 
-## 0.4.8 - unreleased
+## 0.4.8 - 2026-10-25
 
-<!-- hns-wallet-release-state: 0.4.8 candidate -->
-This heading describes the current unpublished release candidate, not an
-existing crates.io package, Git tag, or GitHub release.
+<!-- hns-wallet-release-state: 0.4.8 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
 
 Expose the exact approved Bitcoin HTLC redeem transaction and its durable
 broadcast or chain-observation stage, including recovery lookup by signed

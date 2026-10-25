@@ -1,10 +1,9 @@
 # hns-wallet-mobile
 
-## 0.6.6 - unreleased
+## 0.6.6 - 2026-10-25
 
-<!-- hns-wallet-release-state: 0.6.6 candidate -->
-This heading describes the current unpublished release candidate, not an
-existing crates.io package, Git tag, or GitHub release.
+<!-- hns-wallet-release-state: 0.6.6 release -->
+This crate changelog describes the prepared `hns-wallet-rs` release source.
 
 Include a local redemption stage and transaction ID in Shakescape execution
 summaries while retaining chain-verified swap progress separately.
